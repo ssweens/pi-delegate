@@ -38,6 +38,7 @@ Models live on OpenRouter but absent from the registry are listed separately (us
 - Waiters attached at completion receive the result instead of a separate completion wake-up. Multiple waiters receive the same result. A late wait does not retract an earlier notification or send another one.
 - `steer` always returns without waiting for the child to finish: it queues a correction on a running child or resumes a saved inactive child in the background. Use `wait` to join resumed work; otherwise completion wakes the parent. Cancelling the parent tool does not cancel the background child.
 - A finished child resumed with `steer` gets a new completion; earlier returned results do not change. A child still stopping cannot resume until its execution settles.
+- Recorded launch, control, and completion details are snapshots. Later worker activity does not mutate earlier tool results. The Agents frame remains live.
 - Run IDs belong to their parent session. Reloading or reopening that same parent restores access to its children. `wait` joins a live child or returns its saved result; it never restarts work.
 
 ## While a child runs
@@ -131,6 +132,10 @@ Async launches have no duplicate status card or dispatch frame in the conversati
 ## Run log
 
 `~/.pi/agent/delegate-runs.jsonl` — one line per run: id, role, model, thinking, context, cwd, **task text**, status, tokens, cost, duration, changed files, dropped tools, error, first 2 KB of output. Child transcripts persist in the working directory the child ran in: `<cwd>/.agents/pi/subsessions/` — `tail -f` one to watch a child live. The full path is in every run-log row (`sessionFile`) and in the expanded outcome record. Each child also has an atomic JSON snapshot of its identity, runtime inputs, stop state, and result. Parent indexes and ownership leases live in the parent's working directory under `.agents/pi/subsessions/owners/`. The directory gets a self-ignoring `.gitignore` (`*`) on creation, so transcripts never reach `git status` or a child's `git add -A`; it is scoped to that directory, so a repo can still track `.agents/` for agent definitions.
+
+## In-process milestone events
+
+Extensions in the **same parent Pi session** may subscribe to `pi.events.on("pi-delegate:milestone.v1", handler)`. Events have `{ version: 1, runId, segment, role, kind, at }` and one kind-specific payload: `started` has a bounded `task`, `note` has up to 500 characters of the child's completed assistant text, and `settled` has `status` and up to 20 changed paths. A note can arrive while the child is still running; the event bus does not start a parent model turn or add a child tool. Silent/tool-only children supply start and settlement, not an invented narrative. These events are **ephemeral**; the existing parent completion receipt and run log remain the durable facts. On reload, live children publish subsequent milestones to the newly attached parent extension. Cross-process peers need a separate transport such as pi-intercom; this event channel has no broker.
 
 ## Verification
 

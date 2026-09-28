@@ -41,6 +41,20 @@ const WRITE_TOOLS = new Set(["edit", "write"]);
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 const MAX_RETAINED_SESSIONS = 8;
 const OUTPUT_CAP = 40_000;
+/** Parent-session event bus only. No model turn or worker tool is created by a milestone. */
+export const DELEGATE_MILESTONE_EVENT = "pi-delegate:milestone.v1";
+export interface DelegateMilestone {
+	version: 1;
+	runId: string;
+	segment: number;
+	role: string;
+	kind: "started" | "note" | "settled";
+	at: number;
+	task?: string;
+	text?: string;
+	status?: Status;
+	changedFiles?: string[];
+}
 
 const CONTRACT_FOOTER = `
 
@@ -140,6 +154,13 @@ const processState = globalThis as typeof globalThis & { [key: symbol]: RuntimeS
 const state = processState[runtimeKey] ??= { runs: new Map(), owners: new Map(), listeners: new Set() };
 const { runs, listeners } = state;
 function changed() { for (const listener of listeners) listener(); }
+function milestone(run: Run, event: Omit<DelegateMilestone, "version" | "runId" | "segment" | "role" | "at">) {
+	const owner = state.owners.get(run.ownerKey);
+	if (!owner?.binding || owner.closed || run.foreign) return;
+	owner.binding.pi.events.emit(DELEGATE_MILESTONE_EVENT, {
+		version: 1, runId: run.id, segment: run.segment, role: run.role, at: Date.now(), ...event,
+	} satisfies DelegateMilestone);
+}
 function newId(role: string): string { return `${role}-${randomUUID()}`; }
 function ownerPath(ctx: ExtensionContext): string {
 	return join(storageDir(ctx.sessionManager.getCwd()), "owners", `${ctx.sessionManager.getSessionId()}.json`);
@@ -182,7 +203,7 @@ function openTranscript(run: Run): SessionManager {
 	return manager;
 }
 function finalResult(run: Run): RunResult {
-	return { content: [{ type: "text", text: resultText(run) }], details: { ...view(run), settled: true, completionReceipt: true, toolCalls: [...run.toolCalls] }, isError: run.status !== "complete" };
+	return { content: [{ type: "text", text: resultText(run) }], details: { ...recordedView(run), settled: true, completionReceipt: true }, isError: run.status !== "complete" };
 }
 function restoreRun(path: string, owner: Owner): Run {
 	const record = readRecord<RunRecord>(path);
@@ -720,6 +741,12 @@ function view(run: Run): RunView {
 	};
 }
 
+// The SDK retains result objects in its session tree. Published facts must not
+// share mutable arrays/objects with a child that is still running or later resumed.
+function recordedView(run: Run): RunView {
+	return structuredClone(view(run));
+}
+
 function summary(run: Run): string {
 	const dur = ((run.endedAt ?? Date.now()) - run.startedAt) / 1000;
 	const parts = [
@@ -793,6 +820,7 @@ function finish(run: Run, status: Status, error?: string) {
 	log(run);
 	retire(run);
 	run.completion.settle(finalResult(run));
+	milestone(run, { kind: "settled", status: run.status, changedFiles: run.changedFiles.slice(0, 20) });
 	changed();
 }
 
@@ -1062,6 +1090,10 @@ export default function (pi: ExtensionAPI) {
 			if (ev.type === "message_end") {
 				try { saveRun(run); }
 				catch (error) { run.status = "error"; run.error = `Cannot save child state: ${String(error)}`; void session.abort(); }
+				if (run.status === "running" && ev.message?.role === "assistant") {
+					const text = ev.message.content?.filter((b: any) => b.type === "text").map((b: any) => b.text).join(" ").trim();
+					if (text) milestone(run, { kind: "note", text: text.slice(0, 500) });
+				}
 			}
 			changed();
 		});
@@ -1075,6 +1107,7 @@ export default function (pi: ExtensionAPI) {
 			run.ready = openSession(run, onUpdate, preparedLoader);
 			await run.ready;
 			if (run.status === "running") {
+				milestone(run, { kind: "started", task: task.slice(0, 600) });
 				run.dirtyBefore = snapshotDirty(run.cwd);
 				run.segmentStartedAt = Date.now();
 				armTimeout(run);
@@ -1232,7 +1265,7 @@ export default function (pi: ExtensionAPI) {
 
 			if (!p.sync) {
 				void work.then(() => publish(completion));
-				return { content: [{ type: "text", text: `${run.id} running (${run.context}, ${run.model}). Completion will wake you; use delegate_ctl wait with this runId when dependent work needs the result.` }], details: view(run) };
+				return { content: [{ type: "text", text: `${run.id} running (${run.context}, ${run.model}). Completion will wake you; use delegate_ctl wait with this runId when dependent work needs the result.` }], details: recordedView(run) };
 			}
 
 			await work;
@@ -1387,7 +1420,7 @@ export default function (pi: ExtensionAPI) {
 			if (p.action === "status" && !p.runId) {
 				const owned = ownedRuns(owner);
 				const lines = owned.map((r) => `${summary(r).split("\n")[0]}${r.status === "running" && r.lastTool ? `  last: ${r.lastTool}` : ""}`);
-				return { content: [{ type: "text", text: lines.join("\n") || "no runs" }], details: { kind: "runs", rows: owned.map(view) } };
+				return { content: [{ type: "text", text: lines.join("\n") || "no runs" }], details: { kind: "runs", rows: owned.map(recordedView) } };
 			}
 			const run = p.runId ? runs.get(p.runId) : undefined;
 			if (!run || run.ownerKey !== owner.key) throw new Error(`unknown runId ${p.runId ?? "(none)"}; known: ${ownedRuns(owner).map((r) => r.id).join(", ") || "none"}`);
@@ -1397,12 +1430,12 @@ export default function (pi: ExtensionAPI) {
 					return await run.completion.wait(signal);
 				case "status":
 					if (run.session && run.status === "running") harvest(run);
-					return { content: [{ type: "text", text: `${summary(run)}${run.status === "running" ? `\nnow: ${run.activeTools.values().next().value?.name ?? (run.lastTool ? `thinking after ${run.lastTool}` : "thinking")} \u00b7 ${run.toolCalls.length} tool call${run.toolCalls.length === 1 ? "" : "s"} so far \u00b7 ${Math.round((run.timeoutMs - (Date.now() - run.startedAt)) / 60000)} min of its budget left` : ""}` }], details: view(run) };
+					return { content: [{ type: "text", text: `${summary(run)}${run.status === "running" ? `\nnow: ${run.activeTools.values().next().value?.name ?? (run.lastTool ? `thinking after ${run.lastTool}` : "thinking")} \u00b7 ${run.toolCalls.length} tool call${run.toolCalls.length === 1 ? "" : "s"} so far \u00b7 ${Math.round((run.timeoutMs - (Date.now() - run.startedAt)) / 60000)} min of its budget left` : ""}` }], details: recordedView(run) };
 				case "result":
-					return run.completion.settled ? finalResult(run) : { content: [{ type: "text", text: resultText(run) }], details: view(run) };
+					return run.completion.settled ? finalResult(run) : { content: [{ type: "text", text: resultText(run) }], details: recordedView(run) };
 				case "cancel":
 					await cancelRun(run);
-					return { content: [{ type: "text", text: `${run.id} stopped; automatic revival is disabled.` }], details: view(run) };
+					return { content: [{ type: "text", text: `${run.id} stopped; automatic revival is disabled.` }], details: recordedView(run) };
 				case "steer": {
 					if (!p.message) throw new Error("steer requires message");
 					const running = run.status === "running";
@@ -1418,7 +1451,7 @@ export default function (pi: ExtensionAPI) {
 					await steer(run, p.message, p.restart, replacement);
 					const moved = replacement?.model ? ` Model changed from ${previous} to ${run.model}${run.thinking ? `:${run.thinking}` : ""} for this and later segments; its earlier work keeps the model it ran on.` : "";
 					const retimed = replacement?.timeoutMs !== undefined ? ` Budget now ${Math.round(run.timeoutMs / 60000)} min for this and later segments.` : "";
-					return { content: [{ type: "text", text: `${run.id}: ${running ? "steer queued" : "resumed in the background"}.${moved}${retimed} Completion will wake you; use wait to join.` }], details: view(run) };
+					return { content: [{ type: "text", text: `${run.id}: ${running ? "steer queued" : "resumed in the background"}.${moved}${retimed} Completion will wake you; use wait to join.` }], details: recordedView(run) };
 				}
 			}
 			return { content: [{ type: "text", text: "unreachable" }], isError: true, details: undefined };
