@@ -91,14 +91,47 @@ test("real SDK delegation lifecycle (loopback provider, no credentials)", { time
 			pending = true; // a message queues while the wait is in flight
 			const interrupted = await wait;
 			pending = false; // reset before assertions so a failure here cannot leak into later tests
-			gate.resolve();
 			assert.match(interrupted.content[0].text, /wait interrupted — queued messages are waiting/);
 			assert.match(interrupted.content[0].text, /call wait again to rejoin/);
 			assert.equal(interrupted.details.status, "running", "an early wake never settles or cancels the child");
 			assert.equal(interrupted.isError, false);
+			gate.resolve();
 			const done = await h.ctl("wait", id);
 			assert.equal(done.details.status, "complete");
 			assert.equal(done.details.output, "WAKE-OK");
+		});
+		await t.test("wait reports a child that stops without reporting completion, and a real completion still wins", async () => {
+			const gate = deferred();
+			const arrived = api.script("Crash watch work", { text: "CRASH-OK", gate });
+			const launch = await h.launch("Crash watch work");
+			const id = launch.details.id;
+			await arrived;
+			const run = state().runs.get(id);
+			const ctx: any = h.ctx();
+			let pending = false;
+			const original = ctx.hasPendingMessages.bind(ctx);
+			ctx.hasPendingMessages = () => pending || original();
+			// Coexistence: with a message queued, the normal wake wins even while status is terminal.
+			run.status = "error"; run.error = "simulated crash: completion never arrived";
+			pending = true;
+			const msgWake = await h.ctl("wait", id);
+			assert.equal(msgWake.isError, false, "a queued message keeps the normal wake");
+			assert.match(msgWake.content[0].text, /wait interrupted/);
+			pending = false;
+			// Two consecutive polls later the terminal status is reported, not waited through.
+			const lost = await h.ctl("wait", id);
+			assert.equal(lost.isError, true);
+			assert.match(lost.content[0].text, /wait lost the child — status=error/);
+			assert.match(lost.content[0].text, /simulated crash/);
+			assert.equal(lost.details.status, "error");
+			assert.equal(run.completion.settled, false, "the crash wake neither settles nor cancels the child");
+			// The injected terminal status is the run's recorded truth: the run still settles
+			// after the wake (the subscription is not orphaned), and finish does not launder
+			// a terminal status back into "complete".
+			gate.resolve();
+			const done = await h.ctl("wait", id);
+			assert.equal(run.completion.settled, true, "the run settles after the crash wake");
+			assert.equal(done.details.status, "error");
 		});
 		// Field report: every delegate failed with `The "path" argument must be of type string` after a
 		// live session reloaded onto per-run ownership. The runtime registry outlives /reload so live
