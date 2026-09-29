@@ -36,7 +36,7 @@ test("automatic Mom waits for a worker to settle, then observes its whole run wi
 			motherRequests.push(input);
 			const ref = /\[src:([^\]]+)\]/.exec(input.newEvents)?.[1] ?? input.original.ref;
 			return { tool: { name: "commit_graph", arguments: { revision: input.graph.revision, purpose: "main", focus: "main", note: null,
-				upsertNodes: [{ id: "main", kind: "try", parent: null, state: "active", label: "Main purpose", intent: "Keep the main purpose.", observed: "Scout progress received.", actor: "lead", sources: [ref] }],
+				upsertNodes: [{ id: "main", kind: "try", parent: null, state: "active", label: "Main purpose", intent: input.original.text, observed: "Scout progress received.", actor: "lead", sources: [ref] }],
 				unfinished: [], upsertEdges: [], removeEdges: [], merges: [], folds: [], removeNodes: [], supersessions: [] } } };
 		});
 		await h.runtime.session.prompt(prompt);
