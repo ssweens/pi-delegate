@@ -76,6 +76,30 @@ test("real SDK delegation lifecycle (loopback provider, no credentials)", { time
 			assert.match(readFileSync(file, "utf8"), /parent-only-marker/);
 			assert.equal((readFileSync(file, "utf8").match(/Reload work/g) ?? []).length, 1);
 		});
+		await t.test("wait wakes early for queued messages, keeps the child running, and rejoins", async () => {
+			const gate = deferred();
+			const arrived = api.script("Pending wake work", { text: "WAKE-OK", gate });
+			const launch = await h.launch("Pending wake work");
+			const id = launch.details.id;
+			await arrived; // the child's model call is parked on the gate
+			const ctx: any = h.ctx();
+			assert.equal(typeof ctx.hasPendingMessages, "function", "the session context exposes queued-message state");
+			let pending = false;
+			const original = ctx.hasPendingMessages.bind(ctx);
+			ctx.hasPendingMessages = () => pending || original();
+			const wait = h.ctl("wait", id);
+			pending = true; // a message queues while the wait is in flight
+			const interrupted = await wait;
+			pending = false; // reset before assertions so a failure here cannot leak into later tests
+			gate.resolve();
+			assert.match(interrupted.content[0].text, /wait interrupted — queued messages are waiting/);
+			assert.match(interrupted.content[0].text, /call wait again to rejoin/);
+			assert.equal(interrupted.details.status, "running", "an early wake never settles or cancels the child");
+			assert.equal(interrupted.isError, false);
+			const done = await h.ctl("wait", id);
+			assert.equal(done.details.status, "complete");
+			assert.equal(done.details.output, "WAKE-OK");
+		});
 		// Field report: every delegate failed with `The "path" argument must be of type string` after a
 		// live session reloaded onto per-run ownership. The runtime registry outlives /reload so live
 		// children survive it, which means the Owner in it was built by the previous version: no `dir`,

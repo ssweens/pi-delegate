@@ -1273,6 +1273,43 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+const WAIT_POLL_MS = 1000;
+/**
+ * Join the child, waking early when queued messages exist: pi delivers steering only after this
+ * tool returns, so a blocking join would postpone every queued message until the child finishes.
+ * Early return is not an error — the child keeps running and wait rejoins after the messages are handled.
+ */
+async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSignal) {
+	if (signal?.aborted) throw new DOMException("Wait cancelled; the child is unaffected.", "AbortError");
+	const interrupted = {
+		content: [{ type: "text" as const, text: `${run.id}: wait interrupted — queued messages are waiting for you; the child keeps running.\nAnswer the queued message(s) first, then call wait again to rejoin.\n${summary(run)}` }],
+		details: recordedView(run),
+		isError: false, // an early wake is a normal result, not a failure
+	};
+	return new Promise<Awaited<ReturnType<typeof run.completion.wait>>>((resolve, reject) => {
+		let done = false;
+		let unsubscribe: () => void = () => {};
+		let poll: ReturnType<typeof setInterval> | undefined;
+		const finish = (deliver: () => void) => {
+			if (done) return;
+			done = true;
+			unsubscribe();
+			if (poll !== undefined) clearInterval(poll);
+			signal?.removeEventListener("abort", onAbort);
+			deliver();
+		};
+		const onAbort = () => finish(() => reject(new DOMException("Wait cancelled; the child is unaffected.", "AbortError")));
+		// Settle wakes instantly (no poll latency); queued messages are polled at WAIT_POLL_MS.
+		// subscribe can fire synchronously when the child already settled: finish() guards the rest.
+		unsubscribe = run.completion.subscribe((value) => finish(() => resolve(value)));
+		if (done) return;
+		poll = setInterval(() => {
+			if (ctx.hasPendingMessages()) finish(() => resolve(interrupted));
+		}, WAIT_POLL_MS);
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
 	pi.registerTool({
 		name: "delegate_ctl",
 		renderCall: blockingCall((args) => args?.action === "wait" ? `Waiting for ${args.runId ?? "a child"}` : undefined),
@@ -1281,7 +1318,7 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"See the delegation skill for the full procedure. models: every offering across all enabled providers, verbatim from the registry (provider/id, reasoning, context, $/M), plus live OpenRouter pricing, tiered rates, expirations and Artificial Analysis indices, your cached ratings, approved defaults and drift \u2014 call before the first delegate of a session. " +
 			"rate: store quality ratings you researched, per exact offering (provider/id), so choices are grounded; stale after 14 days. approve: record a role's default model after the user agreed in conversation. " +
-			"roles: list roles. status: one run or all \u2014 a nonblocking progress read: status, current tool, tool calls so far, elapsed, remaining time budget. result: current report without waiting. wait: join an existing runId without polling; returns its final report, immediately if finished. Cancelling wait only detaches; the child keeps running. An attached waiter receives completion instead of a separate wake-up. steer: queue a correction or resume a finished child in the background, keeping its context; returns immediately. Use wait to join the resumed work. Saved children are restored on parent reopen without running; steer revives them with their original configuration unless you pass model:, which moves that child to another offering from the next segment on \u2014 propose it in conversation first, including when the saved offering is exhausted or gone. Explicitly stopped children require restart:true and the user's request. cancel: stop the child and prevent automatic revival.",
+			"roles: list roles. status: one run or all \u2014 a nonblocking progress read: status, current tool, tool calls so far, elapsed, remaining time budget. result: current report without waiting. wait: join an existing runId; returns its final report, immediately if finished. If queued messages arrive while waiting it returns early with the child still running — answer them, then wait again to rejoin. Cancelling wait only detaches; the child keeps running. An attached waiter receives completion instead of a separate wake-up. steer: queue a correction or resume a finished child in the background, keeping its context; returns immediately. Use wait to join the resumed work. Saved children are restored on parent reopen without running; steer revives them with their original configuration unless you pass model:, which moves that child to another offering from the next segment on \u2014 propose it in conversation first, including when the saved offering is exhausted or gone. Explicitly stopped children require restart:true and the user's request. cancel: stop the child and prevent automatic revival.",
 		parameters: Type.Object({
 			action: StringEnum(["models", "rate", "approve", "roles", "status", "result", "wait", "steer", "cancel"] as const),
 			role: Type.Optional(Type.String({ description: "approve: role name" })),
@@ -1427,7 +1464,7 @@ export default function (pi: ExtensionAPI) {
 
 			switch (p.action) {
 				case "wait":
-					return await run.completion.wait(signal);
+					return await waitForChild(run, ctx, signal);
 				case "status":
 					if (run.session && run.status === "running") harvest(run);
 					return { content: [{ type: "text", text: `${summary(run)}${run.status === "running" ? `\nnow: ${run.activeTools.values().next().value?.name ?? (run.lastTool ? `thinking after ${run.lastTool}` : "thinking")} \u00b7 ${run.toolCalls.length} tool call${run.toolCalls.length === 1 ? "" : "s"} so far \u00b7 ${Math.round((run.timeoutMs - (Date.now() - run.startedAt)) / 60000)} min of its budget left` : ""}` }], details: recordedView(run) };

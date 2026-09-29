@@ -114,7 +114,7 @@ export async function harness(box: Sandbox, parent?: string, hooks: { beforeNoti
 		return result;
 	};
 	const ctl = (action: string, runId?: string, extra: any = {}, signal?: AbortSignal) => raw("delegate_ctl", { action, runId, ...extra }, signal);
-	return { sdk, runtime, errors, notices, notice, parent: manager.getSessionFile()!, ctl,
+	return { sdk, runtime, errors, notices, notice, parent: manager.getSessionFile()!, ctl, ctx: () => ctx,
 		launch: (task: string, extra: any = {}) => raw("delegate", { role: "scout", context: "fresh", task, cwd: box.cwd, model: "fixture/fixture:off", ...extra }),
 		state: () => (globalThis as any)[Symbol.for("@ssweens/pi-delegate/runtime/1")],
 	};

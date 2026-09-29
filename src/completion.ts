@@ -43,4 +43,17 @@ export class RunCompletion<T> {
 			signal?.addEventListener("abort", abort, { once: true });
 		});
 	}
+
+	/**
+	 * Attach a value listener instead of a result promise: fires immediately when already settled,
+	 * on settle otherwise, and the returned unsubscribe detaches cleanly (a detached subscriber
+	 * must not mark the result claimed). Lets a joiner wake instantly on settle while polling
+	 * something else.
+	 */
+	subscribe(onValue: (value: T) => void): () => void {
+		if (this.completed) { onValue(this.value); return () => {}; }
+		const waiter = { resolve: onValue, detach: () => {} };
+		this.waiters.add(waiter);
+		return () => { this.waiters.delete(waiter); }; // NOTE: unsubscribing before settle leaves claimed=false, as with no joiner.
+	}
 }
