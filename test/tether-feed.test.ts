@@ -5,10 +5,10 @@ import { test } from "node:test";
 import { deferred, provider, sandbox, harness } from "./fixture.ts";
 
 // Real parent/child tool protocol, sessions, reload and event bus. Only HTTP model replies are scripted.
-test("automatic Mom observes a live worker across reload without bookkeeping or an extra lead turn", { timeout: 30000 }, async () => {
+test("automatic Mom waits for a worker to settle, then observes its whole run without bookkeeping or an extra lead turn", { timeout: 30000 }, async () => {
 	const api = await provider(), box = sandbox(api.url);
 	const { default: tether } = await import("../../pi-tether/src/index.ts");
-	const { CHECKPOINT } = await import("../../pi-tether/src/checkpoint.ts");
+	const { SidecarStore } = await import("../../pi-tether/src/sidecar.ts");
 	const { LiveFeed } = await import("../../pi-tether/src/feed.ts");
 	const h = await harness(box, undefined, { register: (pi: any) => {
 		tether(new Proxy(pi, { get(target, key) {
@@ -21,7 +21,7 @@ test("automatic Mom observes a live worker across reload without bookkeeping or 
 	const motherRequests: any[] = [];
 	const until = async (predicate: () => unknown) => {
 		const deadline = Date.now() + 8000;
-		while (!predicate()) { if (Date.now() > deadline) throw new Error(`Mom did not capture the worker narrative: ${JSON.stringify({ motherRequests, extensionErrors: h.errors, providerErrors: api.errors })}`); await new Promise((resolve) => setTimeout(resolve, 20)); }
+		while (!(await predicate())) { if (Date.now() > deadline) throw new Error(`Mom did not capture the worker narrative: ${JSON.stringify({ motherRequests, extensionErrors: h.errors, providerErrors: api.errors })}`); await new Promise((resolve) => setTimeout(resolve, 20)); }
 	};
 	try {
 		const prompt = "Keep user work anchored while the scout traces the route.";
@@ -37,7 +37,7 @@ test("automatic Mom observes a live worker across reload without bookkeeping or 
 			const ref = /\[src:([^\]]+)\]/.exec(input.newEvents)?.[1] ?? input.original.ref;
 			return { tool: { name: "commit_graph", arguments: { revision: input.graph.revision, purpose: "main", focus: "main", note: null,
 				upsertNodes: [{ id: "main", kind: "try", parent: null, state: "active", label: "Main purpose", intent: "Keep the main purpose.", observed: "Scout progress received.", actor: "lead", sources: [ref] }],
-				directions: input.userDirections.map((event: any) => ({ source: event.ref, authorizedWork: event.text, continuingConstraints: [] })), unfinished: [], upsertEdges: [], removeEdges: [], merges: [], folds: [], removeNodes: [] } } };
+				unfinished: [], upsertEdges: [], removeEdges: [], merges: [], folds: [], removeNodes: [], supersessions: [] } } };
 		});
 		await h.runtime.session.prompt(prompt);
 		await arrived;
@@ -47,9 +47,11 @@ test("automatic Mom observes a live worker across reload without bookkeeping or 
 		const id = launch.message.details.id;
 		const recordedLaunch = JSON.stringify(launch);
 		await h.runtime.session.reload();
+		const callsBeforeProgress = motherRequests.length;
 		firstGate.resolve();
-		await until(() => motherRequests.some((input) => input.newEvents.includes("Exploring the boundary before changing code.")));
 		await until(() => h.state().runs.get(id)?.toolCalls.length === 1);
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		assert.equal(motherRequests.length, callsBeforeProgress, "worker progress must not wake Mom mid-run");
 		assert.equal(JSON.stringify(launch), recordedLaunch, "worker progress must not mutate a recorded launch result");
 		const feed = new LiveFeed(manager);
 		await feed.capture();
@@ -58,12 +60,16 @@ test("automatic Mom observes a live worker across reload without bookkeeping or 
 		assert.equal((await h.ctl("status", id)).details.status, "running");
 		assert.equal(h.notices.length, 0);
 		assert.equal(api.requests.filter((r: any) => r.tools?.some((t: any) => t.function?.name === "delegate")).length, 2, "only the original parent tool round and reply ran");
-		const checkpoint = h.runtime.session.sessionManager.getBranch().findLast((e: any) => e.customType === CHECKPOINT) as any;
-		assert.equal(checkpoint.data.cut.workers.length, 1);
-		assert.equal(checkpoint.data.cut.workers[0].runId, id);
+		// Nothing publishes while the worker is still running.
+		const sidecar = () => new SidecarStore(() => h.parent, manager.getSessionId()).load();
+		assert(!(await sidecar()).some((r) => r.type === "checkpoint"));
 		gate.resolve();
 		assert.equal((await h.ctl("wait", id)).details.status, "complete");
-		await until(() => motherRequests.some((input) => input.newEvents.includes("Worker result: the route is understood.")));
+		await until(() => motherRequests.some((input) => input.newEvents.includes("Exploring the boundary before changing code.") && input.newEvents.includes("Worker result: the route is understood.")));
+		await until(async () => (await sidecar()).some((r) => r.type === "checkpoint" && r.data.cut.workers.length === 1));
+		const checkpoint = (await sidecar()).findLast((r) => r.type === "checkpoint")!;
+		assert.equal(checkpoint.data.cut.workers[0].runId, id);
+		assert(!manager.getEntries().some((e: any) => typeof e.customType === "string" && e.customType.startsWith("pi-tether.mom.")), "no Mom checkpoint in the session file");
 		assert.deepEqual(h.errors, []); assert.deepEqual(api.errors, []);
 	} finally { firstGate.resolve(); gate.resolve(); await h.runtime.dispose(); await api.close(); rmSync(box.root, { recursive: true, force: true }); }
 });
