@@ -62,13 +62,13 @@ test("automatic Mom waits for a worker to settle, then observes its whole run wi
 		assert.equal(api.requests.filter((r: any) => r.tools?.some((t: any) => t.function?.name === "delegate")).length, 2, "only the original parent tool round and reply ran");
 		// Nothing publishes while the worker is still running.
 		const sidecar = () => new SidecarStore(() => h.parent, manager.getSessionId()).load();
-		assert(!(await sidecar()).some((r) => r.type === "checkpoint"));
+		assert(!(await sidecar()).some((r) => r.type === "map" && r.data.snapshot));
 		gate.resolve();
 		assert.equal((await h.ctl("wait", id)).details.status, "complete");
 		await until(() => motherRequests.some((input) => input.newEvents.includes("Exploring the boundary before changing code.") && input.newEvents.includes("Worker result: the route is understood.")));
-		await until(async () => (await sidecar()).some((r) => r.type === "checkpoint" && r.data.cut.workers.length === 1));
-		const checkpoint = (await sidecar()).findLast((r) => r.type === "checkpoint")!;
-		assert.equal(checkpoint.data.cut.workers[0].runId, id);
+		await until(async () => (await sidecar()).some((r) => r.type === "map" && r.data.snapshot?.cut.workers.length === 1));
+		const checkpoint = (await sidecar()).findLast((r) => r.type === "map" && r.data.snapshot)!;
+		assert.equal(checkpoint.data.snapshot.cut.workers[0].runId, id);
 		assert(!manager.getEntries().some((e: any) => typeof e.customType === "string" && e.customType.startsWith("pi-tether.mom.")), "no Mom checkpoint in the session file");
 		assert.deepEqual(h.errors, []); assert.deepEqual(api.errors, []);
 	} finally { firstGate.resolve(); gate.resolve(); await h.runtime.dispose(); await api.close(); rmSync(box.root, { recursive: true, force: true }); }
