@@ -5,7 +5,7 @@ import { test } from "node:test";
 import { deferred, provider, sandbox, harness } from "./fixture.ts";
 
 // Real parent/child tool protocol, sessions, reload and event bus. Only HTTP model replies are scripted.
-test("automatic Mom waits for a worker to settle, then observes its whole run without bookkeeping or an extra lead turn", { timeout: 30000 }, async () => {
+test("Mom batches settled worker evidence until lead cadence is due, without extra delegate work", { timeout: 30000 }, async () => {
 	const api = await provider(), box = sandbox(api.url);
 	const { default: tether } = await import("../../pi-tether/src/index.ts");
 	const { SidecarStore } = await import("../../pi-tether/src/sidecar.ts");
@@ -59,12 +59,14 @@ test("automatic Mom waits for a worker to settle, then observes its whole run wi
 		await cold.restore(feed.cut());
 		assert.equal((await h.ctl("status", id)).details.status, "running");
 		assert.equal(h.notices.length, 0);
-		assert.equal(api.requests.filter((r: any) => r.tools?.some((t: any) => t.function?.name === "delegate")).length, 2, "only the original parent tool round and reply ran");
+		assert.equal(manager.getBranch().filter((e: any) => e.type === "message" && e.message.role === "toolResult" && e.message.toolName === "delegate").length, 1, "Mom evaluation must not launch another worker");
 		// Nothing publishes while the worker is still running.
 		const sidecar = () => new SidecarStore(() => h.parent, manager.getSessionId()).load();
 		assert(!(await sidecar()).some((r) => r.type === "map" && r.data.snapshot));
 		gate.resolve();
 		assert.equal((await h.ctl("wait", id)).details.status, "complete");
+		assert.equal(motherRequests.length, callsBeforeProgress, "a delegate settlement alone must not wake Mom");
+		for (let i = 0; i < 5; i++) await h.runtime.session.prompt(`Ordinary lead exchange ${i + 1}.`);
 		await until(() => motherRequests.some((input) => input.newEvents.includes("Exploring the boundary before changing code.") && input.newEvents.includes("Worker result: the route is understood.")));
 		await until(async () => (await sidecar()).some((r) => r.type === "map" && r.data.snapshot?.cut.workers.length === 1));
 		const checkpoint = (await sidecar()).findLast((r) => r.type === "map" && r.data.snapshot)!;
