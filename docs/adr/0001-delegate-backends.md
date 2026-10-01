@@ -1,6 +1,6 @@
 # ADR 0001: One delegate surface over pi and acp backends
 
-Status: Accepted, 2026-09-30. Todos 039 and 040. Amended 2026-09-30 for parking and revival (043). Contract: `src/backend.ts`.
+Status: Accepted, 2026-09-30. Todos 039 and 040. Amended 2026-09-30 for parking and revival (043), and 2026-10-01 for one Coordinator per Pi process. Contract: `src/backend.ts`.
 
 ## Context
 
@@ -48,3 +48,4 @@ ACP runs are durable like pi runs. Each run's record (identity, origin, native s
 - Revival depends on the adapter. A created session on an adapter without ACP resume or load cannot continue after a restart; the caller starts a new run.
 - `role` means a role name on pi and `read-only|writer` on acp. The field name is shared, the domain is not.
 - An opened run may have no task. It is `idle` until it sends a turn, so it can observe without posting.
+- One Coordinator per Pi process, each with its own state dir under `<agentDir>/pi-strings/proc/`, so ACP works in every Pi process at once (amended 2026-10-01; one machine-wide state lock had confined it to one). Writer-cwd and native-session exclusivity are machine-wide claims under `pi-strings/locks/`, and a run revived in another process adopts its worker from the dir that held it.

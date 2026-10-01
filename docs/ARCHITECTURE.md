@@ -15,7 +15,7 @@ Parent Pi -> delegate / delegate_ctl -> acp backend (src/acp-backend.ts)
                                 └─ configured ACP agents
 ```
 
-There is one Coordinator per process (`src/acp/instance.ts`). The backend owns the delegate run: its run ID, its record, parking and revival, and the mapping to Coordinator actions. The Coordinator owns worker identity, request state, persistence, worktree admission, bounded evidence, deadlines and lifecycle actions. ACPX owns ACP process and session handling, normalized events, permissions, cancellation primitives and close.
+There is one Coordinator per Pi process (`src/acp/instance.ts`), with its own state dir (§6). Any number of Pi processes use ACP at once. The backend owns the delegate run: its run ID, its record, parking and revival, and the mapping to Coordinator actions. The Coordinator owns worker identity, request state, persistence, worktree admission, bounded evidence, deadlines and lifecycle actions. ACPX owns ACP process and session handling, normalized events, permissions, cancellation primitives and close.
 
 ## 2. Coordinator actions
 
@@ -114,7 +114,7 @@ Provider-native write scoping is provider-specific and is **not enforced by ACPX
 
 ## 5. Writer isolation
 
-The backend never creates or removes worktrees implicitly. The default isolation mode is `shared`: the writer runs in the given `cwd` and one live writer per canonical cwd is enforced. A second ACP writer in the same cwd is rejected with `WRITER_CWD_OWNED`. This check covers ACP workers only; the pi backend checks its own writers separately.
+The backend never creates or removes worktrees implicitly. The default isolation mode is `shared`: the writer runs in the given `cwd` and one live writer per canonical cwd is enforced across every Pi process on the machine. A second ACP writer in the same cwd is rejected with `WRITER_CWD_OWNED`, naming the holder's PID when it is another process. This check covers ACP workers only; the pi backend checks its own writers separately.
 
 `isolation: "worktree"` is opt-in compatibility mode. In that mode, `cwd` must be an existing linked worktree, differ from the parent checkout, and remain unowned by another live writer. Isolation is revalidated before each turn.
 
@@ -124,14 +124,24 @@ Future stronger isolation may use CoW (copy-on-write) temp copies of the repo ra
 
 Two layers persist state.
 
-**Coordinator state.** The root is `${PI_AGENT_DIR:-~/.pi/agent}/pi-strings/`. The directory kept its pre-merge name.
+**Coordinator state.** Each Pi process's Coordinator has its own state dir, so ACP works in every Pi process at once. The home is `<agentDir>/pi-strings/`, where the agent dir is Pi's: `PI_CODING_AGENT_DIR` (with `~` expanded), else `~/.pi/agent`. `PI_AGENT_DIR` still overrides it. The directory kept its pre-merge name.
 
 ```text
-state.json                    worker registry and bounded request results
-state.json.lock/              coordinator ownership lease
-requests/<request-id>.ndjson  normalized event log
-acpx/                         ACPX session records
+proc/<pid>-<token>/                one process's state dir; <token> tells a reused PID from its earlier owner
+  state.json                       worker registry and bounded request results
+  owner.json                       the holding process: PID, host, token
+  requests/<request-id>.ndjson     normalized event log
+  acpx/                            ACPX session records
+proc/<pid>-<token>.lock/           the dir's lease: one live process per state dir (COORDINATOR_OWNED names the holder)
+locks/<hash>.json                  machine-wide claims (below)
+state.json                         the legacy single state dir, from before per-process state; only read, to adopt
 ```
+
+A process reads only its own state dir at startup, so it never reconnects another process's workers. Dirs of exited processes are left in place: a parked run may still need the provenance in one. Nothing deletes them yet.
+
+**Machine-wide claims.** What one Coordinator's in-memory checks enforced is also claimed across processes in `locks/`: one live writer per canonical cwd (`WRITER_CWD_OWNED`) and per linked worktree (`WRITER_WORKTREE_OWNED`), and one live binding per native session, opened or created (`SESSION_IN_USE`). A claim file names its holder's PID, host, token and state dir; proper-lockfile serializes its read-check-write for milliseconds. A claim is stale once its PID no longer runs, or its state dir lease is no longer fresh (a reused PID), and is then taken over at once. Claims are released on close, park and shutdown. A refusal names the holder's PID. Not covered: a created Amp run's T-ID, which is learned after creation, and ACP use by Pi processes still running a version from before per-process state.
+
+**Adoption.** A parked run can come back in another process. Its record names the state dir that held its worker (`stateDir`). On steer, a Coordinator whose own dir differs first adopts the worker from that dir: it reads it without locking or changing it, and copies the created session's provenance and its ACPX session record. Then owned resume (created) or native opening (opened) proceeds as in one process. While the dir's process is alive and still holds the worker, adoption fails `RUN_OWNED_ELSEWHERE` with its PID. A record without `stateDir` predates per-process state; its worker is adopted from the legacy single dir, like a dead process's dir.
 
 Directories are mode 0700 and files mode 0600. State is atomically replaced, locked and strictly schema-validated. Direct workers persist their validated tool list (and selected creation-time model) so restart reconstruction cannot broaden policy. The current version does not accept legacy `waiting` statuses or `questions`; such state returns `STATE_CORRUPT` rather than silently discarding authority data. Requests left running after parent loss become `PARENT_PROCESS_LOST`.
 
@@ -172,5 +182,6 @@ Coordinator `status` exposes live model discovery (`currentModelId`, `availableM
 | Parent loss | Active requests become `PARENT_PROCESS_LOST`; the delegate run is parked |
 | Parked created run, adapter cannot resume | `steer` fails `RUN_NOT_RESUMABLE`; the record stays readable |
 | Run owned by another live Pi process | Read-only snapshot; actions fail `RUN_OWNED_ELSEWHERE` |
+| Writer cwd or native session held by another live Pi process | Spawn/open fails `WRITER_CWD_OWNED` or `SESSION_IN_USE`, naming that process's PID |
 | Corrupt state | Return `STATE_CORRUPT`; do not reset silently |
 | Output exceeds bound | Continue draining to private log; retain bounded summary |

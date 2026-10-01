@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { dirname, resolve } from "node:path";
+import { copyFile, mkdir } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { AcpxRuntime, createAgentRegistry, createFileSessionStore, type AcpRuntimeEvent, type AcpRuntimeHandle, type NativeSessionBinding, type NativeSessionDescription } from "../../../dist/acpx-runtime/runtime.js";
 import type { NormalizedEvent, Profile, RuntimeHandle, RuntimePort, RuntimeStatus, RuntimeTerminal, RuntimeTurn, TurnUsage } from "../domain/types.js";
@@ -69,7 +70,7 @@ export class AcpxRuntimePort implements RuntimePort {
   private readonly runtime: AcpxRuntime;
   private readonly sessionStore: ReturnType<typeof createFileSessionStore>;
 
-  constructor(cwd: string, stateDir: string, profile: Profile, private readonly origin: "created" | "opened" = "created", agentOverrides: AgentOverrides = {}) {
+  constructor(cwd: string, private readonly stateDir: string, profile: Profile, private readonly origin: "created" | "opened" = "created", agentOverrides: AgentOverrides = {}) {
     const piAdapterArgv = origin === "opened"
       ? [process.execPath, adapterEntry, "--pi-strings-opened"]
       : [process.execPath, adapterEntry, "--pi-strings-worker", "--pi-tools-json", JSON.stringify(profile.tools)];
@@ -201,6 +202,16 @@ export class AcpxRuntimePort implements RuntimePort {
     // The session keeps the model it was configured with; the Coordinator re-selects it per turn.
     const { model: _model, ...profile } = input.profile;
     return this.ensureSession({ name: input.name, agent: input.agent, cwd: input.cwd, profile, resumeSessionId: input.sessionId });
+  }
+
+  /** ACPX keeps a created session's record under its session key; resumeSession reads it from this state dir. */
+  async adoptSession(input: { name: string; fromStateDir: string }): Promise<void> {
+    const file = `${encodeURIComponent(`pi-strings:${input.name}`)}.json`;
+    const target = join(resolve(this.stateDir, "acpx"), "sessions");
+    await mkdir(target, { recursive: true, mode: 0o700 });
+    // The other dir held the session last, so its record replaces any older copy here. None there: resumeSession reports it.
+    try { await copyFile(join(resolve(input.fromStateDir, "acpx"), "sessions", file), join(target, file)); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
   }
 
   async getStatus(handle: RuntimeHandle): Promise<RuntimeStatus> {

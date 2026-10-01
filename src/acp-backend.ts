@@ -17,6 +17,12 @@
  * same native ID, a created run through the Coordinator's owned resume, which needs the adapter's
  * session/resume or session/load and fails RUN_NOT_RESUMABLE otherwise. delegate_ctl close is final.
  *
+ * Each Pi process has its own Coordinator and state dir, and the record names the dir that holds
+ * the run's worker. A run reopened in another process first has that Coordinator adopt the worker
+ * from the recorded dir (its provenance and saved session); while the dir's process still holds
+ * the worker, the run is RUN_OWNED_ELSEWHERE. A record without a dir predates per-process state:
+ * its worker is in the legacy single dir.
+ *
  * Opened Amp runs can also be observed (todo 044, amp-observe.ts): status/result with observe reads
  * the thread through one `amp threads export`, on demand, and the cursor is saved with the record.
  *
@@ -81,6 +87,8 @@ interface AcpRunRecord extends Partial<RunOwner> {
 	ownerKey: string;
 	/** Coordinator worker name. Internal: never shown in text, never accepted from a caller. Reused when a parked run is reopened. */
 	worker: string;
+	/** The Coordinator state dir that holds the worker: the dir of the process that last ran it. Absent on records older than per-process state. */
+	stateDir?: string;
 	agent: string;
 	origin: SessionOrigin;
 	task?: string;
@@ -450,6 +458,7 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 		const coordinator = await acpCoordinator();
 		const spawned = await coordinator.execute(spawn);
 		if (!spawned.ok) throw coordinatorError(spawned, run);
+		run.stateDir = coordinator.stateDir;
 		run.last = coordinator.snapshot(run.worker);
 		registry().set(run.id, run);
 		if (input.task !== undefined) {
@@ -513,7 +522,14 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 		run.reviving ??= (async () => {
 			// A process that died without parking can leave its worker in the Coordinator's state.
 			// An idle one the Coordinator already reconnected is the session itself; anything else is released first.
-			const stale = (await loaded(coordinator, run)).snapshot(run.worker).worker;
+			// One that lived in another process's state dir is adopted from there first; a live holder refuses it.
+			if (run.stateDir !== (await loaded(coordinator, run)).stateDir) {
+				const handle = run.last?.worker?.handle;
+				const sessionId = run.origin === "created" ? handle?.backendSessionId ?? handle?.agentSessionId : undefined;
+				const adopted = await coordinator.execute({ action: "adopt", name: run.worker, agent: run.agent, ...(run.stateDir ? { stateDir: run.stateDir } : {}), ...(sessionId ? { sessionId } : {}) });
+				if (!adopted.ok) throw coordinatorError(adopted, run);
+			}
+			const stale = coordinator.snapshot(run.worker).worker;
 			if (stale && stale.status !== "idle") {
 				const released = await coordinator.execute({ action: "close", name: run.worker, force: true });
 				if (!released.ok) throw coordinatorError(released, run);
@@ -522,6 +538,7 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 				if (run.origin === "opened") await this.reopen(run, coordinator);
 				else await this.resume(run, coordinator);
 			}
+			run.stateDir = coordinator.stateDir;
 			delete run.parkedAt;
 			delete run.interruptedTurn;
 			delete run.unreleased;

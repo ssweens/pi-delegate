@@ -6,13 +6,13 @@ import test from "node:test";
 import { Coordinator } from "../../src/acp/orchestration/coordinator.ts";
 import { StateStore } from "../../src/acp/persistence/state-store.ts";
 
-test("coordinator state lease excludes a second parent", async () => {
+test("coordinator state lease excludes a second parent, and names the holder's PID", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-strings-state-"));
   const first = new StateStore(root);
   const second = new StateStore(root);
   await first.acquire();
   try {
-    await assert.rejects(second.acquire(), (error: unknown) => (error as { code?: string }).code === "COORDINATOR_OWNED");
+    await assert.rejects(second.acquire(), (error: unknown) => (error as { code?: string }).code === "COORDINATOR_OWNED" && (error as Error).message.includes(`Pi process ${process.pid} `));
   } finally {
     await first.close();
   }

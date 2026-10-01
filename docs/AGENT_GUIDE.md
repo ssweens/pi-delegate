@@ -118,7 +118,7 @@ Preserve the state file and the `STATE_CORRUPT` evidence. Do not delete it or re
 Use tmux only for human observation, for example:
 
 ```bash
-tmux new-window -n acp-log 'tail -F ~/.pi/agent/pi-strings/requests/REQUEST_ID.ndjson'
+tmux new-window -n acp-log 'tail -F ~/.pi/agent/pi-strings/proc/*/requests/REQUEST_ID.ndjson'
 ```
 
 The Coordinator's state directory kept its pre-merge `pi-strings` name. Do not use `send-keys`, pane scraping, prompt matching or pane exit as an automation API. ACPX events and terminal results are authoritative.

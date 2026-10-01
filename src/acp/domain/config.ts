@@ -1,8 +1,8 @@
 import { readFile } from "node:fs/promises";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import type { IsolationMode, Profile, WorkerKind } from "./types.js";
 import { StringsError } from "./errors.js";
+import { agentDir } from "../persistence/home.js";
 
 const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls"]);
 const KINDS = new Set(["oracle", "finder", "worker", "free"]);
@@ -73,7 +73,7 @@ function boundedInteger(value: unknown, fallback: number | undefined, field: str
 }
 
 export async function loadProfiles(cwd: string): Promise<Record<string, Profile>> {
-  const user = await readConfig(join(homedir(), ".pi", "agent", "pi-strings.json"));
+  const user = await readConfig(join(agentDir(), "pi-strings.json"));
   const project = await readConfig(join(cwd, ".pi", "pi-strings.json"));
   const merged: Record<string, unknown> = { ...DEFAULTS, ...user, ...project };
   return Object.fromEntries(Object.entries(merged).map(([name, value]) => [name, parseProfile(name, value)]));

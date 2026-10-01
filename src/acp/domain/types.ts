@@ -101,6 +101,8 @@ export interface RuntimePort {
   disconnect?(handle: RuntimeHandle): Promise<void>;
   /** Reopen a created session that was closed without discarding it. Fails RESUME_UNSUPPORTED when the adapter cannot resume or load it. */
   resumeSession?(input: { name: string; agent: string; cwd: string; profile: Profile; sessionId: string }): Promise<RuntimeHandle>;
+  /** Take over the saved session record a created worker left in another, dead process's state dir, so resumeSession finds it here. Copies; never changes the other dir. */
+  adoptSession?(input: { name: string; fromStateDir: string }): Promise<void>;
   startTurn(input: { handle: RuntimeHandle; prompt: string; requestId: string; timeoutMs: number }): RuntimeTurn;
   getStatus?(handle: RuntimeHandle): Promise<RuntimeStatus>;
   setConfigOption?(input: { handle: RuntimeHandle; key: string; value: string }): Promise<void>;

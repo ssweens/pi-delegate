@@ -164,7 +164,7 @@ Field changes:
 
 **The Amp plugin bridge is gone.** pi-strings once reached Amp through a project plugin and portal (`op_observe`, `op_append`, `op_steer`, `op_cancel_remote`). That bridge and its `PI_STRINGS_AMP_BRIDGE_*` settings are deleted. Every Amp control now takes a native path: steer is a native send, cancel is ACP session cancel, and observation is `amp threads export`. One thing is lost: cancelling a turn that someone else started in a shared thread. Cancel only ever acts on this run's own turn.
 
-The ACP Coordinator still keeps its state under `~/.pi/agent/pi-strings/`. That directory name did not change.
+The ACP Coordinator still keeps its state under `~/.pi/agent/pi-strings/` (each Pi process in its own `proc/` subdirectory). That directory name did not change.
 
 ## Phased todos
 

@@ -5,6 +5,7 @@ import writeFileAtomic from "write-file-atomic";
 import { z } from "zod";
 import type { RequestRecord, RuntimeHandle, WorkerRole, WorkerStatus, WorktreeIdentity } from "../domain/types.js";
 import { StringsError } from "../domain/errors.js";
+import { describeOwner, OWNER_FILE, processIdentity, readOwner } from "./home.js";
 import { NativeSessionDescriptionSchema, type NativeSessionDescription } from "../../../dist/acpx-runtime/runtime.js";
 
 export interface SessionProvenance {
@@ -93,8 +94,27 @@ export class StateStore {
         onCompromised: (error) => { throw error; },
       });
     } catch (error) {
-      throw new StringsError("COORDINATOR_OWNED", `Another Pi process owns ${this.root}: ${error instanceof Error ? error.message : String(error)}`, true);
+      const owner = await readOwner(this.root);
+      throw new StringsError("COORDINATOR_OWNED", `${describeOwner(owner)} owns ${this.root}: ${error instanceof Error ? error.message : String(error)}`, true);
     }
+    // Who holds the dir, so a claim, an adoption or this error elsewhere can name the process.
+    await writeFileAtomic(join(this.root, OWNER_FILE), `${JSON.stringify(processIdentity())}\n`, { encoding: "utf8", mode: 0o600 });
+  }
+
+  /**
+   * Read another state dir without taking it: no lock, no writes. For adopting a worker's
+   * provenance from a process that is gone. Undefined when the dir has no state.
+   */
+  static async peek(root: string): Promise<{ workers: StoredWorker[]; sessions: SessionProvenance[] } | undefined> {
+    let raw: unknown;
+    try { raw = JSON.parse(await readFile(join(root, "state.json"), "utf8")); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw new StringsError("STATE_CORRUPT", `Cannot read ${join(root, "state.json")}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const parsed = z.union([StateSchema, LegacyStateSchema]).safeParse(raw);
+    if (!parsed.success) throw new StringsError("STATE_CORRUPT", `Cannot read ${join(root, "state.json")}: ${parsed.error.message}`);
+    return { workers: parsed.data.workers.map(worker => ({ ...worker, origin: "origin" in worker ? worker.origin : "created" })) as StoredWorker[], sessions: parsed.data.sessions ?? [] };
   }
 
   async load(): Promise<StateFile> {

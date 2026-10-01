@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { appendFile, chmod, mkdir, realpath } from "node:fs/promises";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { Profile, RequestRecord, RuntimeHandle, RuntimePort, RuntimeStatus, RuntimeTerminal, RuntimeTurn, StringsResponse, TurnUsage, UsageBreakdown, UsageCost, WorkerKind, WorkerRecord, WorktreeIdentity, NativeSessionDescription, SessionOrigin } from "../domain/types.js";
 import { failure, StringsError } from "../domain/errors.js";
 import { loadProfiles } from "../domain/config.js";
@@ -9,6 +8,8 @@ import { requireCwdUnowned, requireIsolatedWriter, requireWriterUnowned } from "
 import { acceptanceContract, parseAcceptanceReport, roleContract, WORKER_CONTRACT } from "../domain/roles.js";
 import { AcpxRuntimePort } from "../runtime/acpx-runtime.js";
 import { StateStore, type SessionProvenance, type StoredWorker } from "../persistence/state-store.js";
+import { Claims, sessionClaim, writerClaims, type Claim } from "../persistence/claims.js";
+import { coordinatorHome, describeOwner, processStateDir, stateDirHolder } from "../persistence/home.js";
 
 const NAME = /^[a-z][a-z0-9-]{0,47}$/;
 const STALL_THRESHOLD = 4;
@@ -22,16 +23,30 @@ interface CoordinatorTerminal {
 
 type Action = Record<string, unknown> & { action: string };
 
-interface LiveWorker { record: WorkerRecord; runtime: RuntimePort; turn?: RuntimeTurn; deadline?: NodeJS.Timeout; stopObservation?: () => void }
+/** claims: the machine-wide claims this worker holds (its writer cwd, its native session), released when it closes. */
+interface LiveWorker { record: WorkerRecord; runtime: RuntimePort; claims?: string[]; turn?: RuntimeTurn; deadline?: NodeJS.Timeout; stopObservation?: () => void }
 type RuntimeFactory = (cwd: string, stateDir: string, profile: Profile, origin?: SessionOrigin) => RuntimePort;
 const ownedSessionKey = (session: SessionProvenance) => JSON.stringify([session.agent, session.profileName, session.role, session.cwd, session.sessionId]);
 const nativeSessionKey = (agent: string, native: NativeSessionDescription) => JSON.stringify([agent.toLowerCase(), native.scope, native.id]);
+/** The session ID another binding would name: an opened worker's native ID, a created one's agent (else ACP) session ID. */
+const boundSessionId = (record: WorkerRecord): string | undefined => record.origin === "opened" ? record.native?.id : record.handle.agentSessionId ?? record.handle.backendSessionId;
+const workerClaims = (record: WorkerRecord): Claim[] => {
+  const session = boundSessionId(record);
+  return [...(record.role === "writer" ? writerClaims(record.cwd, record.worktree) : []), ...(session ? [sessionClaim(record.profile.agent, session)] : [])];
+};
 
 export function resumeIdentityMatches(provenance: SessionProvenance, profile: Profile, cwd: string, profileName: string): boolean {
   return provenance.agent === profile.agent && provenance.role === profile.role && provenance.cwd === cwd && provenance.profileName === profileName;
 }
 
 export interface CoordinatorOptions {
+  /**
+   * The Coordinator home shared by every Pi process: <home>/proc/<pid>-<token> is this process's
+   * state dir, <home>/locks its machine-wide claims, <home>/state.json the legacy single state.
+   * Default <agentDir>/pi-strings.
+   */
+  home?: string;
+  /** Exactly this state dir instead of the process's own. Without a home, its claims live in <stateDir>/locks and there is no legacy state. */
   stateDir?: string;
   runtimeFactory?: RuntimeFactory;
   profiles?: Record<string, Profile>;
@@ -46,7 +61,11 @@ export class Coordinator {
   private readonly completions = new Map<string, Promise<void>>();
   private readonly terminalSignals = new Set<string>();
   private profiles: Record<string, Profile> | undefined;
-  private readonly stateDir: string;
+  /** This Coordinator's own state dir. One live process at a time can hold it. */
+  readonly stateDir: string;
+  /** The single state dir from before per-process state, adopted from like a dead process's dir. */
+  private readonly legacyDir: string | undefined;
+  private readonly claims: Claims;
   private readonly stateStore: StateStore;
   private readonly runtimeFactory: RuntimeFactory;
   private initializePromise?: Promise<void>;
@@ -56,7 +75,10 @@ export class Coordinator {
   private actionTail: Promise<void> = Promise.resolve();
 
   constructor(private readonly parentCwd: string, options: CoordinatorOptions = {}) {
-    this.stateDir = options.stateDir ?? join(process.env.PI_AGENT_DIR ?? join(homedir(), ".pi", "agent"), "pi-strings");
+    const home = options.home ?? (options.stateDir ? undefined : coordinatorHome());
+    this.stateDir = options.stateDir ?? processStateDir(home!);
+    this.legacyDir = home;
+    this.claims = new Claims(join(home ?? this.stateDir, "locks"), this.stateDir);
     this.stateStore = new StateStore(this.stateDir);
     this.runtimeFactory = options.runtimeFactory ?? ((cwd, stateDir, profile, origin) => new AcpxRuntimePort(cwd, stateDir, profile, origin));
     this.profiles = options.profiles;
@@ -88,6 +110,7 @@ export class Coordinator {
         case "cancel": return await this.cancel(input);
         case "close": return await this.close(input);
         case "resume": return await this.resume(input);
+        case "adopt": return await this.adopt(input);
         default: throw new StringsError("ACTION_INVALID", `Unknown strings action: ${input.action}`);
       }
     } catch (error) { return failure(input.action, error); }
@@ -145,8 +168,11 @@ export class Coordinator {
         if (record.worktree) requireWriterUnowned([...this.workers.values()].map(worker => worker.record), record.worktree);
         else requireCwdUnowned([...this.workers.values()].map(worker => worker.record), record.cwd);
       }
+      // Another live process may hold its cwd or session meanwhile: then it is never reconnected here.
+      const claims = await this.claims.acquireAll(workerClaims(record)).catch(() => undefined);
+      if (!claims) record.status = "failed";
       const runtime = this.runtimeFactory(record.cwd, this.stateDir, profile, record.origin);
-      if (opened) {
+      if (!claims) { /* failed above */ } else if (opened) {
         if (!record.native || !runtime.openSession || !runtime.describeNativeSession || !runtime.disconnect) {
           record.status = "failed";
         } else if (!wasActive && record.status === "idle") {
@@ -182,7 +208,7 @@ export class Coordinator {
         const provenance = { sessionId, agent: profile.agent, profileName: record.profileName, role: profile.role, cwd: record.cwd };
         this.sessions.set(ownedSessionKey(provenance), provenance);
       }
-      this.workers.set(record.name, { record, runtime });
+      this.workers.set(record.name, { record, runtime, ...(claims ? { claims } : {}) });
     }
     await this.persist();
     this.initialized = true;
@@ -227,6 +253,7 @@ export class Coordinator {
       await this.persist();
     }
     this.persistenceEnabled = false;
+    await this.claims.releaseAll();
     await this.stateStore.close();
   }
 
@@ -290,31 +317,43 @@ export class Coordinator {
     const cwd = await realpath(typeof input.cwd === "string" ? input.cwd : this.parentCwd);
     const worktree = await this.admitWriter(profile, cwd);
     await mkdir(this.stateDir, { recursive: true, mode: 0o700 });
-    const runtime = this.runtimeFactory(cwd, this.stateDir, profile);
-    const executionEnvironment = optionalString(input.executionEnvironment);
-    const title = optionalString(input.title);
-    let handle: RuntimeHandle | undefined;
+    const claims = await this.claims.acquireAll(profile.role === "writer" ? writerClaims(cwd, worktree) : []);
     try {
-      handle = await runtime.ensureSession({ name, agent: profile.agent, cwd, profile, ...(executionEnvironment ? { executionEnvironment } : {}), ...(mode ? { mode } : {}), ...(title ? { title } : {}) });
-      if (profile.model) await this.requireSelectedModel(runtime, handle, profile.model);
-    } catch (error) {
-      if (handle) await runtime.close(handle, "model selection failed", true).catch(() => undefined);
-      if (profile.model && isRequestedModelUnsupported(error)) {
-        throw new StringsError("MODEL_UNAVAILABLE", `Requested model ${profile.model} is not available for this worker.`);
+      const runtime = this.runtimeFactory(cwd, this.stateDir, profile);
+      const executionEnvironment = optionalString(input.executionEnvironment);
+      const title = optionalString(input.title);
+      let handle: RuntimeHandle | undefined;
+      try {
+        handle = await runtime.ensureSession({ name, agent: profile.agent, cwd, profile, ...(executionEnvironment ? { executionEnvironment } : {}), ...(mode ? { mode } : {}), ...(title ? { title } : {}) });
+        if (profile.model) await this.requireSelectedModel(runtime, handle, profile.model);
+      } catch (error) {
+        if (handle) await runtime.close(handle, "model selection failed", true).catch(() => undefined);
+        if (profile.model && isRequestedModelUnsupported(error)) {
+          throw new StringsError("MODEL_UNAVAILABLE", `Requested model ${profile.model} is not available for this worker.`);
+        }
+        throw error;
       }
-      throw error;
-    }
-    if (!handle) throw new StringsError("SESSION_INIT_FAILED", `Worker ${name} did not return a runtime session handle.`);
-    const now = new Date().toISOString();
-    const record: WorkerRecord = { origin: "created", name, profileName, profile, role: profile.role, ...(profile.model ? { model: profile.model } : {}), ...(mode ? { mode } : {}), status: "idle", cwd, ...(worktree ? { worktree } : {}), handle: { ...handle, agent: profile.agent, profileName, role: profile.role, cwd }, createdAt: now, updatedAt: now };
-    const sessionId = record.handle.backendSessionId ?? record.handle.agentSessionId;
-    if (sessionId) {
-      const provenance = { sessionId, agent: profile.agent, profileName, role: profile.role, cwd };
-      this.sessions.set(ownedSessionKey(provenance), provenance);
-    }
-    this.workers.set(name, { record, runtime });
+      if (!handle) throw new StringsError("SESSION_INIT_FAILED", `Worker ${name} did not return a runtime session handle.`);
+      const now = new Date().toISOString();
+      const record: WorkerRecord = { origin: "created", name, profileName, profile, role: profile.role, ...(profile.model ? { model: profile.model } : {}), ...(mode ? { mode } : {}), status: "idle", cwd, ...(worktree ? { worktree } : {}), handle: { ...handle, agent: profile.agent, profileName, role: profile.role, cwd }, createdAt: now, updatedAt: now };
+      claims.push(...await this.claimSession(record, runtime));
+      const sessionId = record.handle.backendSessionId ?? record.handle.agentSessionId;
+      if (sessionId) {
+        const provenance = { sessionId, agent: profile.agent, profileName, role: profile.role, cwd };
+        this.sessions.set(ownedSessionKey(provenance), provenance);
+      }
+      this.workers.set(name, { record, runtime, claims });
+    } catch (error) { await this.claims.release(claims); throw error; }
     await this.persist();
-    return { ok: true, action: "spawn", details: this.publicWorker(record) };
+    return { ok: true, action: "spawn", details: this.publicWorker(this.getWorker(name).record) };
+  }
+
+  /** Claim a created worker's session once its handle names it. Held elsewhere: the new handle is closed, never discarded. */
+  private async claimSession(record: WorkerRecord, runtime: RuntimePort): Promise<string[]> {
+    const session = boundSessionId(record);
+    if (!session) return [];
+    try { return await this.claims.acquireAll([sessionClaim(record.profile.agent, session)]); }
+    catch (error) { await runtime.close(record.handle, "session held elsewhere", false).catch(() => undefined); throw error; }
   }
 
   private requireSameNative(expected: NativeSessionDescription, actual: NativeSessionDescription): void {
@@ -349,16 +388,20 @@ export class Coordinator {
         : worker.record.profile.agent.toLowerCase() === agent.toLowerCase() && (worker.record.handle.agentSessionId ?? worker.record.handle.backendSessionId) === sessionId;
       if (duplicate) throw new StringsError("SESSION_IN_USE", `Native session is already bound to ${worker.record.name}.`);
     }
-    const handle = await runtime.openSession({ name, agent, native });
-    if (handle.agentSessionId !== sessionId) {
-      await runtime.disconnect(handle);
-      throw new StringsError("SESSION_IDENTITY_CHANGED", "Runtime did not verify the requested native ID.");
-    }
-    const now = new Date().toISOString();
-    const record: WorkerRecord = { origin: "opened", native, name, profileName: `direct:${agent}`, profile,
-      role: "read-only", status: "idle", cwd: native.cwd,
-      handle: { ...handle, agent, cwd: native.cwd }, createdAt: now, updatedAt: now };
-    this.workers.set(name, { record, runtime });
+    const claims = await this.claims.acquireAll([sessionClaim(agent, native.id)]);
+    try {
+      const handle = await runtime.openSession({ name, agent, native });
+      if (handle.agentSessionId !== sessionId) {
+        await runtime.disconnect(handle);
+        throw new StringsError("SESSION_IDENTITY_CHANGED", "Runtime did not verify the requested native ID.");
+      }
+      const now = new Date().toISOString();
+      const record: WorkerRecord = { origin: "opened", native, name, profileName: `direct:${agent}`, profile,
+        role: "read-only", status: "idle", cwd: native.cwd,
+        handle: { ...handle, agent, cwd: native.cwd }, createdAt: now, updatedAt: now };
+      this.workers.set(name, { record, runtime, claims });
+    } catch (error) { await this.claims.release(claims); throw error; }
+    const record = this.getWorker(name).record;
     await this.persist();
     return { ok: true, action: "spawn", details: this.publicWorker(record) };
   }
@@ -385,16 +428,53 @@ export class Coordinator {
     const worktree = await this.admitWriter(profile, cwd);
     const runtime = this.runtimeFactory(cwd, this.stateDir, profile);
     if (!runtime.resumeSession) throw new StringsError("RESUME_UNSUPPORTED", "The worker runtime cannot resume a created session.");
-    const handle = await runtime.resumeSession({ name, agent, cwd, profile, sessionId });
-    if ((handle.backendSessionId ?? handle.agentSessionId) !== sessionId) {
-      await runtime.close(handle, "resume identity changed", false).catch(() => undefined);
-      throw new StringsError("SESSION_IDENTITY_CHANGED", `Worker ${name} resumed with a different session identity.`);
-    }
-    const now = new Date().toISOString();
-    const record: WorkerRecord = { origin: "created", name, profileName, profile, role: profile.role, ...(profile.model ? { model: profile.model } : {}), status: "idle", cwd, ...(worktree ? { worktree } : {}), handle: { ...handle, agent, profileName, role: profile.role, cwd }, createdAt: now, updatedAt: now };
-    this.workers.set(name, { record, runtime });
+    const claims = await this.claims.acquireAll(profile.role === "writer" ? writerClaims(cwd, worktree) : []);
+    try {
+      const handle = await runtime.resumeSession({ name, agent, cwd, profile, sessionId });
+      if ((handle.backendSessionId ?? handle.agentSessionId) !== sessionId) {
+        await runtime.close(handle, "resume identity changed", false).catch(() => undefined);
+        throw new StringsError("SESSION_IDENTITY_CHANGED", `Worker ${name} resumed with a different session identity.`);
+      }
+      const now = new Date().toISOString();
+      const record: WorkerRecord = { origin: "created", name, profileName, profile, role: profile.role, ...(profile.model ? { model: profile.model } : {}), status: "idle", cwd, ...(worktree ? { worktree } : {}), handle: { ...handle, agent, profileName, role: profile.role, cwd }, createdAt: now, updatedAt: now };
+      claims.push(...await this.claimSession(record, runtime));
+      this.workers.set(name, { record, runtime, claims });
+    } catch (error) { await this.claims.release(claims); throw error; }
+    const record = this.getWorker(name).record;
     await this.persist();
     return { ok: true, action: "resume", details: this.publicWorker(record) };
+  }
+
+  /**
+   * Internal (not an op_* action): take over what a worker left in another process's state dir,
+   * so this Coordinator can resume or reopen it. Each Pi process has its own state dir; a parked
+   * run may come back in a different process. The other dir is only read, never locked or changed:
+   * the created session's provenance and the runtime's saved session record are copied here.
+   * Refused while the other dir's process is alive and still holds the worker. With no stateDir,
+   * the legacy single state dir is the source. Nothing to take over is not an error.
+   */
+  private async adopt(input: Action): Promise<StringsResponse> {
+    const name = requiredString(input.name, "name");
+    const from = typeof input.stateDir === "string" ? resolve(input.stateDir) : this.legacyDir;
+    const none = { ok: true as const, action: "adopt", details: { adopted: false } };
+    if (!from || from === resolve(this.stateDir) || this.workers.has(name)) return none;
+    const state = await StateStore.peek(from);
+    if (!state) return none;
+    const stored = state.workers.find(worker => worker.name === name);
+    if (stored && stored.status !== "closed") {
+      const holder = await stateDirHolder(from);
+      if (holder.live) throw new StringsError("RUN_OWNED_ELSEWHERE", `Worker ${name} is still held by ${describeOwner(holder.owner)} (its Coordinator state: ${from}).`);
+    }
+    const sessionId = optionalString(input.sessionId);
+    const agent = optionalString(input.agent);
+    const imported = sessionId ? state.sessions.filter(session => session.sessionId === sessionId && (!agent || session.agent === agent)) : [];
+    for (const session of imported) this.sessions.set(ownedSessionKey(session), session);
+    if (imported.length) {
+      const runtime = this.runtimeFactory(imported[0]!.cwd, this.stateDir, directProfile(imported[0]!.agent, imported[0]!.role, undefined));
+      await runtime.adoptSession?.({ name, fromStateDir: from });
+      await this.persist();
+    }
+    return { ok: true, action: "adopt", details: { adopted: true, from, sessions: imported.length } };
   }
 
   private async send(input: Action): Promise<StringsResponse> {
@@ -904,6 +984,7 @@ export class Coordinator {
       worker.record.status = "closed";
       const details = this.publicWorker(worker.record);
       this.workers.delete(worker.record.name);
+      await this.claims.release(worker.claims ?? []);
       await this.persist();
       return { ok: true, action: "close", details };
     }
@@ -931,6 +1012,7 @@ export class Coordinator {
     worker.record.updatedAt = new Date().toISOString();
     const details = this.publicWorker(worker.record);
     this.workers.delete(worker.record.name);
+    await this.claims.release(worker.claims ?? []);
     await this.persist();
     return { ok: true, action: "close", details };
   }
