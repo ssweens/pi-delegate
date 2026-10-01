@@ -282,14 +282,18 @@ export class Coordinator {
     if (!configuredProfile) throw new StringsError("PROFILE_INVALID", `Worker ${name} has no resolved profile.`);
     const requestedModel = optionalModel(input.model);
     const profile: Profile = requestedModel === undefined ? configuredProfile : { ...configuredProfile, model: requestedModel };
+    if ((input.mode !== undefined || input.title !== undefined) && profile.agent.toLowerCase() !== "amp") throw new StringsError("INPUT_INVALID", "mode and title are Amp-only.");
+    if (input.mode !== undefined && requestedModel !== undefined) throw new StringsError("INPUT_INVALID", "On Amp, model and mode both select the agent mode; pass one.");
     const cwd = await realpath(typeof input.cwd === "string" ? input.cwd : this.parentCwd);
     const worktree = await this.admitWriter(profile, cwd);
     await mkdir(this.stateDir, { recursive: true, mode: 0o700 });
     const runtime = this.runtimeFactory(cwd, this.stateDir, profile);
     const executionEnvironment = optionalString(input.executionEnvironment);
+    const mode = optionalString(input.mode);
+    const title = optionalString(input.title);
     let handle: RuntimeHandle | undefined;
     try {
-      handle = await runtime.ensureSession({ name, agent: profile.agent, cwd, profile, ...(executionEnvironment ? { executionEnvironment } : {}) });
+      handle = await runtime.ensureSession({ name, agent: profile.agent, cwd, profile, ...(executionEnvironment ? { executionEnvironment } : {}), ...(mode ? { mode } : {}), ...(title ? { title } : {}) });
       if (profile.model) await this.requireSelectedModel(runtime, handle, profile.model);
     } catch (error) {
       if (handle) await runtime.close(handle, "model selection failed", true).catch(() => undefined);
@@ -300,7 +304,7 @@ export class Coordinator {
     }
     if (!handle) throw new StringsError("SESSION_INIT_FAILED", `Worker ${name} did not return a runtime session handle.`);
     const now = new Date().toISOString();
-    const record: WorkerRecord = { origin: "created", name, profileName, profile, role: profile.role, ...(profile.model ? { model: profile.model } : {}), status: "idle", cwd, ...(worktree ? { worktree } : {}), handle: { ...handle, agent: profile.agent, profileName, role: profile.role, cwd }, createdAt: now, updatedAt: now };
+    const record: WorkerRecord = { origin: "created", name, profileName, profile, role: profile.role, ...(profile.model ? { model: profile.model } : {}), ...(mode ? { mode } : {}), status: "idle", cwd, ...(worktree ? { worktree } : {}), handle: { ...handle, agent: profile.agent, profileName, role: profile.role, cwd }, createdAt: now, updatedAt: now };
     const sessionId = record.handle.backendSessionId ?? record.handle.agentSessionId;
     if (sessionId) {
       const provenance = { sessionId, agent: profile.agent, profileName, role: profile.role, cwd };
@@ -319,7 +323,7 @@ export class Coordinator {
 
   private async openNative(input: Action, name: string, agent: string, sessionId: string): Promise<StringsResponse> {
     const executionEnvironment = optionalString(input.executionEnvironment);
-    for (const key of ["profile", "role", "tools", "model", "thinking"]) {
+    for (const key of ["profile", "role", "tools", "model", "thinking", "mode", "title"]) {
       if (input[key] !== undefined) throw new StringsError("OPEN_OVERRIDE_FORBIDDEN", `Opening preserves native settings; ${key} is creation-only.`);
     }
     if (executionEnvironment && agent.toLowerCase() !== "amp") {
@@ -653,6 +657,10 @@ export class Coordinator {
       const closeSettled = await settlesWithin(turn.closeStream("terminal result"), profile.cancellationGraceMs).catch(() => false);
       const streamSettled = await settlesWithin(Promise.all([eventDrain, appendTail]).then(() => undefined), profile.cancellationGraceMs).catch(() => false);
       if (coordinatorTerminal) return coordinatorTerminal;
+      // A created Amp session learns its native thread ID (T-ID) from its first execution, and the
+      // adapter reports it with the turn's result. Record it before the request settles, so every
+      // reader of the settled request also sees the native identity. The status action does the same.
+      if (worker.record.origin === "created" && !worker.record.native && worker.record.profile.agent.toLowerCase() === "amp") await this.learnNative(worker);
       // terminal came from turn.result (the eventDrain guard hangs when the
       // request is still running), so it is defined here.
       this.applyTerminal(worker, request, terminal as RuntimeTerminal);
@@ -670,6 +678,14 @@ export class Coordinator {
       }
       return undefined;
     }
+  }
+
+  /** Best effort: a status the runtime cannot give leaves the identity unknown, never fails the turn. */
+  private async learnNative(worker: LiveWorker): Promise<void> {
+    try {
+      const status = await worker.runtime.getStatus?.(worker.record.handle);
+      if (status?.native) worker.record.native = status.native;
+    } catch { /* unknown until a later status */ }
   }
 
   private applyTerminal(worker: LiveWorker, request: RequestRecord, terminal: RuntimeTerminal): void {
@@ -936,7 +952,7 @@ export class Coordinator {
     name: record.name, origin: record.origin, agent: record.profile.agent,
     ...(record.origin === "created" ? { profile: record.profileName, role: record.role } : { policy: "provider-native" }),
     ...(record.native ? { native: record.native } : {}),
-    ...(record.model ? { model: record.model } : {}), status: record.status, cwd: record.cwd, activeRequestId: record.activeRequestId,
+    ...(record.model ? { model: record.model } : {}), ...(record.mode ? { mode: record.mode } : {}), status: record.status, cwd: record.cwd, activeRequestId: record.activeRequestId,
     session: record.handle.backendSessionId ?? record.handle.agentSessionId, nativeSessionId: record.native?.id ?? record.handle.agentSessionId,
   }; }
 }

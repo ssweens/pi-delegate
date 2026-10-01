@@ -1343,6 +1343,7 @@ export default function (pi: ExtensionAPI) {
 			agent: Type.Optional(Type.String({ description: "acp only: the ACP agent to run, e.g. pi, amp, codex, claude" })),
 			sessionId: Type.Optional(Type.String({ description: "acp only: open this exact provider-native session (e.g. an Amp T-ID) instead of creating one" })),
 			executionEnvironment: Type.Optional(Type.String({ description: 'acp only: "local" or "orb". Creating: where the session runs. Opening (Amp only): a verification hint' })),
+			mode: Type.Optional(Type.String({ description: 'acp + amp only, created threads: Amp\'s agent mode (low, medium, high, ultra or a plugin mode), used for every turn. Not with model or sessionId' })),
 		}),
 		async execute(_id, params, signal, onUpdate, ctx) {
 			const start = validateStartInput(params as Record<string, unknown>);
@@ -1512,7 +1513,8 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 			"wait with runIds and mode any|all joins several runs of either backend at once; timeoutMs only ends that wait, never the runs. " +
 			"Runs started with backend acp take the same runId actions: status and result read the session and its latest turn; wait joins it; steer sends the next turn (a running turn must finish or be cancelled first); cancel stops only a turn this run started; close releases the session \u2014 a created one is disposed, an opened one only disconnected, never archived or deleted. close is acp only and final. " +
 			"When the parent exits, its acp runs are parked, not closed: their sessions are released and their records stay readable after a restart; steer reopens one (an opened run by its native ID, a created run by native resume, else RUN_NOT_RESUMABLE). " +
-			"status or result with observe:true on an opened Amp run also reads its thread once (one amp threads export, never in the background) and returns only the messages after the last ones this run was shown, from any participant; a failed read is reported as unknown. Other runs fail ACTION_UNSUPPORTED.",
+			"status or result with observe:true on an opened Amp run also reads its thread once (one amp threads export, never in the background) and returns only the messages after the last ones this run was shown, from any participant; a failed read is reported as unknown. Other runs fail ACTION_UNSUPPORTED. " +
+			"status or result with a runId on an Amp run also reads its thread cost once (amp threads usage); unknown when it cannot be read.",
 		parameters: Type.Object({
 			action: StringEnum(["models", "rate", "approve", "roles", "status", "result", "wait", "steer", "cancel", "close"] as const),
 			role: Type.Optional(Type.String({ description: "approve: role name" })),
@@ -1674,10 +1676,14 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 				try {
 					switch (p.action) {
 						case "status": {
+							await acp.refreshUsage(id);
 							const v = p.observe === true ? await acp.observe(id) : (await acp.status([id]))[0]!;
 							return { content: [{ type: "text", text: acpStatusText(v) }], details: v };
 						}
-						case "result": return acpRunResult(p.observe === true ? await acp.observe(id) : await acp.result(id));
+						case "result": {
+							await acp.refreshUsage(id);
+							return acpRunResult(p.observe === true ? await acp.observe(id) : await acp.result(id));
+						}
 						case "wait": {
 							const outcome = await acp.wait({ runIds: [id], mode: "all", ...(p.timeoutMs !== undefined ? { timeoutMs: p.timeoutMs } : {}) }, signal, () => ctx.hasPendingMessages());
 							return await acpWaitResult(outcome, [id], p.timeoutMs);
@@ -1701,7 +1707,7 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 				} catch (error) { return failed(error); }
 			}
 			const run = p.runId ? runs.get(p.runId) : undefined;
-			if (!run || run.ownerKey !== owner.key) throw new Error(`unknown runId ${p.runId ?? "(none)"}; known: ${[...ownedRuns(owner).map((r) => r.id), ...acp.owned(owner.key).map((v) => v.id)].join(", ") || "none"}`);
+			if (!run || run.ownerKey !== owner.key) return failed(new DelegateError("RUN_NOT_FOUND", `unknown runId ${p.runId ?? "(none)"}; known: ${[...ownedRuns(owner).map((r) => r.id), ...acp.owned(owner.key).map((v) => v.id)].join(", ") || "none"}`, "runId"));
 			// The pi backend's capability report decides what it cannot do; that fails, it never becomes another action.
 			const capability = requireAction(PI_CAPABILITIES, p.observe === true ? "observe" : p.action as LifecycleAction);
 			if (!capability.ok) return failed(new DelegateError(capability.error.code, capability.error.message));

@@ -47,8 +47,9 @@ export interface RunView {
 	turn?: { requestId: string; status: string; delivery: string; providerOutcome?: string; truncated: boolean };
 }
 
-/** An ACP run's tokens and cost, summed over its turns. */
-export function acpUsage(turns: AcpRunView["turns"]): Pick<RunView, "tokens" | "cost"> {
+/** An ACP run's tokens and cost, summed over its turns. An Amp run's cost is its thread's, as last read (`amp threads usage`). */
+export function acpUsage(v: Pick<AcpRunView, "turns" | "usage">): Pick<RunView, "tokens" | "cost"> {
+	const turns = v.turns;
 	const tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 	let cost = 0;
 	for (const t of turns) {
@@ -59,13 +60,13 @@ export function acpUsage(turns: AcpRunView["turns"]): Pick<RunView, "tokens" | "
 		tokens.cacheWrite += b?.cachedWriteTokens ?? 0;
 		cost += t.usage?.cost?.amount ?? 0;
 	}
-	return { tokens, cost };
+	return { tokens, cost: v.usage?.cost?.amount ?? cost };
 }
 
 /** An ACP run in the shape every run surface draws: one line, the Agents frame, history, the child view. */
 export function acpRowView(v: AcpRunView): RunView {
 	const latest = v.turns.at(-1);
-	const { tokens, cost } = acpUsage(v.turns);
+	const { tokens, cost } = acpUsage(v);
 	return {
 		id: v.id, segment: v.turns.length, stopped: false, settled: v.status !== "running",
 		role: `acp ${v.session.agent}`, model: v.model ?? "", cwd: v.cwd, thinking: "", context: "fresh",

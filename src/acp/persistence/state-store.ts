@@ -22,6 +22,7 @@ export interface StoredWorker {
   profileName: string;
   role: WorkerRole;
   model?: string;
+  mode?: string;
   tools?: string[];
   status: WorkerStatus;
   cwd: string;
@@ -49,8 +50,9 @@ const LegacyWorkerSchema = z.object({
   status: z.enum(["spawning", "idle", "running", "failed", "closing", "closed"]), cwd: z.string().min(1), worktree: WorktreeSchema.optional(),
   handle: HandleSchema, activeRequestId: z.string().optional(), createdAt: z.iso.datetime(), updatedAt: z.iso.datetime(),
 }).strict();
-const WorkerSchema = LegacyWorkerSchema.extend({ origin: z.enum(["created", "opened"]), native: NativeSessionDescriptionSchema.optional() })
-  .refine(worker => (worker.origin === "opened") === (worker.native !== undefined), "Opened workers require native identity; created workers cannot acquire it by migration");
+// A created worker learns its native identity after creation (an Amp T-ID, once the adapter receives it); an opened one has it from the start.
+const WorkerSchema = LegacyWorkerSchema.extend({ origin: z.enum(["created", "opened"]), native: NativeSessionDescriptionSchema.optional(), mode: z.string().min(1).optional() })
+  .refine(worker => worker.origin !== "opened" || worker.native !== undefined, "Opened workers require native identity");
 const FailureSchema = z.object({ code: z.string().min(1), message: z.string(), retryable: z.boolean(), detailCode: z.string().optional() }).strict();
 const UsageBreakdownSchema = z.object({
   inputTokens: z.number().optional(), outputTokens: z.number().optional(), cachedReadTokens: z.number().optional(),

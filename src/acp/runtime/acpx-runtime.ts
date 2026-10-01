@@ -139,7 +139,9 @@ export class AcpxRuntimePort implements RuntimePort {
 
   disconnect(handle: RuntimeHandle): Promise<void> { return this.runtime.disconnect({ handle: fromHandle(handle) }); }
 
-  async ensureSession(input: { name: string; agent: string; cwd: string; profile: Profile; resumeSessionId?: string; executionEnvironment?: string }): Promise<RuntimeHandle> {
+  async ensureSession(input: { name: string; agent: string; cwd: string; profile: Profile; resumeSessionId?: string; executionEnvironment?: string; mode?: string; title?: string }): Promise<RuntimeHandle> {
+    const amp = input.agent.toLowerCase() === "amp";
+    if ((input.mode !== undefined || input.title !== undefined) && !amp) throw new StringsError("INPUT_INVALID", "mode and title are Amp-only.");
     const handle = await this.runtime.ensureSession({
       sessionKey: `pi-strings:${input.name}`,
       agent: input.agent,
@@ -149,10 +151,13 @@ export class AcpxRuntimePort implements RuntimePort {
       sessionOptions: {
         ...(input.profile.model ? { model: input.profile.model } : {}),
         ...(input.agent === "pi" ? { allowedTools: input.profile.tools } : {}),
+        // The adapter titles the thread its first execution creates (`amp --title`). ACPX persists
+        // session env under its snake_case key policy, hence the lowercase name.
+        ...(amp && input.title ? { env: { amp_acp_thread_title: input.title } } : {}),
       },
     });
     try {
-      const status = (input.executionEnvironment || input.profile.model) ? await this.runtime.getStatus({ handle }) : undefined;
+      const status = (input.executionEnvironment || input.profile.model || input.mode) ? await this.runtime.getStatus({ handle }) : undefined;
       if (input.executionEnvironment) {
         const options = status?.details?.configOptions as Array<{ id: string; options?: Array<{ value?: string; options?: Array<{ value: string }> }> }> | undefined;
         const option = options?.find(option => option.id === "execution-environment");
@@ -164,6 +169,12 @@ export class AcpxRuntimePort implements RuntimePort {
         const options = status.details.configOptions as Array<{ id: string; category?: string }>;
         const modelConfigId = options.find(option => option.category === "model")?.id;
         if (modelConfigId) await this.runtime.setConfigOption({ handle, key: modelConfigId, value: input.profile.model });
+      }
+      if (input.mode) {
+        // Amp's agent mode (`amp --mode`): any mode Amp knows, plugin modes included, so it is not checked against the advertised list.
+        const options = status?.details?.configOptions as Array<{ id: string }> | undefined;
+        if (!options?.some(option => option.id === "amp-mode")) throw new Error("The Amp adapter does not advertise its mode option.");
+        await this.runtime.setConfigOption({ handle, key: "amp-mode", value: input.mode });
       }
       if (input.agent === "codex") await this.runtime.setMode?.({ handle, mode: input.profile.role === "writer" ? "agent" : "read-only" });
     } catch (error) {

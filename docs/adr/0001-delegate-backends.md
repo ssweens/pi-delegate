@@ -42,9 +42,9 @@ ACP runs are durable like pi runs. Each run's record (identity, origin, native s
 
 ## Consequences
 
-- Lost: cancelling a turn someone else started in a shared Amp thread. It fails explicitly as unsupported.
+- Lost: cancelling a turn someone else started in a shared Amp thread. Delegate can't see such turns without observing, so cancel acts only on this run's own turn; with none running it fails `WORKER_NOT_RUNNING`, and a turn started by someone else is never cancelled.
 - Observation is on demand only, with no background polling. `amp threads export` is a full dump (about 0.5 s and 35 KB for 14 messages, measured 2026-09-30), so each call returns only messages after the last `messageId` returned. Turns this run starts stream live through `--execute --stream-json`.
-- pi has no open-existing and no close: they fail as unsupported. Cancel covers it.
+- pi has no open-existing and no close. `sessionId` on pi fails `FIELD_REQUIRES_ACP` at validation; `close` on a pi run fails `ACTION_UNSUPPORTED`. Cancel covers it.
 - Revival depends on the adapter. A created session on an adapter without ACP resume or load cannot continue after a restart; the caller starts a new run.
 - `role` means a role name on pi and `read-only|writer` on acp. The field name is shared, the domain is not.
 - An opened run may have no task. It is `idle` until it sends a turn, so it can observe without posting.

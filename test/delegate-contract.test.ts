@@ -147,6 +147,7 @@ test("the delegate contract, by backend, origin and agent, through delegate and 
 				UNKNOWN_BACKEND: () => h.launch("x", { backend: "remote" }),
 				FIELD_REQUIRES_ACP: () => h.launch("x", { agent: "amp" }),
 				FIELD_NOT_ON_ACP: () => delegate({ backend: "acp", agent: "pi", task: "x", context: "fork" }),
+				FIELD_REQUIRES_AMP: () => delegate({ backend: "acp", agent: "pi", task: "x", mode: "high" }),
 				OPEN_OVERRIDE_FORBIDDEN: () => delegate({ backend: "acp", agent: "amp", sessionId: "T-codes", model: "high" }),
 				INPUT_INVALID: () => delegate({ backend: "acp", task: "x" }),
 				ACTION_UNSUPPORTED: async () => h.ctl("close", (await h.launch("pi codes", { sync: true })).details.id),
@@ -156,6 +157,8 @@ test("the delegate contract, by backend, origin and agent, through delegate and 
 				assert.equal(codeOf(result), code, result.content[0].text);
 				assert.equal(result.isError, true);
 			}
+			const missing = await h.ctl("status", "no-such-run");
+			assert.equal(codeOf(missing), "RUN_NOT_FOUND", missing.content[0].text);
 			assert.equal(JSON.stringify(fake.calls), before, "a rejected call creates, opens, cancels and closes nothing");
 			await h.runtime.session.agent.waitForIdle();
 		});

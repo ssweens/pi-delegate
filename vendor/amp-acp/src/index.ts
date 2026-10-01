@@ -34,6 +34,11 @@ type Executor = (typeof EXECUTORS)[number];
 const AMP_THREAD_ID = /^T-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const ACP_SESSION_ID = /^S-[a-z0-9]+-[a-z0-9]{6}$/i;
 const AMP_MODES = ["low", "medium", "high", "ultra"] as const;
+/**
+ * Set by the embedder for a session it creates: the title of the new thread (`--title` on its first
+ * execution). Lowercase because ACPX persists session env under a snake_case key policy.
+ */
+const THREAD_TITLE_ENV = "amp_acp_thread_title";
 
 type NativeBinding = {
   id: string;
@@ -153,6 +158,7 @@ type AmpExecution = {
   executor: Executor;
   continue?: string;
   mode?: string;
+  title?: string;
   dangerouslyAllowAll?: boolean;
 };
 
@@ -169,6 +175,7 @@ function ampArgs(options: AmpExecution): string[] {
   args.push("--execute", "--stream-json", "--no-archive-after-execute");
   if (options.executor === "orb") args.push("--orb-execute");
   if (options.mode) args.push("--mode", options.mode);
+  if (options.title && !options.continue) args.push("--title", options.title);
   if (options.dangerouslyAllowAll) args.push("--dangerously-allow-all");
   return args;
 }
@@ -176,8 +183,9 @@ function ampArgs(options: AmpExecution): string[] {
 async function* executeAmp(prompt: string, options: AmpExecution, signal: AbortSignal): AsyncIterable<AmpStreamMessage> {
   signal.throwIfAborted();
   const selected = ampCommand();
+  const { [THREAD_TITLE_ENV]: _title, ...env } = process.env;
   const child = spawn(selected.command, [...selected.prefix, ...ampArgs(options)], {
-    cwd: options.cwd, env: { ...process.env, TERM: "dumb" }, stdio: ["pipe", "pipe", "pipe"],
+    cwd: options.cwd, env: { ...env, TERM: "dumb" }, stdio: ["pipe", "pipe", "pipe"],
   });
   const stderr: Buffer[] = [];
   child.stderr.on("data", chunk => stderr.push(chunk));
@@ -366,6 +374,7 @@ class AmpAcpAgent implements Agent {
       continue: state.threadId || undefined,
       noArchiveAfterExecute: true,
       ...(state.model ? { mode: state.model } : {}),
+      ...(!state.threadId && !state.native && process.env[THREAD_TITLE_ENV]?.trim() ? { title: process.env[THREAD_TITLE_ENV]!.trim() } : {}),
       ...(state.executor === "local" && state.mode === "bypass" ? { dangerouslyAllowAll: true } : {}),
     };
     try {

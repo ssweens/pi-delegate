@@ -94,7 +94,8 @@ export interface RuntimeTurn {
 }
 
 export interface RuntimePort {
-  ensureSession(input: { name: string; agent: string; cwd: string; profile: Profile; resumeSessionId?: string; executionEnvironment?: string }): Promise<RuntimeHandle>;
+  /** mode and title are Amp-only: its agent mode (`amp --mode`) and the title of the thread the first turn creates. */
+  ensureSession(input: { name: string; agent: string; cwd: string; profile: Profile; resumeSessionId?: string; executionEnvironment?: string; mode?: string; title?: string }): Promise<RuntimeHandle>;
   describeNativeSession?(agent: string, sessionId: string, options?: { cwd?: string; executionEnvironment?: string }): Promise<NativeSessionDescription>;
   openSession?(input: { name: string; agent: string; native: NativeSessionDescription; handle?: RuntimeHandle }): Promise<RuntimeHandle>;
   disconnect?(handle: RuntimeHandle): Promise<void>;
@@ -139,6 +140,8 @@ export interface WorkerRecord {
   profile: Profile;
   role: WorkerRole;
   model?: string;
+  /** Amp's agent mode, chosen at creation. The adapter keeps it for every turn of the thread. */
+  mode?: string;
   status: WorkerStatus;
   cwd: string;
   worktree?: WorktreeIdentity;

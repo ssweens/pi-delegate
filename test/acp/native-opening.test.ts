@@ -202,5 +202,11 @@ test("v1 migration remains created-only and v2 opened records require native ide
     assert.equal(migrated.workers[0]!.native, undefined);
     await writeFile(join(h.options.stateDir, "state.json"), JSON.stringify({ version: 2, workers: [{ ...worker, origin: "opened" }], requests: [] }));
     await assert.rejects(store.load(), /Opened workers require native identity/);
+    // A created worker learns its native identity after creation (an Amp T-ID) and keeps its Amp mode.
+    const native = { id: "T-00000000-0000-0000-0000-000000000001", scope: "amp://account/a", cwd: h.root, executionEnvironment: "local", attachment: "shared-session", disconnectEffect: "stops-local-executor", concurrentNativeClients: "unknown", activity: "unknown" };
+    await writeFile(join(h.options.stateDir, "state.json"), JSON.stringify({ version: 2, workers: [{ ...worker, origin: "created", native, mode: "ultra" }], requests: [] }));
+    const learned = await store.load();
+    assert.equal(learned.workers[0]!.native?.id, native.id);
+    assert.equal(learned.workers[0]!.mode, "ultra");
   } finally { await store.close(); await rm(h.root, { recursive: true, force: true }); }
 });

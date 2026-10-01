@@ -70,11 +70,11 @@ Use `backend: "acp"` when the user asks for a specific external agent (Codex, Cl
 Rules that differ from pi:
 
 - `agent` is required. `role` is `read-only` (default) or `writer`, never a pi role name. `model` is the agent's own model ID. `context` fails: an ACP agent never sees your conversation, so the brief must stand alone.
-- A new Amp thread needs `executionEnvironment` `local` or `orb`. Ask the user if they did not say; never pick one.
-- Opening (`sessionId`) rejects `role` and `model`. Your text goes in exactly as written, is never retried, and shows in Amp as an ordinary `## User` message. Only send into a shared thread what the user asked you to send.
+- A new Amp thread needs `executionEnvironment` `local` or `orb`. Ask the user if they did not say; never pick one. `mode` sets Amp's agent mode (`low`…`ultra` or a plugin mode); it fails `FIELD_REQUIRES_AMP` on other agents.
+- Opening (`sessionId`) rejects `role`, `model` and `mode`. Your text goes in exactly as written, is never retried, and shows in Amp as an ordinary `## User` message. Only send into a shared thread what the user asked you to send.
 - Each turn has its own request ID and `delivery`. `accepted` means the provider reported the turn complete; anything else is `unknown`. Never report `unknown` as delivered.
 - A `wait` timeout never cancels. `timeoutMs` on `delegate` or `steer` is the turn budget: on a created session it ends the turn as `timeout` and the session must be closed; on an opened session it only stops your wait.
-- Steer needs the current turn to be finished or cancelled. `cancel` stops only a turn this run started; on a shared Amp thread, someone else's turn fails `ACTION_UNSUPPORTED`. Cancel stops the turn, not the run.
+- Steer needs the current turn to be finished or cancelled. `cancel` stops only a turn this run started; on a shared Amp thread, a turn someone else started is never cancelled; with no turn of this run active, cancel fails `WORKER_NOT_RUNNING`. Cancel stops the turn, not the run.
 - `close` is ACP-only and final. It disposes a created session and only disconnects an opened one; it never archives or deletes a thread. Pass `force: true` only to cancel an active turn first. Close every ACP run you finish with.
 - On an opened Amp run, `status` with `observe: true` and one `runId` reads the thread: one export per call, only messages since the last read. A plain `status` doesn't read it. One read is not a poll loop.
 - After the parent restarts, ACP runs are parked: `status`, `result` and `wait` read their records, and `steer` reopens them. A created run whose adapter cannot resume fails `RUN_NOT_RESUMABLE`; tell the user and start a new run rather than retrying.

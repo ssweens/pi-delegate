@@ -13,8 +13,8 @@ One tool pair, two backends:
 
 ## Tools
 
-**`delegate({ backend?, role?, task?, model?, reason?, context?, cwd?, timeoutMs?, sync?, agent?, sessionId?, executionEnvironment? })`**
-On the pi backend, `role` and `task` are required, and it runs `role` on `task` in its own in-process session (`createAgentSession`, no extensions/skills loaded — built-in tools only). Returns final report, changed files, turns, tokens, cost, run id, and the child's session file path. Refuses a second writing child in a `cwd` that already has one running. `agent`, `sessionId` and `executionEnvironment` are ACP-only; see [Backends](#backends).
+**`delegate({ backend?, role?, task?, model?, reason?, context?, cwd?, timeoutMs?, sync?, agent?, sessionId?, executionEnvironment?, mode? })`**
+On the pi backend, `role` and `task` are required, and it runs `role` on `task` in its own in-process session (`createAgentSession`, no extensions/skills loaded — built-in tools only). Returns final report, changed files, turns, tokens, cost, run id, and the child's session file path. Refuses a second writing child in a `cwd` that already has one running. `agent`, `sessionId`, `executionEnvironment` and `mode` are ACP-only; see [Backends](#backends).
 
 - `context: "fork"` (default) — child starts with the parent's conversation so far (`buildSessionContext` of the active branch, trailing unresolved tool call trimmed). No re-acquisition. Delegation records are left out of that inheritance — `delegate`/`delegate_ctl` calls, their results, and completion notices — so a child inherits the work rather than a pattern of handing it off; children have no delegation tools, and copies of those calls only produced confident re-delegation attempts and false "extension not loaded" diagnoses. A forked child is also told, in its own instructions, that the inherited conversation belongs to the agent that delegated to it: stripping the calls stops the mimicry, but the surrounding prose still reads as supervising a worker, and a child that adopts that voice inspects the job instead of doing it. When the parent's recent conversation is mostly orchestration, `fresh` with a complete brief remains the safer choice.
 - `context: "fresh"` — adversarial/independent review.
@@ -81,6 +81,8 @@ Ask in plain words. The agent turns the request into a `delegate` or `delegate_c
 
 A new Amp thread needs `executionEnvironment`. Nothing picks local or Orb for you.
 
+`mode` (Amp only) is Amp's agent mode: `low`, `medium`, `high`, `ultra` or a plugin mode, passed as `amp --mode` on every turn of the thread. `model` on Amp still selects one of the four built-in modes; pass one or the other. The new thread is titled with the brief's first line. Once its T-ID is known, it is labeled `pi-delegate` plus the run's UUID without hyphens (Amp labels are at most 32 characters). A failed label is a note on the run, never a failure. `status` and `result` with a `runId` read the thread's cost with one `amp threads usage`; the cost is `unknown` when it cannot be read.
+
 ### An existing Amp thread
 
 > "Open T-… but don't post anything yet."
@@ -97,7 +99,7 @@ With no `task`, the run is `idle`: it attaches and sends nothing. Steer it when 
 {"action":"steer","runId":"amp-…","message":"Please rerun the suite and report any failures."}
 ```
 
-The message goes in exactly as written, and Amp shows it as an ordinary `## User` message. To send a turn at once, put `task` in the `delegate` call. Opening rejects `role` and `model`, because the thread keeps its own. On open, `executionEnvironment` is only a hint that the provider's metadata must match.
+The message goes in exactly as written, and Amp shows it as an ordinary `## User` message. To send a turn at once, put `task` in the `delegate` call. Opening rejects `role`, `model` and `mode`, because the thread keeps its own; it is never labeled or retitled. On open, `executionEnvironment` is only a hint that the provider's metadata must match.
 
 ### Wait across runs
 
@@ -130,7 +132,7 @@ On an opened Amp run, `delegate_ctl status` or `result` with `observe: true` (an
 - **Opening.** pi cannot open an existing session. On acp, opening needs an adapter that verifies native identity and can disconnect. Today the vendored Pi and Amp adapters do. Other agents fail `NATIVE_OPEN_UNSUPPORTED`.
 - **Timeouts.** A `wait` timeout never cancels anything; the runs keep going. The `timeoutMs` on `delegate` or `steer` is the turn budget, which is different. On pi it aborts the child's segment. On a created ACP session it ends the turn as `timeout` (`TURN_TIMEOUT`) and the session becomes unusable: close the run and start a new one. On an opened session it only stops the local wait; the native turn keeps running.
 - **Delivery.** Each ACP turn reports `delivery` and the provider outcome as separate fields. `delivery` is `accepted` only when the provider reports that the turn completed. Anything else (running, failed, cancelled, timed out, lost) is `unknown`. pi runs have no delivery field.
-- **Cancellation.** On pi, `cancel` stops the child and turns off automatic revival. On acp, `cancel` sends ACP session cancel for the active turn this run started, with a grace period. It stops that turn, not the run, so you can steer again. On an opened Amp thread, you cannot cancel a turn someone else started: that fails `ACTION_UNSUPPORTED`. With no active turn, cancel fails `WORKER_NOT_RUNNING`.
+- **Cancellation.** On pi, `cancel` stops the child and turns off automatic revival. On acp, `cancel` sends ACP session cancel for the active turn this run started, with a grace period. It stops that turn, not the run, so you can steer again. On an opened Amp thread, cancel acts only on a turn this run started; a turn someone else started is never cancelled. With no turn of this run active, cancel fails `WORKER_NOT_RUNNING`.
 - **Steer.** On pi, steer queues into a running child or resumes a finished one. On acp, a running turn must finish or be cancelled first. `model` on steer is rejected on an opened session. `restart` is pi-only.
 - **Close.** `close` is ACP-only; on pi it fails `ACTION_UNSUPPORTED`, so use `cancel`. Close refuses a run with an active turn unless `force: true`, which cancels the turn first. A created session is disposed; `discardPersistentState: true` also stops it from being resumable. An opened session is only disconnected. It is never cancelled, archived or deleted, and `discardPersistentState` fails `OPEN_OVERRIDE_FORBIDDEN`. Disconnecting an opened Pi session ends that local adapter process, so a turn still running there may stop with an unknown outcome.
 - **Parent exit and restart.** pi children recover as [Reload and recovery](#reload-and-recovery) describes. ACP runs are *parked* when the parent exits: each session is released the way close releases it (a created one is closed but kept resumable, an opened one is disconnected), but the run is not closed. A turn still running at exit ends as `PARENT_PROCESS_LOST` with delivery `unknown`. After a restart, `status`, `result` and `wait` read the saved record without starting anything. `steer` revives the run: an opened run reopens the same native ID and checks its identity; a created run resumes only if its adapter supports ACP `session/resume` or `session/load`. Otherwise steer fails `RUN_NOT_RESUMABLE`. The record stays readable, so start a new run. A run that another live Pi process owns is read-only here (`RUN_OWNED_ELSEWHERE`).
@@ -160,7 +162,7 @@ Field changes:
 - `prompt` becomes `task` (first turn) or `message` (steer). `requestTimeoutMs` becomes `timeoutMs` on `delegate` or steer. `waitTimeoutMs` becomes `timeoutMs` on `wait`.
 - `delegate` takes no `profile`, `tools` or `predecessorRequestId`, and `cancel` takes no `reason`. Choose tools with `role: "read-only"` or `"writer"`. Wait on runs by listing their `runIds`, not by `names` or `all`.
 
-**The Amp plugin bridge is gone.** pi-strings once reached Amp through a project plugin and portal (`op_observe`, `op_append`, `op_steer`, `op_cancel_remote`). That bridge and its `PI_STRINGS_AMP_BRIDGE_*` settings are deleted. Every Amp control now takes a native path: steer is a native send, cancel is ACP session cancel, and observation is `amp threads export`. One thing is lost: cancelling a turn that someone else started in a shared thread. It fails `ACTION_UNSUPPORTED`.
+**The Amp plugin bridge is gone.** pi-strings once reached Amp through a project plugin and portal (`op_observe`, `op_append`, `op_steer`, `op_cancel_remote`). That bridge and its `PI_STRINGS_AMP_BRIDGE_*` settings are deleted. Every Amp control now takes a native path: steer is a native send, cancel is ACP session cancel, and observation is `amp threads export`. One thing is lost: cancelling a turn that someone else started in a shared thread. Cancel only ever acts on this run's own turn.
 
 The ACP Coordinator still keeps its state under `~/.pi/agent/pi-strings/`. That directory name did not change.
 

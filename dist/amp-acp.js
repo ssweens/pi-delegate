@@ -20,9 +20,9 @@ function ampCommand() {
   const configured = process.env.AMP_CLI_PATH?.trim() || "amp";
   return /\.(?:c|m)?js$/i.test(configured) ? { command: process.execPath, prefix: [configured] } : { command: configured, prefix: [] };
 }
-async function ampThreadExport(id, cwd, options = {}) {
+async function runAmp(args, cwd, options = {}) {
   const selected = ampCommand();
-  const child = spawn(selected.command, [...selected.prefix, "threads", "export", id], {
+  const child = spawn(selected.command, [...selected.prefix, ...args], {
     cwd,
     env: process.env,
     stdio: ["ignore", "pipe", "pipe"]
@@ -46,6 +46,9 @@ async function ampThreadExport(id, cwd, options = {}) {
     if (timer) clearTimeout(timer);
   }
 }
+function ampThreadExport(id, cwd, options = {}) {
+  return runAmp(["threads", "export", id], cwd, options);
+}
 
 // vendor/amp-acp/src/index.ts
 var NATIVE_SESSION_CAPABILITY = "pi-strings/native-session";
@@ -57,6 +60,7 @@ var EXECUTORS = ["local", "orb"];
 var AMP_THREAD_ID = /^T-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 var ACP_SESSION_ID = /^S-[a-z0-9]+-[a-z0-9]{6}$/i;
 var AMP_MODES = ["low", "medium", "high", "ultra"];
+var THREAD_TITLE_ENV = "amp_acp_thread_title";
 function isAmpThreadId(value) {
   return typeof value === "string" && AMP_THREAD_ID.test(value);
 }
@@ -153,15 +157,17 @@ function ampArgs(options) {
   args.push("--execute", "--stream-json", "--no-archive-after-execute");
   if (options.executor === "orb") args.push("--orb-execute");
   if (options.mode) args.push("--mode", options.mode);
+  if (options.title && !options.continue) args.push("--title", options.title);
   if (options.dangerouslyAllowAll) args.push("--dangerously-allow-all");
   return args;
 }
 async function* executeAmp(prompt, options, signal) {
   signal.throwIfAborted();
   const selected = ampCommand();
+  const { [THREAD_TITLE_ENV]: _title, ...env } = process.env;
   const child = spawn2(selected.command, [...selected.prefix, ...ampArgs(options)], {
     cwd: options.cwd,
-    env: { ...process.env, TERM: "dumb" },
+    env: { ...env, TERM: "dumb" },
     stdio: ["pipe", "pipe", "pipe"]
   });
   const stderr = [];
@@ -362,6 +368,7 @@ var AmpAcpAgent = class {
       continue: state.threadId || void 0,
       noArchiveAfterExecute: true,
       ...state.model ? { mode: state.model } : {},
+      ...!state.threadId && !state.native && process.env[THREAD_TITLE_ENV]?.trim() ? { title: process.env[THREAD_TITLE_ENV].trim() } : {},
       ...state.executor === "local" && state.mode === "bypass" ? { dangerouslyAllowAll: true } : {}
     };
     try {

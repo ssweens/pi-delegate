@@ -47,7 +47,7 @@ test("an unknown backend fails instead of falling back", () => {
 // --- pi backend --------------------------------------------------------------------------
 
 test("pi rejects every ACP-only field, including when backend is omitted", () => {
-	const values = { agent: "amp", sessionId: "T-123", executionEnvironment: "orb" } as const;
+	const values = { agent: "amp", sessionId: "T-123", executionEnvironment: "orb", mode: "high" } as const;
 	for (const field of ACP_ONLY_FIELDS) {
 		for (const backend of ["pi", undefined]) {
 			const error = errorOf(validateStartInput({ backend, role: "scout", task: "t", [field]: values[field] }));
@@ -113,6 +113,28 @@ test("acp open-existing takes sessionId, keeps native settings and may skip the 
 	}
 	const hint = errorOf(validateStartInput({ backend: "acp", agent: "pi", sessionId: "abc", executionEnvironment: "local" }));
 	assert.deepEqual([hint.code, hint.field], ["OPEN_OVERRIDE_FORBIDDEN", "executionEnvironment"]);
+});
+
+test("mode is Amp's agent mode: created Amp threads only, never with model, never another agent or pi", () => {
+	const created = validateStartInput({ backend: "acp", agent: "amp", task: "t", executionEnvironment: "local", mode: "ultra" });
+	assert.deepEqual(created, { ok: true, value: { backend: "acp", origin: "created", agent: "amp", task: "t", executionEnvironment: "local", mode: "ultra" } });
+	const plugin = validateStartInput({ backend: "acp", agent: " Amp ", task: "t", executionEnvironment: "orb", mode: " Deep Research " });
+	assert.equal(plugin.ok && plugin.value.backend === "acp" && plugin.value.origin === "created" && plugin.value.mode, "Deep Research", "a plugin mode, by key or label, passes through");
+	for (const agent of ["codex", "pi", "claude"]) {
+		for (const extra of [{ task: "t" }, { sessionId: "abc" }]) {
+			const error = errorOf(validateStartInput({ backend: "acp", agent, mode: "high", ...extra }));
+			assert.deepEqual([error.code, error.field], ["FIELD_REQUIRES_AMP", "mode"], `${agent} ${JSON.stringify(extra)}`);
+		}
+	}
+	const opened = errorOf(validateStartInput({ backend: "acp", agent: "amp", sessionId: "T-019a", mode: "high" }));
+	assert.deepEqual([opened.code, opened.field], ["OPEN_OVERRIDE_FORBIDDEN", "mode"], "an opened thread keeps its native mode");
+	const both = errorOf(validateStartInput({ backend: "acp", agent: "amp", task: "t", executionEnvironment: "local", mode: "high", model: "low" }));
+	assert.deepEqual([both.code, both.field], ["INPUT_INVALID", "mode"], "one field decides the mode");
+	for (const mode of ["", "  ", "--dangerously-allow-all", "a\nb", 3]) {
+		assert.deepEqual(errorOf(validateStartInput({ backend: "acp", agent: "amp", task: "t", executionEnvironment: "local", mode })).code, "INPUT_INVALID", JSON.stringify(mode));
+	}
+	const modeled = validateStartInput({ backend: "acp", agent: "amp", task: "t", executionEnvironment: "local", model: "high" });
+	assert.equal(modeled.ok && modeled.value.backend === "acp" && modeled.value.origin === "created" && modeled.value.model, "high", "model on Amp keeps working as before");
 });
 
 // --- capabilities --------------------------------------------------------------------------

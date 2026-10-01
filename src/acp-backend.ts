@@ -19,6 +19,13 @@
  *
  * Opened Amp runs can also be observed (todo 044, amp-observe.ts): status/result with observe reads
  * the thread through one `amp threads export`, on demand, and the cursor is saved with the record.
+ *
+ * Amp extras (todo 058). A created Amp run takes Amp's agent mode (`amp --mode`) and titles its new
+ * thread with the brief's first line. Once its T-ID is known (the Coordinator records it as the first
+ * turn settles) the thread is labeled for the run, once, with `amp threads label`; a failed label is
+ * a note, never a failed run. Opened threads are never labeled or retitled. For every Amp run,
+ * delegate_ctl status/result with a runId reads the thread's cost with one `amp threads usage` and
+ * caches it on the record with its time; nothing else reads it, so drawing a view never runs Amp.
  */
 import { randomUUID } from "node:crypto";
 import { existsSync, readdirSync } from "node:fs";
@@ -47,6 +54,8 @@ import {
 	turnView,
 } from "./backend.js";
 import { type ObserveCursor, observationText, observeAmpThread } from "./amp-observe.js";
+import { AMP_LABEL, ampThreadLabel, ampThreadUsage, parseAmpCost, type AmpRun } from "./acp/runtime/amp-cli.js";
+import type { AmpThreadUsage } from "./backend.js";
 import { acpUsage, elapsed } from "./render.js";
 import { ownedElsewhere, processOwner, readRecord, type RunOwner, writeRecord } from "./storage.js";
 import type { ChildActivity } from "./transcript.js";
@@ -77,6 +86,16 @@ interface AcpRunRecord extends Partial<RunOwner> {
 	cwd: string;
 	role?: WorkerRole;
 	model?: string;
+	/** Created Amp runs: Amp's agent mode, given at creation. */
+	mode?: string;
+	/** The provider-native session ID once known (an Amp T-ID), kept when the worker that reported it is gone. */
+	nativeSessionId?: string;
+	/** Created Amp runs: the one labeling of the thread, attempted once its T-ID was known. */
+	labeled?: { at: number; labels: string[]; ok: boolean };
+	/** Amp runs: the thread's cost as last read by status/result. */
+	usage?: AmpThreadUsage;
+	/** Side effects that failed without failing the run. */
+	notes?: string[];
 	/** Per-turn budget from delegate; steer reuses it unless it passes its own. */
 	timeoutMs?: number;
 	/** How an opened run was opened, so reopening it targets exactly that native session. */
@@ -123,6 +142,52 @@ const WAIT_SLICE_MS = 1000;
 /** The Coordinator's default profile bound, for a run whose worker profile was never seen. */
 const DEFAULT_MAX_OUTPUT_BYTES = 256_000;
 const WATCH_SLICE_MS = 60_000;
+/** Bounds on the Amp CLI calls a run makes besides its turns: a slow Amp delays, never blocks, a status or a wake. */
+const AMP_LABEL_TIMEOUT_MS = 15_000;
+const AMP_USAGE_TIMEOUT_MS = 15_000;
+const AMP_THREAD_ID = /^T-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** Every thread delegate creates carries this label, so leftover threads are easy to find. */
+export const AMP_DELEGATE_LABEL = "pi-delegate";
+/** Amp's own limit is 256 characters; a title is the brief's first line, not the brief. */
+const AMP_TITLE_MAX = 120;
+
+const isAmp = (run: Pick<AcpRunRecord, "agent">): boolean => run.agent === "amp";
+
+/**
+ * The label that names a run in Amp. Amp labels are at most 32 lowercase alphanumerics and hyphens,
+ * so the 40-character run ID cannot be one: its UUID without hyphens (32 hex digits) names it exactly.
+ */
+export function ampRunLabel(runId: string): string {
+	const uuid = /([0-9a-f]{8})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{12})$/i.exec(runId);
+	const label = (uuid ? uuid.slice(1).join("") : runId).toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+/, "").slice(0, 32);
+	return AMP_LABEL.test(label) ? label : AMP_DELEGATE_LABEL;
+}
+
+/** The title of a thread delegate creates: the brief's first line, as the delegate tool asks briefs to start. */
+export function ampThreadTitle(task: string): string | undefined {
+	// Markdown markers go, so a title never reads as a CLI option (`--title -x`).
+	const line = task.split("\n").map((text) => text.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").replace(/^[\s#>*\-–—]+/, "").trim()).find(Boolean);
+	if (!line) return undefined;
+	return line.length > AMP_TITLE_MAX ? `${line.slice(0, AMP_TITLE_MAX - 1).trimEnd()}…` : line;
+}
+
+/** The run's Amp thread ID: an opened run's own, or the T-ID a created run's adapter reported. Never an ACP session ID. */
+function ampThreadId(run: AcpRunRecord): string | undefined {
+	const id = run.open?.sessionId ?? run.last?.worker?.native?.id ?? run.nativeSessionId;
+	return id && AMP_THREAD_ID.test(id) ? id : undefined;
+}
+
+/** Where an Amp CLI call about this run's thread runs: the thread's own workspace, when it still exists. */
+function ampCwd(run: AcpRunRecord): string {
+	return [run.last?.worker?.native?.cwd, run.open?.cwd, run.cwd].find((dir): dir is string => typeof dir === "string" && existsSync(dir)) ?? process.cwd();
+}
+
+/** Why an Amp CLI call failed, in one line. */
+function ampFailure(command: string, run: AmpRun | Error): string {
+	if (run instanceof Error) return `${command} could not start: ${run.message}`;
+	if (run.timedOut) return `${command} timed out`;
+	return `${command} exited ${run.code ?? "by signal"}${run.stderr ? `: ${run.stderr.split("\n")[0]}` : ""}`;
+}
 
 function slug(agent: string): string {
 	const s = agent.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 11);
@@ -161,7 +226,9 @@ function view(run: AcpRunRecord): AcpRunView {
 	const finishedAt = latest?.finishedAt ? Date.parse(latest.finishedAt) : undefined;
 	const status = acpRunStatus(turns);
 	const handle = worker?.handle;
-	const nativeSessionId = worker?.native?.id ?? handle?.agentSessionId;
+	// A created Amp run learns its T-ID after creation; the record keeps it once seen.
+	if (worker?.native?.id && run.nativeSessionId !== worker.native.id) run.nativeSessionId = worker.native.id;
+	const nativeSessionId = worker?.native?.id ?? run.nativeSessionId ?? handle?.agentSessionId;
 	const v: AcpRunView = {
 		backend: "acp",
 		id: run.id,
@@ -181,6 +248,7 @@ function view(run: AcpRunRecord): AcpRunView {
 			...(nativeSessionId ? { nativeSessionId } : {}),
 			...(worker?.native ? { executionEnvironment: worker.native.executionEnvironment, native: worker.native }
 				: run.executionEnvironment ? { executionEnvironment: run.executionEnvironment } : {}),
+			...(run.labeled?.ok ? { labels: [...run.labeled.labels] } : {}),
 		},
 		turns,
 		output: latest?.output ?? "",
@@ -191,6 +259,9 @@ function view(run: AcpRunRecord): AcpRunView {
 	if (run.role) v.role = run.role;
 	const model = worker?.model ?? run.model;
 	if (model) v.model = model;
+	if (run.mode) v.mode = run.mode;
+	if (run.usage) v.usage = { ...run.usage, ...(run.usage.cost ? { cost: { ...run.usage.cost } } : {}) };
+	if (run.notes?.length) v.notes = [...run.notes];
 	const endedAt = run.closedAt ?? (status === "running" || status === "idle" ? undefined : finishedAt);
 	if (endedAt !== undefined) v.endedAt = endedAt;
 	if (run.closedAt !== undefined) v.closed = true;
@@ -291,6 +362,10 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 			const run: AcpRunRecord = { ...fields, waiters: 0, claimed: new Set() };
 			// An unreadable cursor only costs repetition: the next observation lists from the start.
 			if (run.observed !== undefined && (typeof run.observed !== "object" || run.observed === null || typeof run.observed.remaining !== "number")) delete run.observed;
+			// The same for a cached cost (read again on the next status) and the record of labeling.
+			if (run.usage !== undefined && (typeof run.usage !== "object" || run.usage === null || typeof run.usage.at !== "number")) delete run.usage;
+			if (run.labeled !== undefined && (typeof run.labeled !== "object" || run.labeled === null || !Array.isArray(run.labeled.labels))) delete run.labeled;
+			if (run.notes !== undefined && (!Array.isArray(run.notes) || run.notes.some((note) => typeof note !== "string"))) delete run.notes;
 			if (ownedElsewhere(run)) { run.foreign = true; restored.push(run); continue; }
 			Object.assign(run, processOwner());
 			if (run.closedAt === undefined && run.parkedAt === undefined) {
@@ -361,6 +436,8 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 		} else {
 			if (input.role) { spawn.role = input.role; run.role = input.role; }
 			if (input.model) { spawn.model = input.model; run.model = input.model; }
+			if (input.mode) { spawn.mode = input.mode; run.mode = input.mode; }
+			if (agent === "amp") { const title = ampThreadTitle(input.task); if (title) spawn.title = title; }
 			if (input.executionEnvironment) run.executionEnvironment = input.executionEnvironment;
 		}
 		const coordinator = await acpCoordinator();
@@ -572,6 +649,43 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 		return { ...view(run), observation };
 	}
 
+	/**
+	 * Read an Amp run's thread cost: one `amp threads usage`, for delegate_ctl status/result with a
+	 * runId, cached on the record with when it was read. Unavailable is unknown: no thread ID yet, or a
+	 * failed or unreadable command. It never fails the request. Other agents read nothing.
+	 */
+	async refreshUsage(runId: string): Promise<void> {
+		const run = this.get(runId);
+		if (!isAmp(run)) return;
+		view(run);
+		const threadId = ampThreadId(run);
+		const at = Date.now();
+		if (!threadId) { run.usage = { at, error: "the Amp thread ID is not known yet" }; this.saveQuietly(run); return; }
+		const command = `amp threads usage ${threadId}`;
+		const read = await ampThreadUsage(threadId, ampCwd(run), { timeoutMs: AMP_USAGE_TIMEOUT_MS }).catch((error: unknown) => error instanceof Error ? error : new Error(String(error)));
+		const amount = read instanceof Error || read.code !== 0 ? undefined : parseAmpCost(read.stdout.toString("utf8"));
+		run.usage = amount !== undefined ? { cost: { amount, currency: "USD" }, at, threadId }
+			: { at, threadId, error: read instanceof Error || read.code !== 0 ? ampFailure(command, read) : `${command} printed no Cost line` };
+		this.saveQuietly(run);
+	}
+
+	/**
+	 * Label a created Amp thread for its run, once, when its T-ID is first known: the run label and
+	 * the delegate label. A failure is a note on the run. Opened threads are never touched.
+	 */
+	private async labelThread(run: AcpRunRecord): Promise<void> {
+		if (run.origin !== "created" || !isAmp(run) || run.labeled || run.foreign) return;
+		view(run);
+		const threadId = ampThreadId(run);
+		if (!threadId) return;
+		const labels = [ampRunLabel(run.id), AMP_DELEGATE_LABEL];
+		const command = `amp threads label ${threadId} ${labels.join(" ")}`;
+		const done = await ampThreadLabel(threadId, labels, ampCwd(run), { timeoutMs: AMP_LABEL_TIMEOUT_MS }).catch((error: unknown) => error instanceof Error ? error : new Error(String(error)));
+		const ok = !(done instanceof Error) && done.code === 0;
+		run.labeled = { at: Date.now(), labels, ok };
+		if (!ok) (run.notes ??= []).push(`labeling Amp thread ${threadId} failed (${ampFailure(command, done)}); the run is unaffected`);
+	}
+
 	async status(runIds?: readonly string[]): Promise<AcpRunView[]> {
 		if (!runIds) return this.owned(this.hooks.ownerKey());
 		return runIds.map((id) => {
@@ -671,6 +785,7 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 				if (!waited.details.timedOut) break;
 			}
 			if (!registry().has(run.id)) return;
+			await this.labelThread(run).catch(() => undefined);
 			this.saveQuietly(run);
 			this.hooks.changed();
 			const current = view(run);
@@ -690,7 +805,8 @@ export function sessionLabel(v: AcpRunView): string {
 }
 
 function sessionText(v: AcpRunView): string {
-	return v.session.executionEnvironment ? `${sessionLabel(v)} (${v.session.executionEnvironment})` : sessionLabel(v);
+	const text = v.session.executionEnvironment ? `${sessionLabel(v)} (${v.session.executionEnvironment})` : sessionLabel(v);
+	return v.session.labels?.length ? `${text}, labeled ${v.session.labels.join(", ")}` : text;
 }
 
 function turnText(v: AcpRunView): string | undefined {
@@ -702,16 +818,21 @@ function turnText(v: AcpRunView): string | undefined {
 
 export function acpSummary(v: AcpRunView): string {
 	const dur = elapsed((v.endedAt ?? Date.now()) - v.startedAt);
-	const { tokens: { input: tokensIn, output: tokensOut }, cost } = acpUsage(v.turns);
+	const { tokens: { input: tokensIn, output: tokensOut }, cost } = acpUsage(v);
+	// An Amp run's cost is its thread's, as last read; never read or unreadable is unknown, not zero.
+	const costText = v.session.agent === "amp"
+		? v.usage?.cost?.amount !== undefined ? `$${v.usage.cost.amount.toFixed(2)} (Amp thread)` : "cost unknown"
+		: cost ? `$${cost.toFixed(4)}` : "";
 	const head = [
 		`${v.status} · ${v.id}`,
 		`backend acp`,
 		`agent ${v.session.agent}`,
 		v.role ? `role ${v.role}` : "",
 		v.model ? `model ${v.model}` : "",
+		v.mode ? `mode ${v.mode}` : "",
 		`${v.turns.length} turn${v.turns.length === 1 ? "" : "s"} in ${dur}`,
 		tokensIn || tokensOut ? `tokens in ${tokensIn}, out ${tokensOut}` : "",
-		cost ? `$${cost.toFixed(4)}` : "",
+		costText,
 	].filter(Boolean).join(" · ");
 	const lines = [head, sessionText(v)];
 	const turn = turnText(v);
@@ -725,6 +846,7 @@ export function acpSummary(v: AcpRunView): string {
 	}
 	if (v.foreign) lines.push(`read-only: owned by another live Pi process (pid ${v.foreign.ownerPid} on ${v.foreign.ownerHost})`);
 	if (v.error) lines.push(`error: ${v.error}`);
+	for (const note of v.notes ?? []) lines.push(`note: ${note}`);
 	return lines.join("\n");
 }
 

@@ -12,7 +12,7 @@
  *   delivery and the provider outcome as separate fields. Accepted is not finished.
  * - An action a backend cannot do fails with ACTION_UNSUPPORTED. It never degrades to a different action.
  */
-import type { NativeSessionDescription, RequestRecord, RuntimeHandle, SessionOrigin, WorkerRole } from "./acp/domain/types.js";
+import type { NativeSessionDescription, RequestRecord, RuntimeHandle, SessionOrigin, UsageCost, WorkerRole } from "./acp/domain/types.js";
 import type { RunView } from "./render.js";
 
 // ---------------------------------------------------------------------------------------------
@@ -27,11 +27,13 @@ export const EXECUTION_ENVIRONMENTS = ["local", "orb"] as const;
 export type ExecutionEnvironment = (typeof EXECUTION_ENVIRONMENTS)[number];
 
 /** Accepted only with backend "acp". On pi each one is an error. */
-export const ACP_ONLY_FIELDS = ["agent", "sessionId", "executionEnvironment"] as const;
+export const ACP_ONLY_FIELDS = ["agent", "sessionId", "executionEnvironment", "mode"] as const;
+/** Accepted only with backend "acp" and agent "amp". On any other agent each one is an error. */
+export const AMP_ONLY_FIELDS = ["mode"] as const;
 /** Accepted only with backend "pi". An ACP child cannot receive the parent conversation. */
 export const PI_ONLY_FIELDS = ["context"] as const;
 /** Opening an existing native session keeps its settings: these are creation-only (Coordinator rule). */
-export const OPEN_FORBIDDEN_FIELDS = ["role", "model"] as const;
+export const OPEN_FORBIDDEN_FIELDS = ["role", "model", "mode"] as const;
 
 interface CommonStartInput {
 	cwd?: string;
@@ -64,6 +66,8 @@ export interface AcpCreateInput extends CommonStartInput {
 	model?: string;
 	/** Where the session runs. Required for Amp: local or Orb is always an explicit choice, never an adapter default. */
 	executionEnvironment?: ExecutionEnvironment;
+	/** Amp only: its agent mode (low, medium, high, ultra or a plugin mode), `amp --mode` on every turn of the thread. */
+	mode?: string;
 }
 
 /**
@@ -202,8 +206,25 @@ export interface AcpSessionView {
 	nativeSessionId?: string;
 	executionEnvironment?: NativeSessionDescription["executionEnvironment"];
 	handle: Pick<RuntimeHandle, "runtimeSessionName" | "acpxRecordId" | "backendSessionId" | "agentSessionId">;
-	/** Present on opened sessions: what the provider reported when the run attached. */
+	/** Opened sessions: what the provider reported when the run attached. Created Amp sessions: what the adapter reported once it learned the T-ID. */
 	native?: NativeSessionDescription;
+	/** Created Amp threads: the labels delegate added once the T-ID was known (`amp threads label`). Opened threads are never labeled. */
+	labels?: string[];
+}
+
+/**
+ * An Amp thread's display cost, from `amp threads usage <T-ID>` (todo 058). Refreshed only by
+ * delegate_ctl status/result for one run, and cached here with when it was read. Without `cost`
+ * it is unknown: no thread ID yet, or the command failed. It covers the whole thread, so an opened
+ * thread's cost includes other participants' work.
+ */
+export interface AmpThreadUsage {
+	cost?: UsageCost;
+	/** When usage was last read (ms). */
+	at: number;
+	threadId?: string;
+	/** Why the cost is unknown. */
+	error?: string;
 }
 
 export interface AcpRunView {
@@ -215,6 +236,8 @@ export interface AcpRunView {
 	cwd: string;
 	role?: WorkerRole;
 	model?: string;
+	/** Created Amp runs: the agent mode delegate was given. */
+	mode?: string;
 	startedAt: number;
 	endedAt?: number;
 	session: AcpSessionView;
@@ -237,6 +260,10 @@ export interface AcpRunView {
 	foreign?: { ownerPid: number; ownerHost: string };
 	/** Present only when this status/result call asked to observe (opened Amp runs): what that one export showed. */
 	observation?: AmpObservation;
+	/** Amp runs: the thread's cost as last read. It fills the run's cost; absent means it was never read. */
+	usage?: AmpThreadUsage;
+	/** Side effects that failed without failing the run, such as labeling a created Amp thread. */
+	notes?: string[];
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -333,6 +360,7 @@ export type ContractErrorCode =
 	| "UNKNOWN_BACKEND"
 	| "FIELD_REQUIRES_ACP"
 	| "FIELD_NOT_ON_ACP"
+	| "FIELD_REQUIRES_AMP"
 	| "OPEN_OVERRIDE_FORBIDDEN"
 	| "INPUT_INVALID"
 	| "ACTION_UNSUPPORTED";
@@ -411,6 +439,11 @@ export function validateStartInput(raw: Record<string, unknown>): Validated<Star
 	}
 	if (!isNonEmptyString(raw.agent)) return fail("INPUT_INVALID", "agent is required with backend \"acp\"", "agent");
 	const agent = acpAgentName(raw.agent);
+	if (agent !== "amp") {
+		for (const field of AMP_ONLY_FIELDS) {
+			if (raw[field] !== undefined) return fail("FIELD_REQUIRES_AMP", `${field} is Amp-only; agent ${agent} has no ${field}`, field);
+		}
+	}
 	let executionEnvironment: ExecutionEnvironment | undefined;
 	if (raw.executionEnvironment !== undefined) {
 		if (!isOneOf(EXECUTION_ENVIRONMENTS, raw.executionEnvironment)) return fail("INPUT_INVALID", 'executionEnvironment must be "local" or "orb"', "executionEnvironment");
@@ -440,6 +473,13 @@ export function validateStartInput(raw: Record<string, unknown>): Validated<Star
 	if (raw.model !== undefined) {
 		if (!isNonEmptyString(raw.model)) return fail("INPUT_INVALID", "model must be a non-empty string", "model");
 		value.model = raw.model;
+	}
+	if (raw.mode !== undefined) {
+		// `amp --mode` takes the value as its own argument: a value that reads as an option is refused.
+		if (!isNonEmptyString(raw.mode) || raw.mode.trim().startsWith("-") || /[\r\n]/.test(raw.mode)) return fail("INPUT_INVALID", "mode must be an Amp mode name: low, medium, high, ultra or a plugin mode", "mode");
+		// model on Amp selects the same mode from the advertised list; one field decides.
+		if (value.model !== undefined) return fail("INPUT_INVALID", "on Amp, mode and model both select the agent mode; pass mode", "mode");
+		value.mode = raw.mode.trim();
 	}
 	// Amp runs either on this machine or in an Orb; a new Amp session names which, never an adapter default.
 	if (!executionEnvironment && agent === "amp") return fail("INPUT_INVALID", 'creating an Amp session needs executionEnvironment "local" or "orb"', "executionEnvironment");
