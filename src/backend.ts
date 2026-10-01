@@ -228,6 +228,20 @@ export interface AmpThreadUsage {
 	error?: string;
 }
 
+/**
+ * The agent's own model IDs, as one bounded Coordinator status read them for a delegate_ctl
+ * status/result call on one run. Never read when a view renders. Without `current` and
+ * `available` the models are unknown: the adapter does not report them, the read failed, or it
+ * did not answer in time (`error` says which). An opened session reports only its current model:
+ * it keeps its native model, and steer refuses `model` there.
+ */
+export interface AcpModelsView {
+	current?: string;
+	/** Created sessions only: the IDs steer `model` can switch to. */
+	available?: string[];
+	error?: string;
+}
+
 export interface AcpRunView {
 	backend: "acp";
 	/** The delegate run ID. */
@@ -263,6 +277,8 @@ export interface AcpRunView {
 	observation?: AmpObservation;
 	/** Amp runs: the thread's cost as last read. It fills the run's cost; absent means it was never read. */
 	usage?: AmpThreadUsage;
+	/** Present only when this status/result call for one run read the agent's model IDs. */
+	models?: AcpModelsView;
 	/** Side effects that failed without failing the run, such as labeling a created Amp thread. */
 	notes?: string[];
 }
@@ -378,6 +394,21 @@ const fail = (code: ContractErrorCode, message: string, field?: string): { ok: f
 	({ ok: false, error: field === undefined ? { code, message } : { code, message, field } });
 
 const isNonEmptyString = (value: unknown): value is string => typeof value === "string" && value.trim() !== "";
+
+/**
+ * ACP agents whose own model IDs never contain "/", so a slash means a pi `provider/id` was passed
+ * by mistake. Claude advertises aliases (`default`, `opus`, `sonnet[1m]`), Codex `model[effort]`
+ * IDs (`gpt-5.5`, `gpt-5.5[high]`), Amp its modes (`low`…`ultra`). Every other agent may use
+ * slashes: pi-acp advertises pi's own `provider/id`, OpenCode and Kilo Code `provider/model`, and
+ * the rest are unverified, so their IDs are passed through for the agent to accept or refuse.
+ */
+export const ACP_SLASHLESS_MODEL_AGENTS: readonly string[] = ["claude", "codex", "amp"];
+
+/** A pi `provider/id` given as an ACP agent's `model`. */
+function piModelOnAcp(agent: string | undefined, model: string): { ok: false; error: ContractError } | undefined {
+	if (agent === undefined || !ACP_SLASHLESS_MODEL_AGENTS.includes(acpAgentName(agent)) || !model.includes("/")) return undefined;
+	return fail("INPUT_INVALID", `\`model\` on acp is the agent's own model ID (see delegate_ctl status); \`${model}\` looks like a pi provider/id — use backend pi for pi offerings`, "model");
+}
 /** An ACP agent name as the backend starts it. Validation and start both read it through this. */
 export const acpAgentName = (agent: string): string => agent.trim().toLowerCase();
 const isOneOf = <T extends string>(values: readonly T[], value: unknown): value is T => typeof value === "string" && (values as readonly string[]).includes(value);
@@ -473,6 +504,8 @@ export function validateStartInput(raw: Record<string, unknown>): Validated<Star
 	}
 	if (raw.model !== undefined) {
 		if (!isNonEmptyString(raw.model)) return fail("INPUT_INVALID", "model must be a non-empty string", "model");
+		const piModel = piModelOnAcp(agent, raw.model);
+		if (piModel) return piModel;
 		value.model = raw.model;
 	}
 	if (raw.mode !== undefined) {
@@ -496,7 +529,7 @@ export function requireAction(capabilities: BackendCapabilities, action: Lifecyc
 }
 
 /** Validate delegate_ctl steer for a run's backend and origin. */
-export function validateSteer(run: { backend: BackendName; origin?: SessionOrigin }, raw: Record<string, unknown>): Validated<SteerRequest> {
+export function validateSteer(run: { backend: BackendName; origin?: SessionOrigin; agent?: string }, raw: Record<string, unknown>): Validated<SteerRequest> {
 	if (!isNonEmptyString(raw.message)) return fail("INPUT_INVALID", "steer requires message", "message");
 	const value: SteerRequest = { message: raw.message };
 	if (raw.restart !== undefined) {
@@ -507,6 +540,8 @@ export function validateSteer(run: { backend: BackendName; origin?: SessionOrigi
 	if (raw.model !== undefined) {
 		if (run.backend === "acp" && run.origin === "opened") return fail("OPEN_OVERRIDE_FORBIDDEN", "an opened session keeps its native model", "model");
 		if (!isNonEmptyString(raw.model)) return fail("INPUT_INVALID", "model must be a non-empty string", "model");
+		const piModel = run.backend === "acp" ? piModelOnAcp(run.agent, raw.model) : undefined;
+		if (piModel) return piModel;
 		value.model = raw.model;
 	}
 	if (raw.timeoutMs !== undefined) {

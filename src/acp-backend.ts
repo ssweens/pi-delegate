@@ -41,6 +41,7 @@ import type { RequestRecord, SessionOrigin, StringsResponse, WorkerRecord, Worke
 import type { Coordinator } from "./acp/orchestration/coordinator.js";
 import { acpAgents, acpCoordinator, existingAcpCoordinator } from "./acp/instance.js";
 import {
+	type AcpModelsView,
 	type AcpRunView,
 	type AcpStartInput,
 	type BackendCapabilities,
@@ -158,6 +159,8 @@ const WATCH_SLICE_MS = 60_000;
 /** Bounds on the Amp CLI calls a run makes besides its turns: a slow Amp delays, never blocks, a status or a wake. */
 const AMP_LABEL_TIMEOUT_MS = 15_000;
 const AMP_USAGE_TIMEOUT_MS = 15_000;
+/** Bound on the model read a status/result makes: a slow Coordinator makes the models unknown, never the status late. */
+const MODELS_READ_TIMEOUT_MS = 3_000;
 /** Every thread delegate creates carries this label, so leftover threads are easy to find. */
 export const AMP_DELEGATE_LABEL = "pi-delegate";
 /** Amp's own limit is 256 characters; a title is the brief's first line, not the brief. */
@@ -763,6 +766,33 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 		return run.labeling;
 	}
 
+	/**
+	 * The agent's current and available model IDs, for delegate_ctl status/result on one run: one
+	 * Coordinator status, bounded. It never fails the request: unsupported, failed or slow discovery
+	 * is unknown. Undefined when the run has no live session here (closed, parked, owned elsewhere),
+	 * so there is nothing to ask. An opened session reports only its current model.
+	 */
+	async models(runId: string): Promise<AcpModelsView | undefined> {
+		const run = this.get(runId);
+		if (run.foreign || run.closedAt !== undefined || run.parkedAt !== undefined) return undefined;
+		const coordinator = existingAcpCoordinator();
+		const status = coordinator?.snapshot(run.worker).worker?.status;
+		if (!coordinator || !status || status === "closing" || status === "closed") return undefined;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const response = await Promise.race([
+			coordinator.execute({ action: "status", name: run.worker }).catch((error: unknown) => error instanceof Error ? error : new Error(String(error))),
+			new Promise<undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), MODELS_READ_TIMEOUT_MS); }),
+		]).finally(() => clearTimeout(timer));
+		if (response === undefined) return { error: `model discovery did not answer within ${MODELS_READ_TIMEOUT_MS / 1000}s` };
+		if (response instanceof Error) return { error: response.message };
+		if (!response.ok) return { error: `${response.error.code}: ${response.error.message}` };
+		const current = typeof response.details.currentModelId === "string" ? response.details.currentModelId : undefined;
+		const available = Array.isArray(response.details.availableModelIds) ? response.details.availableModelIds.filter((id): id is string => typeof id === "string") : [];
+		if (run.origin === "opened") return current ? { current } : { error: "the opened session does not report its model" };
+		if (!current && !available.length) return { error: "the adapter reported no model IDs" };
+		return { ...(current ? { current } : {}), available };
+	}
+
 	async status(runIds?: readonly string[]): Promise<AcpRunView[]> {
 		if (!runIds) return this.owned(this.hooks.ownerKey());
 		return runIds.map((id) => {
@@ -913,6 +943,13 @@ function turnText(v: AcpRunView): string | undefined {
 	return `turn ${t.requestId}: ${t.status}, delivery ${t.delivery}${t.providerOutcome ? `, provider outcome ${t.providerOutcome}` : ""}${cause}${t.truncated ? ", output truncated" : ""}`;
 }
 
+/** The agent's own model IDs, as one status/result read them. */
+function modelsText(models: AcpModelsView): string {
+	if (!models.current && !models.available?.length) return "models: unknown";
+	if (!models.available) return `models: current ${models.current}`;
+	return `models: current ${models.current ?? "unknown"}; available ${models.available.join(", ") || "none"}`;
+}
+
 export function acpSummary(v: AcpRunView): string {
 	const dur = elapsed((v.endedAt ?? Date.now()) - v.startedAt);
 	const { tokens: { input: tokensIn, output: tokensOut }, cost } = acpUsage(v);
@@ -934,6 +971,7 @@ export function acpSummary(v: AcpRunView): string {
 	const lines = [head, sessionText(v)];
 	const turn = turnText(v);
 	if (turn) lines.push(turn);
+	if (v.models) lines.push(modelsText(v.models));
 	if (v.status === "idle") lines.push(v.session.origin === "opened" ? "idle: attached without sending a turn" : "idle");
 	if (v.closed) lines.push(v.session.origin === "opened" ? "closed: disconnected; the native session is unchanged" : "closed: session disposed");
 	if (v.parked) {

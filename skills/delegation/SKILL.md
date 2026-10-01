@@ -79,6 +79,19 @@ Rules that differ from pi:
 - On an opened Amp run, `status` with `observe: true` and one `runId` reads the thread: one export per call, only messages since the last read. A plain `status` doesn't read it. One read is not a poll loop.
 - After the parent restarts, ACP runs are parked: `status`, `result` and `wait` read their records, and `steer` reopens them. A created run whose adapter cannot resume fails `RUN_NOT_RESUMABLE`; tell the user and start a new run rather than retrying.
 
+### Choosing between a pi child and an ACP agent
+Model research, ratings and approval (`models`, `rate`, `approve`) cover pi offerings only. For ACP you choose an agent, not an offering. Use one when the user names it, or when its own harness or subscription is the point. Then `model` is that agent's own model ID, never a pi `provider/id`; on Claude, Codex and Amp a `provider/id` fails `INPUT_INVALID`.
+
+To see an agent's models, start without `model` and read `delegate_ctl status` for the run. Its `models:` line gives the current and available IDs, or `unknown`. Then `steer` with `model` to switch. Or ask the user. An opened session shows only its current model and keeps it.
+
+Weigh before you choose:
+- An ACP agent brings its own tools and harness and gets no forked context. The brief must stand alone.
+- It may bill a flat-rate subscription. Codex reported no cost in the live smoke, so cost can show as unknown.
+- Writers are not yet confined to the worktree on Codex and Amp (todo 060). Prefer `read-only` unless you will check the diff.
+- A pi child on the same vendor's model through a pi provider is metered, tracked by the model tools, and can fork your context.
+
+Never carry an agent's model ID from memory either. Read it from status.
+
 The old pi-strings `op_*` tools are gone. The [README](../../README.md#migrating-from-pi-strings) maps each one to these calls.
 
 ## Execution model and terminal independence
@@ -118,7 +131,7 @@ Check `turns`, `failedAttempts` and cost against what you asked for. Three turns
 Treat the report as a claim. Read the diff (`changed:` in the result), rerun the named verification, observe the behavior when tests alone do not prove it. Then accept, steer, or escalate.
 
 ## Model per role — research, then the user approves
-Before the first `delegate` of a session run `delegate_ctl action=models`. The output is facts only; how to read them:
+This governs pi offerings (`provider/id[:thinking]`); an ACP agent's model is its own ID, read from its run's status (see [Choosing between a pi child and an ACP agent](#choosing-between-a-pi-child-and-an-acp-agent)). Before the first `delegate` of a session run `delegate_ctl action=models`. The output is facts only; how to read them:
 
 - **DEFAULTS** — approved `role → provider/id[:thinking]`, age, the reason recorded. **DRIFT** lines mean the approval no longer matches reality (default gone, price changed, older than 30 days, live OpenRouter price or expiration differs, new offerings since approval) — propose a specific update to the user before delegating on that role.
 - **RATINGS** — count and age of ratings you stored with `action=rate`; stale past 14 days.

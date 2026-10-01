@@ -1676,10 +1676,11 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 			}
 			if (acp.find(p.runId, owner.key)) {
 				const id = p.runId!;
-				// The cost read and an observation's export are separate Amp calls: run them together, then read the view both updated.
+				// The cost read, an observation's export and the model read are separate calls: run them together, then read the view they updated.
 				const read = async (latest: () => Promise<AcpRunView>): Promise<AcpRunView> => {
-					const [, observed] = await Promise.all([acp.refreshUsage(id), p.observe === true ? acp.observe(id) : undefined]);
-					return observed ? { ...(await latest()), ...(observed.observation ? { observation: observed.observation } : {}) } : latest();
+					const [, observed, models] = await Promise.all([acp.refreshUsage(id), p.observe === true ? acp.observe(id) : undefined, acp.models(id)]);
+					const v = observed ? { ...(await latest()), ...(observed.observation ? { observation: observed.observation } : {}) } : await latest();
+					return models ? { ...v, models } : v;
 				};
 				try {
 					switch (p.action) {
@@ -1694,7 +1695,7 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 						}
 						case "steer": {
 							const current = await acp.result(id);
-							const request = unwrap(validateSteer({ backend: "acp", origin: current.session.origin }, p as Record<string, unknown>));
+							const request = unwrap(validateSteer({ backend: "acp", origin: current.session.origin, agent: current.session.agent }, p as Record<string, unknown>));
 							const v = await acp.steer(id, request);
 							return { content: [{ type: "text", text: `${id}: turn ${v.turns.at(-1)?.requestId} sent${request.model ? ` on model ${request.model}` : ""}. Completion will wake you; use wait to join.` }], details: v };
 						}

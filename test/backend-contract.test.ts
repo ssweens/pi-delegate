@@ -3,6 +3,7 @@ import { test } from "node:test";
 import type { RequestRecord } from "../src/acp/domain/types.ts";
 import {
 	ACP_ONLY_FIELDS,
+	ACP_SLASHLESS_MODEL_AGENTS,
 	acpCapabilities,
 	acpRunStatus,
 	type AcpRunView,
@@ -23,7 +24,7 @@ import {
 	validateSteer,
 } from "../src/backend.ts";
 
-const errorOf = (result: { ok: boolean; error?: { code: string; field?: string } }) => {
+const errorOf = (result: { ok: boolean; error?: { code: string; message?: string; field?: string } }) => {
 	assert.equal(result.ok, false, "expected a contract error");
 	return result.error!;
 };
@@ -185,6 +186,33 @@ test("steer validation follows the run's backend and origin", () => {
 	assert.equal(validateSteer({ backend: "acp", origin: "created" }, { message: "go", model: "gpt-5" }).ok, true);
 	assert.equal(errorOf(validateSteer({ backend: "acp", origin: "opened" }, { message: "go", model: "gpt-5" })).code, "OPEN_OVERRIDE_FORBIDDEN");
 	assert.equal(errorOf(validateSteer({ backend: "pi" }, {})).field, "message");
+});
+
+test("a pi provider/id as an ACP model fails on agents whose own IDs have no slash; others pass it through", () => {
+	assert.deepEqual([...ACP_SLASHLESS_MODEL_AGENTS], ["claude", "codex", "amp"]);
+	const create = (agent: string, model: string) => validateStartInput({ backend: "acp", agent, task: "t", model, ...(agent === "amp" ? { executionEnvironment: "local" } : {}) });
+	for (const agent of ["claude", "codex", "amp", " Codex "]) {
+		const error = errorOf(create(agent, "anthropic/claude-sonnet-5"));
+		assert.deepEqual([error.code, error.field], ["INPUT_INVALID", "model"], agent);
+		assert.equal(error.message, "`model` on acp is the agent's own model ID (see delegate_ctl status); `anthropic/claude-sonnet-5` looks like a pi provider/id — use backend pi for pi offerings");
+		const steer = errorOf(validateSteer({ backend: "acp", origin: "created", agent }, { message: "go", model: "openai/gpt-5.5" }));
+		assert.deepEqual([steer.code, steer.field], ["INPUT_INVALID", "model"], `${agent} steer`);
+	}
+	// The agents' own IDs: Claude aliases, Codex model[effort], Amp modes.
+	for (const [agent, model] of [["claude", "opus"], ["claude", "sonnet[1m]"], ["codex", "gpt-5.5"], ["codex", "gpt-5.5[high]"], ["amp", "high"]] as const) {
+		assert.equal(create(agent, model).ok, true, `${agent} ${model}`);
+		assert.equal(validateSteer({ backend: "acp", origin: "created", agent }, { message: "go", model }).ok, true, `${agent} steer ${model}`);
+	}
+	// pi-acp advertises pi's provider/id; OpenCode provider/model; an unverified agent is passed through.
+	for (const agent of ["pi", "opencode", "kilocode", "gemini", "fixture"]) {
+		assert.equal(create(agent, "anthropic/claude-sonnet-5").ok, true, agent);
+		assert.equal(validateSteer({ backend: "acp", origin: "created", agent }, { message: "go", model: "anthropic/claude-sonnet-5" }).ok, true, `${agent} steer`);
+	}
+	// pi keeps its provider/id; a steer that does not name the agent is not checked; opened still refuses model first.
+	assert.equal(validateStartInput({ backend: "pi", role: "worker", task: "t", model: "anthropic/claude-sonnet-5:high" }).ok, true);
+	assert.equal(validateSteer({ backend: "pi" }, { message: "go", model: "anthropic/claude-sonnet-5" }).ok, true);
+	assert.equal(validateSteer({ backend: "acp", origin: "created" }, { message: "go", model: "a/b" }).ok, true);
+	assert.equal(errorOf(validateSteer({ backend: "acp", origin: "opened", agent: "codex" }, { message: "go", model: "a/b" })).code, "OPEN_OVERRIDE_FORBIDDEN");
 });
 
 // --- result shape: identities and outcomes stay distinct ----------------------------------

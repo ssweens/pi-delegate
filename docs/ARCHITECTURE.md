@@ -38,7 +38,7 @@ Responses carry `ok`, `action` and structured details. Errors carry a stable cod
 
 ### `status`
 
-The Coordinator reports origin, native identity and capabilities when opened, and advertised model IDs. Created-worker model discovery needs ACPX `getStatus`; unsupported discovery fails `MODEL_DISCOVERY_UNSUPPORTED`. On an opened Amp run, `status` or `result` with `observe: true` reads the thread: one `amp threads export` per call, returning only messages after the persisted cursor (todo 044). A plain status never exports.
+The Coordinator reports origin, native identity and capabilities when opened, and advertised model IDs. Created-worker model discovery needs ACPX `getStatus`; unsupported discovery fails `MODEL_DISCOVERY_UNSUPPORTED`. `delegate_ctl` status/result for one ACP run show it as a `models:` line: one Coordinator `status` per call, bounded at 3 s, never on render; unsupported, failed or slow discovery reads `models: unknown`, and an opened session shows only its current model. On Claude, Codex and Amp, whose own IDs have no slash, a `model` with `/` is a pi `provider/id` and fails `INPUT_INVALID`; pi-acp (`provider/id`), OpenCode (`provider/model`) and the other agents pass it through. On an opened Amp run, `status` or `result` with `observe: true` reads the thread: one `amp threads export` per call, returning only messages after the persisted cursor (todo 044). A plain status never exports.
 
 ### `send`
 
