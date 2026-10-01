@@ -272,3 +272,40 @@ test("the Agents frame shows an ACP run's backend, agent and native session", as
 		assert.doesNotMatch(frame, /Thinking…|w-1|pi-strings:/);
 	} finally { panel.dispose(); }
 });
+
+test("the Agents frame shows each child's provider and model, and drops the column when narrow", async () => {
+	const { initTheme } = await import("@earendil-works/pi-coding-agent");
+	initTheme();
+	const { AgentsPanel } = await import("../src/inspector.ts");
+	const { acpRowView } = await import("../src/render.ts");
+	const { acpCapabilities } = await import("../src/backend.ts");
+	const pi: any = {
+		id: "pi-1", status: "running", settled: false, stopped: false, role: "scout",
+		model: "anthropic/claude-sonnet-5", task: "Map the parser", cwd: "/repo", thinking: "high",
+		context: "fresh", segment: 1, output: "", turns: 1, durationMs: 4000,
+		tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, cost: 0,
+		changedFiles: [], droppedTools: [], toolCalls: [], revision: 1,
+	};
+	const acp = acpRowView({
+		backend: "acp", id: "amp-1", status: "running", model: "gpt-5.6", task: "Port the parser", cwd: "/repo", startedAt: Date.now(),
+		session: { agent: "amp", origin: "created", worker: "w-1", handle: { runtimeSessionName: "pi-strings:w-1" } },
+		turns: [{ requestId: "req_1", delivery: "unknown", status: "running", startedAt: new Date().toISOString(), truncated: false }],
+		output: "", truncated: false, capabilities: acpCapabilities({ origin: "created", agent: "amp" }),
+	});
+	const { model: _dropped, ...noModel } = acp;
+	const opened = { ...noModel, id: "amp-2", model: "", task: "Read the docs", nativeSessionId: localThread };
+	const tui: any = { addInputListener: () => () => {}, requestRender: () => {}, hasOverlay: () => false, terminal: { rows: 40 } };
+	const panel = new AgentsPanel({ all: () => [pi, acp, opened], activity: () => ({ messages: [], activeTools: new Map() }), subscribe: () => () => {}, steer: async () => {}, cancel: async () => {} }, theme, tui, async () => {});
+	try {
+		const wide = panel.render(140).join("\n");
+		assert.match(wide, /anthropic\/claude-sonnet-5/, "a pi row shows provider/id");
+		assert.doesNotMatch(wide, /claude-sonnet-5:high/, "thinking stays out of the frame");
+		assert.match(wide, /gpt-5\.6/, "an ACP row shows the agent's model");
+		const blank = wide.split("\n").find((l) => l.includes("Read the docs")) ?? "";
+		assert.doesNotMatch(blank, /gpt-5\.6/, "an opened session with no model leaves the column blank");
+		assert.equal(blank.indexOf("session"), wide.split("\n").find((l) => l.includes("Port the parser"))!.indexOf("session"), "the blank column still holds its width, so activity lines up");
+		const narrow = panel.render(80).join("\n");
+		assert.doesNotMatch(narrow, /anthropic\/claude-sonnet-5|gpt-5\.6/, "the column drops before it crowds the activity");
+		assert.match(narrow, /Map the parser/);
+	} finally { panel.dispose(); }
+});

@@ -115,22 +115,30 @@ export class AgentsPanel implements Component, Focusable {
 		this.offset = Math.max(0, Math.min(this.offset, index, rows.length - count));
 		if (index >= this.offset + count) this.offset = index - count + 1;
 		const inner = Math.max(1, width - 4);
-		const body = rows.slice(this.offset, this.offset + count).map((v) => {
+		// One width for every row, so the column lines up. It only appears where the activity
+		// column keeps at least 16 columns after it; narrower terminals drop it entirely.
+		const roleWidth = 12;
+		const titleWidth = Math.min(36, Math.floor(inner * 0.38));
+		const modelSpare = inner - 4 - titleWidth - roleWidth - 7 - 4 - 16;
+		const shown = rows.slice(this.offset, this.offset + count);
+		const modelWidth = inner >= 65 && modelSpare >= 16 && shown.some((v) => v.model) ? Math.min(28, modelSpare) : 0;
+		const body = shown.map((v) => {
 			const selected = this.focused && v.id === this.selectedId;
 			const prefix = `${selected ? this.theme.fg("accent", "›") : " "} ${icon(v, this.theme)} `;
 			const time = elapsed(v.durationMs);
 			const title = this.theme.fg(selected ? "accent" : "text", runTitle(v));
 			if (inner < 65) return pad(`${prefix}${title}`, Math.max(1, inner - time.length - 1)) + ` ${time}`;
-			const roleWidth = 12;
-			const titleWidth = Math.min(36, Math.floor(inner * 0.38));
-			const activityWidth = Math.max(1, inner - 4 - titleWidth - roleWidth - time.length - 3);
+			// Reserve the column on every row once it is shown, so a session with no model
+			// stays blank instead of pulling the activity column left.
+			const model = modelWidth ? pad(this.theme.fg("muted", v.model), modelWidth) + " " : "";
+			const activityWidth = Math.max(1, inner - 4 - titleWidth - roleWidth - visibleWidth(model) - time.length - 3);
 			// An ACP agent streams no tool calls here: its session is the fact worth the column.
 			const activity = v.backend === "acp"
 				? this.theme.fg("dim", v.status === "running" ? `session ${v.nativeSessionId ?? "pending"}` : v.status)
 				: v.status === "running"
 				? v.activeTool ? formatToolCall(v.activeTool.name, v.activeTool.args, this.theme) : this.theme.fg("dim", "Thinking…")
 				: this.theme.fg("warning", "Stopping…");
-			return prefix + pad(title, titleWidth) + " " + pad(this.theme.fg("muted", v.role), roleWidth) + " " + pad(activity, activityWidth) + " " + this.theme.fg("dim", time);
+			return prefix + pad(title, titleWidth) + " " + pad(this.theme.fg("muted", v.role), roleWidth) + " " + model + pad(activity, activityWidth) + " " + this.theme.fg("dim", time);
 		});
 		const range = rows.length > count ? ` · ${this.offset + 1}–${this.offset + count}/${rows.length}` : "";
 		// A queued prompt in the parent editor is otherwise unexplained: say when its turn is blocked here.
