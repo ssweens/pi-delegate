@@ -9,7 +9,7 @@ import { acceptanceContract, parseAcceptanceReport, roleContract, WORKER_CONTRAC
 import { AcpxRuntimePort } from "../runtime/acpx-runtime.js";
 import { StateStore, type SessionProvenance, type StoredWorker } from "../persistence/state-store.js";
 import { Claims, sessionClaim, writerClaims, type Claim } from "../persistence/claims.js";
-import { coordinatorHome, describeOwner, processStateDir, stateDirHolder } from "../persistence/home.js";
+import { coordinatorHome, describeOwner, legacyStateDir, processStateDir, stateDirHolder } from "../persistence/home.js";
 
 const NAME = /^[a-z][a-z0-9-]{0,47}$/;
 const STALL_THRESHOLD = 4;
@@ -30,6 +30,8 @@ const ownedSessionKey = (session: SessionProvenance) => JSON.stringify([session.
 const nativeSessionKey = (agent: string, native: NativeSessionDescription) => JSON.stringify([agent.toLowerCase(), native.scope, native.id]);
 /** The session ID another binding would name: an opened worker's native ID, a created one's agent (else ACP) session ID. */
 const boundSessionId = (record: WorkerRecord): string | undefined => record.origin === "opened" ? record.native?.id : record.handle.agentSessionId ?? record.handle.backendSessionId;
+/** The codes a claim fails with when another live process holds it. */
+const HELD_ELSEWHERE = new Set(["WRITER_CWD_OWNED", "WRITER_WORKTREE_OWNED", "SESSION_IN_USE"]);
 const workerClaims = (record: WorkerRecord): Claim[] => {
   const session = boundSessionId(record);
   return [...(record.role === "writer" ? writerClaims(record.cwd, record.worktree) : []), ...(session ? [sessionClaim(record.profile.agent, session)] : [])];
@@ -77,7 +79,7 @@ export class Coordinator {
   constructor(private readonly parentCwd: string, options: CoordinatorOptions = {}) {
     const home = options.home ?? (options.stateDir ? undefined : coordinatorHome());
     this.stateDir = options.stateDir ?? processStateDir(home!);
-    this.legacyDir = home;
+    this.legacyDir = options.home ?? (options.stateDir ? undefined : legacyStateDir());
     this.claims = new Claims(join(home ?? this.stateDir, "locks"), this.stateDir);
     this.stateStore = new StateStore(this.stateDir);
     this.runtimeFactory = options.runtimeFactory ?? ((cwd, stateDir, profile, origin) => new AcpxRuntimePort(cwd, stateDir, profile, origin));
@@ -169,7 +171,7 @@ export class Coordinator {
         else requireCwdUnowned([...this.workers.values()].map(worker => worker.record), record.cwd);
       }
       // Another live process may hold its cwd or session meanwhile: then it is never reconnected here.
-      const claims = await this.claims.acquireAll(workerClaims(record)).catch(() => undefined);
+      const claims = await this.claimRestored(record);
       if (!claims) record.status = "failed";
       const runtime = this.runtimeFactory(record.cwd, this.stateDir, profile, record.origin);
       if (!claims) { /* failed above */ } else if (opened) {
@@ -212,6 +214,20 @@ export class Coordinator {
     }
     await this.persist();
     this.initialized = true;
+  }
+
+  /**
+   * A restored worker's claims. Held by another live process: undefined, and the worker fails.
+   * Anything else (a claim mutex still busy, an I/O error) is retried once before it fails.
+   */
+  private async claimRestored(record: WorkerRecord): Promise<string[] | undefined> {
+    for (let attempt = 0; ; attempt++) {
+      try { return await this.claims.acquireAll(workerClaims(record)); }
+      catch (error) {
+        const heldElsewhere = error instanceof StringsError && HELD_ELSEWHERE.has(error.code);
+        if (heldElsewhere || attempt > 0) return undefined;
+      }
+    }
   }
 
   private addRequest(request: RequestRecord): void {
@@ -458,14 +474,20 @@ export class Coordinator {
     const from = typeof input.stateDir === "string" ? resolve(input.stateDir) : this.legacyDir;
     const none = { ok: true as const, action: "adopt", details: { adopted: false } };
     if (!from || from === resolve(this.stateDir) || this.workers.has(name)) return none;
-    const state = await StateStore.peek(from);
+    const sessionId = optionalString(input.sessionId);
+    let state: Awaited<ReturnType<typeof StateStore.peek>>;
+    try { state = await StateStore.peek(from); }
+    catch (error) {
+      // Only a created session's provenance is taken from the dir; an opened run's native session is claimed when it reopens.
+      if (!sessionId && error instanceof StringsError && error.code === "STATE_CORRUPT") return none;
+      throw error;
+    }
     if (!state) return none;
     const stored = state.workers.find(worker => worker.name === name);
     if (stored && stored.status !== "closed") {
       const holder = await stateDirHolder(from);
       if (holder.live) throw new StringsError("RUN_OWNED_ELSEWHERE", `Worker ${name} is still held by ${describeOwner(holder.owner)} (its Coordinator state: ${from}).`);
     }
-    const sessionId = optionalString(input.sessionId);
     const agent = optionalString(input.agent);
     const imported = sessionId ? state.sessions.filter(session => session.sessionId === sessionId && (!agent || session.agent === agent)) : [];
     for (const session of imported) this.sessions.set(ownedSessionKey(session), session);

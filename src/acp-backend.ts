@@ -811,6 +811,12 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 			else {
 				// A session parking did not release is still in the Coordinator's state, and its next use would reconnect it.
 				const coordinator = run.unreleased ? await loaded(await acpCoordinator(), run) : existingAcpCoordinator();
+				// One in another process's state dir: refused while that process lives and holds it, as reviving it would be.
+				// A dead holder's claims are already stale, and nothing loads its dir again.
+				if (coordinator && run.unreleased && run.stateDir !== coordinator.stateDir) {
+					const checked = await coordinator.execute({ action: "adopt", name: run.worker, agent: run.agent, ...(run.stateDir ? { stateDir: run.stateDir } : {}) });
+					if (!checked.ok) throw coordinatorError(checked, run);
+				}
 				if (coordinator?.snapshot(run.worker).worker) {
 					const released = await coordinator.execute({ action: "close", name: run.worker, force: true });
 					if (!released.ok) throw coordinatorError(released, run);

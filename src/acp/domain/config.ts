@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import type { IsolationMode, Profile, WorkerKind } from "./types.js";
 import { StringsError } from "./errors.js";
@@ -14,12 +15,13 @@ const DEFAULTS: Record<string, Profile> = {
   "pi-finder": { agent: "pi", role: "read-only", kind: "finder", tools: ["read", "grep", "find", "ls"], timeoutMs: 300_000, cancellationGraceMs: 5_000, maxOutputBytes: 256_000, maxTurns: 12 },
 };
 
-async function readConfig(path: string): Promise<Record<string, unknown>> {
+/** A config file's profiles; undefined when there is no file. */
+async function readConfig(path: string): Promise<Record<string, unknown> | undefined> {
   try {
     const parsed = JSON.parse(await readFile(path, "utf8")) as { profiles?: Record<string, unknown> };
     return parsed.profiles ?? {};
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw new StringsError("CONFIG_INVALID", `Cannot load ${path}: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
@@ -73,8 +75,11 @@ function boundedInteger(value: unknown, fallback: number | undefined, field: str
 }
 
 export async function loadProfiles(cwd: string): Promise<Record<string, Profile>> {
-  const user = await readConfig(join(agentDir(), "pi-strings.json"));
-  const project = await readConfig(join(cwd, ".pi", "pi-strings.json"));
+  // User profiles live in Pi's agent dir. Deprecated: ~/.pi/agent/pi-strings.json, where they were
+  // before, still loads when the agent dir has none (the two differ only when PI_CODING_AGENT_DIR
+  // or PI_AGENT_DIR moves the agent dir). Move the file into the agent dir.
+  const user = await readConfig(join(agentDir(), "pi-strings.json")) ?? await readConfig(join(homedir(), ".pi", "agent", "pi-strings.json")) ?? {};
+  const project = await readConfig(join(cwd, ".pi", "pi-strings.json")) ?? {};
   const merged: Record<string, unknown> = { ...DEFAULTS, ...user, ...project };
   return Object.fromEntries(Object.entries(merged).map(([name, value]) => [name, parseProfile(name, value)]));
 }

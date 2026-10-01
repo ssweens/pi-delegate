@@ -4,25 +4,43 @@
  * <agentDir>/pi-strings/                  the Coordinator home, shared by every Pi process
  *   proc/<pid>-<token>/                    one process's state dir: state.json, requests/, acpx/, owner.json
  *   locks/                                 machine-wide claims: one live writer per cwd, one live binding per native session
- *   state.json                             the legacy single state dir, from before per-process state; read only to adopt
  *
- * The agent dir is Pi's: PI_CODING_AGENT_DIR (with ~ expanded, as Pi does), else ~/.pi/agent.
- * PI_AGENT_DIR, which the Coordinator read before, still overrides it.
+ * The agent dir is Pi's (its getAgentDir(): PI_CODING_AGENT_DIR, else ~/.pi/agent). PI_AGENT_DIR, which
+ * the Coordinator read before, still overrides it.
+ *
+ * The legacy single state dir, from before per-process state, is read only to adopt from. It is
+ * where that Coordinator kept it: <PI_AGENT_DIR, else ~/.pi/agent>/pi-strings/state.json, which is
+ * the home above unless PI_CODING_AGENT_DIR moves Pi's agent dir.
  */
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import lockfile from "proper-lockfile";
 
-export function agentDir(env: NodeJS.ProcessEnv = process.env): string {
-  const dir = env.PI_AGENT_DIR || env.PI_CODING_AGENT_DIR;
+/**
+ * Pi's getAgentDir(), copied (test/acp-processes.test.ts checks they agree; Windows shell paths
+ * aside). Importing it would load all of @earendil-works/pi-coding-agent into every module here,
+ * and that measurably slowed the Coordinator's event handling in tests.
+ */
+function piAgentDir(): string {
+  const dir = process.env.PI_CODING_AGENT_DIR;
   if (!dir) return join(homedir(), ".pi", "agent");
   if (dir === "~") return homedir();
-  return dir.startsWith("~/") ? join(homedir(), dir.slice(2)) : dir;
+  if (dir.startsWith("~/")) return join(homedir(), dir.slice(2));
+  return dir.startsWith("file://") ? fileURLToPath(dir) : dir;
 }
 
-export function coordinatorHome(env: NodeJS.ProcessEnv = process.env): string { return join(agentDir(env), "pi-strings"); }
+export function agentDir(): string { return process.env.PI_AGENT_DIR || piAgentDir(); }
+
+export function coordinatorHome(): string { return join(agentDir(), "pi-strings"); }
+
+/** The agent dir as the Coordinator read it before per-process state, which ignored PI_CODING_AGENT_DIR. */
+export function legacyAgentDir(): string { return process.env.PI_AGENT_DIR ?? join(homedir(), ".pi", "agent"); }
+
+/** The single state dir from before per-process state. */
+export function legacyStateDir(): string { return join(legacyAgentDir(), "pi-strings"); }
 
 /** This process, as its state dir and its claims name it. The token tells a reused PID from its earlier owner. */
 export interface ProcessIdentity { pid: number; host: string; token: string; startedAt: string }

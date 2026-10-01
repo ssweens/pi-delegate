@@ -6,12 +6,17 @@
  * fixture ACP agent and the fake Amp CLI. No credentials, no network.
  */
 import assert from "node:assert/strict";
-import { fork, type ChildProcess } from "node:child_process";
+import { execFileSync, fork, spawn, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { test } from "node:test";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { loadProfiles } from "../src/acp/domain/config.ts";
+import { StringsError } from "../src/acp/domain/errors.ts";
 import { Coordinator } from "../src/acp/orchestration/coordinator.ts";
+import { Claims, writerClaims } from "../src/acp/persistence/claims.ts";
 import { agentDir } from "../src/acp/persistence/home.ts";
 import { fakeRuntime } from "./acp-fake-runtime.ts";
 
@@ -199,18 +204,160 @@ test("the legacy single state dir is adopted from like a dead process's dir", { 
 	await here.shutdown();
 });
 
-test("the agent dir is Pi's: PI_CODING_AGENT_DIR with ~ expanded; PI_AGENT_DIR overrides it", () => {
-	assert.equal(agentDir({}), join(homedir(), ".pi", "agent"));
-	assert.equal(agentDir({ PI_CODING_AGENT_DIR: "~/pi-agent" }), join(homedir(), "pi-agent"));
-	assert.equal(agentDir({ PI_CODING_AGENT_DIR: "/a" }), "/a");
-	assert.equal(agentDir({ PI_CODING_AGENT_DIR: "/a", PI_AGENT_DIR: "/b" }), "/b");
+test("the agent dir agrees with Pi's getAgentDir(); PI_AGENT_DIR overrides it", () => {
 	const saved = { coding: process.env.PI_CODING_AGENT_DIR, agent: process.env.PI_AGENT_DIR };
 	try {
-		process.env.PI_CODING_AGENT_DIR = "/tmp/pi-agent-dir-test";
+		for (const coding of [undefined, "", "~/pi-agent", "~", "/a", "relative/dir", "file:///tmp/pi-agent-url"]) {
+			if (coding === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = coding;
+			delete process.env.PI_AGENT_DIR;
+			assert.equal(agentDir(), getAgentDir(), `PI_CODING_AGENT_DIR=${coding}`);
+			process.env.PI_AGENT_DIR = "/b";
+			assert.equal(agentDir(), "/b");
+		}
 		delete process.env.PI_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = "~/pi-agent";
+		assert.equal(agentDir(), join(homedir(), "pi-agent"));
+		process.env.PI_CODING_AGENT_DIR = "/tmp/pi-agent-dir-test";
 		assert.match(new Coordinator(process.cwd(), {}).stateDir, new RegExp(`^/tmp/pi-agent-dir-test/pi-strings/proc/${process.pid}-[0-9a-f]+$`));
 	} finally {
 		if (saved.coding === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = saved.coding;
 		if (saved.agent === undefined) delete process.env.PI_AGENT_DIR; else process.env.PI_AGENT_DIR = saved.agent;
 	}
+});
+
+const writerProfile = (isolation: "shared" | "worktree") => ({ agent: "fake", role: "writer" as const, tools: ["read", "write"], isolation, timeoutMs: 60_000, cancellationGraceMs: 1_000, maxOutputBytes: 100_000 });
+function gitWorktree(root: string, repo: string): string {
+	const git = (...args: string[]) => execFileSync("git", ["-C", repo, "-c", "user.email=t@example.com", "-c", "user.name=t", "-c", "commit.gpgsign=false", ...args], { stdio: "ignore" });
+	git("init", "-q");
+	git("commit", "-q", "--allow-empty", "-m", "init");
+	const wt = join(root, "wt");
+	git("worktree", "add", "-q", wt);
+	return realpathSync(wt);
+}
+
+test("two workers in one process that share a writer claim keep it until the last one closes", { timeout: 60000 }, async (t) => {
+	const m = machine(t);
+	const wt = gitWorktree(m.root, m.cwd);
+	const here = new Coordinator(m.cwd, { home: m.home, stateDir: join(m.root, "here"), profiles: { shared: writerProfile("shared"), isolated: writerProfile("worktree") }, runtimeFactory: fakeRuntime().factory });
+	// A shared writer in the linked worktree takes cwd:wt; a worktree writer there needs cwd:wt too, and the worktree.
+	for (const [name, profile] of [["w1", "shared"], ["w2", "isolated"]]) {
+		const spawned = await here.execute({ action: "spawn", name, profile, cwd: wt });
+		assert.ok(spawned.ok, JSON.stringify(spawned));
+	}
+	assert.ok((await here.execute({ action: "close", name: "w1" })).ok);
+	const b = await m.pi();
+	const refused = await b.ask("start", created(wt, "WAIT", { role: "writer" }));
+	assert.equal(refused.code, "WRITER_CWD_OWNED", `w2 still writes in ${wt}: ${refused.code}: ${refused.message}`);
+	assert.match(refused.message!, new RegExp(`held by Pi process ${process.pid} `));
+	assert.ok((await here.execute({ action: "close", name: "w2" })).ok);
+	assert.ok((await b.ask("start", created(wt, "WAIT", { role: "writer" }))).ok, "the last holder's close releases it");
+	await here.shutdown();
+});
+
+test("closing a parked run whose worker another live process still holds is refused with its PID; allowed once it is gone", { timeout: 60000 }, async (t) => {
+	const m = machine(t);
+	const a = await m.pi();
+	const run = await a.call("start", created(m.cwd, "NOCLOSE", { role: "writer" }));
+	await a.call("wait", { ids: [run.id] });
+	// A replaced this parent's session but lives on: its close failed, so the run parked unreleased.
+	await a.call("release");
+	assert.equal(m.record(run.id).unreleased, true);
+
+	const b = await m.pi();
+	await b.call("restore");
+	const refused = await b.ask("close", { id: run.id });
+	assert.equal(refused.code, "RUN_OWNED_ELSEWHERE", `${refused.code}: ${refused.message}`);
+	assert.match(refused.message!, new RegExp(`Pi process ${a.pid} `));
+	assert.equal(m.record(run.id).closedAt, undefined, "not marked closed while another process holds its session and claims");
+
+	await a.kill();
+	assert.ok((await b.ask("close", { id: run.id })).ok, "its holder is gone");
+	assert.ok((await b.ask("start", created(m.cwd, "WAIT", { role: "writer" }))).ok, "a dead holder's claims do not block");
+});
+
+test("the legacy state dir is where the old Coordinator kept it: PI_AGENT_DIR, else ~/.pi/agent, never PI_CODING_AGENT_DIR", { timeout: 30000 }, async (t) => {
+	const m = machine(t);
+	const saved = { home: process.env.HOME, coding: process.env.PI_CODING_AGENT_DIR, agent: process.env.PI_AGENT_DIR };
+	t.after(() => { for (const [key, value] of [["HOME", saved.home], ["PI_CODING_AGENT_DIR", saved.coding], ["PI_AGENT_DIR", saved.agent]] as const) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } });
+	process.env.HOME = m.root;
+	process.env.PI_CODING_AGENT_DIR = m.agent;
+	delete process.env.PI_AGENT_DIR;
+	const legacy = join(m.root, ".pi", "agent", "pi-strings");
+	mkdirSync(legacy, { recursive: true });
+	writeFileSync(join(legacy, "state.json"), JSON.stringify({ version: 2, workers: [], requests: [], sessions: [{ sessionId: "sess-old", agent: "fake", profileName: "direct:fake", role: "read-only", cwd: m.cwd }] }));
+	const here = new Coordinator(m.cwd, { profiles: {}, runtimeFactory: fakeRuntime().factory });
+	assert.match(here.stateDir, new RegExp(`^${m.agent}/pi-strings/proc/`), "new state follows Pi's agent dir");
+	const adopted = await here.execute({ action: "adopt", name: "w-old", agent: "fake", sessionId: "sess-old" });
+	assert.ok(adopted.ok && adopted.details.sessions === 1, JSON.stringify(adopted));
+	await here.shutdown();
+});
+
+test("user profiles: Pi's agent dir first, the old ~/.pi/agent/pi-strings.json when it has none", { timeout: 30000 }, async (t) => {
+	const m = machine(t);
+	const saved = { home: process.env.HOME, coding: process.env.PI_CODING_AGENT_DIR, agent: process.env.PI_AGENT_DIR };
+	t.after(() => { for (const [key, value] of [["HOME", saved.home], ["PI_CODING_AGENT_DIR", saved.coding], ["PI_AGENT_DIR", saved.agent]] as const) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } });
+	process.env.HOME = m.root;
+	process.env.PI_CODING_AGENT_DIR = m.agent;
+	delete process.env.PI_AGENT_DIR;
+	const profile = (agent: string) => JSON.stringify({ profiles: { mine: { agent, role: "read-only", tools: ["read"] } } });
+	mkdirSync(join(m.root, ".pi", "agent"), { recursive: true });
+	writeFileSync(join(m.root, ".pi", "agent", "pi-strings.json"), profile("old"));
+	assert.equal((await loadProfiles(m.cwd)).mine?.agent, "old", "a profile kept where it always was still loads");
+	mkdirSync(m.agent, { recursive: true });
+	writeFileSync(join(m.agent, "pi-strings.json"), profile("new"));
+	assert.equal((await loadProfiles(m.cwd)).mine?.agent, "new", "one in Pi's agent dir wins");
+});
+
+test("a claim error that is not another live holder does not fail a restored worker for good", { timeout: 30000 }, async (t) => {
+	const m = machine(t);
+	const options = { home: m.home, stateDir: join(m.root, "here"), profiles: {}, runtimeFactory: fakeRuntime().factory };
+	const first = new Coordinator(m.cwd, options);
+	assert.ok((await first.execute({ action: "spawn", name: "w-busy", agent: "fake", cwd: m.cwd })).ok);
+	await first.shutdown();
+	for (const [code, status] of [["CLAIM_BUSY", "idle"], ["SESSION_IN_USE", "failed"]] as const) {
+		const next = new Coordinator(m.cwd, options);
+		const claims = (next as unknown as { claims: { acquireAll(claims: unknown[]): Promise<string[]> } }).claims;
+		const acquireAll = claims.acquireAll.bind(claims);
+		let failures = 1;
+		claims.acquireAll = async (wanted) => { if (failures-- > 0) throw new StringsError(code, `${code} once`, code === "CLAIM_BUSY"); return acquireAll(wanted); };
+		const listed = await next.execute({ action: "list" });
+		assert.ok(listed.ok, JSON.stringify(listed));
+		assert.equal((listed.details.workers as { status: string }[])[0]?.status, status, `after ${code}`);
+		await next.shutdown();
+	}
+});
+
+test("a process killed inside a claim's read-check-write blocks that claim only briefly", { timeout: 30000 }, async (t) => {
+	const m = machine(t);
+	const locks = join(m.home, "locks");
+	mkdirSync(locks, { recursive: true });
+	const [claim] = writerClaims(m.cwd);
+	const path = join(locks, `${createHash("sha256").update(claim!.key).digest("hex").slice(0, 40)}.json`);
+	const holder = spawn(process.execPath, ["-e", `require("proper-lockfile").lock(${JSON.stringify(path)}, { realpath: false }).then(() => { console.log("locked"); setInterval(() => {}, 1000); })`], { cwd: new URL("..", import.meta.url).pathname, stdio: ["ignore", "pipe", "inherit"] });
+	await new Promise<void>((resolve) => holder.stdout!.once("data", () => resolve()));
+	holder.kill("SIGKILL");
+	await new Promise((resolve) => holder.once("exit", resolve));
+	assert.ok(existsSync(`${path}.lock`), "the dead process left its mutex behind");
+	const claims = new Claims(locks, join(m.root, "here"));
+	const started = Date.now();
+	await claims.acquire(claim!);
+	assert.ok(Date.now() - started < 8_000);
+	await claims.releaseAll();
+});
+
+test("an opened run revives in another process even when the dead process's state is unreadable", { timeout: 120000 }, async (t) => {
+	const m = machine(t);
+	const a = await m.pi("acpx");
+	const opened = await a.call("start", { origin: "opened", agent: "amp", sessionId: localThread });
+	const dirA = await a.call("stateDir");
+	await a.call("park");
+	await a.exit();
+	// An opened run takes nothing from the dir that held it.
+	writeFileSync(join(dirA, "state.json"), "{ not json");
+
+	const b = await m.pi("acpx");
+	await b.call("restore");
+	const steered = await b.ask("steer", { id: opened.id, message: "hello" });
+	assert.ok(steered.ok, `${steered.code}: ${steered.message}`);
+	assert.equal((await b.call("wait", { ids: [opened.id] })).settled[0].output, "AMP_LOCAL_OK");
 });

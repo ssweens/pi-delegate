@@ -25,6 +25,8 @@ const ops: Record<string, (args: any) => Promise<unknown>> = {
 	restore: async () => backend.restore(ownerKey),
 	/** Parent exit, as Pi's session_shutdown does it: park this parent's runs, then shut the Coordinator down. */
 	park: async () => { await backend.closeOwner(ownerKey); await shutdownAcpCoordinator(); },
+	/** Session replacement while another parent in this process keeps the Coordinator: park this parent's runs only. */
+	release: async () => { await backend.closeOwner(ownerKey); },
 	stateDir: async () => (await acpCoordinator() as unknown as { stateDir: string }).stateDir,
 	exit: async () => { setImmediate(() => process.exit(0)); },
 };
