@@ -38,6 +38,7 @@ import {
 	type Validated,
 	type WaitOutcome,
 	type WaitRequest,
+	acpAgentName,
 	acpCapabilities,
 	acpRunStatus,
 	checkCancel,
@@ -46,7 +47,7 @@ import {
 	turnView,
 } from "./backend.js";
 import { type ObserveCursor, observationText, observeAmpThread } from "./amp-observe.js";
-import { elapsed } from "./render.js";
+import { acpUsage, elapsed } from "./render.js";
 import { ownedElsewhere, processOwner, readRecord, type RunOwner, writeRecord } from "./storage.js";
 import type { ChildActivity } from "./transcript.js";
 
@@ -90,6 +91,8 @@ interface AcpRunRecord extends Partial<RunOwner> {
 	parkedAt?: number;
 	/** The turn that was still running when the run was parked. */
 	interruptedTurn?: string;
+	/** Its session may still be in the Coordinator's state: its process died, or parking could not release it. Steer and close release it there first. */
+	unreleased?: true;
 	/** Last seen worker and turns, so a closed or parked run (or a Coordinator not yet restored) still shows its session. */
 	last?: { worker?: WorkerRecord; requests: RequestRecord[] };
 	/** What each turn was sent, by request ID, for the child view. */
@@ -130,6 +133,13 @@ function slug(agent: string): string {
 function coordinatorError(response: Extract<StringsResponse, { ok: false }>, run?: Pick<AcpRunRecord, "id" | "worker">): DelegateError {
 	const message = run ? response.error.message.replaceAll(`Worker ${run.worker}`, run.id).replaceAll(run.worker, run.id) : response.error.message;
 	return new DelegateError(response.error.code, message);
+}
+
+/** The Coordinator, after it loaded its state file. Until its first action, snapshot() cannot see a worker a dead process left there. */
+async function loaded(coordinator: Coordinator, run: Pick<AcpRunRecord, "id" | "worker">): Promise<Coordinator> {
+	const listed = await coordinator.execute({ action: "list" });
+	if (!listed.ok) throw coordinatorError(listed, run);
+	return coordinator;
 }
 
 /** Turns in send order: the saved ones, updated by what the Coordinator holds now. */
@@ -284,16 +294,18 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 			if (ownedElsewhere(run)) { run.foreign = true; restored.push(run); continue; }
 			Object.assign(run, processOwner());
 			if (run.closedAt === undefined && run.parkedAt === undefined) {
-				// Its process ended without parking it: nothing holds its session now.
+				// Its process ended without parking it: nothing released its session, and nothing holds it now.
 				run.parkedAt = savedAt;
-				for (const request of run.last?.requests ?? []) {
-					if (request.status !== "running") continue;
-					request.status = "failed";
-					request.finishedAt = new Date(savedAt).toISOString();
-					request.failure = { code: "PARENT_PROCESS_LOST", message: "Pi exited before this request reached a terminal result.", retryable: request.delivery === undefined };
-					if (request.delivery !== undefined) request.delivery = "unknown";
-					run.interruptedTurn = request.id;
-				}
+				run.unreleased = true;
+			}
+			// A turn still running in the record ended with the process that ran it, parked or not.
+			for (const request of run.last?.requests ?? []) {
+				if (request.status !== "running") continue;
+				request.status = "failed";
+				request.finishedAt = new Date(savedAt).toISOString();
+				request.failure = { code: "PARENT_PROCESS_LOST", message: "Pi exited before this request reached a terminal result.", retryable: request.delivery === undefined };
+				if (request.delivery !== undefined) request.delivery = "unknown";
+				if (run.closedAt === undefined) run.interruptedTurn = request.id;
 			}
 			restored.push(run);
 		}
@@ -329,7 +341,7 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 
 	async start(input: AcpStartInput): Promise<AcpRunView> {
 		const ownerKey = this.hooks.ownerKey();
-		const agent = input.agent.trim().toLowerCase();
+		const agent = acpAgentName(input.agent);
 		const known = acpAgents();
 		if (known && !known.includes(agent)) throw new DelegateError("INPUT_INVALID", `unknown agent "${input.agent}"; known agents: ${known.join(", ")}`, "agent");
 		unwrap(requireAction(acpCapabilities({ origin: input.origin, agent }), input.origin === "opened" ? "open" : "create"));
@@ -409,7 +421,7 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 		run.reviving ??= (async () => {
 			// A process that died without parking can leave its worker in the Coordinator's state.
 			// An idle one the Coordinator already reconnected is the session itself; anything else is released first.
-			const stale = coordinator.snapshot(run.worker).worker;
+			const stale = (await loaded(coordinator, run)).snapshot(run.worker).worker;
 			if (stale && stale.status !== "idle") {
 				const released = await coordinator.execute({ action: "close", name: run.worker, force: true });
 				if (!released.ok) throw coordinatorError(released, run);
@@ -420,6 +432,7 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 			}
 			delete run.parkedAt;
 			delete run.interruptedTurn;
+			delete run.unreleased;
 			this.save(run);
 			this.hooks.changed();
 		})().finally(() => { delete run.reviving; });
@@ -593,13 +606,15 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 			// Discarding a created session's saved state needs the session back first; anything else needs no process at all.
 			if (input.discardPersistentState === true) await this.revive(run, await acpCoordinator());
 			else {
-				const coordinator = existingAcpCoordinator();
+				// A session parking did not release is still in the Coordinator's state, and its next use would reconnect it.
+				const coordinator = run.unreleased ? await loaded(await acpCoordinator(), run) : existingAcpCoordinator();
 				if (coordinator?.snapshot(run.worker).worker) {
 					const released = await coordinator.execute({ action: "close", name: run.worker, force: true });
 					if (!released.ok) throw coordinatorError(released, run);
 				}
 				run.closedAt = Date.now();
 				delete run.parkedAt;
+				delete run.unreleased;
 				this.save(run);
 				this.hooks.changed();
 				return view(run);
@@ -633,7 +648,10 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 			if (run.foreign) continue;
 			if (run.closedAt === undefined && run.parkedAt === undefined) {
 				const before = view(run);
-				if (coordinator?.snapshot(run.worker).worker) await coordinator.execute({ action: "close", name: run.worker, force: true }).catch(() => undefined);
+				// Without a Coordinator that confirms the close, the session may still be in its state: steer or close releases it later.
+				const held = coordinator ? await loaded(coordinator, run).then((c) => c.snapshot(run.worker).worker !== undefined, () => true) : true;
+				const released = !held || (await coordinator?.execute({ action: "close", name: run.worker, force: true }).catch(() => undefined))?.ok === true;
+				if (!released) run.unreleased = true;
 				if (before.status === "running") { const turn = before.turns.at(-1); if (turn) run.interruptedTurn = turn.requestId; }
 				run.parkedAt = Date.now();
 			}
@@ -666,10 +684,13 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 // ---------------------------------------------------------------------------------------------
 // Text the parent model reads. Session evidence, no transport detail.
 
+/** The run's session as the parent model reads it: created or opened, and its native ID once known. */
+export function sessionLabel(v: AcpRunView): string {
+	return `${v.session.origin === "opened" ? "opened native session" : "session"} ${v.session.nativeSessionId ?? "pending"}`;
+}
+
 function sessionText(v: AcpRunView): string {
-	const id = v.session.nativeSessionId ?? "pending";
-	const where = v.session.executionEnvironment ? ` (${v.session.executionEnvironment})` : "";
-	return `${v.session.origin === "opened" ? "opened native session" : "session"} ${id}${where}`;
+	return v.session.executionEnvironment ? `${sessionLabel(v)} (${v.session.executionEnvironment})` : sessionLabel(v);
 }
 
 function turnText(v: AcpRunView): string | undefined {
@@ -681,12 +702,7 @@ function turnText(v: AcpRunView): string | undefined {
 
 export function acpSummary(v: AcpRunView): string {
 	const dur = elapsed((v.endedAt ?? Date.now()) - v.startedAt);
-	let tokensIn = 0, tokensOut = 0, cost = 0;
-	for (const t of v.turns) {
-		tokensIn += t.usage?.breakdown?.inputTokens ?? 0;
-		tokensOut += t.usage?.breakdown?.outputTokens ?? 0;
-		cost += t.usage?.cost?.amount ?? 0;
-	}
+	const { tokens: { input: tokensIn, output: tokensOut }, cost } = acpUsage(v.turns);
 	const head = [
 		`${v.status} · ${v.id}`,
 		`backend acp`,

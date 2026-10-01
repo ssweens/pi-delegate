@@ -6,15 +6,18 @@
  * That cursor is saved with the run record (acp-backend.ts), so it survives a parent restart. The
  * thread's `v` and `updatedAt` decide "no change" without reading the messages. The output is held
  * to the session's maxOutputBytes; what the bound leaves out is returned by the next call, never
- * skipped. A failed or unreadable export is reported as unknown and moves nothing.
+ * skipped: a message larger than the bound is returned in parts, the cursor keeping how much of it
+ * was shown. A failed or unreadable export is reported as unknown and moves nothing.
  */
 import { ampThreadExport } from "./acp/runtime/amp-cli.js";
 import type { AmpObservation, ObservedMessage } from "./backend.js";
 
 /** Where the last observation left off. */
 export interface ObserveCursor {
-	/** The last messageId returned. Absent until a message with an ID was returned. */
+	/** The last messageId returned whole. Absent until a message with an ID was returned. */
 	messageId?: string;
+	/** Characters already returned of the message after `messageId`, which the bound cut. The next observation returns the rest. */
+	offset?: number;
 	version?: number;
 	updatedAt?: string;
 	/** Messages the bound left unread at that observation. */
@@ -61,7 +64,7 @@ function cut(text: string, bytes: number): string {
 }
 
 export function messageHeader(m: ObservedMessage): string {
-	return `#${m.messageId} ${m.role} · author ${m.author} · ${m.createdAt}`;
+	return `#${m.messageId} ${m.role} · author ${m.author} · ${m.createdAt}${m.continued ? " · continued" : ""}`;
 }
 
 const messageBytes = (m: ObservedMessage) => Buffer.byteLength(`${messageHeader(m)}\n${m.text}\n`, "utf8");
@@ -76,7 +79,7 @@ export function selectObserved(threadId: string, exported: ThreadExport, cursor:
 	const base = { threadId, at, ...(version !== undefined ? { version } : {}), ...(updatedAt !== undefined ? { updatedAt } : {}), maxBytes };
 	// The thread's version marks change: the same v and updatedAt, with nothing left unread, is no change.
 	const sameThread = cursor !== undefined && version !== undefined && cursor.version === version && cursor.updatedAt === updatedAt;
-	if (sameThread && cursor.remaining === 0) {
+	if (sameThread && cursor.remaining === 0 && !cursor.offset) {
 		return { observation: { ...base, state: "unchanged", messages: [], remaining: 0, truncated: false }, cursor: { ...cursor, at } };
 	}
 	const all = (exported.messages as ExportedMessage[]).filter((m) => m && typeof m === "object");
@@ -88,40 +91,45 @@ export function selectObserved(threadId: string, exported: ThreadExport, cursor:
 		else cursorReset = true;
 	}
 	const pending = all.slice(start);
+	// The bound cut the first pending message last time: it continues from there.
+	const resume = !cursorReset && typeof cursor?.offset === "number" && cursor.offset > 0 ? cursor.offset : 0;
 	const messages: ObservedMessage[] = [];
 	let budget = maxBytes;
-	let cutOne = false;
+	let cutAt: number | undefined;
 	let lastId = cursorReset ? undefined : cursor?.messageId;
-	for (const raw of pending) {
+	for (const [index, raw] of pending.entries()) {
+		const skip = index === 0 ? resume : 0;
 		const message: ObservedMessage = {
 			messageId: idOf(raw) ?? UNKNOWN,
 			role: typeof raw.role === "string" && raw.role ? raw.role : UNKNOWN,
 			// The export carries no per-message author; the thread's creator is not every sender's identity.
 			author: UNKNOWN,
 			createdAt: timeOf(raw.createdAt) ?? UNKNOWN,
-			text: textOf(raw.content),
+			text: textOf(raw.content).slice(skip),
+			...(skip ? { continued: true as const } : {}),
 		};
 		const size = messageBytes(message);
 		if (size > budget) {
 			if (messages.length) break;
-			// The first message alone exceeds the bound: return what fits of it, so the cursor still moves.
+			// The first message alone exceeds the bound: return what fits of it; the cursor keeps where it was cut.
 			message.text = cut(message.text, budget - messageBytes({ ...message, text: "" }));
 			message.truncated = true;
-			cutOne = true;
+			cutAt = skip + message.text.length;
 		}
 		messages.push(message);
 		budget -= messageBytes(message);
+		if (cutAt !== undefined) break;
 		const id = idOf(raw);
 		if (id !== undefined) lastId = id;
-		if (cutOne) break;
 	}
+	const cutOne = cutAt !== undefined;
 	const remaining = pending.length - messages.length;
 	// Same version: unchanged, even while earlier-unread messages are still being returned. Without a
 	// version on either side, only "no message after the cursor" can be said.
 	const unversioned = version === undefined && cursor !== undefined && cursor.version === undefined && messages.length === 0 && !cursorReset;
 	const state = sameThread || unversioned ? "unchanged" : "changed";
 	const observation: AmpObservation = { ...base, state, messages, remaining, truncated: remaining > 0 || cutOne, ...(cursorReset ? { cursorReset: true as const } : {}) };
-	const next: ObserveCursor = { remaining, at, ...(lastId !== undefined ? { messageId: lastId } : {}), ...(version !== undefined ? { version } : {}), ...(updatedAt !== undefined ? { updatedAt } : {}) };
+	const next: ObserveCursor = { remaining, at, ...(lastId !== undefined ? { messageId: lastId } : {}), ...(cutAt !== undefined ? { offset: cutAt } : {}), ...(version !== undefined ? { version } : {}), ...(updatedAt !== undefined ? { updatedAt } : {}) };
 	return { observation, cursor: next };
 }
 
@@ -155,7 +163,7 @@ export function observationText(o: AmpObservation): string {
 		o.state === "unchanged" ? "the thread is unchanged since the last observation; these were left unread by its bound" : "",
 		o.cursorReset ? "the last message shown before is no longer in the thread, so this lists from its start" : "",
 		o.remaining ? `${o.remaining} more after these were left out by the ${o.maxBytes}-byte bound; observe again to read them` : "",
-		o.messages.some((m) => m.truncated) ? `a message was cut to the ${o.maxBytes}-byte bound` : "",
+		o.messages.some((m) => m.truncated) ? `a message was cut to the ${o.maxBytes}-byte bound; observe again for the rest of it` : "",
 	].filter(Boolean);
 	const count = `${o.messages.length} message${o.messages.length === 1 ? "" : "s"} since the last observation`;
 	const lines = [`${head}: ${count}${notes.length ? `; ${notes.join("; ")}` : ""}.`];

@@ -22,7 +22,7 @@ import { AgentHistory, AgentsPanel, ChildView, type LiveSource } from "./inspect
 import type { ActiveTool, ChildActivity } from "./transcript.js";
 import { type AAIndices, acpRowView, asRunView, elapsed, empty, framed, type LiveFacts, type ModelRow, type ModelsDetails, resultLines, resultView, type RunView } from "./render.js";
 import { type AcpRunView, type LifecycleAction, type PiStartInput, type WaitOutcome, PI_CAPABILITIES, requireAction, validateStartInput, validateSteer } from "./backend.js";
-import { AcpBackend, acpResultText, acpStatusText, acpSummary, DelegateError, unwrap } from "./acp-backend.js";
+import { AcpBackend, acpResultText, acpStatusText, acpSummary, DelegateError, sessionLabel, unwrap } from "./acp-backend.js";
 import { shutdownAcpCoordinator } from "./acp/instance.js";
 import { loadRoles } from "./roles.js";
 import { installTodo } from "./todo-ext.js";
@@ -1217,7 +1217,7 @@ export default function (pi: ExtensionAPI) {
 	const settledBadly = (v: AcpRunView) => v.status !== "running" && v.status !== "idle" && v.status !== "complete";
 	const acpRunResult = (v: AcpRunView) => ({ content: [{ type: "text" as const, text: acpResultText(v) }], details: v, isError: settledBadly(v) });
 	const acpStartText = (v: AcpRunView) => {
-		const session = `${v.session.origin === "opened" ? "opened native session" : "session"} ${v.session.nativeSessionId ?? "pending"}`;
+		const session = sessionLabel(v);
 		if (v.status === "idle") return `${v.id} idle (acp ${v.session.agent}, ${session}); no turn sent. Use delegate_ctl steer with this runId to send one, status or result to read it, close to disconnect.`;
 		return `${v.id} running (acp ${v.session.agent}, ${session}). Completion will wake you; use delegate_ctl wait with this runId when dependent work needs the result.`;
 	};
@@ -1269,6 +1269,8 @@ export default function (pi: ExtensionAPI) {
 		const deadline = timeoutMs === undefined ? Number.POSITIVE_INFINITY : Date.now() + timeoutMs;
 		const stoppedSince = new Map<string, number>();
 		let aborted = false, coordinatorLost = false;
+		// At most one Coordinator wait at a time: a pass woken by a pi run reuses the one still outstanding.
+		let acpNext: Promise<void> | undefined;
 		try {
 			for (;;) {
 				const acpViews = new Map(join.views().map((v) => [v.id, v]));
@@ -1298,7 +1300,8 @@ export default function (pi: ExtensionAPI) {
 					wake = () => { clearTimeout(timer); signal?.removeEventListener("abort", onAbort); wake = () => {}; resolve(); };
 					signal?.addEventListener("abort", onAbort, { once: true });
 					// The ACP slice ends early on a settling turn.
-					if (pendingAcp.length) void join.next(pendingAcp, slice).then((reported) => { if (!reported) coordinatorLost = true; wake(); }, () => wake());
+					if (pendingAcp.length) acpNext ??= join.next(pendingAcp, slice).then((reported) => { if (!reported) coordinatorLost = true; }, () => {})
+						.finally(() => { acpNext = undefined; wake(); });
 				});
 			}
 		} finally {
@@ -1808,7 +1811,8 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 		if (event.reason !== "reload") {
 			await closeOwner(previous);
 			await acp.closeOwner(previous.key);
-			await shutdownAcpCoordinator();
+			// The Coordinator is process-wide: it stays while another parent in this process may hold runs on it.
+			if (!state.owners.size) await shutdownAcpCoordinator();
 		}
 	});
 }

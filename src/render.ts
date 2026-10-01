@@ -47,12 +47,11 @@ export interface RunView {
 	turn?: { requestId: string; status: string; delivery: string; providerOutcome?: string; truncated: boolean };
 }
 
-/** An ACP run in the shape every run surface draws: one line, the Agents frame, history, the child view. */
-export function acpRowView(v: AcpRunView): RunView {
-	const latest = v.turns.at(-1);
+/** An ACP run's tokens and cost, summed over its turns. */
+export function acpUsage(turns: AcpRunView["turns"]): Pick<RunView, "tokens" | "cost"> {
 	const tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 	let cost = 0;
-	for (const t of v.turns) {
+	for (const t of turns) {
 		const b = t.usage?.breakdown;
 		tokens.input += b?.inputTokens ?? 0;
 		tokens.output += b?.outputTokens ?? 0;
@@ -60,6 +59,13 @@ export function acpRowView(v: AcpRunView): RunView {
 		tokens.cacheWrite += b?.cachedWriteTokens ?? 0;
 		cost += t.usage?.cost?.amount ?? 0;
 	}
+	return { tokens, cost };
+}
+
+/** An ACP run in the shape every run surface draws: one line, the Agents frame, history, the child view. */
+export function acpRowView(v: AcpRunView): RunView {
+	const latest = v.turns.at(-1);
+	const { tokens, cost } = acpUsage(v.turns);
 	return {
 		id: v.id, segment: v.turns.length, stopped: false, settled: v.status !== "running",
 		role: `acp ${v.session.agent}`, model: v.model ?? "", cwd: v.cwd, thinking: "", context: "fresh",

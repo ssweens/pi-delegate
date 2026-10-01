@@ -40,6 +40,8 @@ export interface CoordinatorOptions {
 export class Coordinator {
   private readonly workers = new Map<string, LiveWorker>();
   private readonly requests = new Map<string, RequestRecord>();
+  /** The same records by worker, in send order, so snapshot() reads one worker without scanning every request. */
+  private readonly requestsByWorker = new Map<string, RequestRecord[]>();
   private readonly sessions = new Map<string, SessionProvenance>();
   private readonly completions = new Map<string, Promise<void>>();
   private readonly terminalSignals = new Set<string>();
@@ -126,7 +128,7 @@ export class Coordinator {
         request.failure = { code: "PARENT_PROCESS_LOST", message: "Pi exited before this request reached a terminal result.", retryable: request.delivery === undefined };
         if (request.delivery !== undefined) request.delivery = "unknown";
       }
-      this.requests.set(request.id, request);
+      this.addRequest(request);
     }
     for (const stored of state.workers) {
       const opened = stored.origin === "opened";
@@ -186,6 +188,12 @@ export class Coordinator {
     this.initialized = true;
   }
 
+  private addRequest(request: RequestRecord): void {
+    this.requests.set(request.id, request);
+    const byWorker = this.requestsByWorker.get(request.workerName);
+    if (byWorker) byWorker.push(request); else this.requestsByWorker.set(request.workerName, [request]);
+  }
+
   private persist(): Promise<void> {
     if (!this.persistenceEnabled) return Promise.resolve();
     const workers: StoredWorker[] = [...this.workers.values()].map(({ record }) => {
@@ -229,7 +237,7 @@ export class Coordinator {
   snapshot(name: string): { worker?: WorkerRecord; requests: RequestRecord[] } {
     const live = this.workers.get(name)?.record;
     const worker = live ? { ...live, handle: { ...live.handle }, ...(live.native ? { native: { ...live.native } } : {}) } : undefined;
-    const requests = [...this.requests.values()].filter(request => request.workerName === name).map(request => ({ ...request }));
+    const requests = (this.requestsByWorker.get(name) ?? []).map(request => ({ ...request }));
     return { ...(worker ? { worker } : {}), requests };
   }
 
@@ -416,7 +424,7 @@ export class Coordinator {
     const record: RequestRecord = { id: requestId, workerName: worker.record.name, status: "running", startedAt: new Date().toISOString(), output: "", truncated: false, eventPath, lineageId, attempt, ...(requestedModel ? { requestedModel } : {}), ...(predecessorRequestId ? { predecessorRequestId } : {}) };
     if (predecessor) predecessor.supersededBy = requestId;
     if (opened) record.delivery = "unknown";
-    this.requests.set(requestId, record);
+    this.addRequest(record);
     worker.record.status = "running";
     worker.record.activeRequestId = requestId;
     worker.record.updatedAt = new Date().toISOString();

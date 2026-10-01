@@ -95,6 +95,13 @@ test("a new Amp session names local or orb; other agents and opening may omit it
 	assert.equal(validateStartInput({ backend: "acp", agent: "amp", sessionId: "T-019a" }).ok, true, "opening takes the executor Amp reports");
 });
 
+test("the agent name is normalized as the backend starts it: a padded Amp is Amp", () => {
+	const padded = errorOf(validateStartInput({ backend: "acp", agent: "amp ", task: "t" }));
+	assert.deepEqual([padded.code, padded.field], ["INPUT_INVALID", "executionEnvironment"]);
+	const opened = validateStartInput({ backend: "acp", agent: " Amp", sessionId: "T-019a", executionEnvironment: "orb" });
+	assert.deepEqual(opened, { ok: true, value: { backend: "acp", origin: "opened", agent: "amp", sessionId: "T-019a", executionEnvironment: "orb" } });
+});
+
 test("acp open-existing takes sessionId, keeps native settings and may skip the task", () => {
 	const ok = validateStartInput({ backend: "acp", agent: "amp", sessionId: "T-019a", executionEnvironment: "orb" });
 	assert.deepEqual(ok, { ok: true, value: { backend: "acp", origin: "opened", agent: "amp", sessionId: "T-019a", executionEnvironment: "orb" } });

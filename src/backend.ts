@@ -255,6 +255,8 @@ export interface ObservedMessage {
 	text: string;
 	/** This message's text was cut to fit the output bound. */
 	truncated?: true;
+	/** The rest of a message an earlier observation cut: `text` starts where that one ended. */
+	continued?: true;
 }
 
 /**
@@ -347,6 +349,8 @@ const fail = (code: ContractErrorCode, message: string, field?: string): { ok: f
 	({ ok: false, error: field === undefined ? { code, message } : { code, message, field } });
 
 const isNonEmptyString = (value: unknown): value is string => typeof value === "string" && value.trim() !== "";
+/** An ACP agent name as the backend starts it. Validation and start both read it through this. */
+export const acpAgentName = (agent: string): string => agent.trim().toLowerCase();
 const isOneOf = <T extends string>(values: readonly T[], value: unknown): value is T => typeof value === "string" && (values as readonly string[]).includes(value);
 
 function commonFields(raw: Record<string, unknown>): Validated<CommonStartInput> {
@@ -406,7 +410,7 @@ export function validateStartInput(raw: Record<string, unknown>): Validated<Star
 		if (raw[field] !== undefined) return fail("FIELD_NOT_ON_ACP", `${field} is pi-only; an ACP child cannot receive the parent conversation`, field);
 	}
 	if (!isNonEmptyString(raw.agent)) return fail("INPUT_INVALID", "agent is required with backend \"acp\"", "agent");
-	const agent = raw.agent;
+	const agent = acpAgentName(raw.agent);
 	let executionEnvironment: ExecutionEnvironment | undefined;
 	if (raw.executionEnvironment !== undefined) {
 		if (!isOneOf(EXECUTION_ENVIRONMENTS, raw.executionEnvironment)) return fail("INPUT_INVALID", 'executionEnvironment must be "local" or "orb"', "executionEnvironment");
@@ -420,7 +424,7 @@ export function validateStartInput(raw: Record<string, unknown>): Validated<Star
 		for (const field of OPEN_FORBIDDEN_FIELDS) {
 			if (raw[field] !== undefined) return fail("OPEN_OVERRIDE_FORBIDDEN", `opening keeps native settings; ${field} is creation-only`, field);
 		}
-		if (executionEnvironment && agent.toLowerCase() !== "amp") return fail("OPEN_OVERRIDE_FORBIDDEN", "only Amp accepts an executionEnvironment hint when opening a native session", "executionEnvironment");
+		if (executionEnvironment && agent !== "amp") return fail("OPEN_OVERRIDE_FORBIDDEN", "only Amp accepts an executionEnvironment hint when opening a native session", "executionEnvironment");
 		const value: AcpOpenInput = { backend: "acp", origin: "opened", agent, sessionId: raw.sessionId, ...common.value };
 		if (task !== undefined) value.task = task;
 		if (executionEnvironment) value.executionEnvironment = executionEnvironment;
@@ -438,7 +442,7 @@ export function validateStartInput(raw: Record<string, unknown>): Validated<Star
 		value.model = raw.model;
 	}
 	// Amp runs either on this machine or in an Orb; a new Amp session names which, never an adapter default.
-	if (!executionEnvironment && agent.toLowerCase() === "amp") return fail("INPUT_INVALID", 'creating an Amp session needs executionEnvironment "local" or "orb"', "executionEnvironment");
+	if (!executionEnvironment && agent === "amp") return fail("INPUT_INVALID", 'creating an Amp session needs executionEnvironment "local" or "orb"', "executionEnvironment");
 	if (executionEnvironment) value.executionEnvironment = executionEnvironment;
 	return { ok: true, value };
 }

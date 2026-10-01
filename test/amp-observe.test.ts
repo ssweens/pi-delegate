@@ -49,7 +49,25 @@ test("the bound cuts the first message on a character boundary and pages the res
 	assert.equal(m!.truncated, true);
 	assert.equal(m!.text.includes("�"), false);
 	assert.ok(Buffer.byteLength(m!.text) < 300);
-	assert.deepEqual([out.observation.remaining, out.observation.truncated, out.cursor.messageId], [1, true, "1"]);
+	assert.deepEqual([out.observation.remaining, out.observation.truncated, out.cursor.messageId, out.cursor.offset], [1, true, undefined, m!.text.length]);
 	const rest = selectObserved(T, { v: 1, messages: [msg(1, "é".repeat(500)), msg(2, "next")] }, out.cursor, 300, at);
-	assert.deepEqual([rest.observation.state, rest.observation.messages.map((x) => x.text), rest.observation.remaining], ["unchanged", ["next"], 0]);
+	const [more] = rest.observation.messages;
+	assert.deepEqual([rest.observation.state, more!.messageId, more!.continued, rest.observation.remaining], ["unchanged", "1", true, 1], "the cut message continues where it was cut");
+	assert.match(observationText(rest.observation), /#1 user · author unknown · unknown · continued/);
+});
+
+test("a message larger than the bound is returned in parts across observations, none of it lost", () => {
+	const long = "é".repeat(500) + "END";
+	const thread = { v: 1, messages: [msg(1, long), msg(2, "next")] };
+	let cursor: ReturnType<typeof selectObserved>["cursor"] | undefined;
+	const parts: string[] = [], after: string[] = [];
+	for (let i = 0; i < 10; i++) {
+		const out = selectObserved(T, thread, cursor, 300, at);
+		for (const m of out.observation.messages) (m.messageId === "1" ? parts : after).push(m.text);
+		cursor = out.cursor;
+		if (!out.observation.truncated) break;
+	}
+	assert.equal(parts.join(""), long, "every part of the cut message is returned, in order");
+	assert.deepEqual(after, ["next"]);
+	assert.equal(selectObserved(T, thread, cursor, 300, at).observation.messages.length, 0, "then nothing is left");
 });

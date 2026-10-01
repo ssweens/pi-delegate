@@ -152,6 +152,30 @@ async function spawn(coordinator: Coordinator, name: string) {
   assert.equal(result.ok, true);
 }
 
+test("snapshot reads one worker's requests without scanning every request the Coordinator holds", async () => {
+  const { coordinator, runtimes } = await harness(REVIEWER);
+  try {
+    await spawn(coordinator, "snap-a"); await spawn(coordinator, "snap-b");
+    const ids: Record<string, string[]> = { "snap-a": [], "snap-b": [] };
+    for (let turn = 0; turn < 3; turn += 1) for (const [index, name] of ["snap-a", "snap-b"].entries()) {
+      const sent = await coordinator.execute({ action: "send", name, prompt: `p${turn}` });
+      assert.equal(sent.ok, true);
+      if (!sent.ok) return;
+      ids[name]!.push(String(sent.details.requestId));
+      runtimes[index]!.turns.at(-1)!.finish({ status: "completed" });
+      await coordinator.execute({ action: "wait", requestId: sent.details.requestId, waitTimeoutMs: 1_000 });
+    }
+    const all = (coordinator as unknown as { requests: Map<string, unknown> }).requests;
+    const values = all.values;
+    let scans = 0;
+    all.values = function (this: Map<string, unknown>) { scans += 1; return values.call(this); };
+    const snapshot = coordinator.snapshot("snap-a");
+    all.values = values;
+    assert.deepEqual(snapshot.requests.map(request => request.id), ids["snap-a"], "that worker's requests, in send order");
+    assert.equal(scans, 0, "a per-frame read costs that worker's requests, not every request held");
+  } finally { await coordinator.shutdown(); }
+});
+
 test("one worker rejects a second turn while different workers overlap", async () => {
   const { coordinator, runtimes } = await harness();
   try {

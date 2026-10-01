@@ -207,8 +207,10 @@ test("native Amp sessions and observation through delegate", { timeout: 120000 }
 			assert.ok(Buffer.byteLength(JSON.stringify(o.messages)) <= 256_000 + 1_000, "the observed text stays within the bound");
 			assert.match(big.content[0].text, /1 more after these were left out by the 256000-byte bound; observe again to read them/);
 			const rest = await h.ctl("status", opened.local, { observe: true });
-			assert.equal(rest.details.observation.state, "unchanged", "the thread did not change; the earlier-unread message follows");
-			assert.deepEqual(rest.details.observation.messages.map((m: any) => m.text), ["after the big one"]);
+			assert.equal(rest.details.observation.state, "unchanged", "the thread did not change; what the bound left follows");
+			const [more, after] = rest.details.observation.messages;
+			assert.deepEqual([more.messageId, more.continued, after.text], ["201", true, "after the big one"]);
+			assert.equal(o.messages[0].text + more.text, "x".repeat(300_000), "the saved cursor resumes the cut message where it was cut");
 			assert.equal((await h.ctl("status", opened.local, { observe: true })).details.observation.state, "unchanged");
 		});
 
