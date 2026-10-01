@@ -3,7 +3,7 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { AcpxRuntimePort, normalize } from "../../src/acp/runtime/acpx-runtime.ts";
+import { AcpxRuntimePort, normalize, permissionModeFor } from "../../src/acp/runtime/acpx-runtime.ts";
 import type { Profile } from "../../src/acp/domain/types.ts";
 
 const fakePi = new URL("./fixtures/fake-pi.mjs", import.meta.url).pathname;
@@ -21,6 +21,12 @@ test("tool normalization preserves identity and derives a fingerprint without ex
     assert.match(normalized.toolFingerprint ?? "", /^read\u0000[0-9a-f]{64}$/);
   }
   assert.doesNotMatch(JSON.stringify(normalized), /rawInput|file\.ts/);
+});
+
+test("routes profile roles to ACPX permission modes", () => {
+  const base = { agent: "codex", tools: ["read", "edit", "write"], timeoutMs: 1_000, cancellationGraceMs: 100, maxOutputBytes: 4_096 };
+  assert.equal(permissionModeFor({ ...base, role: "writer" } satisfies Profile), "approve-reads");
+  assert.equal(permissionModeFor({ ...base, role: "read-only" } satisfies Profile), "approve-reads");
 });
 
 async function collect(turn: ReturnType<AcpxRuntimePort["startTurn"]>): Promise<{ status: string; output: string }> {

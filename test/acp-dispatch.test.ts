@@ -222,17 +222,13 @@ test("delegate dispatches to the acp backend; no backend is today's pi path", { 
 			await h.ctl("close", withTask.details.id);
 		});
 
-		await t.test("one Coordinator per process, shared by the op_* entry; the bridge actions are gone", async () => {
+		await t.test("one Coordinator per process, shared with delegate; the bridge actions are gone", async () => {
 			const coordinator = await acpCoordinator();
 			assert.equal(existingAcpCoordinator(), coordinator);
-			const { default: opEntry } = await import("../src/acp/index.ts");
-			const tools = new Map<string, any>();
-			opEntry({ on: () => undefined, registerTool: (tool: any) => tools.set(tool.name, tool) } as never);
-			assert.deepEqual([...tools.keys()], ["op_spawn", "op_status", "op_send", "op_wait", "op_result", "op_list", "op_cancel", "op_close"]);
-			const listed = await tools.get("op_list").execute("op", {});
-			assert.equal(listed.details.ok, true);
-			assert.ok(listed.details.details.requests.length >= 7, "op_list sees the turns delegate sent: the same Coordinator");
-			assert.equal("controls" in listed.details.details, false);
+			const listed: any = await coordinator.execute({ action: "list" });
+			assert.equal(listed.ok, true);
+			assert.ok(listed.details.requests.length >= 7, "list sees the turns delegate sent: the same Coordinator");
+			assert.equal("controls" in listed.details, false);
 			for (const action of ["observe", "append", "steer", "cancel_remote"]) {
 				const response = await coordinator.execute({ action, name: "anything" });
 				assert.equal(response.ok, false);
