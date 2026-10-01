@@ -5,10 +5,16 @@
   "type": "module",
   "main": "src/index.ts",
   "license": "MIT",
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "scripts": {
+    "build": "npm run build:acpx && node scripts/build.mjs",
+    "build:acpx": "tsc -p tsconfig.acpx.json",
     "check": "npm run typecheck && npm test",
-    "typecheck": "tsc --noEmit",
-    "test": "tsx --test test/*.test.ts",
+    "typecheck": "npm run build:acpx && tsc --noEmit && tsc -p tsconfig.acp.json && tsc -p tsconfig.vendor.json",
+    "test": "npm run build && tsx --test test/*.test.ts test/acp/*.test.ts test/acp/integration/*.test.ts",
+    "test:acp:e2e": "PI_STRINGS_E2E=1 tsx --test test/acp/integration/*.test.ts",
     "check:install": "tsx test/install-smoke.ts",
     "smoke:tui": "tsx test/terminal-smoke.ts"
   },
@@ -29,6 +35,12 @@
   "keywords": [
     "pi-package"
   ],
+  "dependencies": {
+    "@agentclientprotocol/sdk": "1.3.0",
+    "proper-lockfile": "4.1.2",
+    "write-file-atomic": "7.0.1",
+    "zod": "4.4.3"
+  },
   "devDependencies": {
     "@types/node": "22.19.19",
     "@earendil-works/pi-coding-agent": "0.99.1",
@@ -36,6 +48,9 @@
     "@earendil-works/pi-tui": "0.99.1",
     "typebox": "1.3.27",
     "tsx": "4.20.6",
-    "typescript": "5.9.3"
+    "typescript": "5.9.3",
+    "@types/proper-lockfile": "^4.1.4",
+    "@types/write-file-atomic": "^4.0.3",
+    "esbuild": "^0.25.12"
   }
 }

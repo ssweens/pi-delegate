@@ -924,6 +924,9 @@ function activityOf(run: Run): ChildActivity {
 }
 
 export default function (pi: ExtensionAPI) {
+	// ACP Pi workers (pi-acp) are full Pi processes that load installed extensions. They must not
+	// receive `delegate`, or a worker could start its own orchestration and recurse.
+	if (process.env.PI_STRINGS_WORKER === "1" || process.env.PI_STRINGS_OPENED === "1") return;
 	// Reload refreshes configuration for future session opens. Live children retain the
 	// runtime they already own; replacing a binding must not mutate their provider state.
 	let modelRuntime: Promise<ModelRuntime> | undefined;
