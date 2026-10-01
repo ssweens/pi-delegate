@@ -9,13 +9,17 @@ const GUARDS = ["PI_STRINGS_WORKER", "PI_STRINGS_OPENED"] as const;
 function recordingApi() {
 	const calls: string[] = [];
 	const tools: string[] = [];
+	const descriptions = new Map<string, string>();
 	const pi = new Proxy({}, {
 		get: (_target, property) => (...args: any[]) => {
 			calls.push(String(property));
-			if (property === "registerTool") tools.push(args[0]?.name);
+			if (property === "registerTool") {
+				tools.push(args[0]?.name);
+				descriptions.set(args[0]?.name, args[0]?.description);
+			}
 		},
 	}) as unknown as ExtensionAPI;
-	return { pi, calls, tools };
+	return { pi, calls, tools, descriptions };
 }
 
 function withEnv(values: Partial<Record<(typeof GUARDS)[number], string>>, run: () => void) {
@@ -30,10 +34,13 @@ function withEnv(values: Partial<Record<(typeof GUARDS)[number], string>>, run: 
 	}
 }
 
-test("without worker markers the extension registers delegate, delegate_ctl and todo", () => {
+test("without worker markers the extension registers delegation tools with the skill reminder", () => {
 	const api = recordingApi();
 	withEnv({}, () => extension(api.pi));
 	for (const name of ["delegate", "delegate_ctl", "todo"]) assert(api.tools.includes(name), `missing ${name}: ${api.tools.join(", ")}`);
+	for (const name of ["delegate", "delegate_ctl"]) {
+		assert.match(api.descriptions.get(name) ?? "", /Before using this tool, read skills\/delegation\/SKILL\.md if you have not read it in this session\./);
+	}
 });
 
 for (const name of GUARDS) {
