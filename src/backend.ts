@@ -62,6 +62,7 @@ export interface AcpCreateInput extends CommonStartInput {
 	role?: WorkerRole;
 	/** The agent's own model ID. */
 	model?: string;
+	/** Where the session runs. Required for Amp: local or Orb is always an explicit choice, never an adapter default. */
 	executionEnvironment?: ExecutionEnvironment;
 }
 
@@ -234,6 +235,54 @@ export interface AcpRunView {
 	parked?: { at: number; interruptedTurn?: string };
 	/** Owned by another live Pi process: a read-only snapshot here. */
 	foreign?: { ownerPid: number; ownerHost: string };
+	/** Present only when this status/result call asked to observe (opened Amp runs): what that one export showed. */
+	observation?: AmpObservation;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Observation of an opened Amp thread (todo 044)
+
+/** One thread message as the export reported it. A field the export did not carry is "unknown", never inferred. */
+export interface ObservedMessage {
+	/** Amp's messageId, as text. */
+	messageId: string;
+	/** "user" or "assistant" as Amp labels it. Amp may label tool results as user messages. */
+	role: string;
+	/** Who sent it. The export has no per-message author today, so this is "unknown" unless it carries one. */
+	author: string;
+	createdAt: string;
+	/** Text blocks verbatim; other blocks as a [type] marker. */
+	text: string;
+	/** This message's text was cut to fit the output bound. */
+	truncated?: true;
+}
+
+/**
+ * The result of one `amp threads export` for a status/result call.
+ * - changed: messages after this run's cursor (possibly none, when only the thread version moved).
+ * - unchanged: the thread's v and updatedAt match the last observation, which left nothing unread.
+ * - unknown: the export failed or was unreadable. The cursor did not move. Nothing is inferred.
+ */
+export interface AmpObservation {
+	threadId: string;
+	/** When the export ran (ISO). */
+	at: string;
+	state: "changed" | "unchanged" | "unknown";
+	/** The thread's version counter (export `v`), when present. */
+	version?: number;
+	updatedAt?: string;
+	/** Messages after the last one this run was shown, oldest first. */
+	messages: ObservedMessage[];
+	/** Messages after these that the output bound left for the next observe. */
+	remaining: number;
+	/** The bound cut this observation short: either `remaining` > 0 or a message's text was cut. */
+	truncated: boolean;
+	/** The bound in bytes (the session's maxOutputBytes). */
+	maxBytes: number;
+	/** The saved cursor was not in this export, so messages are listed from the start of the thread. */
+	cursorReset?: true;
+	/** Why the state is unknown. */
+	error?: string;
 }
 
 export type PiRunView = RunView & { backend: "pi" };
@@ -388,6 +437,8 @@ export function validateStartInput(raw: Record<string, unknown>): Validated<Star
 		if (!isNonEmptyString(raw.model)) return fail("INPUT_INVALID", "model must be a non-empty string", "model");
 		value.model = raw.model;
 	}
+	// Amp runs either on this machine or in an Orb; a new Amp session names which, never an adapter default.
+	if (!executionEnvironment && agent.toLowerCase() === "amp") return fail("INPUT_INVALID", 'creating an Amp session needs executionEnvironment "local" or "orb"', "executionEnvironment");
 	if (executionEnvironment) value.executionEnvironment = executionEnvironment;
 	return { ok: true, value };
 }

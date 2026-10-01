@@ -87,6 +87,14 @@ test("executionEnvironment is local or orb", () => {
 	assert.deepEqual([error.code, error.field], ["INPUT_INVALID", "executionEnvironment"]);
 });
 
+test("a new Amp session names local or orb; other agents and opening may omit it", () => {
+	const missing = errorOf(validateStartInput({ backend: "acp", agent: "Amp", task: "t" }));
+	assert.deepEqual([missing.code, missing.field], ["INPUT_INVALID", "executionEnvironment"]);
+	assert.equal(validateStartInput({ backend: "acp", agent: "amp", task: "t", executionEnvironment: "orb" }).ok, true);
+	assert.equal(validateStartInput({ backend: "acp", agent: "pi", task: "t" }).ok, true);
+	assert.equal(validateStartInput({ backend: "acp", agent: "amp", sessionId: "T-019a" }).ok, true, "opening takes the executor Amp reports");
+});
+
 test("acp open-existing takes sessionId, keeps native settings and may skip the task", () => {
 	const ok = validateStartInput({ backend: "acp", agent: "amp", sessionId: "T-019a", executionEnvironment: "orb" });
 	assert.deepEqual(ok, { ok: true, value: { backend: "acp", origin: "opened", agent: "amp", sessionId: "T-019a", executionEnvironment: "orb" } });

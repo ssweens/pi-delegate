@@ -3,7 +3,7 @@
 // vendor/amp-acp/src/index.ts
 import { realpath } from "node:fs/promises";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { spawn } from "node:child_process";
+import { spawn as spawn2 } from "node:child_process";
 import { createInterface } from "node:readline";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -13,6 +13,41 @@ import {
   RequestError,
   ndJsonStream
 } from "@agentclientprotocol/sdk";
+
+// src/acp/runtime/amp-cli.ts
+import { spawn } from "node:child_process";
+function ampCommand() {
+  const configured = process.env.AMP_CLI_PATH?.trim() || "amp";
+  return /\.(?:c|m)?js$/i.test(configured) ? { command: process.execPath, prefix: [configured] } : { command: configured, prefix: [] };
+}
+async function ampThreadExport(id, cwd, options = {}) {
+  const selected = ampCommand();
+  const child = spawn(selected.command, [...selected.prefix, "threads", "export", id], {
+    cwd,
+    env: process.env,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  const stdout = [];
+  const stderr = [];
+  child.stdout.on("data", (chunk) => stdout.push(chunk));
+  child.stderr.on("data", (chunk) => stderr.push(chunk));
+  let timedOut = false;
+  const timer = options.timeoutMs === void 0 ? void 0 : setTimeout(() => {
+    timedOut = true;
+    child.kill("SIGKILL");
+  }, options.timeoutMs);
+  try {
+    const code = await new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (exitCode) => resolve(exitCode));
+    });
+    return { code, stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr).toString().trim(), timedOut };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+// vendor/amp-acp/src/index.ts
 var NATIVE_SESSION_CAPABILITY = "pi-strings/native-session";
 var NATIVE_SESSION_DESCRIBE = "pi-strings/session/describe";
 var EXECUTION_CONFIG = "execution-environment";
@@ -113,10 +148,6 @@ function nativeBinding(params) {
     ...typeof value.model === "string" ? { model: value.model } : {}
   };
 }
-function ampCommand() {
-  const configured = process.env.AMP_CLI_PATH?.trim() || "amp";
-  return /\.(?:c|m)?js$/i.test(configured) ? { command: process.execPath, prefix: [configured] } : { command: configured, prefix: [] };
-}
 function ampArgs(options) {
   const args = options.continue ? ["threads", "continue", options.continue] : [];
   args.push("--execute", "--stream-json", "--no-archive-after-execute");
@@ -128,7 +159,7 @@ function ampArgs(options) {
 async function* executeAmp(prompt, options, signal) {
   signal.throwIfAborted();
   const selected = ampCommand();
-  const child = spawn(selected.command, [...selected.prefix, ...ampArgs(options)], {
+  const child = spawn2(selected.command, [...selected.prefix, ...ampArgs(options)], {
     cwd: options.cwd,
     env: { ...process.env, TERM: "dumb" },
     stdio: ["pipe", "pipe", "pipe"]
@@ -164,27 +195,11 @@ async function* executeAmp(prompt, options, signal) {
   }
 }
 async function lookupAmpThread(id, cwd) {
-  const selected = ampCommand();
-  const child = spawn(selected.command, [...selected.prefix, "threads", "export", id], {
-    cwd,
-    env: process.env,
-    stdio: ["ignore", "pipe", "pipe"]
-  });
-  const stdout = [];
-  const stderr = [];
-  child.stdout.on("data", (chunk) => stdout.push(chunk));
-  child.stderr.on("data", (chunk) => stderr.push(chunk));
-  const code = await new Promise((resolve, reject) => {
-    child.once("error", reject);
-    child.once("close", (exitCode) => resolve(exitCode));
-  });
-  if (code !== 0) {
-    const details = Buffer.concat(stderr).toString().trim();
-    throw RequestError.invalidParams(`Amp thread lookup failed${details ? `: ${details}` : ""}`);
-  }
+  const { code, stdout, stderr: details } = await ampThreadExport(id, cwd);
+  if (code !== 0) throw RequestError.invalidParams(`Amp thread lookup failed${details ? `: ${details}` : ""}`);
   let exported;
   try {
-    exported = JSON.parse(Buffer.concat(stdout).toString("utf8"));
+    exported = JSON.parse(stdout.toString("utf8"));
   } catch {
     throw RequestError.invalidParams("Amp thread lookup returned invalid export data");
   }

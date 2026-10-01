@@ -16,6 +16,9 @@
  * under the same worker name: an opened run through the Coordinator's native-opening path with the
  * same native ID, a created run through the Coordinator's owned resume, which needs the adapter's
  * session/resume or session/load and fails RUN_NOT_RESUMABLE otherwise. delegate_ctl close is final.
+ *
+ * Opened Amp runs can also be observed (todo 044, amp-observe.ts): status/result with observe reads
+ * the thread through one `amp threads export`, on demand, and the cursor is saved with the record.
  */
 import { randomUUID } from "node:crypto";
 import { existsSync, readdirSync } from "node:fs";
@@ -42,6 +45,7 @@ import {
 	requireAction,
 	turnView,
 } from "./backend.js";
+import { type ObserveCursor, observationText, observeAmpThread } from "./amp-observe.js";
 import { elapsed } from "./render.js";
 import { ownedElsewhere, processOwner, readRecord, type RunOwner, writeRecord } from "./storage.js";
 import type { ChildActivity } from "./transcript.js";
@@ -76,6 +80,10 @@ interface AcpRunRecord extends Partial<RunOwner> {
 	timeoutMs?: number;
 	/** How an opened run was opened, so reopening it targets exactly that native session. */
 	open?: { sessionId: string; cwd?: string; executionEnvironment?: string };
+	/** Where a created run was told to execute (Amp: always explicit, local or orb). */
+	executionEnvironment?: string;
+	/** Opened Amp runs: where the last observation left off, so the next one returns only newer messages. */
+	observed?: ObserveCursor;
 	startedAt: number;
 	closedAt?: number;
 	/** The parent exited, or its process died, and the session was released. Steer reopens it. */
@@ -95,9 +103,11 @@ interface AcpRunRecord extends Partial<RunOwner> {
 	foreign?: true;
 	/** A reopening in flight, so concurrent steers reopen once. */
 	reviving?: Promise<void>;
+	/** An observation in flight: observations of one run are serialized so each moves the cursor once. */
+	observing?: Promise<unknown>;
 }
 
-type AcpRunFile = Omit<AcpRunRecord, "waiters" | "claimed" | "foreign" | "reviving"> & { version: 1; backend: "acp"; savedAt: number };
+type AcpRunFile = Omit<AcpRunRecord, "waiters" | "claimed" | "foreign" | "reviving" | "observing"> & { version: 1; backend: "acp"; savedAt: number };
 
 // Process-wide like the pi runtime state: a /reload rebinds the tools, the runs stay.
 const RUNS_KEY = Symbol.for("@ssweens/pi-delegate/acp-runs/1");
@@ -107,6 +117,8 @@ const registry = (): Map<string, AcpRunRecord> => {
 };
 
 const WAIT_SLICE_MS = 1000;
+/** The Coordinator's default profile bound, for a run whose worker profile was never seen. */
+const DEFAULT_MAX_OUTPUT_BYTES = 256_000;
 const WATCH_SLICE_MS = 60_000;
 
 function slug(agent: string): string {
@@ -157,7 +169,8 @@ function view(run: AcpRunRecord): AcpRunView {
 				...(handle?.agentSessionId ? { agentSessionId: handle.agentSessionId } : {}),
 			},
 			...(nativeSessionId ? { nativeSessionId } : {}),
-			...(worker?.native ? { executionEnvironment: worker.native.executionEnvironment, native: worker.native } : {}),
+			...(worker?.native ? { executionEnvironment: worker.native.executionEnvironment, native: worker.native }
+				: run.executionEnvironment ? { executionEnvironment: run.executionEnvironment } : {}),
 		},
 		turns,
 		output: latest?.output ?? "",
@@ -237,7 +250,7 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 	private save(run: AcpRunRecord): void {
 		if (run.foreign) return;
 		view(run);
-		const { waiters: _waiters, claimed: _claimed, foreign: _foreign, reviving: _reviving, ...record } = run;
+		const { waiters: _waiters, claimed: _claimed, foreign: _foreign, reviving: _reviving, observing: _observing, ...record } = run;
 		writeRecord(this.recordPath(run), { ...record, version: 1, backend: "acp", savedAt: Date.now() } satisfies AcpRunFile);
 	}
 
@@ -266,6 +279,8 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 			if (registry().has(record.id)) continue;
 			const { version: _version, backend: _backend, savedAt, ...fields } = record;
 			const run: AcpRunRecord = { ...fields, waiters: 0, claimed: new Set() };
+			// An unreadable cursor only costs repetition: the next observation lists from the start.
+			if (run.observed !== undefined && (typeof run.observed !== "object" || run.observed === null || typeof run.observed.remaining !== "number")) delete run.observed;
 			if (ownedElsewhere(run)) { run.foreign = true; restored.push(run); continue; }
 			Object.assign(run, processOwner());
 			if (run.closedAt === undefined && run.parkedAt === undefined) {
@@ -334,6 +349,7 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 		} else {
 			if (input.role) { spawn.role = input.role; run.role = input.role; }
 			if (input.model) { spawn.model = input.model; run.model = input.model; }
+			if (input.executionEnvironment) run.executionEnvironment = input.executionEnvironment;
 		}
 		const coordinator = await acpCoordinator();
 		const spawned = await coordinator.execute(spawn);
@@ -514,6 +530,35 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 		return view(run);
 	}
 
+	/**
+	 * Observe an opened Amp run's thread for one status/result call: one `amp threads export`, on
+	 * demand, returning only the messages after the last one this run was shown. It needs no session,
+	 * so a parked run is observed without reopening it. A failed export is an unknown observation,
+	 * not an error, and leaves the cursor where it was.
+	 */
+	async observe(runId: string): Promise<AcpRunView> {
+		const run = this.get(runId);
+		unwrap(requireAction(acpCapabilities(run), "observe"));
+		this.writable(run);
+		if (run.closedAt !== undefined) throw new DelegateError("RUN_CLOSED", `${run.id} is closed, and its observation ended with it; open the thread again with delegate sessionId`);
+		const next = (run.observing ?? Promise.resolve()).catch(() => undefined).then(() => this.observeOnce(run));
+		run.observing = next;
+		try { return await next; }
+		finally { if (run.observing === next) delete run.observing; }
+	}
+
+	private async observeOnce(run: AcpRunRecord): Promise<AcpRunView> {
+		const current = view(run);
+		const threadId = run.open?.sessionId ?? current.session.nativeSessionId;
+		if (!threadId) throw new DelegateError("RUN_NOT_OBSERVABLE", `${run.id} has no recorded native thread ID to observe`);
+		const worker = run.last?.worker;
+		// The export reads the thread by ID; run it where the thread was verified, when that still exists.
+		const cwd = [worker?.native?.cwd, run.open?.cwd, run.cwd].find((dir): dir is string => typeof dir === "string" && existsSync(dir)) ?? process.cwd();
+		const { observation, cursor } = await observeAmpThread({ threadId, cwd, ...(run.observed ? { cursor: run.observed } : {}), maxBytes: worker?.profile.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES });
+		if (cursor) { run.observed = cursor; this.saveQuietly(run); }
+		return { ...view(run), observation };
+	}
+
 	async status(runIds?: readonly string[]): Promise<AcpRunView[]> {
 		if (!runIds) return this.owned(this.hooks.ownerKey());
 		return runIds.map((id) => {
@@ -669,6 +714,11 @@ export function acpSummary(v: AcpRunView): string {
 
 /** The agent's words are quoted, never blended into this tool's own reporting. */
 export function acpResultText(v: AcpRunView): string {
-	if (!v.turns.length) return acpSummary(v);
-	return `${acpSummary(v)}\n\n----- ${v.id} reported, verbatim -----\n${v.output || "(the turn ended without output)"}\n----- end of report -----`;
+	const report = v.turns.length ? `${acpSummary(v)}\n\n----- ${v.id} reported, verbatim -----\n${v.output || "(the turn ended without output)"}\n----- end of report -----` : acpSummary(v);
+	return v.observation ? `${report}\n\n${observationText(v.observation)}` : report;
+}
+
+/** delegate_ctl status text: the summary, and the observation when one was asked for. */
+export function acpStatusText(v: AcpRunView): string {
+	return v.observation ? `${acpSummary(v)}\n\n${observationText(v.observation)}` : acpSummary(v);
 }

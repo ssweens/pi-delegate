@@ -21,6 +21,8 @@ import {
   type SetSessionConfigOptionRequest,
   type SessionConfigOption,
 } from "@agentclientprotocol/sdk";
+// Shared with the delegate backend's observation so both run the Amp CLI the same way.
+import { ampCommand, ampThreadExport } from "../../../src/acp/runtime/amp-cli.js";
 
 const NATIVE_SESSION_CAPABILITY = "pi-strings/native-session";
 const NATIVE_SESSION_DESCRIBE = "pi-strings/session/describe";
@@ -162,13 +164,6 @@ type AmpStreamMessage = {
   message?: { content?: unknown };
 };
 
-function ampCommand(): { command: string; prefix: string[] } {
-  const configured = process.env.AMP_CLI_PATH?.trim() || "amp";
-  return /\.(?:c|m)?js$/i.test(configured)
-    ? { command: process.execPath, prefix: [configured] }
-    : { command: configured, prefix: [] };
-}
-
 function ampArgs(options: AmpExecution): string[] {
   const args = options.continue ? ["threads", "continue", options.continue] : [];
   args.push("--execute", "--stream-json", "--no-archive-after-execute");
@@ -220,24 +215,10 @@ type AmpThreadLookup = {
 };
 
 async function lookupAmpThread(id: string, cwd: string): Promise<AmpThreadLookup> {
-  const selected = ampCommand();
-  const child = spawn(selected.command, [...selected.prefix, "threads", "export", id], {
-    cwd, env: process.env, stdio: ["ignore", "pipe", "pipe"],
-  });
-  const stdout: Buffer[] = [];
-  const stderr: Buffer[] = [];
-  child.stdout.on("data", chunk => stdout.push(chunk));
-  child.stderr.on("data", chunk => stderr.push(chunk));
-  const code = await new Promise<number | null>((resolve, reject) => {
-    child.once("error", reject);
-    child.once("close", exitCode => resolve(exitCode));
-  });
-  if (code !== 0) {
-    const details = Buffer.concat(stderr).toString().trim();
-    throw RequestError.invalidParams(`Amp thread lookup failed${details ? `: ${details}` : ""}`);
-  }
+  const { code, stdout, stderr: details } = await ampThreadExport(id, cwd);
+  if (code !== 0) throw RequestError.invalidParams(`Amp thread lookup failed${details ? `: ${details}` : ""}`);
   let exported: unknown;
-  try { exported = JSON.parse(Buffer.concat(stdout).toString("utf8")); }
+  try { exported = JSON.parse(stdout.toString("utf8")); }
   catch { throw RequestError.invalidParams("Amp thread lookup returned invalid export data"); }
   if (!exported || typeof exported !== "object" || Array.isArray(exported)) throw RequestError.invalidParams("Amp thread lookup returned invalid export data");
   const record = exported as Record<string, unknown>;
