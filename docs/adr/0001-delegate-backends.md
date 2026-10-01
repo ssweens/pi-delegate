@@ -1,0 +1,38 @@
+# ADR 0001: One delegate surface over pi and acp backends
+
+Status: Accepted, 2026-09-30. Todos 039 and 040. Contract: `src/backend.ts`.
+
+## Context
+
+pi-delegate runs in-process Pi children through `delegate`/`delegate_ctl`. pi-strings ran ACP workers (pi-acp, Amp, others) through 12 `op_*` tools and its own Coordinator. Commit 1dee4e8 moved that code into `src/acp/`. Two surfaces and two Coordinators would mean cross-package lookup, a double lock and version coupling.
+
+## Decision
+
+- One package and one Coordinator. `delegate` takes `backend: "pi" | "acp"`. Omitted means `pi`, today's behavior. An unknown backend fails. Nothing falls back from acp to pi.
+- ACP-only fields (`agent`, `sessionId`, `executionEnvironment: local|orb`) fail on pi. `context` fails on acp. An opened session rejects `role` and `model`.
+- A run keeps these apart: delegate run ID, one provider request ID per turn, native session ID (Amp `T-…`), delivery (`accepted|unknown`) and provider outcome. Accepted is not finished.
+- Each run reports its capabilities. An unsupported action fails with `ACTION_UNSUPPORTED` and never becomes a different action.
+- No Amp plugin bridge. Amp controls use native paths: steer is a native send, and cancel is ACP session cancel. 042 deletes `amp-plugin-bridge.ts`, `vendor/amp-plugin`, `PI_STRINGS_AMP_BRIDGE_*` and the bridge tests.
+
+| op_* | New home |
+|---|---|
+| spawn | `delegate backend:"acp"`. Create, or open with `sessionId`. The first turn is `task`. |
+| send | First turn: `delegate`. Later turns: `delegate_ctl steer`. |
+| steer, append | `delegate_ctl steer` as a native send. Shows as `## User`. Opened sessions are undecorated and never retried. |
+| observe | `delegate_ctl status`/`result` on an opened Amp run. One `amp threads export` per call, on demand. |
+| status, list | `delegate_ctl status`. With no runId it lists. |
+| wait | `delegate_ctl wait`, with any/all over several runs. A timeout never cancels. |
+| result | `delegate_ctl result`. Keeps request IDs, delivery and the truncation flag. |
+| cancel | `delegate_ctl cancel`. Cooperative, with grace. |
+| cancel_remote | `delegate_ctl cancel` through ACP session cancel, for turns this run started. |
+| close | New `delegate_ctl close`. Disposes created sessions. Only disconnects opened ones, never archives or deletes. |
+
+No `op_*` tool survives (053).
+
+## Consequences
+
+- Lost: cancelling a turn someone else started in a shared Amp thread. It fails explicitly as unsupported.
+- Observation is on demand only, with no background polling. `amp threads export` is a full dump (about 0.5 s and 35 KB for 14 messages, measured 2026-09-30), so each call returns only messages after the last `messageId` returned. Turns this run starts stream live through `--execute --stream-json`.
+- pi has no open-existing and no close: they fail as unsupported. Cancel covers it.
+- `role` means a role name on pi and `read-only|writer` on acp. The field name is shared, the domain is not.
+- An opened run may have no task. It is `idle` until it sends a turn, so it can observe without posting.
