@@ -1,5 +1,7 @@
 # Coordination capability layers
 
+Historical record from pi-strings, 2026-08-02. The layers still describe the Coordinator under `delegate backend:"acp"`. One name changed: `delegate_ctl steer` is now the public continuation, and it is still an ordinary later send after the current turn ends, not in-flight injection. See [ADR 0001](adr/0001-delegate-backends.md).
+
 ## Purpose
 
 `pi-strings` uses evidence-backed coordination layers. The shipped baseline is intentionally a routing and lifecycle coordinator, not a general task graph or interactive messaging system. New behavior must preserve one active turn per worker, explicit terminal results, honest persistence, and parent authority.
@@ -55,9 +57,9 @@ Potential future work includes standard ACP elicitation if ACPX exposes it porta
 | Close failure and retry | coordinator close regression |
 | Shutdown action-tail ordering | coordinator shutdown regression |
 | Strict state corruption handling | `test/acp/state-store.test.ts` legacy waiting/questions regressions |
-| Permission routing | `test/acp/extension.test.ts` and ACPX contract configuration |
+| Permission routing | `test/acp/pi-acp-runtime.test.ts` and ACPX contract configuration |
 | Pi through common runtime | `test/acp/pi-acp-runtime.test.ts` |
 
 ## Acceptance ledger
 
-The current acceptance ledger is maintained in [`../TEST_COVERAGE.md`](../TEST_COVERAGE.md). Retired steering and question cases are marked not applicable there; no obsolete capability is counted as covered.
+The current acceptance ledger is maintained in [`ACP_TEST_COVERAGE.md`](ACP_TEST_COVERAGE.md). Retired steering and question cases are marked not applicable there; no obsolete capability is counted as covered.

@@ -1,6 +1,6 @@
 ---
 name: delegation
-description: Decision rules for delegating work to child agents with the delegate tool — when to delegate at all, which tier, when a review is a gate versus ceremony, and how to correct a child without a re-review loop. Use when considering delegate/delegate_ctl, splitting work across agents, or choosing a model tier for a subtask.
+description: "Decision rules for delegating work to child agents with the delegate tool — when to delegate at all, which tier, when a review is a gate versus ceremony, and how to correct a child without a re-review loop. Covers both backends: in-process Pi children and external ACP agents (Codex, Claude, Amp, Pi), including opening an existing Amp thread. Use when considering delegate/delegate_ctl, splitting work across agents, choosing a model tier for a subtask, or running or opening an ACP agent session."
 ---
 
 # Delegation
@@ -52,6 +52,34 @@ Distinguish the three in your own words when you report to the user: the child's
 `sync: true` remains available when joining at launch is explicitly needed; a dependency discovered later is not a reason to require it upfront. Parallel lanes are several background calls with disjoint `cwd` or ownership — one writer per tree.
 
 If automatic continuation fails, distinguish child completion, notification delivery, and parent continuation using the transcript and runtime errors. Do not claim the cause from configuration alone or work around it by switching every launch to synchronous.
+
+## ACP backend: external agents and existing sessions
+Use `backend: "acp"` when the user asks for a specific external agent (Codex, Claude, Amp, an ACP Pi), or to work in an existing native session such as an Amp `T-…` thread. Otherwise stay on pi, the default. Everything above about briefs, background runs, `wait` and single `status` reads applies to ACP runs too.
+
+| User says | Call |
+|---|---|
+| "Have a scout map session storage." | `delegate {"role":"scout","task":"Map session storage\n…","context":"fresh"}` |
+| "Ask Codex for a read-only review of src/backend.ts." | `delegate {"backend":"acp","agent":"codex","role":"read-only","task":"Review src/backend.ts\n…"}` |
+| "Let Claude fix the failing test in that worktree." | `delegate {"backend":"acp","agent":"claude","role":"writer","task":"Fix the failing test\n…","cwd":"/abs/worktree"}` |
+| "Start an Amp thread here." / "…in an Orb." | `delegate {"backend":"acp","agent":"amp","executionEnvironment":"local","task":"…"}` (or `"orb"`) |
+| "Open T-… but don't post yet." | `delegate {"backend":"acp","agent":"amp","sessionId":"T-…"}`: the run is `idle` and sends nothing |
+| "Now ask that thread to rerun the suite." | `delegate_ctl {"action":"steer","runId":"amp-…","message":"Please rerun the suite."}` |
+| "Tell me when either is done; give it 10 minutes." | `delegate_ctl {"action":"wait","runIds":["scout-…","codex-…"],"mode":"any","timeoutMs":600000}` |
+| "We're done with that thread." | `delegate_ctl {"action":"close","runId":"amp-…"}` |
+
+Rules that differ from pi:
+
+- `agent` is required. `role` is `read-only` (default) or `writer`, never a pi role name. `model` is the agent's own model ID. `context` fails: an ACP agent never sees your conversation, so the brief must stand alone.
+- A new Amp thread needs `executionEnvironment` `local` or `orb`. Ask the user if they did not say; never pick one.
+- Opening (`sessionId`) rejects `role` and `model`. Your text goes in exactly as written, is never retried, and shows in Amp as an ordinary `## User` message. Only send into a shared thread what the user asked you to send.
+- Each turn has its own request ID and `delivery`. `accepted` means the provider reported the turn complete; anything else is `unknown`. Never report `unknown` as delivered.
+- A `wait` timeout never cancels. `timeoutMs` on `delegate` or `steer` is the turn budget: on a created session it ends the turn as `timeout` and the session must be closed; on an opened session it only stops your wait.
+- Steer needs the current turn to be finished or cancelled. `cancel` stops only a turn this run started; on a shared Amp thread, someone else's turn fails `ACTION_UNSUPPORTED`. Cancel stops the turn, not the run.
+- `close` is ACP-only and final. It disposes a created session and only disconnects an opened one; it never archives or deletes a thread. Pass `force: true` only to cancel an active turn first. Close every ACP run you finish with.
+- On an opened Amp run, `status` with `observe: true` and one `runId` reads the thread: one export per call, only messages since the last read. A plain `status` doesn't read it. One read is not a poll loop.
+- After the parent restarts, ACP runs are parked: `status`, `result` and `wait` read their records, and `steer` reopens them. A created run whose adapter cannot resume fails `RUN_NOT_RESUMABLE`; tell the user and start a new run rather than retrying.
+
+The old pi-strings `op_*` tools are gone. The [README](../../README.md#migrating-from-pi-strings) maps each one to these calls.
 
 ## Execution model and terminal independence
 Keep children in the parent Pi process. Here, **background means asynchronous, not a detached worker**. Use `delegate` and `delegate_ctl` for child coordination. The pinned Agents frame shows only live work; finished children leave one expandable transcript line. For human inspection, `/agents` opens finished-child history; Ctrl+J focuses live children or opens history when idle. Opening history or a child transcript does not restart work.

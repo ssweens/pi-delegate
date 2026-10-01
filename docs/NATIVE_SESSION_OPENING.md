@@ -1,35 +1,37 @@
 # Create or open native sessions through one provider interface
 
-Status: Pi and Amp create/open paths are implemented through the common ACPX runtime. Amp native opening uses authenticated export metadata for executor, owner scope, cwd, and mode when available; `cwd` and `executionEnvironment` remain optional verification hints. Live account/executor and lifecycle proofs remain acceptance gates. Amp owns participant identity, presence, queueing, and cross-user attribution; those are not pi-strings acceptance gates. Arbitrary history-page/character limits are not part of the shared contract.
+Status: Pi and Amp create/open paths are implemented through the common ACPX runtime and exposed through `delegate backend:"acp"` ([ADR 0001](adr/0001-delegate-backends.md)). Amp native opening uses authenticated export metadata for executor, owner scope, cwd, and mode when available; `cwd` and `executionEnvironment` remain optional verification hints. Live account/executor and lifecycle proofs remain acceptance gates. Amp owns participant identity, presence, queueing, and cross-user attribution; those are not acceptance gates here. Arbitrary history-page/character limits are not part of the shared contract.
+
+This record was written when the surface was pi-strings' `op_*` tools. Those tools are retired. The public contract below now names the `delegate` calls; the sections after it keep the original design reasoning.
 Tracked by [019](../../todos/019-complete-amp-participant-boundary.md) and [hub 018](../../todos/018-ready-amp-participant-coordination.md).
 
 ## Decision
 
-Every agent integration must support creating a new session and opening an existing provider-native thread/session. Use the existing `op_*` surface and ACPX runtime. No separate Amp extension, package, tool family, or always-on plugin bridge.
+Every agent integration must support creating a new session and opening an existing provider-native thread/session. Use the common `delegate` surface and ACPX runtime. No separate Amp extension, package, tool family, or plugin bridge.
 
 Execution location and session origin are independent. Amp already exposes `execution-environment: local | orb`; opening an existing thread must preserve its executor, not reinterpret a supplied ID as a new Orb request.
 
 A provider missing native opening is an implementation gap. Returning an honest unsupported error is necessary failure behavior, not completion of that provider's acceptance criteria. Custom ACP commands remain supported as a transport path; arbitrary unknown implementations cannot be claimed verified.
 
-## Proposed public contract
+## Public contract
 
-Keep the tool names. Extend `op_spawn` with `sessionId`, meaning the exact provider-native ID. Omit it to create; supply it to open. Pi opening is implemented; other agents currently return `NATIVE_OPEN_UNSUPPORTED`:
+`delegate backend:"acp"` takes `sessionId`, meaning the exact provider-native ID. Omit it to create; supply it to open. Pi and Amp opening is implemented; other agents return `NATIVE_OPEN_UNSUPPORTED` until their adapters advertise it:
 
 ```json
-{"name":"research","agent":"amp","executionEnvironment":"orb"}
-{"name":"existing-research","agent":"amp","sessionId":"T-<exact-id>"}
-{"name":"existing-codex","agent":"codex","sessionId":"<exact-native-thread-id>","cwd":"<original-workspace>"}
+{"backend":"acp","agent":"amp","executionEnvironment":"orb","task":"…"}
+{"backend":"acp","agent":"amp","sessionId":"T-<exact-id>"}
+{"backend":"acp","agent":"codex","sessionId":"<exact-native-thread-id>","cwd":"<original-workspace>"}
 ```
 
-- `executionEnvironment` applies to creation and must match an advertised provider option. Amp native opening may accept it as an explicit executor verification hint; other agents reject it on open. Do not assume other agents support Amp's values.
+- `executionEnvironment` applies to creation, and a new Amp session requires it. Amp native opening may accept it as an explicit executor verification hint; other agents reject it on open. Do not assume other agents support Amp's values.
 - Opening never falls back to creating, selecting latest, suffix matching, forking, or importing a transcript into a new thread.
-- Replace the public adapter-level `resumeSessionId` with native `sessionId`; migrate callers/tests/docs in one cutover. Internal restoration of a coordinator-owned ACP handle remains distinct from first opening an external native session.
-- Opening rejects explicit creation-time model, thinking, tool, or executor overrides. Ambient profile defaults must not be applied to the existing thread. Original local cwd must be resolved/verified; using Pi's current directory is not evidence that it is the thread's workspace.
-- `op_status` and `op_list` report native identity separately from ACP/runtime identity, origin (`created` or `opened`), execution location when known, and the capabilities actually established. Unknown values remain unknown.
-- `op_send`, `op_wait`, and `op_result` remain the common message/request interface. Opened sessions receive the requested text without `WORKER_CONTRACT` or acceptance-report decoration. The local request result is not automatically the shared thread's global completion state.
-- `op_cancel` is an explicit stop request. `op_close` for an opened session disconnects local participation; it must not secretly invoke cancellation, archive, deletion, or backend `session/close` with stronger semantics. Existing owned-worker force-close behavior remains intact for created workers.
+- The public adapter-level `resumeSessionId` is replaced by native `sessionId`. Internal restoration of a coordinator-owned ACP handle (used to revive a parked run) remains distinct from first opening an external native session.
+- Opening rejects creation-time `role` and `model`. Ambient profile defaults are not applied to the existing thread. Original local cwd must be resolved/verified; using Pi's current directory is not evidence that it is the thread's workspace.
+- `delegate_ctl status` reports native identity (`session.nativeSessionId`) separately from the run ID and runtime identity, plus origin (`created` or `opened`), execution location when known, and the capabilities actually established. Unknown values remain unknown.
+- An opened run with no `task` is `idle`. `delegate_ctl steer`, `wait` and `result` are the common message/request interface. Opened sessions receive the requested text without `WORKER_CONTRACT` or acceptance-report decoration. The local request result is not automatically the shared thread's global completion state.
+- `delegate_ctl cancel` is an explicit stop request for a turn this run started. `delegate_ctl close` on an opened session disconnects local participation; it does not invoke cancellation, archive, deletion, or backend `session/close` with stronger semantics. Created sessions are disposed, with `force` to cancel an active turn first.
 
-Opening an idle stored local session is not the same as attaching to the live terminal process that previously used it. Advertise these distinctions; do not promise concurrent participation from a `loadSession` method alone. Amp owns busy-thread and multiplayer behavior; pi-strings reports only its local observation and provider outcome.
+Opening an idle stored local session is not the same as attaching to the live terminal process that previously used it. Advertise these distinctions; do not promise concurrent participation from a `loadSession` method alone. Amp owns busy-thread and multiplayer behavior; the backend reports only its local observation and provider outcome.
 
 ## Internal changes required
 
@@ -55,7 +57,7 @@ ACPX `close` currently calls `cancel` first; with discard it may issue backend `
 
 Stopping an adapter process can itself affect a locally executing turn even when no cancel RPC is sent. Surface provider behavior and refuse to claim durable execution across disconnect without proof. In particular, idle-close evidence below does not prove active-turn survival.
 
-For opened sessions, disable automatic prompt retry/model fallback and worker prompt decoration. A transport loss can leave delivery unknown; do not resend. A request deadline ends Pi's wait, not authority over other contributors. Record local observation/request outcome separately from provider work state. Shared result attribution belongs to Amp. Pi-strings must not infer it from the last assistant message or an idle snapshot.
+For opened sessions, disable automatic prompt retry/model fallback and worker prompt decoration. A transport loss can leave delivery unknown; do not resend. A request deadline ends Pi's wait, not authority over other contributors. Record local observation/request outcome separately from provider work state. Shared result attribution belongs to Amp. The backend must not infer it from the last assistant message or an idle snapshot.
 
 ### Persistence cutover
 
@@ -63,7 +65,7 @@ Update the stored schema, namespace keys, restart logic, and every caller togeth
 
 ## Provider coverage matrix
 
-The vendored registry has **21 entries**, plus pi-strings' Amp override: **22 named integrations**. The README names Pi, Codex, OpenCode, Amp, and Claude as well-exercised. A registry entry is only a launch recipe, not native-open proof.
+The vendored registry has **21 entries**, plus the vendored Amp adapter: **22 named integrations**. The README names Pi, Codex, OpenCode, Amp, and Claude as well-exercised. A registry entry is only a launch recipe, not native-open proof.
 
 | Provider | Investigated artifact | Native opening evidence | Remaining gate |
 | --- | --- | --- | --- |
@@ -94,6 +96,8 @@ The last 13 are **unverified**, not declared unsupported or removed from scope. 
 
 ## Executed evidence
 
+Evidence below predates the move into pi-delegate.
+
 - `npm run check`: **96 pass, 19 skipped, 0 fail**. The skipped cases are live-provider/worktree gates. This is a pre-change baseline, not proof of the proposed API.
 - Current `Coordinator.execute({action:'spawn', agent:'amp', resumeSessionId:<synthetic T-ID>})`: `RESUME_PROVENANCE_UNKNOWN`; adapter session calls **0**. Confirms the admission barrier without touching a real thread.
 - Actual ACPX plus subprocess fixture, seeded outside coordinator: exact supplied fixture ID loads, provider state remains unchanged; unknown ID rejects and creates no provider session. No real provider or model was involved.
@@ -106,13 +110,13 @@ The last 13 are **unverified**, not declared unsupported or removed from scope. 
 
 Fresh Codex-2 Astra review (`reviewer-610408d9-9283-4215-9fde-93a9aabe7cda`) accepted this implementation contract. Its probe finding was corrected: reject only the exact unknown-session error, not any exception, and inventory the full isolated native session tree. Parent reran the corrected real probe successfully; reviewer independently checked syntax/source, not live provider behavior. Active-turn disconnect, process disposal, and all-provider capabilities remain proof gates.
 
-- [020](../../todos/020-ready-amp-readonly-participant.md): common contract/persistence/lifecycle plus native Pi vertical slice.
+- [020](../../todos/020-complete-amp-readonly-participant.md): common contract/persistence/lifecycle plus native Pi vertical slice.
 - [026](../../todos/026-ready-codex-native-opening.md), [027](../../todos/027-ready-claude-native-opening.md), [028](../../todos/028-ready-opencode-native-opening.md): Codex, Claude, OpenCode create/open/continue evidence.
 - [029](../../todos/029-ready-amp-native-opening.md): Amp local/Orb creation and exact native opening/observation; [021](../../todos/021-ready-amp-approved-contribution.md) then proves an approved contribution.
-- [030](../../todos/030-ready-remaining-native-provider-coverage.md): remaining17 provider delivery routes and bounded children; decision closure is not delivery of those providers.
-- [022](../../todos/022-complete-amp-multiplayer-recovery.md) and [024](../../todos/024-ready-amp-evidence-handoff.md): multiplayer scope decision and evidence handoff. [023](../../todos/023-pending-amp-plugin-bridge.md) stays conditional on a demonstrated 029 gap and explicit user deployment approval.
+- [030](../../todos/030-ready-remaining-native-provider-coverage.md): remaining 17 provider delivery routes and bounded children; decision closure is not delivery of those providers.
+- [022](../../todos/022-complete-amp-multiplayer-recovery.md) and [024](../../todos/024-ready-amp-evidence-handoff.md): multiplayer scope decision and evidence handoff. [023](../../todos/023-complete-amp-plugin-bridge.md) built a plugin bridge; ADR 0001 later removed it in favor of native paths.
 
-019 closed in user-approved main-branch commit `382b9e9`; dependent020 and030 are authorized to start. Production implementation and live provider proofs are still outstanding.
+019 closed in user-approved main-branch commit `382b9e9`; dependent 020 and 030 were authorized to start. Production implementation and live provider proofs are still outstanding.
 
 ## Proof required before claiming delivery
 
@@ -120,7 +124,7 @@ For every supported integration: create a native session independently, capture 
 
 Core deterministic coverage must include scoped-ID collisions, existing owned restoration, no creation-setting replay on open/reconnect, imported history bounds, unsupported capability, native-ID mismatch, no silent fallback, ambiguous delivery, and shutdown races. All existing owned-worker tests must continue passing.
 
-Amp additionally needs existing local and Orb cases, permission failure, active-turn/disconnect evidence, bounded observation, and cross-thread handoff evidence. Participant identity and shared activity remain provider-owned. A plugin is conditional only if an adapter capability cannot supply a required native function; placement/authentication requires an explicit decision before deployment.
+Amp additionally needs existing local and Orb cases, permission failure, active-turn/disconnect evidence, bounded observation, and cross-thread handoff evidence. Participant identity and shared activity remain provider-owned. There is no plugin path: ADR 0001 settled every Amp control on native paths.
 
 [amp]: https://github.com/tao12345666333/amp-acp/blob/e35216d4fd3258445ac8b3ac5db7ef4ce3a40af9/src/server.ts
 [codex]: https://unpkg.com/@agentclientprotocol/codex-acp@1.1.5/dist/index.js

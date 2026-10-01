@@ -1,46 +1,64 @@
 # Architecture and operational contract
 
+This document covers the `acp` backend of `delegate`: the Coordinator, the ACPX runtime and the permission model under it. The public surface is `delegate`/`delegate_ctl`, described in the [README](../README.md) and decided in [ADR 0001](adr/0001-delegate-backends.md). The `pi` backend runs in-process children and is described in the README only.
+
 ## 1. Objective and boundary
 
-`pi-strings` gives a Pi parent a named-worker control plane without PTY scraping or provider-specific orchestration. The production path has exactly one runtime port:
+The `acp` backend gives a Pi parent ACP agent sessions without PTY scraping or provider-specific orchestration. The production path has exactly one runtime port:
 
 ```text
-Parent Pi -> op_* tools -> Coordinator -> AcpxRuntimePort -> vendored ACPX runtime
-                                                        ├─ vendored Pi ACP adapter
-                                                        └─ configured ACP agents
+Parent Pi -> delegate / delegate_ctl -> acp backend (src/acp-backend.ts)
+          -> Coordinator (src/acp/orchestration/coordinator.ts)
+          -> AcpxRuntimePort -> vendored ACPX runtime
+                                ├─ vendored Pi ACP adapter
+                                ├─ vendored Amp ACP adapter
+                                └─ configured ACP agents
 ```
 
-The coordinator owns worker identity, request state, persistence, worktree admission, bounded evidence, deadlines, and lifecycle actions. ACPX owns ACP process/session handling, normalized events, permissions, cancellation primitives, and close.
+There is one Coordinator per process (`src/acp/instance.ts`). The backend owns the delegate run: its run ID, its record, parking and revival, and the mapping to Coordinator actions. The Coordinator owns worker identity, request state, persistence, worktree admission, bounded evidence, deadlines and lifecycle actions. ACPX owns ACP process and session handling, normalized events, permissions, cancellation primitives and close.
 
-## 2. Stable tool contract
+## 2. Coordinator actions
 
-The public actions are `spawn`, `status`, `send`, `wait`, `result`, `list`, `cancel`, and `close`. Responses include `ok`, `action`, and structured details; errors include a stable code, message, and retryability.
+The Coordinator is internal. Callers use `delegate`/`delegate_ctl`, and the backend maps each call to one Coordinator action. The Coordinator worker name never reaches the caller; a run is addressed by its delegate run ID.
+
+| delegate call | Coordinator action |
+|---|---|
+| `delegate backend:"acp"` | `spawn`, then `send` when there is a `task` |
+| `delegate_ctl steer` | `send` on the same worker (after `resume` when the run is parked) |
+| `delegate_ctl wait` | `wait`. A wait deadline never cancels work. |
+| `delegate_ctl status`, `result` | `status`, `result` |
+| `delegate_ctl cancel` | `cancel` of a turn this run started |
+| `delegate_ctl close` | `close`: dispose a created session, disconnect an opened one |
+
+Responses carry `ok`, `action` and structured details. Errors carry a stable code, a message and retryability.
 
 ### `spawn`
 
-`name` is required; `profile` is optional for reusable policy bundles, and `agent` is optional (default `pi`). Without a profile, direct workers use safe read-only defaults (`read`, `grep`, `find`, `ls`); `role: "writer"` selects the explicit writer tool default, or callers may provide `tools`. `cwd`, `model`, and `executionEnvironment` apply to creation. `sessionId` opens an existing provider-native session instead of creating one: opening preserves native settings, rejects creation overrides, and does not decorate prompts or retry. Native opening currently verifies identity through the Pi adapter; other adapters fail with `NATIVE_OPEN_UNSUPPORTED` until they advertise the same capability. Opening a stored Pi session starts a new local executor for that file, not attachment to an already-running terminal process. Names are unique and validated. Writers default to shared isolation (one live writer per canonical cwd); `isolation: "worktree"` remains a profile policy and requires a linked worktree distinct from the parent. A failed spawn registers no half-created worker.
+`agent` is required on the delegate surface. Direct workers use safe read-only tools (`read`, `grep`, `find`, `ls`); `role: "writer"` selects the writer tool default. `cwd`, `model` and `executionEnvironment` apply to creation. A new Amp session needs `executionEnvironment` `local` or `orb`. `sessionId` opens an existing provider-native session instead of creating one: opening keeps native settings, rejects creation overrides, and does not decorate prompts or retry. Native opening verifies identity through the adapter. Today the vendored Pi and Amp adapters do this; other adapters fail `NATIVE_OPEN_UNSUPPORTED` until they advertise the same capability. Opening a stored Pi session starts a new local executor for that file. It does not attach to an already-running terminal process. Writers default to shared isolation (one live writer per canonical cwd). A failed spawn registers no half-created worker.
 
 ### `status`
 
-`name` is required. The coordinator reports origin, native identity/capabilities when opened, and advertised model IDs. Created-worker model discovery still requires ACPX `getStatus`; unsupported discovery fails with `MODEL_DISCOVERY_UNSUPPORTED`.
+The Coordinator reports origin, native identity and capabilities when opened, and advertised model IDs. Created-worker model discovery needs ACPX `getStatus`; unsupported discovery fails `MODEL_DISCOVERY_UNSUPPORTED`. On an opened Amp run, `status` or `result` with `observe: true` reads the thread: one `amp threads export` per call, returning only messages after the persisted cursor (todo 044). A plain status never exports.
 
 ### `send`
 
-`name` and `prompt` are required. An optional `model` is checked against live discovery and selected before the turn; unavailable IDs and unsupported discovery/selection fail explicitly. The selected `requestedModel` is retained in request provenance. It is accepted only for an idle worker and starts exactly one normal prompt turn. A later `send` after terminal completion continues the same persistent session. A second prompt is never submitted while a handle is active; there is no steering or in-flight injection operation.
+`prompt` is required; the backend passes `task` or the steer `message`. An optional `model` is checked against live discovery and selected before the turn; unavailable IDs and unsupported discovery or selection fail explicitly. The selected `requestedModel` is kept in request provenance. `send` is accepted only for an idle worker and starts exactly one prompt turn. A later `send` after terminal completion continues the same persistent session. A second prompt is never submitted while a turn is active.
 
-The coordinator starts ACPX turns with timeout `0` and runs the profile deadline itself. On deadline it records `timed_out`, gates late output/results, attempts cooperative cancellation, closes the stream/runtime within bounded grace, and marks the worker failed and unusable until explicitly closed or replaced.
+The Coordinator starts ACPX turns with timeout `0` and runs the turn deadline itself. On a created session's deadline it records `timed_out` (`TURN_TIMEOUT`), gates late output, attempts cooperative cancellation, closes the stream and runtime within bounded grace, and marks the worker failed and unusable until closed. On an opened session the deadline only stops local observation; the native turn keeps running.
 
-Created-worker prompts are decorated with the role and acceptance contracts based on `kind` (oracle, finder, worker, free). Opened sessions receive the exact prompt, including surrounding whitespace, and never retry or apply stall/turn-budget cancellation. Oracle, finder, and worker kinds are expected to produce a fenced `acceptance-report` block in their output; the coordinator parses it onto the request.
+Created-worker prompts are decorated with the worker contract plus the role and acceptance contracts for the profile's `kind` (oracle, finder, worker, or `free`, the default for direct workers). Opened sessions receive the exact prompt, including surrounding whitespace, and never retry or apply stall or turn-budget cancellation.
 
-For profiles with `fallbackModels` and `maxAttempts > 1`, a retryable provider failure triggers a bounded retry on the same persistent session with the fallback model. The public request ID is stable across retries. Non-retryable failures, cancellations, and policy violations (stall, turn budget) are never retried.
+For profiles with `fallbackModels` and `maxAttempts > 1`, a retryable provider failure triggers a bounded retry on the same session with the fallback model. The request ID stays the same across retries. Non-retryable failures, cancellations and policy violations (stall, turn budget) are never retried.
+
+A turn's delivery is `accepted` only when the provider reports that it completed. Any other outcome (failed, cancelled, transport loss) leaves delivery `unknown`, for created and opened turns alike.
 
 ### `wait` and `result`
 
-`wait` selects a request, worker names, or a fixed `all` snapshot. Its own wait deadline returns control without cancelling work. `result` returns bounded progress or the authoritative terminal record. Terminal completion closes/drains the event stream so an iterator that never ends cannot strand a request. Stream loss before the terminal result is transport failure.
+`wait` takes a fixed snapshot of requests. Its own deadline returns control without cancelling work. `result` returns bounded progress or the authoritative terminal record. Terminal completion closes and drains the event stream, so an iterator that never ends cannot strand a request. Stream loss before the terminal result is a transport failure.
 
 ### `cancel` and `close`
 
-Cancel is cooperative first and escalates after bounded grace; cancellation intent wins over a late normal result. Close may force cancellation, records cleanup failure as a failed unusable worker, and removes the worker only after successful cleanup. Repeated close attempts after a failure can retry cleanup.
+Cancel is cooperative first and escalates after bounded grace; cancellation intent wins over a late normal result. The backend cancels only a turn this run started. Close may force cancellation, records cleanup failure as a failed unusable worker, and removes the worker only after successful cleanup. Repeated close attempts after a failure can retry cleanup. Close on an opened session only disconnects: it never cancels, archives or deletes the native session.
 
 ## 3. State machines and invariants
 
@@ -65,17 +83,17 @@ Each worker has zero or one active request. Each request has one terminal transi
 
 ## 4. Profiles and permissions
 
-A profile contains agent, role, kind (oracle/finder/worker/free), model/options, tools, deadline, cancellation grace, output bound, isolation mode, maxTurns, fallbackModels, and maxAttempts. Profiles are optional policy bundles; direct workers resolve the same domain profile shape from `agent` (default `pi`), role, and tools. The coordinator appends a worker contract prohibiting recursive orchestration, unsafe git operations, package installation, and shared-environment changes. Role contracts and acceptance contracts are appended based on `kind`.
+A profile contains agent, role, kind (oracle/finder/worker/free), model/options, tools, deadline, cancellation grace, output bound, isolation mode, maxTurns, fallbackModels, and maxAttempts. `delegate` never names a profile: it creates direct workers, which resolve the same profile shape from `agent`, `role` and the default tools for that role. Named profiles remain a Coordinator feature. The coordinator appends a worker contract prohibiting recursive orchestration, unsafe git operations, package installation, and shared-environment changes. Role contracts and acceptance contracts are appended based on `kind`.
 
 Permission enforcement is entirely native to ACPX:
 
 - Every role uses ACPX `approve-reads` as its base mode.
 - Read-only workers pass ACPX's native policy with `autoApprove: ["read", "search"]` and `defaultAction: "deny"`; writers pass native `defaultAction: "approve"` so explicit writer turns do not wait for an unavailable permission UI.
-- pi-strings sets ACPX `nonInteractivePermissions: "deny"` as the fallback for unpromptable requests.
+- The runtime sets ACPX `nonInteractivePermissions: "deny"` as the fallback for unpromptable requests.
 - Pi additionally receives its validated `allowedTools` list through the vendored adapter command override.
-- pi-strings does not implement provider-specific permission callbacks or custom permission matching.
+- The backend does not implement provider-specific permission callbacks or custom permission matching.
 
-`permissionMode` and `permissionPolicy` are ACPX choices, not a pi-strings reimplementation. Profile tool lists, ACPX `cwd`, and provider-native sandbox behavior are not claimed as universal enforcement for arbitrary provider-native tools.
+`permissionMode` and `permissionPolicy` are ACPX choices, not a reimplementation. Profile tool lists, ACPX `cwd`, and provider-native sandbox behavior are not claimed as universal enforcement for arbitrary provider-native tools.
 
 Provider-native write scoping is provider-specific and is **not enforced by ACPX params**:
 
@@ -84,11 +102,11 @@ Provider-native write scoping is provider-specific and is **not enforced by ACPX
 - **OpenCode**: confined by its own `permission` config (e.g. `{ edit: "allow", external_directory: "deny" }`), which the boundary test injects.
 - **Claude Code**: supported via ACPX's built-in `claude` registry entry (`npx @agentclientprotocol/claude-agent-acp@^0.64.2`); `agent: "claude"` resolves natively (no override needed). Requires Claude Code subscription access (org-enabled) or an `ANTHROPIC_API_KEY`.
 
-  **Deep-dive (why Claude escapes, and why it is the one that is *ACP-confinable*):** Claude's native `Write`/`Edit` route through the SDK's `canUseTool` hook (`claude-agent-acp/src/acp-agent.ts`), which forwards a real ACP `session/request_permission` to the host in the default (non-bypass) mode. So unlike Codex (Guardian Review) and Amp (`apply_patch`), Claude's write **goes through the ACP permission layer** — ACPX sees it and resolves it via its `permissionPolicy`. The escape happens only because pi-strings gives writers `permissionPolicy: { defaultAction: "approve" }`, and ACPX's `permissionPolicy` shapes (`defaultAction`/`autoApprove`) match by tool kind/name, **not by path** (`vendor/acpx/src/permissions.ts`). The worktree path is never examined.
+  **Deep-dive (why Claude escapes, and why it is the one that is *ACP-confinable*):** Claude's native `Write`/`Edit` route through the SDK's `canUseTool` hook (in claude-agent-acp's `acp-agent.ts`), which forwards a real ACP `session/request_permission` to the host in the default (non-bypass) mode. So unlike Codex (Guardian Review) and Amp (`apply_patch`), Claude's write **goes through the ACP permission layer** — ACPX sees it and resolves it via its `permissionPolicy`. The escape happens only because the backend gives writers `permissionPolicy: { defaultAction: "approve" }`, and ACPX's `permissionPolicy` shapes (`defaultAction`/`autoApprove`) match by tool kind/name, **not by path** (`vendor/acpx/src/permissions.ts`). The worktree path is never examined.
 
   **Implication:** a **path-aware ACPX permission decision** (approve writes only within the worker `cwd`) would confine Claude without forking the provider — the only one of the three native writers where that's true. That would require path-based permission matching at the ACPX host layer (a deliberate step against the thin-proxy "no custom permission matching" stance), or a cwd-scoped policy. Currently not done; Claude's `real … permission boundary` E2E fails on the default approve policy.
 
-`agent: "amp"` is supported via the `amp` registry override (`npx -y amp-acp`); see `tasks/todo.md` and `vendor/codex-acp/README.md`.
+`agent: "amp"` runs the vendored Amp adapter (`vendor/amp-acp`, built to `dist/amp-acp.js`), which drives the locally installed `amp` CLI. See [NATIVE_SESSION_OPENING.md](NATIVE_SESSION_OPENING.md) for its create and open paths.
 
 ### Turn budget and stall detection
 
@@ -96,15 +114,17 @@ Provider-native write scoping is provider-specific and is **not enforced by ACPX
 
 ## 5. Writer isolation
 
-`pi-strings` never creates or removes worktrees implicitly. The default isolation mode is `shared`: the writer runs in the given `cwd` and one live writer per canonical cwd is enforced. A second writer in the same cwd is rejected with `WRITER_CWD_OWNED`.
+The backend never creates or removes worktrees implicitly. The default isolation mode is `shared`: the writer runs in the given `cwd` and one live writer per canonical cwd is enforced. A second ACP writer in the same cwd is rejected with `WRITER_CWD_OWNED`. This check covers ACP workers only; the pi backend checks its own writers separately.
 
 `isolation: "worktree"` is opt-in compatibility mode. In that mode, `cwd` must be an existing linked worktree, differ from the parent checkout, and remain unowned by another live writer. Isolation is revalidated before each turn.
 
 Future stronger isolation may use CoW (copy-on-write) temp copies of the repo rather than worktrees.
 
-## 6. Persistence and recovery
+## 6. Persistence, parking and revival
 
-State root: `${PI_AGENT_DIR:-~/.pi/agent}/pi-strings/`.
+Two layers persist state.
+
+**Coordinator state.** The root is `${PI_AGENT_DIR:-~/.pi/agent}/pi-strings/`. The directory kept its pre-merge name.
 
 ```text
 state.json                    worker registry and bounded request results
@@ -113,7 +133,15 @@ requests/<request-id>.ndjson  normalized event log
 acpx/                         ACPX session records
 ```
 
-Directories are mode 0700 and files mode 0600. State is atomically replaced, locked, and strictly schema-validated. Direct workers persist their validated tool list (and selected creation-time model) so restart reconstruction cannot broaden policy. The current version deliberately does not accept legacy `waiting` statuses or `questions`; such state returns `STATE_CORRUPT` rather than silently discarding authority data. Requests left running after parent loss become `PARENT_PROCESS_LOST`; idle persistent sessions may reconnect with identity validation.
+Directories are mode 0700 and files mode 0600. State is atomically replaced, locked and strictly schema-validated. Direct workers persist their validated tool list (and selected creation-time model) so restart reconstruction cannot broaden policy. The current version does not accept legacy `waiting` statuses or `questions`; such state returns `STATE_CORRUPT` rather than silently discarding authority data. Requests left running after parent loss become `PARENT_PROCESS_LOST`.
+
+**Delegate run records (043).** The backend saves each ACP run's record under the parent's `.agents/pi/subsessions/owners/<parent>/acp/` at every lifecycle step: identity, origin, native session, turns with request IDs, delivery, outcome and output.
+
+- On parent exit the run is parked, not closed. Its session is released through the Coordinator the way close releases it: a created session is closed without discarding it, and an opened one is disconnected. No agent process outlives the parent. The record says parked. A turn still running then ends as `PARENT_PROCESS_LOST` with delivery `unknown`.
+- A later process restores the record without starting anything. `status`, `result` and `wait` read it without constructing a Coordinator.
+- `steer` reopens a parked run under the same worker name. An opened run goes through the native-opening path with the same native ID and an identity check. A created run goes through the Coordinator's owned `resume`, which needs the adapter's ACP `session/resume` or `session/load`; otherwise steer fails `RUN_NOT_RESUMABLE` and the record stays readable.
+- A run whose owning process died is adopted parked. A run that another live Pi process owns is a read-only snapshot (`RUN_OWNED_ELSEWHERE`). A run that cannot be recorded is released (`RUN_NOT_PERSISTED`).
+- `delegate_ctl close` is final. A closed run is never reopened.
 
 Shutdown rejects new work, lets an already-running action tail finish, and prevents queued mutating actions from creating untracked workers before runtime cleanup.
 
@@ -121,16 +149,16 @@ Shutdown rejects new work, lets an already-running action tail finish, and preve
 
 `vendor/acpx/` contains the auditable ACPX `0.13.0` source snapshot at commit `e91cc504` (PR #468). `npm run build` emits the runtime and declarations under `dist/acpx-runtime`; `src/acp/runtime/acpx-runtime.ts` imports that generated local module. The port normalizes ACPX events into local types, exposes `getStatus().models.currentModelId`/`availableModelIds`, and passes `timeoutMs: 0` both at runtime construction and turn start. Any ACPX upgrade requires contract tests for session continuity, model discovery/selection, event/result ordering, cancellation, close, permissions, and state compatibility.
 
-The vendored Pi adapter remains an ACP executable adapter, not a second runtime implementation. Embedded workers share the parent extension process lifetime; active work is not claimed durable across parent loss.
+The vendored Pi and Amp adapters are ACP executable adapters, not second runtime implementations. Agent processes share the parent's lifetime: a parked run's session is released, and a turn running at parent exit is not claimed durable.
 
 ## 8. Observability and failure table
 
-`status` exposes live model discovery (`currentModelId`, `availableModelIds`); `list` and `result` expose worker/request status, IDs, timestamps, bounded output, event paths, model provenance, and diagnostics. Raw ACP tool payloads are not retained by the runtime facade. tmux is optional human observation only.
+Coordinator `status` exposes live model discovery (`currentModelId`, `availableModelIds`); its `list` and `result` expose worker/request status, IDs, timestamps, bounded output, event paths, model provenance, and diagnostics. Raw ACP tool payloads are not retained by the runtime facade. tmux is optional human observation only.
 
 | Failure | Required behavior |
 |---|---|
 | Missing/invalid agent | Spawn fails without registering a worker |
-| Model discovery unsupported | `op_status` or a requested model fails explicitly with `MODEL_DISCOVERY_UNSUPPORTED` |
+| Model discovery unsupported | Coordinator `status` or a requested model fails explicitly with `MODEL_DISCOVERY_UNSUPPORTED` |
 | Model unavailable | Spawn/send fails explicitly with `MODEL_UNAVAILABLE`; no turn starts |
 | Model selection unsupported/fails | Requested spawn/send fails explicitly with `MODEL_SELECTION_UNSUPPORTED` or `MODEL_SELECTION_FAILED` |
 | Provider error (retryable) | Request retries on fallback model if configured; otherwise `failed` with provider diagnostic |
@@ -141,6 +169,8 @@ The vendored Pi adapter remains an ACP executable adapter, not a second runtime 
 | Repeated identical tool call | Request is `failed` with `STALLED`; no retry |
 | Ignored cancel | Escalate; request remains `cancelled` |
 | Close rejection/timeout | Worker remains persisted as `failed`, never `closing` indefinitely |
-| Parent loss | Active requests become `PARENT_PROCESS_LOST` on restart |
+| Parent loss | Active requests become `PARENT_PROCESS_LOST`; the delegate run is parked |
+| Parked created run, adapter cannot resume | `steer` fails `RUN_NOT_RESUMABLE`; the record stays readable |
+| Run owned by another live Pi process | Read-only snapshot; actions fail `RUN_OWNED_ELSEWHERE` |
 | Corrupt state | Return `STATE_CORRUPT`; do not reset silently |
 | Output exceeds bound | Continue draining to private log; retain bounded summary |
