@@ -5,6 +5,8 @@ import { AgentSideConnection, ndJsonStream } from "@agentclientprotocol/sdk";
 const stateArgument = process.argv[2];
 if (!stateArgument) throw new Error("state path is required");
 const statePath: string = stateArgument;
+// "no-load": an agent that cannot resume or load a session, so a closed session cannot be reopened.
+const canLoad = process.argv[3] !== "no-load";
 type FixtureState = Record<string, { nonce?: string }>;
 async function load(): Promise<FixtureState> { try { return JSON.parse(await readFile(statePath, "utf8")) as FixtureState; } catch { return {}; } }
 async function save(state: FixtureState): Promise<void> { await writeFile(statePath, JSON.stringify(state)); }
@@ -13,7 +15,7 @@ const waits = new Map<string, () => void>();
 let connection: any;
 const agent: any = {
   async initialize(params: any) {
-    return { protocolVersion: params.protocolVersion === 1 ? 1 : 1, agentInfo: { name: "pi-strings-fixture", version: "1" }, authMethods: [], agentCapabilities: { loadSession: true, promptCapabilities: { image: false, audio: false, embeddedContext: false }, mcpCapabilities: { http: false, sse: false }, sessionCapabilities: { close: {} } } };
+    return { protocolVersion: params.protocolVersion === 1 ? 1 : 1, agentInfo: { name: "pi-strings-fixture", version: "1" }, authMethods: [], agentCapabilities: { loadSession: canLoad, promptCapabilities: { image: false, audio: false, embeddedContext: false }, mcpCapabilities: { http: false, sse: false }, sessionCapabilities: { close: {} } } };
   },
   async newSession() {
     const sessionId = `fixture-${randomUUID()}`;
@@ -29,6 +31,7 @@ const agent: any = {
     const text = params.prompt.map((block: any) => block.type === "text" ? block.text : "").join("");
     const state = await load(); const session = state[params.sessionId] ??= {};
     const set = /SET:([^\s]+)/.exec(text)?.[1]; if (set) { session.nonce = set; await save(state); }
+    if (text.includes("FAIL")) throw new Error("fixture provider failure");
     if (text.includes("WAIT")) await new Promise<void>(resolve => waits.set(params.sessionId, resolve));
     if (text.includes("PERMISSIONS")) {
       for (const kind of ["read", "edit"]) {
@@ -43,7 +46,7 @@ const agent: any = {
         await connection.sessionUpdate({ sessionId: params.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `${kind}:${permission.outcome.outcome}:${permission.outcome.outcome === "selected" ? permission.outcome.optionId : "cancelled"}` } } });
       }
     }
-    const output = text.includes("GET") ? `NONCE:${session.nonce ?? "missing"}` : text.includes("WAIT") ? "CANCELLED" : "READY";
+    const output = text.includes("GET") ? `NONCE:${session.nonce ?? "missing"}` : text.includes("WAIT") ? "CANCELLED" : text.includes("BIG") ? "x".repeat(300_000) : "READY";
     await connection.sessionUpdate({ sessionId: params.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: output } } });
     return { stopReason: text.includes("WAIT") ? "cancelled" : "end_turn" };
   },

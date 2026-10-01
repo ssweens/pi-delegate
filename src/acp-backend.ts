@@ -1,14 +1,27 @@
 /**
- * The `acp` backend (todo 042): `delegate`/`delegate_ctl` over the process's one Coordinator.
+ * The `acp` backend (todos 042, 043): `delegate`/`delegate_ctl` over the process's one Coordinator.
  *
- * Each mapping is thin and keeps Coordinator semantics (043 hardens the lifecycle):
- * create = spawn + first send, open = spawn with sessionId (+ send when there is a task),
- * steer = send, wait = Coordinator wait (a timeout never cancels), cancel = cancel of a turn this
- * run started, close = close (dispose created, disconnect opened). A run is addressed by its
- * delegate run ID; the Coordinator worker name stays internal.
+ * Each mapping is thin and keeps Coordinator semantics: create = spawn + first send, open = spawn
+ * with sessionId (+ send when there is a task), steer = send, wait = Coordinator wait (a timeout
+ * never cancels), cancel = cancel of a turn this run started, close = close (dispose created,
+ * disconnect opened). A run is addressed by its delegate run ID; the Coordinator worker name stays
+ * internal.
+ *
+ * Runs are durable like pi runs (043). Each run's record (identity, origin, native session, turns
+ * with request IDs, delivery, outcome and output) is saved under the parent's subsession directory
+ * at every lifecycle step. On parent exit the run is parked: its session is released through the
+ * Coordinator (a created session closed without discarding it, an opened one only disconnected), so
+ * no process outlives the parent, and the record says parked, not closed. A later process restores
+ * the record without starting anything; status and result read it. A steer reopens a parked run
+ * under the same worker name: an opened run through the Coordinator's native-opening path with the
+ * same native ID, a created run through the Coordinator's owned resume, which needs the adapter's
+ * session/resume or session/load and fails RUN_NOT_RESUMABLE otherwise. delegate_ctl close is final.
  */
 import { randomUUID } from "node:crypto";
+import { existsSync, readdirSync } from "node:fs";
+import { join } from "node:path";
 import type { RequestRecord, SessionOrigin, StringsResponse, WorkerRecord, WorkerRole } from "./acp/domain/types.js";
+import type { Coordinator } from "./acp/orchestration/coordinator.js";
 import { acpAgents, acpCoordinator, existingAcpCoordinator } from "./acp/instance.js";
 import {
 	type AcpRunView,
@@ -30,6 +43,7 @@ import {
 	turnView,
 } from "./backend.js";
 import { elapsed } from "./render.js";
+import { ownedElsewhere, processOwner, readRecord, type RunOwner, writeRecord } from "./storage.js";
 import type { ChildActivity } from "./transcript.js";
 
 /** A failure the tool layer reports by code: a contract violation, or a Coordinator error passed through. */
@@ -46,11 +60,11 @@ export function unwrap<T>(validated: Validated<T>): T {
 }
 function contractError(error: ContractError): DelegateError { return new DelegateError(error.code, error.message, error.field); }
 
-/** What this backend records about a run. The Coordinator owns the session and its turns. */
-interface AcpRunRecord {
+/** What this backend records about a run. The Coordinator owns the live session and its turns. */
+interface AcpRunRecord extends Partial<RunOwner> {
 	id: string;
 	ownerKey: string;
-	/** Coordinator worker name. Internal: never shown in text, never accepted from a caller. */
+	/** Coordinator worker name. Internal: never shown in text, never accepted from a caller. Reused when a parked run is reopened. */
 	worker: string;
 	agent: string;
 	origin: SessionOrigin;
@@ -60,17 +74,30 @@ interface AcpRunRecord {
 	model?: string;
 	/** Per-turn budget from delegate; steer reuses it unless it passes its own. */
 	timeoutMs?: number;
+	/** How an opened run was opened, so reopening it targets exactly that native session. */
+	open?: { sessionId: string; cwd?: string; executionEnvironment?: string };
 	startedAt: number;
 	closedAt?: number;
-	/** Last seen worker and turns, so a closed run (or a Coordinator not yet restored) still shows its session. */
+	/** The parent exited, or its process died, and the session was released. Steer reopens it. */
+	parkedAt?: number;
+	/** The turn that was still running when the run was parked. */
+	interruptedTurn?: string;
+	/** Last seen worker and turns, so a closed or parked run (or a Coordinator not yet restored) still shows its session. */
 	last?: { worker?: WorkerRecord; requests: RequestRecord[] };
 	/** What each turn was sent, by request ID, for the child view. */
 	prompts: Record<string, string>;
+	// In-process only, never saved:
 	/** Joined delegate_ctl waits. A turn that settles while one is joined reports to it instead of waking the parent. */
 	waiters: number;
 	/** Turns a joined wait already returned: their settlement was delivered, so they wake no one. */
 	claimed: Set<string>;
+	/** Owned by another live Pi process: read-only here, never written or released. */
+	foreign?: true;
+	/** A reopening in flight, so concurrent steers reopen once. */
+	reviving?: Promise<void>;
 }
+
+type AcpRunFile = Omit<AcpRunRecord, "waiters" | "claimed" | "foreign" | "reviving"> & { version: 1; backend: "acp"; savedAt: number };
 
 // Process-wide like the pi runtime state: a /reload rebinds the tools, the runs stay.
 const RUNS_KEY = Symbol.for("@ssweens/pi-delegate/acp-runs/1");
@@ -93,11 +120,18 @@ function coordinatorError(response: Extract<StringsResponse, { ok: false }>, run
 	return new DelegateError(response.error.code, message);
 }
 
+/** Turns in send order: the saved ones, updated by what the Coordinator holds now. */
+function mergeRequests(saved: readonly RequestRecord[], live: readonly RequestRecord[]): RequestRecord[] {
+	const byId = new Map(saved.map((request) => [request.id, request]));
+	for (const request of live) byId.set(request.id, request);
+	return [...byId.values()];
+}
+
 function view(run: AcpRunRecord): AcpRunView {
-	const live = existingAcpCoordinator()?.snapshot(run.worker);
-	// A closed worker leaves the Coordinator, and a restored one may not be loaded yet: keep what was last seen.
-	if (live?.worker) run.last = { worker: live.worker, requests: live.requests };
-	else if (live?.requests.length) run.last = { ...run.last, requests: live.requests };
+	// A parked run's session was released; a Coordinator that holds its old turns still reports them.
+	const live = run.foreign ? undefined : existingAcpCoordinator()?.snapshot(run.worker);
+	if (live?.worker) run.last = { worker: live.worker, requests: mergeRequests(run.last?.requests ?? [], live.requests) };
+	else if (live?.requests.length) run.last = { ...run.last, requests: mergeRequests(run.last?.requests ?? [], live.requests) };
 	const worker = run.last?.worker;
 	const requests = run.last?.requests ?? [];
 	const turns = requests.map(turnView);
@@ -137,8 +171,21 @@ function view(run: AcpRunRecord): AcpRunView {
 	const endedAt = run.closedAt ?? (status === "running" || status === "idle" ? undefined : finishedAt);
 	if (endedAt !== undefined) v.endedAt = endedAt;
 	if (run.closedAt !== undefined) v.closed = true;
+	else if (run.parkedAt !== undefined) v.parked = { at: run.parkedAt, ...(run.interruptedTurn ? { interruptedTurn: run.interruptedTurn } : {}) };
+	if (run.foreign) v.foreign = { ownerPid: run.ownerPid ?? 0, ownerHost: run.ownerHost ?? "" };
 	if (latest?.failure) v.error = `${latest.failure.code}: ${latest.failure.message}`;
 	return v;
+}
+
+/** One wait's hold on its runs. While held, a turn that settles reports to the wait instead of waking the parent. */
+export interface AcpJoin {
+	views(): AcpRunView[];
+	/** Block until a pending run's turn settles or `ms` passes. False when no Coordinator can report them (shut down, or another process owns them). */
+	next(pending: readonly AcpRunView[], ms: number): Promise<boolean>;
+	/** These settled runs were reported by the wait: they wake no one. */
+	claim(settled: readonly AcpRunView[]): void;
+	/** End the hold. With redeliver, a turn that settled during the wait but was never reported wakes the parent as usual. */
+	release(redeliver: boolean): void;
 }
 
 export interface AcpBackendHooks {
@@ -148,7 +195,11 @@ export interface AcpBackendHooks {
 	changed(): void;
 	/** A turn settled while no wait was joined to its run: wake that run's parent. */
 	settled(view: AcpRunView, ownerKey: string): void;
+	/** Where this parent's ACP run records live. */
+	runDir(ownerKey: string): string;
 }
+
+const RESUME_REFUSALS = new Set(["RESUME_UNSUPPORTED", "RESUME_PROVENANCE_UNKNOWN"]);
 
 export class AcpBackend implements DelegateBackend<"acp"> {
 	readonly name = "acp" as const;
@@ -167,8 +218,71 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 		return run;
 	}
 
+	/** A run another live process owns is read-only here: it can be read, never steered, cancelled or closed. */
+	private writable(run: AcpRunRecord): void {
+		if (run.foreign) throw new DelegateError("RUN_OWNED_ELSEWHERE", `${run.id} is owned by another live Pi process (pid ${run.ownerPid} on ${run.ownerHost}); it is read-only here. Use that session, or wait for it to exit.`);
+	}
+
 	owned(ownerKey: string): AcpRunView[] {
 		return [...registry().values()].filter((run) => run.ownerKey === ownerKey).map(view);
+	}
+
+	// --- Durable records -----------------------------------------------------------------------
+
+	private recordPath(run: Pick<AcpRunRecord, "id" | "ownerKey">): string {
+		return join(this.hooks.runDir(run.ownerKey), `${encodeURIComponent(run.id)}.json`);
+	}
+
+	/** Save the run as last seen. Never writes a run another live process owns. */
+	private save(run: AcpRunRecord): void {
+		if (run.foreign) return;
+		view(run);
+		const { waiters: _waiters, claimed: _claimed, foreign: _foreign, reviving: _reviving, ...record } = run;
+		writeRecord(this.recordPath(run), { ...record, version: 1, backend: "acp", savedAt: Date.now() } satisfies AcpRunFile);
+	}
+
+	/** Background saves (a turn settling) must not fail the turn; the next lifecycle step saves again. */
+	private saveQuietly(run: AcpRunRecord): void {
+		try { this.save(run); } catch { /* the previous record stays; the next save retries */ }
+	}
+
+	/**
+	 * Load a parent's saved runs without starting anything. A run whose owner process died is
+	 * adopted and parked; a turn that was running then is lost, as the Coordinator records it.
+	 * A run another live process owns is shown read-only. A corrupt record fails the attach.
+	 */
+	restore(ownerKey: string): void {
+		const dir = this.hooks.runDir(ownerKey);
+		if (!existsSync(dir)) return;
+		const restored: AcpRunRecord[] = [];
+		for (const name of readdirSync(dir).filter((n) => n.endsWith(".json")).sort()) {
+			const path = join(dir, name);
+			const record = readRecord<AcpRunFile>(path);
+			if (!record || record.version !== 1 || record.backend !== "acp" || record.ownerKey !== ownerKey || typeof record.id !== "string" ||
+				typeof record.worker !== "string" || typeof record.agent !== "string" || typeof record.cwd !== "string" || typeof record.startedAt !== "number" ||
+				(record.origin !== "created" && record.origin !== "opened") || typeof record.prompts !== "object" || record.prompts === null) {
+				throw new Error(`Cannot restore delegate metadata: ${path}`);
+			}
+			if (registry().has(record.id)) continue;
+			const { version: _version, backend: _backend, savedAt, ...fields } = record;
+			const run: AcpRunRecord = { ...fields, waiters: 0, claimed: new Set() };
+			if (ownedElsewhere(run)) { run.foreign = true; restored.push(run); continue; }
+			Object.assign(run, processOwner());
+			if (run.closedAt === undefined && run.parkedAt === undefined) {
+				// Its process ended without parking it: nothing holds its session now.
+				run.parkedAt = savedAt;
+				for (const request of run.last?.requests ?? []) {
+					if (request.status !== "running") continue;
+					request.status = "failed";
+					request.finishedAt = new Date(savedAt).toISOString();
+					request.failure = { code: "PARENT_PROCESS_LOST", message: "Pi exited before this request reached a terminal result.", retryable: request.delivery === undefined };
+					if (request.delivery !== undefined) request.delivery = "unknown";
+					run.interruptedTurn = request.id;
+				}
+			}
+			restored.push(run);
+		}
+		for (const run of restored) { registry().set(run.id, run); this.save(run); }
 	}
 
 	/** The run's turns as a conversation for the child view: each prompt sent, then the agent's output. */
@@ -207,15 +321,17 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 		const uuid = randomUUID();
 		const run: AcpRunRecord = {
 			id: `${slug(agent)}-${uuid}`, ownerKey, worker: `w-${uuid}`, agent, origin: input.origin,
-			cwd: input.cwd ?? process.cwd(), startedAt: Date.now(), prompts: {}, waiters: 0, claimed: new Set(),
+			cwd: input.cwd ?? process.cwd(), startedAt: Date.now(), prompts: {}, waiters: 0, claimed: new Set(), ...processOwner(),
 		};
 		if (input.task !== undefined) run.task = input.task;
 		if (input.timeoutMs !== undefined) run.timeoutMs = input.timeoutMs;
 		const spawn: Record<string, unknown> & { action: string } = { action: "spawn", name: run.worker, agent };
 		if (input.cwd !== undefined) spawn.cwd = input.cwd;
 		if (input.executionEnvironment) spawn.executionEnvironment = input.executionEnvironment;
-		if (input.origin === "opened") spawn.sessionId = input.sessionId;
-		else {
+		if (input.origin === "opened") {
+			spawn.sessionId = input.sessionId;
+			run.open = { sessionId: input.sessionId, ...(input.cwd !== undefined ? { cwd: input.cwd } : {}), ...(input.executionEnvironment ? { executionEnvironment: input.executionEnvironment } : {}) };
+		} else {
 			if (input.role) { spawn.role = input.role; run.role = input.role; }
 			if (input.model) { spawn.model = input.model; run.model = input.model; }
 		}
@@ -235,16 +351,25 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 			run.prompts[String(sent.details.requestId)] = input.task;
 			this.watch(run, String(sent.details.requestId));
 		}
+		try { this.save(run); }
+		catch (error) {
+			// An unrecorded run could not be found again after a restart: refuse it rather than run it untracked.
+			registry().delete(run.id);
+			await coordinator.execute({ action: "close", name: run.worker, force: true }).catch(() => undefined);
+			throw new DelegateError("RUN_NOT_PERSISTED", `${run.id} could not be recorded, so it was released: ${String(error)}`);
+		}
 		this.hooks.changed();
 		return view(run);
 	}
 
 	async steer(runId: string, input: SteerRequest): Promise<AcpRunView> {
 		const run = this.get(runId);
+		this.writable(run);
 		unwrap(requireAction(acpCapabilities(run), "steer"));
 		if (run.closedAt !== undefined) throw new DelegateError("RUN_CLOSED", `${run.id} is closed; start a new run with delegate`);
 		const timeoutMs = input.timeoutMs ?? run.timeoutMs;
 		const coordinator = await acpCoordinator();
+		if (run.parkedAt !== undefined) await this.revive(run, coordinator);
 		const sent = await coordinator.execute({
 			action: "send", name: run.worker, prompt: input.message,
 			...(input.model !== undefined ? { model: input.model } : {}),
@@ -254,42 +379,132 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 		if (input.model !== undefined) run.model = input.model;
 		run.prompts[String(sent.details.requestId)] = input.message;
 		this.watch(run, String(sent.details.requestId));
+		this.saveQuietly(run);
 		this.hooks.changed();
 		return view(run);
 	}
 
 	/**
-	 * Join runs until the mode is satisfied. A timeout, an abort or queued parent messages end the
-	 * wait only: nothing is cancelled. Coordinator waits are sliced so those checks stay prompt.
+	 * Reopen a parked run under its worker name. Opened: the Coordinator's native-opening path with
+	 * the same native ID, and the reopened session must still be the one recorded. Created: the
+	 * Coordinator's owned resume. Either way nothing new is created in place of the old session.
 	 */
-	async wait(request: WaitRequest, signal?: AbortSignal, interrupted?: () => boolean): Promise<WaitOutcome<AcpRunView>> {
-		const runs = request.runIds.map((id) => this.get(id));
+	private async revive(run: AcpRunRecord, coordinator: Coordinator): Promise<void> {
+		run.reviving ??= (async () => {
+			// A process that died without parking can leave its worker in the Coordinator's state.
+			// An idle one the Coordinator already reconnected is the session itself; anything else is released first.
+			const stale = coordinator.snapshot(run.worker).worker;
+			if (stale && stale.status !== "idle") {
+				const released = await coordinator.execute({ action: "close", name: run.worker, force: true });
+				if (!released.ok) throw coordinatorError(released, run);
+			}
+			if (stale?.status !== "idle") {
+				if (run.origin === "opened") await this.reopen(run, coordinator);
+				else await this.resume(run, coordinator);
+			}
+			delete run.parkedAt;
+			delete run.interruptedTurn;
+			this.save(run);
+			this.hooks.changed();
+		})().finally(() => { delete run.reviving; });
+		await run.reviving;
+	}
+
+	private async reopen(run: AcpRunRecord, coordinator: Coordinator): Promise<void> {
+		const recorded = run.last?.worker?.native;
+		const open = run.open ?? (recorded ? { sessionId: recorded.id } : undefined);
+		if (!open) throw new DelegateError("RUN_NOT_RESUMABLE", `${run.id} has no recorded native session ID to reopen; open it again with delegate sessionId`);
+		const spawned = await coordinator.execute({
+			action: "spawn", name: run.worker, agent: run.agent, sessionId: open.sessionId,
+			...(open.cwd !== undefined ? { cwd: open.cwd } : {}),
+			...(open.executionEnvironment ? { executionEnvironment: open.executionEnvironment } : {}),
+		});
+		if (!spawned.ok) throw coordinatorError(spawned, run);
+		const native = coordinator.snapshot(run.worker).worker?.native;
+		if (recorded && (!native || native.id !== recorded.id || native.scope !== recorded.scope || native.cwd !== recorded.cwd || native.executionEnvironment !== recorded.executionEnvironment)) {
+			await coordinator.execute({ action: "close", name: run.worker }).catch(() => undefined);
+			throw new DelegateError("SESSION_IDENTITY_CHANGED", `${run.id}: native session ${recorded.id} no longer has the storage scope, workspace or executor it was opened with; it was disconnected, not reopened.`);
+		}
+	}
+
+	private async resume(run: AcpRunRecord, coordinator: Coordinator): Promise<void> {
+		const worker = run.last?.worker;
+		const sessionId = worker?.handle.backendSessionId ?? worker?.handle.agentSessionId;
+		if (!worker || !sessionId) throw new DelegateError("RUN_NOT_RESUMABLE", `${run.id} has no recorded ACP session to resume; start a new run with delegate`);
+		const resumed = await coordinator.execute({
+			action: "resume", name: run.worker, agent: run.agent, sessionId, cwd: worker.cwd, role: worker.role, tools: worker.profile.tools,
+			...(worker.model ? { model: worker.model } : {}),
+		});
+		if (resumed.ok) return;
+		if (RESUME_REFUSALS.has(resumed.error.code)) {
+			throw new DelegateError("RUN_NOT_RESUMABLE", `${run.id} cannot be reopened (${resumed.error.code}: ${resumed.error.message}). Its record stays readable; start a new run with delegate.`);
+		}
+		throw coordinatorError(resumed, run);
+	}
+
+	/** Hold runs for one wait. Used by wait here and by the tool layer's mixed-backend wait. */
+	join(runIds: readonly string[]): AcpJoin {
+		const runs = runIds.map((id) => this.get(id));
 		for (const run of runs) unwrap(requireAction(acpCapabilities(run), "wait"));
-		const deadline = request.timeoutMs === undefined ? Number.POSITIVE_INFINITY : Date.now() + request.timeoutMs;
+		// The turns running when the wait began: if one settles and the wait never reports it, it still wakes the parent.
+		const runningAtJoin = new Map(runs.flatMap((run) => { const v = view(run); const turn = v.turns.at(-1); return v.status === "running" && turn ? [[run.id, turn.requestId] as const] : []; }));
 		for (const run of runs) run.waiters += 1;
-		try {
-			for (;;) {
-				const views = runs.map(view);
-				const settled = views.filter((v) => v.status !== "running");
-				const pending = views.filter((v) => v.status === "running");
-				if (request.mode === "any" ? settled.length > 0 : pending.length === 0) {
-					for (const v of settled) { const turn = v.turns.at(-1); if (turn) registry().get(v.id)?.claimed.add(turn.requestId); }
-					return { reason: "settled", settled, pending: pending.map((v) => v.id) };
-				}
-				if (signal?.aborted) throw new DOMException("Wait cancelled; the runs are unaffected.", "AbortError");
-				if (interrupted?.()) return { reason: "interrupted", settled, pending: pending.map((v) => v.id) };
-				const left = deadline - Date.now();
-				if (left <= 0) return { reason: "timeout", settled, pending: pending.map((v) => v.id) };
+		let released = false;
+		return {
+			views: () => runs.map(view),
+			next: async (pending, ms) => {
 				const coordinator = existingAcpCoordinator();
-				if (!coordinator) return { reason: "lost", settled, pending: pending.map((v) => v.id) };
-				const waited = await coordinator.execute({ action: "wait", names: pending.map((v) => v.session.worker), mode: "any", waitTimeoutMs: Math.min(WAIT_SLICE_MS, left) });
+				const names = coordinator ? pending.filter((v) => coordinator.snapshot(v.session.worker).worker).map((v) => v.session.worker) : [];
+				if (!coordinator || !names.length) return false;
+				const waited = await coordinator.execute({ action: "wait", names, mode: "any", waitTimeoutMs: ms });
 				if (!waited.ok) {
-					if (waited.error.code === "COORDINATOR_SHUTTING_DOWN") return { reason: "lost", settled, pending: pending.map((v) => v.id) };
+					if (waited.error.code === "COORDINATOR_SHUTTING_DOWN") return false;
 					throw coordinatorError(waited);
 				}
+				return true;
+			},
+			claim: (settled) => {
+				for (const v of settled) { const turn = v.turns.at(-1); if (turn) registry().get(v.id)?.claimed.add(turn.requestId); }
+			},
+			release: (redeliver) => {
+				if (released) return;
+				released = true;
+				for (const run of runs) {
+					run.waiters -= 1;
+					const requestId = runningAtJoin.get(run.id);
+					if (!redeliver || run.waiters > 0 || !requestId || run.claimed.has(requestId) || !registry().has(run.id)) continue;
+					const current = view(run);
+					if (current.status !== "running" && current.turns.at(-1)?.requestId === requestId) { run.claimed.add(requestId); this.hooks.settled(current, run.ownerKey); }
+				}
+			},
+		};
+	}
+
+	/**
+	 * Join runs until the mode is satisfied. A timeout, an abort or queued parent messages end the
+	 * wait only: nothing is cancelled. Coordinator waits are sliced so those checks stay prompt.
+	 * Every run a returned outcome reports as settled is delivered by it; an abort delivers nothing,
+	 * so a turn that settled meanwhile wakes the parent as it would have without the wait.
+	 */
+	async wait(request: WaitRequest, signal?: AbortSignal, interrupted?: () => boolean): Promise<WaitOutcome<AcpRunView>> {
+		const join = this.join(request.runIds);
+		const deadline = request.timeoutMs === undefined ? Number.POSITIVE_INFINITY : Date.now() + request.timeoutMs;
+		let aborted = false;
+		try {
+			for (;;) {
+				const views = join.views();
+				const settled = views.filter((v) => v.status !== "running");
+				const pending = views.filter((v) => v.status === "running");
+				const end = (reason: WaitOutcome<AcpRunView>["reason"]): WaitOutcome<AcpRunView> => { join.claim(settled); return { reason, settled, pending: pending.map((v) => v.id) }; };
+				if (request.mode === "any" ? settled.length > 0 : pending.length === 0) return end("settled");
+				if (signal?.aborted) { aborted = true; throw new DOMException("Wait cancelled; the runs are unaffected.", "AbortError"); }
+				if (interrupted?.()) return end("interrupted");
+				const left = deadline - Date.now();
+				if (left <= 0) return end("timeout");
+				if (!(await join.next(pending, Math.min(WAIT_SLICE_MS, left)))) return end("lost");
 			}
 		} finally {
-			for (const run of runs) run.waiters -= 1;
+			join.release(aborted);
 		}
 	}
 
@@ -310,21 +525,41 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 
 	async cancel(runId: string, input: CancelRequest): Promise<AcpRunView> {
 		const run = this.get(runId);
+		this.writable(run);
 		const current = view(run);
 		// Every turn this run can see is one it sent: a turn another participant started is not a request here.
 		unwrap(checkCancel(current.capabilities, current.status === "running" ? "own" : "none"));
 		if (current.status !== "running") throw new DelegateError("WORKER_NOT_RUNNING", `${run.id} has no active turn to cancel`);
 		const coordinator = await acpCoordinator();
 		const cancelled = await coordinator.execute({ action: "cancel", name: run.worker, ...(input.reason ? { reason: input.reason } : {}) });
+		this.saveQuietly(run);
 		this.hooks.changed();
 		if (!cancelled.ok) throw coordinatorError(cancelled, run);
 		return view(run);
 	}
 
+	/** Final: a closed run is never reopened. A parked run's session was already released when it parked. */
 	async close(runId: string, input: CloseRequest): Promise<AcpRunView> {
 		const run = this.get(runId);
 		if (run.closedAt !== undefined) return view(run);
+		this.writable(run);
 		unwrap(checkClose(acpCapabilities(run), input));
+		if (run.parkedAt !== undefined) {
+			// Discarding a created session's saved state needs the session back first; anything else needs no process at all.
+			if (input.discardPersistentState === true) await this.revive(run, await acpCoordinator());
+			else {
+				const coordinator = existingAcpCoordinator();
+				if (coordinator?.snapshot(run.worker).worker) {
+					const released = await coordinator.execute({ action: "close", name: run.worker, force: true });
+					if (!released.ok) throw coordinatorError(released, run);
+				}
+				run.closedAt = Date.now();
+				delete run.parkedAt;
+				this.save(run);
+				this.hooks.changed();
+				return view(run);
+			}
+		}
 		const coordinator = await acpCoordinator();
 		view(run); // Keep the session as last seen: the Coordinator forgets a closed worker.
 		const closed = await coordinator.execute({
@@ -332,19 +567,33 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 			...(input.force !== undefined ? { force: input.force } : {}),
 			...(input.discardPersistentState !== undefined ? { discardPersistentState: input.discardPersistentState } : {}),
 		});
-		if (!closed.ok) { this.hooks.changed(); throw coordinatorError(closed, run); }
+		if (!closed.ok) { this.saveQuietly(run); this.hooks.changed(); throw coordinatorError(closed, run); }
 		run.closedAt = Date.now();
+		this.save(run);
 		this.hooks.changed();
 		return view(run);
 	}
 
-	/** Parent exit: release every session this parent holds, then forget its runs. */
+	/**
+	 * Parent exit: park every run this parent holds. Its session is released through the
+	 * Coordinator, as close would (a created session closed without discarding it, so it stays
+	 * resumable; an opened one only disconnected, its native work untouched), so nothing outlives
+	 * the parent. The record is saved parked, its ownership released, and the run forgotten here.
+	 */
 	async closeOwner(ownerKey: string): Promise<void> {
 		const coordinator = existingAcpCoordinator();
 		for (const run of [...registry().values()]) {
 			if (run.ownerKey !== ownerKey) continue;
-			if (coordinator && run.closedAt === undefined) await coordinator.execute({ action: "close", name: run.worker, force: true }).catch(() => undefined);
 			registry().delete(run.id);
+			if (run.foreign) continue;
+			if (run.closedAt === undefined && run.parkedAt === undefined) {
+				const before = view(run);
+				if (coordinator?.snapshot(run.worker).worker) await coordinator.execute({ action: "close", name: run.worker, force: true }).catch(() => undefined);
+				if (before.status === "running") { const turn = before.turns.at(-1); if (turn) run.interruptedTurn = turn.requestId; }
+				run.parkedAt = Date.now();
+			}
+			delete run.ownerPid; delete run.ownerHost; delete run.ownerToken;
+			this.saveQuietly(run);
 		}
 	}
 
@@ -358,9 +607,12 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 				if (!waited.ok) return;
 				if (!waited.details.timedOut) break;
 			}
+			if (!registry().has(run.id)) return;
+			this.saveQuietly(run);
 			this.hooks.changed();
 			const current = view(run);
-			if (!registry().has(run.id) || run.waiters > 0 || run.claimed.has(requestId) || current.turns.at(-1)?.requestId !== requestId) return;
+			if (run.waiters > 0 || run.claimed.has(requestId) || current.turns.at(-1)?.requestId !== requestId) return;
+			run.claimed.add(requestId);
 			this.hooks.settled(current, run.ownerKey);
 		})().catch(() => undefined);
 	}
@@ -378,7 +630,8 @@ function sessionText(v: AcpRunView): string {
 function turnText(v: AcpRunView): string | undefined {
 	const t = v.turns.at(-1);
 	if (!t) return undefined;
-	return `turn ${t.requestId}: ${t.status}, delivery ${t.delivery}${t.providerOutcome ? `, provider outcome ${t.providerOutcome}` : ""}${t.truncated ? ", output truncated" : ""}`;
+	const cause = t.failure ? `, cause ${t.failure.code}` : t.stopReason && t.stopReason !== "end_turn" ? `, stop reason ${t.stopReason}` : "";
+	return `turn ${t.requestId}: ${t.status}, delivery ${t.delivery}${t.providerOutcome ? `, provider outcome ${t.providerOutcome}` : ""}${cause}${t.truncated ? ", output truncated" : ""}`;
 }
 
 export function acpSummary(v: AcpRunView): string {
@@ -404,6 +657,12 @@ export function acpSummary(v: AcpRunView): string {
 	if (turn) lines.push(turn);
 	if (v.status === "idle") lines.push(v.session.origin === "opened" ? "idle: attached without sending a turn" : "idle");
 	if (v.closed) lines.push(v.session.origin === "opened" ? "closed: disconnected; the native session is unchanged" : "closed: session disposed");
+	if (v.parked) {
+		const released = v.session.origin === "opened" ? "disconnected, the native session unchanged" : "its session closed and kept resumable";
+		const reopen = v.session.origin === "opened" ? "steer reopens the same native session" : "steer resumes it";
+		lines.push(`parked: the parent exited, ${released}; ${reopen}, close ends it${v.parked.interruptedTurn ? `. Turn ${v.parked.interruptedTurn} was still running then` : ""}`);
+	}
+	if (v.foreign) lines.push(`read-only: owned by another live Pi process (pid ${v.foreign.ownerPid} on ${v.foreign.ownerHost})`);
 	if (v.error) lines.push(`error: ${v.error}`);
 	return lines.join("\n");
 }

@@ -42,6 +42,8 @@ export interface RunView {
 	nativeSessionId?: string;
 	executionEnvironment?: string;
 	closed?: boolean;
+	/** The parent exited and the session was released; steer reopens it. */
+	parked?: boolean;
 	turn?: { requestId: string; status: string; delivery: string; providerOutcome?: string; truncated: boolean };
 }
 
@@ -69,6 +71,7 @@ export function acpRowView(v: AcpRunView): RunView {
 		...(v.session.nativeSessionId ? { nativeSessionId: v.session.nativeSessionId } : {}),
 		...(v.session.executionEnvironment ? { executionEnvironment: v.session.executionEnvironment } : {}),
 		...(v.closed ? { closed: true } : {}),
+		...(v.parked ? { parked: true } : {}),
 		...(latest ? { turn: { requestId: latest.requestId, status: latest.status, delivery: latest.delivery, truncated: latest.truncated, ...(latest.providerOutcome ? { providerOutcome: latest.providerOutcome } : {}) } } : {}),
 	};
 }
@@ -138,7 +141,7 @@ export function resultLines(v: RunView, expanded: boolean, theme: Theme, width: 
 		lines.push(theme.fg("dim", "id ") + theme.fg("muted", v.id) + theme.fg("dim", "  backend ") + theme.fg("muted", "acp") + theme.fg("dim", "  agent ") + theme.fg("muted", v.agent ?? "")
 			+ (v.model ? theme.fg("dim", "  model ") + theme.fg("muted", v.model) : ""));
 		lines.push(theme.fg("dim", `${v.origin === "opened" ? "opened session" : "session"} `) + theme.fg("muted", v.nativeSessionId ?? "pending")
-			+ (v.executionEnvironment ? theme.fg("dim", ` (${v.executionEnvironment})`) : "") + (v.closed ? theme.fg("dim", v.origin === "opened" ? "  disconnected" : "  closed") : ""));
+			+ (v.executionEnvironment ? theme.fg("dim", ` (${v.executionEnvironment})`) : "") + (v.closed ? theme.fg("dim", v.origin === "opened" ? "  disconnected" : "  closed") : v.parked ? theme.fg("dim", "  parked: steer reopens it") : ""));
 		if (v.turn) lines.push(theme.fg("dim", "turn ") + theme.fg("muted", v.turn.requestId) + theme.fg("dim", ` ${v.turn.status} · delivery ${v.turn.delivery}${v.turn.providerOutcome ? ` · outcome ${v.turn.providerOutcome}` : ""}`)
 			+ (v.turn.truncated ? theme.fg("warning", " · output truncated") : ""));
 		else lines.push(theme.fg("dim", "idle: attached without sending a turn"));

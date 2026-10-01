@@ -856,6 +856,8 @@ function publish(completion: RunCompletion<RunResult>) {
 }
 
 function acknowledge(owner: Owner, details: any) {
+	// A several-run wait delivers each settled pi run it reports, with that run's own receipt.
+	if (details?.kind === "runs" && Array.isArray(details.rows)) { for (const row of details.rows) acknowledge(owner, row); return; }
 	const run = details?.id ? runs.get(details.id) : undefined;
 	if (!run || !details.completionReceipt || run.ownerKey !== owner.key || details.status === "running" || details.segment !== run.segment || run.acknowledged) return;
 	run.acknowledged = true;
@@ -970,6 +972,8 @@ export default function (pi: ExtensionAPI) {
 				{ deliverAs: "followUp", triggerTurn: true },
 			);
 		},
+		// Next to this parent's pi run pointers, under the subsession directory.
+		runDir: (ownerKey) => join(state.owners.get(ownerKey)?.dir ?? pointerDir(ownerKey), "acp"),
 	});
 	// Canonical phased todo (transferred from pi-omp; see todo-ext.ts). The reminder reads this
 	// parent's live children: while one is unsettled its completion message re-wakes the loop,
@@ -1016,7 +1020,9 @@ export default function (pi: ExtensionAPI) {
 					const run = restoreRun(recordPath, created);
 					runs.set(run.id, run);
 				}
-			} catch (error) { await closeOwner(created); throw error; }
+				// ACP runs come back parked: readable at once, reopened only by a steer.
+				acp.restore(created.key);
+			} catch (error) { await closeOwner(created); await acp.closeOwner(created.key); throw error; }
 			existing = created;
 		}
 		owner = existing;
@@ -1215,18 +1221,98 @@ export default function (pi: ExtensionAPI) {
 		if (v.status === "idle") return `${v.id} idle (acp ${v.session.agent}, ${session}); no turn sent. Use delegate_ctl steer with this runId to send one, status or result to read it, close to disconnect.`;
 		return `${v.id} running (acp ${v.session.agent}, ${session}). Completion will wake you; use delegate_ctl wait with this runId when dependent work needs the result.`;
 	};
+	/** One run in a wait report: its full report once settled, its one-line summary while pending. */
+	interface WaitRow { id: string; settled: boolean; report: string; summary: string; details: any; bad: boolean }
+	const acpRow = (v: AcpRunView, settled: boolean): WaitRow => ({ id: v.id, settled, report: acpResultText(v), summary: acpSummary(v), details: v, bad: settledBadly(v) });
+	const piRow = (run: Run): WaitRow => run.completion.settled
+		? { id: run.id, settled: true, report: resultText(run), summary: summary(run), details: finalResult(run).details, bad: run.status !== "complete" }
+		: { id: run.id, settled: false, report: resultText(run), summary: summary(run), details: recordedView(run), bad: false };
+	const waitResult = (reason: WaitOutcome<unknown>["reason"], rows: WaitRow[], runIds: readonly string[], timeoutMs?: number, lost = "these runs; they did not settle") => {
+		const settled = rows.filter((row) => row.settled), pending = rows.filter((row) => !row.settled);
+		const still = pending.map((row) => row.id).join(", ");
+		const head = reason === "timeout" ? `wait timed out after ${timeoutMs} ms; nothing was cancelled. Still running: ${still}`
+			: reason === "interrupted" ? `wait interrupted — queued messages are waiting for you; the runs keep going.\nAnswer the queued message(s) first, then call wait again to rejoin. Still running: ${still}`
+			: reason === "lost" ? `wait lost ${lost}: ${still}`
+			: pending.length ? `${settled.length} settled; still running: ${still}` : "";
+		const text = [head, ...settled.map((row) => row.report), ...(reason === "settled" ? [] : pending.map((row) => row.summary))].filter(Boolean).join("\n\n");
+		const details = runIds.length === 1 ? (settled[0] ?? pending[0])?.details : { kind: "runs", rows: [...settled, ...pending].map((row) => row.details), wait: { reason, pending: pending.map((row) => row.id) } };
+		return { content: [{ type: "text" as const, text }], details, isError: reason === "lost" || (reason === "settled" && settled.some((row) => row.bad)) };
+	};
 	const acpWaitResult = async (outcome: WaitOutcome<AcpRunView>, runIds: readonly string[], timeoutMs?: number) => {
 		const pending = await Promise.all(outcome.pending.map((id) => acp.result(id)));
-		const reports = outcome.settled.map(acpResultText);
-		const still = pending.map((v) => v.id).join(", ");
-		const head = outcome.reason === "timeout" ? `wait timed out after ${timeoutMs} ms; nothing was cancelled. Still running: ${still}`
-			: outcome.reason === "interrupted" ? `wait interrupted — queued messages are waiting for you; the runs keep going.\nAnswer the queued message(s) first, then call wait again to rejoin. Still running: ${still}`
-			: outcome.reason === "lost" ? `wait lost the ACP coordinator (it is shutting down); these runs did not settle: ${still}`
-			: pending.length ? `${outcome.settled.length} settled; still running: ${still}` : "";
-		const text = [head, ...reports, ...(outcome.reason === "settled" ? [] : pending.map(acpSummary))].filter(Boolean).join("\n\n");
-		const details = runIds.length === 1 ? (outcome.settled[0] ?? pending[0]) : { kind: "runs", rows: [...outcome.settled, ...pending], wait: { reason: outcome.reason, pending: outcome.pending } };
-		return { content: [{ type: "text" as const, text }], details, isError: outcome.reason === "lost" || (outcome.reason === "settled" && outcome.settled.some(settledBadly)) };
+		return waitResult(outcome.reason, [...outcome.settled.map((v) => acpRow(v, true)), ...pending.map((v) => acpRow(v, false))], runIds, timeoutMs, "the ACP coordinator (it is shutting down); these runs did not settle");
 	};
+
+	/**
+	 * delegate_ctl wait over runs of either backend, any or all. pi runs are joined through their
+	 * completion as a single-run wait joins them, so a segment that settles reports here instead of
+	 * waking the parent; ACP runs through the backend's join. Queued parent messages end the wait
+	 * early, a timeout ends it, and an abort only detaches: no run is ever cancelled. A run this wait
+	 * reports is delivered by it; any other run keeps its own wake-up.
+	 */
+	async function waitRuns(owner: Owner, ids: readonly string[], mode: "any" | "all", ctx: ExtensionContext, signal?: AbortSignal, timeoutMs?: number) {
+		const piRuns = new Map<string, Run>();
+		const acpIds: string[] = [];
+		for (const id of ids) {
+			if (acp.find(id, owner.key)) { acpIds.push(id); continue; }
+			const run = runs.get(id);
+			if (!run || run.ownerKey !== owner.key) throw new DelegateError("RUN_NOT_FOUND", `unknown runId ${id}`, "runIds");
+			unwrap(requireAction(PI_CAPABILITIES, "wait"));
+			piRuns.set(id, run);
+		}
+		if (!piRuns.size) return acpWaitResult(await acp.wait({ runIds: acpIds, mode, ...(timeoutMs !== undefined ? { timeoutMs } : {}) }, signal, () => ctx.hasPendingMessages()), ids, timeoutMs);
+		if (signal?.aborted) throw new DOMException("Wait cancelled; the runs are unaffected.", "AbortError");
+		const join = acp.join(acpIds);
+		let wake = () => {};
+		// While subscribed, a segment that settles is claimed by this wait, exactly as waitForChild claims it.
+		const joined = new Map([...piRuns].map(([id, run]) => [id, { completion: run.completion, settledAtJoin: run.completion.settled, unsubscribe: run.completion.subscribe(() => wake()) }]));
+		const deadline = timeoutMs === undefined ? Number.POSITIVE_INFINITY : Date.now() + timeoutMs;
+		const stoppedSince = new Map<string, number>();
+		let aborted = false, coordinatorLost = false;
+		try {
+			for (;;) {
+				const acpViews = new Map(join.views().map((v) => [v.id, v]));
+				const rows = ids.map((id) => { const v = acpViews.get(id); return v ? acpRow(v, v.status !== "running") : piRow(piRuns.get(id)!); });
+				const settled = rows.filter((row) => row.settled);
+				const end = (reason: WaitOutcome<unknown>["reason"], lost?: string) => {
+					join.claim(settled.flatMap((row) => acpViews.has(row.id) ? [acpViews.get(row.id)!] : []));
+					return waitResult(reason, rows, ids, timeoutMs, lost);
+				};
+				if (mode === "any" ? settled.length > 0 : settled.length === rows.length) return end("settled");
+				if (signal?.aborted) { aborted = true; throw new DOMException("Wait cancelled; the runs are unaffected.", "AbortError"); }
+				if (ctx.hasPendingMessages()) return end("interrupted");
+				if (coordinatorLost) return end("lost", "the ACP coordinator (it is shutting down, or another process owns these runs); not settled");
+				// A terminal status that never settles is a child that stopped without reporting completion (see waitForChild).
+				for (const [id, run] of piRuns) {
+					if (run.status === "running" || run.completion.settled) { stoppedSince.delete(id); continue; }
+					if (!stoppedSince.has(id)) stoppedSince.set(id, Date.now());
+					else if (Date.now() - stoppedSince.get(id)! >= 2 * WAIT_POLL_MS) return end("lost", `${id}, which stopped without reporting completion (read its status or result; steer with restart:true if it must continue). Not settled`);
+				}
+				const left = deadline - Date.now();
+				if (left <= 0) return end("timeout");
+				const slice = Math.min(WAIT_POLL_MS, left);
+				const pendingAcp = rows.flatMap((row) => !row.settled && acpViews.has(row.id) ? [acpViews.get(row.id)!] : []);
+				await new Promise<void>((resolve) => {
+					const onAbort = () => wake();
+					const timer = setTimeout(() => wake(), slice);
+					wake = () => { clearTimeout(timer); signal?.removeEventListener("abort", onAbort); wake = () => {}; resolve(); };
+					signal?.addEventListener("abort", onAbort, { once: true });
+					// The ACP slice ends early on a settling turn.
+					if (pendingAcp.length) void join.next(pendingAcp, slice).then((reported) => { if (!reported) coordinatorLost = true; wake(); }, () => wake());
+				});
+			}
+		} finally {
+			for (const [id, entry] of joined) {
+				entry.unsubscribe();
+				// An abort reports nothing: a segment this wait claimed as it settled still wakes the parent.
+				if (aborted && !entry.settledAtJoin && entry.completion.settled && entry.completion.claimed && piRuns.get(id)?.completion === entry.completion) {
+					entry.completion.claimed = false;
+					publish(entry.completion);
+				}
+			}
+			join.release(aborted);
+		}
+	}
 
 	pi.registerTool({
 		name: "delegate",
@@ -1420,18 +1506,20 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 			"See the delegation skill for the full procedure. models: every offering across all enabled providers, verbatim from the registry (provider/id, reasoning, context, $/M), plus live OpenRouter pricing, tiered rates, expirations and Artificial Analysis indices, your cached ratings, approved defaults and drift \u2014 call before the first delegate of a session. " +
 			"rate: store quality ratings you researched, per exact offering (provider/id), so choices are grounded; stale after 14 days. approve: record a role's default model after the user agreed in conversation. " +
 			"roles: list roles. status: one run or all \u2014 a nonblocking progress read: status, current tool, tool calls so far, elapsed, remaining time budget. result: current report without waiting. wait: join an existing runId; returns its final report, immediately if finished. If queued messages arrive while waiting it returns early with the child still running — answer them, then wait again to rejoin. If the child stops without reporting completion it returns an error report instead of blocking until the run budget. Cancelling wait only detaches; the child keeps running. An attached waiter receives completion instead of a separate wake-up. steer: queue a correction or resume a finished child in the background, keeping its context; returns immediately. Use wait to join the resumed work. Saved children are restored on parent reopen without running; steer revives them with their original configuration unless you pass model:, which moves that child to another offering from the next segment on \u2014 propose it in conversation first, including when the saved offering is exhausted or gone. Explicitly stopped children require restart:true and the user's request. cancel: stop the child and prevent automatic revival. " +
-			"Runs started with backend acp take the same runId actions: status and result read the session and its latest turn; wait joins it, or several with runIds and mode any|all, and timeoutMs only ends the wait, never the runs; steer sends the next turn (a running turn must finish or be cancelled first); cancel stops only a turn this run started; close releases the session \u2014 a created one is disposed, an opened one only disconnected, never archived or deleted. close is acp only.",
+			"wait with runIds and mode any|all joins several runs of either backend at once; timeoutMs only ends that wait, never the runs. " +
+			"Runs started with backend acp take the same runId actions: status and result read the session and its latest turn; wait joins it; steer sends the next turn (a running turn must finish or be cancelled first); cancel stops only a turn this run started; close releases the session \u2014 a created one is disposed, an opened one only disconnected, never archived or deleted. close is acp only and final. " +
+			"When the parent exits, its acp runs are parked, not closed: their sessions are released and their records stay readable after a restart; steer reopens one (an opened run by its native ID, a created run by native resume, else RUN_NOT_RESUMABLE).",
 		parameters: Type.Object({
 			action: StringEnum(["models", "rate", "approve", "roles", "status", "result", "wait", "steer", "cancel", "close"] as const),
 			role: Type.Optional(Type.String({ description: "approve: role name" })),
 			model: Type.Optional(Type.String({ description: "approve: provider/id[:thinking] the user agreed to. steer: run the next segment on this offering instead of the child's saved one; the user chooses it, you never substitute silently" })),
 			runId: Type.Optional(Type.String()),
-			runIds: Type.Optional(Type.Array(Type.String(), { description: "wait (acp runs): join several runs at once, with mode" })),
+			runIds: Type.Optional(Type.Array(Type.String(), { description: "wait: join several runs at once, pi and acp alike, with mode" })),
 			mode: Type.Optional(StringEnum(["any", "all"] as const, { description: "wait with runIds: any returns when the first run settles, all (default) when every one has" })),
 			force: Type.Optional(Type.Boolean({ description: "close: cancel an active turn first instead of refusing" })),
 			discardPersistentState: Type.Optional(Type.Boolean({ description: "close, created acp sessions only: do not keep the session resumable" })),
 			restart: Type.Optional(Type.Boolean({ description: "steer only: restart an explicitly stopped child, only when the user requested it" })),
-			timeoutMs: Type.Optional(Type.Number({ description: "steer: give the child this time budget instead of its saved one \u2014 re-armed at once on a running child, applied to the next segment of an inactive one. wait (acp runs): stop waiting after this many ms; the runs keep going" })),
+			timeoutMs: Type.Optional(Type.Number({ description: "steer: give the child this time budget instead of its saved one \u2014 re-armed at once on a running child, applied to the next segment of an inactive one. wait with runIds, or on an acp run: stop waiting after this many ms; the runs keep going" })),
 			message: Type.Optional(Type.String({ description: "steer: the correction. models: substring filter. approve: one-line reason the user agreed to" })),
 			ratings: Type.Optional(
 				Type.Array(
@@ -1567,13 +1655,10 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 				return { content: [{ type: "text", text: lines.join("\n") || "no runs" }], details: { kind: "runs", rows: [...owned.map(recordedView), ...external] } };
 			}
 			if (p.action === "wait" && (p.runIds !== undefined || p.mode !== undefined)) {
-				const ids = p.runIds ?? (p.runId ? [p.runId] : []);
+				const ids = [...new Set(p.runIds ?? (p.runId ? [p.runId] : []))];
 				try {
 					if (!ids.length) throw new DelegateError("INPUT_INVALID", "wait with mode needs runIds", "runIds");
-					const piRun = ids.find((id) => !acp.find(id, owner.key) && runs.get(id)?.ownerKey === owner.key);
-					if (piRun) throw new DelegateError("ACTION_UNSUPPORTED", `${piRun} is a pi run: several-run wait covers acp runs; wait for a pi run alone with runId`, "runIds");
-					const outcome = await acp.wait({ runIds: ids, mode: p.mode ?? "all", ...(p.timeoutMs !== undefined ? { timeoutMs: p.timeoutMs } : {}) }, signal, () => ctx.hasPendingMessages());
-					return await acpWaitResult(outcome, ids, p.timeoutMs);
+					return await waitRuns(owner, ids, p.mode ?? "all", ctx, signal, p.timeoutMs);
 				} catch (error) { return failed(error); }
 			}
 			if (acp.find(p.runId, owner.key)) {

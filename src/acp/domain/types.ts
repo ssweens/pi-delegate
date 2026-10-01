@@ -98,6 +98,8 @@ export interface RuntimePort {
   describeNativeSession?(agent: string, sessionId: string, options?: { cwd?: string; executionEnvironment?: string }): Promise<NativeSessionDescription>;
   openSession?(input: { name: string; agent: string; native: NativeSessionDescription; handle?: RuntimeHandle }): Promise<RuntimeHandle>;
   disconnect?(handle: RuntimeHandle): Promise<void>;
+  /** Reopen a created session that was closed without discarding it. Fails RESUME_UNSUPPORTED when the adapter cannot resume or load it. */
+  resumeSession?(input: { name: string; agent: string; cwd: string; profile: Profile; sessionId: string }): Promise<RuntimeHandle>;
   startTurn(input: { handle: RuntimeHandle; prompt: string; requestId: string; timeoutMs: number }): RuntimeTurn;
   getStatus?(handle: RuntimeHandle): Promise<RuntimeStatus>;
   setConfigOption?(input: { handle: RuntimeHandle; key: string; value: string }): Promise<void>;

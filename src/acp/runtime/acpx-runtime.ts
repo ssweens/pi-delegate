@@ -67,15 +67,17 @@ export function acpAgentNames(overrides: AgentOverrides = {}): string[] {
 
 export class AcpxRuntimePort implements RuntimePort {
   private readonly runtime: AcpxRuntime;
+  private readonly sessionStore: ReturnType<typeof createFileSessionStore>;
 
   constructor(cwd: string, stateDir: string, profile: Profile, private readonly origin: "created" | "opened" = "created", agentOverrides: AgentOverrides = {}) {
     const piAdapterArgv = origin === "opened"
       ? [process.execPath, adapterEntry, "--pi-strings-opened"]
       : [process.execPath, adapterEntry, "--pi-strings-worker", "--pi-tools-json", JSON.stringify(profile.tools)];
     if (origin === "created" && profile.thinking) piAdapterArgv.push("--pi-thinking", profile.thinking);
+    this.sessionStore = createFileSessionStore({ stateDir: resolve(stateDir, "acpx") });
     const runtimeOptions = {
       cwd,
-      sessionStore: createFileSessionStore({ stateDir: resolve(stateDir, "acpx") }),
+      sessionStore: this.sessionStore,
       agentRegistry: createAgentRegistry({
         overrides: {
           pi: piAdapterArgv,
@@ -172,6 +174,22 @@ export class AcpxRuntimePort implements RuntimePort {
     // low/medium/high/ultra) via ACP config options rather than ACP session modes,
     // so no setMode call here; the adapter default (Default permissions) is used.
     return { ...toHandle(handle), agent: input.agent, role: input.profile.role, cwd: input.cwd };
+  }
+
+  /**
+   * Reopen a created session under its original session key. ACPX keeps the record of a session
+   * closed without discard; its persistent reconnect is same-session-only, so the agent must
+   * advertise session/resume or session/load (recorded at its last initialize). Without that the
+   * resume is refused here rather than failing on the next turn.
+   */
+  async resumeSession(input: { name: string; agent: string; cwd: string; profile: Profile; sessionId: string }): Promise<RuntimeHandle> {
+    const saved = await this.sessionStore.load(`pi-strings:${input.name}`);
+    if (!saved || saved.acpSessionId !== input.sessionId) throw new StringsError("RESUME_UNSUPPORTED", `No saved ACP session ${input.sessionId} remains for this worker; it was discarded or never persisted.`);
+    const capabilities = saved.agentCapabilities;
+    if (!capabilities?.loadSession && !capabilities?.sessionCapabilities?.resume) throw new StringsError("RESUME_UNSUPPORTED", `Agent ${input.agent} does not advertise session/resume or session/load; session ${input.sessionId} cannot be reopened.`);
+    // The session keeps the model it was configured with; the Coordinator re-selects it per turn.
+    const { model: _model, ...profile } = input.profile;
+    return this.ensureSession({ name: input.name, agent: input.agent, cwd: input.cwd, profile, resumeSessionId: input.sessionId });
   }
 
   async getStatus(handle: RuntimeHandle): Promise<RuntimeStatus> {

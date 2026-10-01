@@ -85,6 +85,7 @@ export class Coordinator {
         case "result": return this.result(input);
         case "cancel": return await this.cancel(input);
         case "close": return await this.close(input);
+        case "resume": return await this.resume(input);
         default: throw new StringsError("ACTION_INVALID", `Unknown strings action: ${input.action}`);
       }
     } catch (error) { return failure(input.action, error); }
@@ -346,6 +347,40 @@ export class Coordinator {
     this.workers.set(name, { record, runtime });
     await this.persist();
     return { ok: true, action: "spawn", details: this.publicWorker(record) };
+  }
+
+  /**
+   * Internal owned reconnect (not an op_* action): reopen a session this Coordinator created and
+   * then closed without discarding it, under the same worker name. Requires coordinator-owned
+   * provenance and adapter support for session/resume or session/load; never creates a new session.
+   */
+  private async resume(input: Action): Promise<StringsResponse> {
+    const name = requiredString(input.name, "name");
+    if (!NAME.test(name)) throw new StringsError("WORKER_NAME_INVALID", `Invalid worker name: ${name}`);
+    if (this.workers.has(name)) throw new StringsError("WORKER_EXISTS", `Worker ${name} already exists.`);
+    const agent = requiredString(input.agent, "agent");
+    const sessionId = requiredString(input.sessionId, "sessionId");
+    const cwd = await realpath(requiredString(input.cwd, "cwd"));
+    const profileName = `direct:${agent}`;
+    const base = directProfile(agent, input.role, input.tools);
+    const model = optionalModel(input.model);
+    const profile: Profile = model === undefined ? base : { ...base, model };
+    if (!this.sessions.has(ownedSessionKey({ sessionId, agent, profileName, role: profile.role, cwd }))) {
+      throw new StringsError("RESUME_PROVENANCE_UNKNOWN", `This coordinator has no record of creating session ${sessionId} for ${agent} in ${cwd}; only an owned session can be resumed.`);
+    }
+    const worktree = await this.admitWriter(profile, cwd);
+    const runtime = this.runtimeFactory(cwd, this.stateDir, profile);
+    if (!runtime.resumeSession) throw new StringsError("RESUME_UNSUPPORTED", "The worker runtime cannot resume a created session.");
+    const handle = await runtime.resumeSession({ name, agent, cwd, profile, sessionId });
+    if ((handle.backendSessionId ?? handle.agentSessionId) !== sessionId) {
+      await runtime.close(handle, "resume identity changed", false).catch(() => undefined);
+      throw new StringsError("SESSION_IDENTITY_CHANGED", `Worker ${name} resumed with a different session identity.`);
+    }
+    const now = new Date().toISOString();
+    const record: WorkerRecord = { origin: "created", name, profileName, profile, role: profile.role, ...(profile.model ? { model: profile.model } : {}), status: "idle", cwd, ...(worktree ? { worktree } : {}), handle: { ...handle, agent, profileName, role: profile.role, cwd }, createdAt: now, updatedAt: now };
+    this.workers.set(name, { record, runtime });
+    await this.persist();
+    return { ok: true, action: "resume", details: this.publicWorker(record) };
   }
 
   private async send(input: Action): Promise<StringsResponse> {
@@ -630,9 +665,12 @@ export class Coordinator {
   }
 
   private applyTerminal(worker: LiveWorker, request: RequestRecord, terminal: RuntimeTerminal): void {
+    // The provider's own terminal result is the only delivery signal a runtime gives: a prompt it
+    // completed was accepted. Nothing reports acceptance at submission, so any other outcome
+    // (failed, cancelled, transport loss) leaves delivery unknown, for created and opened turns alike.
+    request.providerOutcome = terminal.status;
+    if (terminal.status === "completed") request.delivery = "accepted";
     if (worker.record.origin === "opened") {
-      request.providerOutcome = terminal.status;
-      if (terminal.status === "completed") request.delivery = "accepted";
       if (request.status !== "running") {
         if (worker.record.status === "running") worker.record.status = terminal.status === "failed" ? "failed" : "idle";
         return;

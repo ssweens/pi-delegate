@@ -2,7 +2,7 @@
  * Backend-neutral delegation contract (todo 040, ADR docs/adr/0001-delegate-backends.md).
  *
  * Types and pure validation only. Nothing here runs a child or touches a Coordinator: 042 wires
- * `delegate`/`delegate_ctl` to a backend, 043 maps the lifecycle controls.
+ * `delegate`/`delegate_ctl` to a backend, 043 maps the lifecycle controls (acp-backend.ts).
  *
  * Rules this file pins:
  * - `backend` is "pi" (default, today's in-process children) or "acp" (Coordinator workers).
@@ -163,8 +163,8 @@ export function acpCapabilities(run: { origin: SessionOrigin; agent: string }): 
 		create: { supported: true },
 		open: { supported: true, note: "fails NATIVE_OPEN_UNSUPPORTED when the adapter cannot verify native identity and disconnect" },
 		steer: opened
-			? { supported: true, note: "native send, undecorated, never retried" }
-			: { supported: true, note: "next turn on the same ACP session" },
+			? { supported: true, note: "native send, undecorated, never retried; a parked run first reopens the same native ID" }
+			: { supported: true, note: "next turn on the same ACP session; a parked run is first resumed, which fails RUN_NOT_RESUMABLE unless the adapter supports session/resume or session/load" },
 		wait: { supported: true },
 		result: { supported: true },
 		status: { supported: true },
@@ -224,8 +224,16 @@ export interface AcpRunView {
 	truncated: boolean;
 	capabilities: BackendCapabilities;
 	error?: string;
-	/** Set once delegate_ctl close released the session (disposed or disconnected, per capabilities.close). */
+	/** Set once delegate_ctl close released the session (disposed or disconnected, per capabilities.close). Final. */
 	closed?: true;
+	/**
+	 * Set while the run is parked: its parent exited (or that process died) and the session was
+	 * released the way close releases it, without the run being closed. Its record stays readable,
+	 * and steer reopens it. `interruptedTurn` is a turn that was still running at that moment.
+	 */
+	parked?: { at: number; interruptedTurn?: string };
+	/** Owned by another live Pi process: a read-only snapshot here. */
+	foreign?: { ownerPid: number; ownerHost: string };
 }
 
 export type PiRunView = RunView & { backend: "pi" };

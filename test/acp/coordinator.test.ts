@@ -1209,3 +1209,74 @@ test("events arriving just after the terminal result are retained before a queue
     }
   } finally { await coordinator.shutdown(); }
 });
+
+test("a created turn is accepted only when the provider completes it; any other outcome leaves delivery unknown", async () => {
+  const { coordinator, runtimes } = await harnessProfiles({ "pi-reviewer": REVIEWER });
+  try {
+    await spawnProfile(coordinator, "delivery", "pi-reviewer");
+    const outcome = async (terminal: RuntimeTerminal) => {
+      const sent = await coordinator.execute({ action: "send", name: "delivery", prompt: "turn" });
+      assert.ok(sent.ok);
+      const running = await coordinator.execute({ action: "result", requestId: sent.details.requestId });
+      assert.equal(running.ok && running.details.delivery, undefined, "nothing reports acceptance at submission");
+      runtimes[0]!.turns.at(-1)!.finish(terminal);
+      await coordinator.execute({ action: "wait", requestId: sent.details.requestId, waitTimeoutMs: 1_000 });
+      const result = await coordinator.execute({ action: "result", requestId: sent.details.requestId });
+      assert.ok(result.ok);
+      return [result.details.status, result.details.delivery, result.details.providerOutcome];
+    };
+    assert.deepEqual(await outcome({ status: "completed", stopReason: "end_turn" }), ["completed", "accepted", "completed"]);
+    assert.deepEqual(await outcome({ status: "cancelled", stopReason: "cancelled" }), ["cancelled", undefined, "cancelled"]);
+    assert.deepEqual(await outcome({ status: "failed", error: { code: "POLICY", message: "denied", retryable: false } }), ["failed", undefined, "failed"]);
+  } finally { await coordinator.shutdown(); }
+});
+
+class ResumableRuntime extends FakeRuntime {
+  resumed: string[] = [];
+  resumeAs?: string;
+  async resumeSession(input: { name: string; cwd: string; sessionId: string }): Promise<RuntimeHandle> {
+    this.resumed.push(input.sessionId);
+    return { sessionKey: input.name, backend: "fake", runtimeSessionName: input.name, cwd: input.cwd, backendSessionId: this.resumeAs ?? input.sessionId };
+  }
+}
+
+test("resume reopens only a session this Coordinator created, under the same name, through the adapter", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "pi-strings-coordinator-"));
+  const runtimes: ResumableRuntime[] = [];
+  let resumable = true;
+  const coordinator = new Coordinator(process.cwd(), {
+    stateDir,
+    runtimeFactory: () => { const runtime = resumable ? new ResumableRuntime() : new FakeRuntime() as ResumableRuntime; runtimes.push(runtime); return runtime; },
+  });
+  const code = (response: Awaited<ReturnType<Coordinator["execute"]>>) => response.ok ? "ok" : response.error.code;
+  try {
+    assert.equal(code(await coordinator.execute({ action: "spawn", name: "owned", agent: "pi" })), "ok");
+    assert.equal(code(await coordinator.execute({ action: "close", name: "owned" })), "ok");
+    assert.deepEqual(runtimes[0]!.closeDiscards, [false], "a plain close keeps the session resumable");
+    const resume = (extra: Record<string, unknown> = {}) => coordinator.execute({ action: "resume", name: "owned", agent: "pi", sessionId: "session-owned", cwd: process.cwd(), ...extra });
+
+    assert.equal(code(await resume({ sessionId: "session-someone-else" })), "RESUME_PROVENANCE_UNKNOWN");
+    assert.equal(code(await resume({ role: "writer" })), "RESUME_PROVENANCE_UNKNOWN", "provenance includes the role it was created with");
+    resumable = false;
+    assert.equal(code(await resume()), "RESUME_UNSUPPORTED");
+    resumable = true;
+    const changed = new ResumableRuntime(); changed.resumeAs = "session-new";
+    const mismatch = new Coordinator(process.cwd(), { stateDir: await mkdtemp(join(tmpdir(), "pi-strings-coordinator-")), runtimeFactory: () => changed });
+    try {
+      await mismatch.execute({ action: "spawn", name: "owned", agent: "pi" });
+      await mismatch.execute({ action: "close", name: "owned" });
+      assert.equal(code(await mismatch.execute({ action: "resume", name: "owned", agent: "pi", sessionId: "session-owned", cwd: process.cwd() })), "SESSION_IDENTITY_CHANGED");
+      assert.deepEqual(changed.closeDiscards, [false, false], "a session that came back as another one is released, not discarded");
+    } finally { await mismatch.shutdown(); }
+
+    const resumed = await resume();
+    assert.equal(code(resumed), "ok");
+    assert.ok(resumed.ok && resumed.details.status === "idle" && resumed.details.session === "session-owned");
+    assert.deepEqual(runtimes.at(-1)!.resumed, ["session-owned"]);
+    assert.equal(code(await resume()), "WORKER_EXISTS");
+    const sent = await coordinator.execute({ action: "send", name: "owned", prompt: "after resume" });
+    assert.ok(sent.ok, "a resumed worker takes turns");
+    runtimes.at(-1)!.turns[0]!.finish({ status: "completed" });
+    await coordinator.execute({ action: "wait", requestId: sent.details.requestId, waitTimeoutMs: 1_000 });
+  } finally { await coordinator.shutdown(); }
+});

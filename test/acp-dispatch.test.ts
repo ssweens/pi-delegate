@@ -88,7 +88,7 @@ test("delegate dispatches to the acp backend; no backend is today's pi path", { 
 			assert.equal(waited.details.status, "complete", waited.content[0].text);
 			assert.equal(waited.details.output, "READY");
 			assert.match(waited.content[0].text, /backend acp · agent fixture/);
-			assert.match(waited.content[0].text, /turn req_[0-9a-f-]+: completed, delivery unknown/);
+			assert.match(waited.content[0].text, /turn req_[0-9a-f-]+: completed, delivery accepted, provider outcome completed/, "the provider completing the prompt is its acceptance");
 			assert.match(waited.content[0].text, /----- fixture-[0-9a-f-]+ reported, verbatim -----\nREADY\n/);
 			const result = await h.ctl("result", created);
 			assert.equal(result.details.output, "READY");
@@ -157,7 +157,9 @@ test("delegate dispatches to the acp backend; no backend is today's pi path", { 
 			assert.match(timedOut.content[0].text, /^wait timed out after 300 ms; nothing was cancelled\. Still running: /);
 			assert.equal(timedOut.details.status, "running");
 			assert.equal((await h.ctl("status", slow)).details.status, "running", "the run kept going");
-			assert.equal(codeOf(await h.ctl("wait", undefined, { runIds: [slow, piRunId] })), "ACTION_UNSUPPORTED");
+			const mixed = await h.ctl("wait", undefined, { runIds: [slow, piRunId], mode: "any" });
+			assert.deepEqual(mixed.details.wait, { reason: "settled", pending: [slow] }, "several-run wait spans both backends");
+			assert.deepEqual(mixed.details.rows.map((row: any) => [row.id, row.status]), [[piRunId, "complete"], [slow, "running"]]);
 			const all = h.ctl("wait", undefined, { runIds: [slow, fast], mode: "all" });
 			await sleep(200);
 			await h.ctl("cancel", slow);
