@@ -21,7 +21,7 @@
   "scripts": {
     "build": "npm run build:acpx && node scripts/build.mjs",
     "build:acpx": "tsc -p tsconfig.acpx.json",
-    "check": "npm run typecheck && npm test",
+    "check": "npm run typecheck && npm test && npm run check:install",
     "typecheck": "npm run build:acpx && tsc --noEmit && tsc -p tsconfig.acp.json && tsc -p tsconfig.vendor.json",
     "test": "npm run build && tsx --test test/*.test.ts test/acp/*.test.ts test/acp/integration/*.test.ts",
     "test:acp:e2e": "PI_STRINGS_E2E=1 tsx --test test/acp/integration/*.test.ts",

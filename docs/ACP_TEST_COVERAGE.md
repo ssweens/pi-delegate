@@ -51,9 +51,38 @@ This ledger describes the current implementation, not the retired interaction de
 
 ## Explicit boundaries
 
-1. Run `npm run check` for the package typecheck, build, and default test suite. Run `npm run test:acp:e2e` for the prerequisite-gated integration tests; provider/model gates are not assumed available.
+1. Run `npm run check` for the package typecheck, build, default test suite and install smoke (`check:install`). Run `npm run test:acp:e2e` for the prerequisite-gated integration tests; provider/model gates are not assumed available.
 2. ACPX is the only production runtime. The port passes timeout `0`; coordinator deadlines own `timed_out` transitions and worker quarantine.
 3. ACPX permission policy is authoritative at the configured layer. Profile tool lists, cwd, and provider-native sandbox behavior are not universal guarantees.
 4. Event results are authoritative after terminal completion; stream loss before terminal remains transport failure.
 5. State version 2 stores origin. Version 1 owned records migrate as `created` only; opened records cannot be inferred from an old ID. Legacy waiting/question data remains `STATE_CORRUPT`.
 6. Native opening is identity/settings/lifecycle, not a transcript dump. History stays in the provider session.
+
+## Delegate contract matrix (todo 046)
+
+One gate: `npm run check` runs `typecheck`, then `test` (build plus the default suite), then `check:install`. Each lifecycle action of `src/backend.ts`, per backend and origin, with the test that proves it through `delegate`/`delegate_ctl`. "Unsupported" means the capability report says so. The tool then fails with that code and does nothing else.
+
+| Action | pi | acp created | acp opened |
+|---|---|---|---|
+| create | `lifecycle.test.ts`; `acp-dispatch` "no backend" | `acp-dispatch` "create"; `acp-native` "create" (Amp local/Orb); `delegate-contract` rows | n/a |
+| open | Unsupported. `sessionId` fails `FIELD_REQUIRES_ACP` before an action is chosen (`acp-dispatch`, `delegate-contract`) | n/a | Amp: `acp-dispatch` "open", `acp-native` "open" (identity, `SESSION_IN_USE`, `NATIVE_LOOKUP_FAILED`, `NATIVE_OPEN_UNSUPPORTED`). Non-Amp: `delegate-contract` |
+| steer | `lifecycle` "async steer reuses identity", "reviving on another offering" | `acp-dispatch` "create" (same session, one request ID per turn); `acp-lifecycle` "steer reopens"; `RUN_NOT_RESUMABLE`, `RUN_CLOSED` | `acp-dispatch` "open"; `acp-native` "native sends"; `OPEN_OVERRIDE_FORBIDDEN` on model; `SESSION_IDENTITY_CHANGED` after park (`delegate-contract`) |
+| wait | `lifecycle`; `completion.test.ts` | `acp-dispatch` "wait any/all"; `acp-lifecycle` "wait across pi and acp runs" (timeout and abort never cancel), parked wait | `acp-dispatch` "open"; `acp-native` "native sends" |
+| result | `lifecycle` "the child's report is quoted"; `completion` | `acp-dispatch`, `acp-lifecycle` "output bounds" | `acp-dispatch` "open"; `acp-native` observe on result |
+| status | `lifecycle`; `acp-dispatch` mixed list | `acp-dispatch`; `acp-lifecycle` "after the restart" | `acp-lifecycle`; `acp-native` |
+| cancel | `lifecycle` "explicit cancel stops"; `completion` | `acp-dispatch` "cancel reaches only an active turn"; `acp-lifecycle` "ambiguous delivery and cancellation" | Own turns only: `delegate-contract` "cancel never reaches a turn this run did not start" |
+| close | Unsupported: `ACTION_UNSUPPORTED` (`acp-dispatch`, `delegate-contract`) | Dispose: `acp-dispatch` "close disposes" (`WORKER_BUSY` without force, final, `RUN_CLOSED`) | Disconnect only: `acp-dispatch`, `acp-native` "close only disconnects"; discard fails `OPEN_OVERRIDE_FORBIDDEN` |
+| observe | Unsupported: `acp-native`, `delegate-contract` | Unsupported (`acp-native` created fixture and Amp; `delegate-contract`) | Amp: `acp-native` "observe" (cursor, bound, unknown, park). Non-Amp: unsupported (`delegate-contract`) |
+| failure | `lifecycle` "timeout and provider failure"; `recovery.test.ts` (SIGKILL) | `acp-lifecycle` "timeout", "provider failure"; `acp-recovery` (real crash); `RUN_NOT_PERSISTED` (`delegate-contract`) | `acp-lifecycle` "provider failure" (Amp); `acp-native` failed native send is not retried |
+| parking and ownership | `lifecycle` "cold reopen is read-only"; `storage.test.ts` | `acp-lifecycle` "parent exit parks", `RUN_OWNED_ELSEWHERE`; `acp-owners` (two parents) | `acp-lifecycle` "steer reopens"; `acp-native` cursor survives park |
+
+Cross-cutting gates:
+
+- Capability reports: `delegate-contract` runs one table over pi, acp created (pi, Amp) and acp opened (pi, Amp). Each acp run must report `acpCapabilities` for its origin and agent. Each run-level action (status, result, wait, observe, steer, cancel, close) is called once through the tools. An action marked unsupported must fail `ACTION_UNSUPPORTED` with the report's reason. An action marked supported must not. If a lifecycle action is added without a row, the typecheck fails.
+- Contract error codes: `delegate-contract` reaches each `ContractErrorCode` through the tools, keyed by a `Record<ContractErrorCode, ...>`, so a new code without a case fails the typecheck. None of these calls creates, opens, cancels or closes a session. `backend-contract.test.ts` covers the pure validators field by field.
+- Worker guard: `worker-guard.test.ts` checks that `PI_STRINGS_WORKER=1` and `PI_STRINGS_OPENED=1` each make the extension register no tools and call no `ExtensionAPI` method.
+- Install smoke: `test/install-smoke.ts` (`check:install`) packs the package, installs it into an isolated Pi and loads it with the ACP runtime.
+
+Counts, `npm run check` at 176bee2 plus this change, 2026-10-01: 279 tests, 260 pass, 0 fail, 19 skipped. Install smoke PASS: 152 packaged files, Pi 0.99.1. Before this change the suite was 269 tests, 250 pass, 19 skipped, and `check` did not run the install smoke.
+
+The 19 skipped tests are all in `test/acp/integration/coordination-e2e.test.ts`. They need `PI_STRINGS_E2E=1`, a model for each agent (`PI_STRINGS_TEST_{PI,CODEX,OPENCODE,AMP,CLAUDE}_MODEL`), the agent executables, and `PI_STRINGS_E2E_WRITER_WORKTREE` for the writer cases. `npm run test:acp:e2e` runs them. Long-running real-provider tests are todo 048.
