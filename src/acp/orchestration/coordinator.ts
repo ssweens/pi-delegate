@@ -2,13 +2,12 @@ import { randomUUID } from "node:crypto";
 import { appendFile, chmod, mkdir, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { AmpControlAction, AmpControlRecord, Profile, RequestRecord, RuntimeHandle, RuntimePort, RuntimeStatus, RuntimeTerminal, RuntimeTurn, StringsResponse, TurnUsage, UsageBreakdown, UsageCost, WorkerKind, WorkerRecord, WorktreeIdentity, NativeSessionDescription, SessionOrigin } from "../domain/types.js";
+import type { Profile, RequestRecord, RuntimeHandle, RuntimePort, RuntimeStatus, RuntimeTerminal, RuntimeTurn, StringsResponse, TurnUsage, UsageBreakdown, UsageCost, WorkerKind, WorkerRecord, WorktreeIdentity, NativeSessionDescription, SessionOrigin } from "../domain/types.js";
 import { failure, StringsError } from "../domain/errors.js";
 import { loadProfiles } from "../domain/config.js";
 import { requireCwdUnowned, requireIsolatedWriter, requireWriterUnowned } from "../domain/worktree.js";
 import { acceptanceContract, parseAcceptanceReport, roleContract, WORKER_CONTRACT } from "../domain/roles.js";
 import { AcpxRuntimePort } from "../runtime/acpx-runtime.js";
-import { ampPluginBridgeFromEnvironment, type AmpBridgeResponse } from "../runtime/amp-plugin-bridge.js";
 import { StateStore, type SessionProvenance, type StoredWorker } from "../persistence/state-store.js";
 
 const NAME = /^[a-z][a-z0-9-]{0,47}$/;
@@ -41,7 +40,6 @@ export interface CoordinatorOptions {
 export class Coordinator {
   private readonly workers = new Map<string, LiveWorker>();
   private readonly requests = new Map<string, RequestRecord>();
-  private readonly controls = new Map<string, AmpControlRecord>();
   private readonly sessions = new Map<string, SessionProvenance>();
   private readonly completions = new Map<string, Promise<void>>();
   private readonly terminalSignals = new Set<string>();
@@ -83,10 +81,6 @@ export class Coordinator {
         case "status": return await this.status(input);
         case "spawn": return await this.spawn(input);
         case "send": return await this.send(input);
-        case "observe": return await this.ampControl(input, "observe");
-        case "append": return await this.ampControl(input, "append");
-        case "steer": return await this.ampControl(input, "steer");
-        case "cancel_remote": return await this.ampControl(input, "cancel");
         case "wait": return await this.wait(input);
         case "result": return this.result(input);
         case "cancel": return await this.cancel(input);
@@ -227,6 +221,17 @@ export class Coordinator {
     await this.stateStore.close();
   }
 
+  /**
+   * Synchronous read of one worker and its requests, for views that render on every frame.
+   * Copies only: no IO, no serialization, no state change. The worker is absent once closed.
+   */
+  snapshot(name: string): { worker?: WorkerRecord; requests: RequestRecord[] } {
+    const live = this.workers.get(name)?.record;
+    const worker = live ? { ...live, handle: { ...live.handle }, ...(live.native ? { native: { ...live.native } } : {}) } : undefined;
+    const requests = [...this.requests.values()].filter(request => request.workerName === name).map(request => ({ ...request }));
+    return { ...(worker ? { worker } : {}), requests };
+  }
+
   private list(input: Action): StringsResponse {
     let records = [...this.workers.values()].map(({ record }) => record);
     let requests = [...this.requests.values()];
@@ -240,8 +245,7 @@ export class Coordinator {
       records = records.filter(record => selected!.has(record.name));
       requests = requests.filter(request => selected!.has(request.workerName));
     }
-    const controls = [...this.controls.values()].filter(control => selected === undefined || selected.has(control.workerName));
-    return { ok: true, action: "list", details: { workers: records.map(record => this.publicWorker(record)), requests: requests.map((r) => ({ ...r })), controls } };
+    return { ok: true, action: "list", details: { workers: records.map(record => this.publicWorker(record)), requests: requests.map((r) => ({ ...r })) } };
   }
 
   private async spawn(input: Action): Promise<StringsResponse> {
@@ -401,77 +405,6 @@ export class Coordinator {
     this.completions.set(requestId, opened ? Promise.race([completion, observationEnd]) : completion);
     await this.persist();
     return { ok: true, action: "send", details: { requestId, worker: worker.record.name, status: "running", lineageId, attempt, ...(requestedModel ? { requestedModel } : {}), session: worker.record.handle.backendSessionId ?? worker.record.handle.agentSessionId, decoratedPromptSuffix: decorated.slice(prompt.length) } };
-  }
-
-  private async ampControl(input: Action, controlAction: AmpControlAction): Promise<StringsResponse> {
-    const worker = this.getWorker(requiredString(input.name, "name"));
-    const native = await this.requireOpenedAmp(worker);
-    const text = input.text === undefined ? undefined : requiredString(input.text, "text");
-    if ((controlAction === "append" || controlAction === "steer") && !text) throw new StringsError("INPUT_INVALID", `${controlAction} requires non-empty text.`);
-    if (input.limit !== undefined && (!Number.isInteger(input.limit) || Number(input.limit) < 1)) throw new StringsError("INPUT_INVALID", "limit must be a positive integer.");
-    const bridge = ampPluginBridgeFromEnvironment();
-    if (!bridge) throw new StringsError("AMP_BRIDGE_UNAVAILABLE", "Configure PI_STRINGS_AMP_BRIDGE_URL and PI_STRINGS_AMP_BRIDGE_TOKEN before using Amp plugin work controls.");
-    const requestId = `ctl_${randomUUID()}`;
-    const startedAt = new Date().toISOString();
-    const record: AmpControlRecord = {
-      id: requestId,
-      workerName: worker.record.name,
-      action: controlAction,
-      nativeSessionId: native.id,
-      startedAt,
-      finishedAt: startedAt,
-      delivery: "unknown",
-      status: "failed",
-    };
-    this.controls.set(requestId, record);
-    const request = {
-      requestId,
-      threadId: native.id,
-      action: controlAction,
-      ...(text !== undefined ? { text } : {}),
-      ...(input.limit !== undefined ? { limit: Number(input.limit) } : {}),
-      ...(typeof input.reason === "string" ? { reason: input.reason } : {}),
-    } as const;
-    let response: AmpBridgeResponse;
-    try {
-      response = await bridge.request(request);
-    } catch (error) {
-      record.finishedAt = new Date().toISOString();
-      record.failure = { code: error instanceof StringsError ? error.code : "AMP_BRIDGE_FAILED", message: error instanceof Error ? error.message : String(error) };
-      await this.persist();
-      return { ok: true, action: input.action, details: { requestId, worker: worker.record.name, threadId: native.id, control: controlAction, delivery: "unknown", error: record.failure } };
-    }
-    record.finishedAt = new Date().toISOString();
-    record.delivery = response.delivery;
-    record.status = response.delivery === "accepted" ? "completed" : "failed";
-    await this.persist();
-    return {
-      ok: true,
-      action: input.action,
-      details: {
-        requestId,
-        worker: worker.record.name,
-        threadId: native.id,
-        control: controlAction,
-        delivery: response.delivery,
-        ...(response.state !== undefined ? { state: response.state } : {}),
-        ...(response.messages !== undefined ? { messages: response.messages } : {}),
-        ...(response.remoteStop !== undefined ? { remoteStop: response.remoteStop } : {}),
-        ...(response.providerMessageId !== undefined ? { providerMessageId: response.providerMessageId } : {}),
-      },
-    };
-  }
-
-  private async requireOpenedAmp(worker: LiveWorker): Promise<NativeSessionDescription> {
-    if (worker.record.origin !== "opened" || worker.record.profile.agent.toLowerCase() !== "amp" || !worker.record.native || !worker.runtime.describeNativeSession) {
-      throw new StringsError("AMP_CONTROL_REQUIRES_OPEN", "Amp plugin work controls require an opened native Amp T-ID.");
-    }
-    const native = await worker.runtime.describeNativeSession("amp", worker.record.native.id, {
-      cwd: worker.record.native.cwd,
-      executionEnvironment: worker.record.native.executionEnvironment,
-    });
-    this.requireSameNative(worker.record.native, native);
-    return native;
   }
 
   private revalidateWriter(worker: LiveWorker): void {

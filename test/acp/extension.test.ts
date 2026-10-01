@@ -7,7 +7,7 @@ import type { Profile } from "../../src/acp/domain/types.ts";
 test("registers the op_* tools in a parent", () => {
   const tools: unknown[] = [];
   piStrings({ on: () => undefined, registerTool: (tool: unknown) => tools.push(tool) } as never);
-  assert.deepEqual(tools.map((tool) => (tool as { name: string }).name), ["op_spawn", "op_status", "op_send", "op_observe", "op_append", "op_steer", "op_cancel_remote", "op_wait", "op_result", "op_list", "op_cancel", "op_close"]);
+  assert.deepEqual(tools.map((tool) => (tool as { name: string }).name), ["op_spawn", "op_status", "op_send", "op_wait", "op_result", "op_list", "op_cancel", "op_close"]);
 });
 
 test("routes profile roles to ACPX permission modes", () => {

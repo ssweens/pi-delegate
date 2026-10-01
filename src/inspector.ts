@@ -124,7 +124,10 @@ export class AgentsPanel implements Component, Focusable {
 			const roleWidth = 12;
 			const titleWidth = Math.min(36, Math.floor(inner * 0.38));
 			const activityWidth = Math.max(1, inner - 4 - titleWidth - roleWidth - time.length - 3);
-			const activity = v.status === "running"
+			// An ACP agent streams no tool calls here: its session is the fact worth the column.
+			const activity = v.backend === "acp"
+				? this.theme.fg("dim", v.status === "running" ? `session ${v.nativeSessionId ?? "pending"}` : v.status)
+				: v.status === "running"
 				? v.activeTool ? formatToolCall(v.activeTool.name, v.activeTool.args, this.theme) : this.theme.fg("dim", "Thinking…")
 				: this.theme.fg("warning", "Stopping…");
 			return prefix + pad(title, titleWidth) + " " + pad(this.theme.fg("muted", v.role), roleWidth) + " " + pad(activity, activityWidth) + " " + this.theme.fg("dim", time);
@@ -155,7 +158,7 @@ export class AgentHistory implements Component {
 		this.list = new SelectList(runs.map((v) => ({
 			value: v.id,
 			label: `${icon(v, theme)} ${runTitle(v)}`,
-			description: `${v.role} · ${v.status} · ${elapsed(v.durationMs)}`,
+			description: `${v.role}${v.backend === "acp" && v.nativeSessionId ? ` ${v.nativeSessionId}` : ""} · ${v.status} · ${elapsed(v.durationMs)}`,
 		})), Math.max(1, Math.min(8, tui.terminal.rows - 6)), {
 			selectedPrefix: (s) => theme.fg("accent", s),
 			selectedText: (s) => theme.fg("accent", s),
@@ -282,7 +285,9 @@ export class ChildView implements Component, Focusable {
 		if (!v) return [pad("Child unavailable · Esc parent", width), ...Array(Math.max(0, height - 1)).fill(" ".repeat(width))];
 		const inner = Math.max(1, width - 4);
 		const header = `${icon(v, this.theme)} ${this.theme.bold(runTitle(v))}${this.theme.fg("muted", ` · ${v.role}`)}`;
-		const meta = `${v.status} · ${elapsed(v.durationMs)} · ${v.model}${v.thinking ? `:${v.thinking}` : ""}`;
+		const meta = v.backend === "acp"
+			? [v.status, elapsed(v.durationMs), `acp ${v.agent ?? ""}`, `${v.origin === "opened" ? "opened session" : "session"} ${v.nativeSessionId ?? "pending"}${v.executionEnvironment ? ` (${v.executionEnvironment})` : ""}`, v.model].filter(Boolean).join(" · ")
+			: `${v.status} · ${elapsed(v.durationMs)} · ${v.model}${v.thinking ? `:${v.thinking}` : ""}`;
 		const head = frame(header, [truncateToWidth(meta, inner, "…")], "borderMuted", this.theme, width);
 		const editor = this.editor.render(width);
 		const footer = [

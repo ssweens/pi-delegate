@@ -57,10 +57,18 @@ function nativeDescriptionFromBinding(binding: NativeSessionBinding | undefined)
   };
 }
 
+/** Extra ACPX agent commands, by agent name. Embedders and tests only; users get the built-in registry. */
+export type AgentOverrides = Readonly<Record<string, readonly string[]>>;
+
+/** Every agent name this runtime can start: ACPX's built-in registry, the vendored pi and amp adapters, and any overrides. */
+export function acpAgentNames(overrides: AgentOverrides = {}): string[] {
+  return [...new Set([...createAgentRegistry().list(), "pi", "amp", ...Object.keys(overrides).map(name => name.trim().toLowerCase())])].sort();
+}
+
 export class AcpxRuntimePort implements RuntimePort {
   private readonly runtime: AcpxRuntime;
 
-  constructor(cwd: string, stateDir: string, profile: Profile, private readonly origin: "created" | "opened" = "created") {
+  constructor(cwd: string, stateDir: string, profile: Profile, private readonly origin: "created" | "opened" = "created", agentOverrides: AgentOverrides = {}) {
     const piAdapterArgv = origin === "opened"
       ? [process.execPath, adapterEntry, "--pi-strings-opened"]
       : [process.execPath, adapterEntry, "--pi-strings-worker", "--pi-tools-json", JSON.stringify(profile.tools)];
@@ -76,6 +84,7 @@ export class AcpxRuntimePort implements RuntimePort {
           // `amp login`; provider-native tools are not confined by ACPX's
           // permission layer (same boundary as Codex's Guardian).
           amp: [process.execPath, ampAdapterEntry],
+          ...Object.fromEntries(Object.entries(agentOverrides).map(([name, argv]) => [name, [...argv]])),
         },
       }),
       permissionMode: permissionModeFor(profile),

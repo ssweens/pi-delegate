@@ -1,6 +1,7 @@
 import type { Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme, keyHint } from "@earendil-works/pi-coding-agent";
 import { type Component, Markdown, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import type { AcpRunView } from "./backend.js";
 
 export interface RunView {
 	id: string;
@@ -15,7 +16,8 @@ export interface RunView {
 	context: "fork" | "fresh";
 	forkedMessages?: number;
 	contextWindow?: number;
-	status: "running" | "complete" | "error" | "cancelled" | "timeout" | "interrupted";
+	/** idle: an opened ACP session with no turn of its own yet. Pi runs are never idle. */
+	status: "running" | "complete" | "error" | "cancelled" | "timeout" | "interrupted" | "idle";
 	task: string;
 	output: string;
 	turns: number;
@@ -33,6 +35,48 @@ export interface RunView {
 	lastTool?: string;
 	error?: string;
 	sessionFile?: string;
+	/** Display facts of an ACP run (acpRowView). Absent on pi runs, which are the default. */
+	backend?: "pi" | "acp";
+	agent?: string;
+	origin?: "created" | "opened";
+	nativeSessionId?: string;
+	executionEnvironment?: string;
+	closed?: boolean;
+	turn?: { requestId: string; status: string; delivery: string; providerOutcome?: string; truncated: boolean };
+}
+
+/** An ACP run in the shape every run surface draws: one line, the Agents frame, history, the child view. */
+export function acpRowView(v: AcpRunView): RunView {
+	const latest = v.turns.at(-1);
+	const tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+	let cost = 0;
+	for (const t of v.turns) {
+		const b = t.usage?.breakdown;
+		tokens.input += b?.inputTokens ?? 0;
+		tokens.output += b?.outputTokens ?? 0;
+		tokens.cacheRead += b?.cachedReadTokens ?? 0;
+		tokens.cacheWrite += b?.cachedWriteTokens ?? 0;
+		cost += t.usage?.cost?.amount ?? 0;
+	}
+	return {
+		id: v.id, segment: v.turns.length, stopped: false, settled: v.status !== "running",
+		role: `acp ${v.session.agent}`, model: v.model ?? "", cwd: v.cwd, thinking: "", context: "fresh",
+		status: v.status, task: v.task ?? "", output: v.output, turns: v.turns.length, tokens, cost,
+		durationMs: (v.endedAt ?? Date.now()) - v.startedAt, changedFiles: [], droppedTools: [], toolCalls: [],
+		revision: v.turns.length * 1_000_003 + v.output.length * 2 + (v.status === "running" ? 0 : 1),
+		...(v.error ? { error: v.error } : {}),
+		backend: "acp", agent: v.session.agent, origin: v.session.origin,
+		...(v.session.nativeSessionId ? { nativeSessionId: v.session.nativeSessionId } : {}),
+		...(v.session.executionEnvironment ? { executionEnvironment: v.session.executionEnvironment } : {}),
+		...(v.closed ? { closed: true } : {}),
+		...(latest ? { turn: { requestId: latest.requestId, status: latest.status, delivery: latest.delivery, truncated: latest.truncated, ...(latest.providerOutcome ? { providerOutcome: latest.providerOutcome } : {}) } } : {}),
+	};
+}
+
+/** Recorded details of either backend, as a run view, or undefined when they are not a run. */
+export function asRunView(details: any): RunView | undefined {
+	if (details?.backend === "acp" && details.session && typeof details.session === "object" && Array.isArray(details.turns) && typeof details.id === "string") return acpRowView(details);
+	return details && typeof details === "object" && typeof details.id === "string" ? details : undefined;
 }
 
 /** A supplied title, not a guessed summary of the brief. */
@@ -50,6 +94,7 @@ export function elapsed(ms: number): string {
 export function statusMark(v: Pick<RunView, "status">): { color: ThemeColor; glyph: string } {
 	if (v.status === "running") return { color: "accent", glyph: "●" };
 	if (v.status === "complete") return { color: "success", glyph: "✓" };
+	if (v.status === "idle") return { color: "muted", glyph: "○" };
 	if (v.status === "error") return { color: "error", glyph: "✗" };
 	return { color: "warning", glyph: "⊘" };
 }
@@ -65,6 +110,7 @@ export function runLine(v: RunView, theme: Theme, width: number, now = Date.now(
 		// The glyph already says "complete"; only a status worth reacting to earns a word.
 		v.status === "running" ? theme.fg("accent", v.activeTool?.name ?? v.lastTool ?? "thinking") : v.status === "complete" ? "" : theme.fg(color, v.status),
 		theme.fg("muted", v.role ?? ""),
+		v.backend === "acp" && v.nativeSessionId ? dim(v.nativeSessionId) : "",
 		dim(elapsed(v.durationMs ?? 0)),
 		v.turns ? dim(`${v.turns} turn${v.turns === 1 ? "" : "s"}`) : "",
 		v.cost ? theme.fg("muted", `$${(v.cost ?? 0).toFixed(4)}`) : "",
@@ -88,7 +134,15 @@ export function resultLines(v: RunView, expanded: boolean, theme: Theme, width: 
 	}
 	if (v.failedAttempts) lines.push(theme.fg("warning", `${v.failedAttempts} failed provider attempt${v.failedAttempts === 1 ? "" : "s"} before this (last: ${v.lastAttemptError})`));
 	if (v.error) lines.push(...wrapTextWithAnsi(theme.fg("error", String(v.error)), Math.max(1, width)));
-	lines.push(theme.fg("dim", "id ") + theme.fg("muted", v.id) + theme.fg("dim", "  model ") + theme.fg("muted", `${v.model ?? ""}${v.thinking ? `:${v.thinking}` : ""}`) + theme.fg("dim", `  ${v.context ?? ""}`));
+	if (v.backend === "acp") {
+		lines.push(theme.fg("dim", "id ") + theme.fg("muted", v.id) + theme.fg("dim", "  backend ") + theme.fg("muted", "acp") + theme.fg("dim", "  agent ") + theme.fg("muted", v.agent ?? "")
+			+ (v.model ? theme.fg("dim", "  model ") + theme.fg("muted", v.model) : ""));
+		lines.push(theme.fg("dim", `${v.origin === "opened" ? "opened session" : "session"} `) + theme.fg("muted", v.nativeSessionId ?? "pending")
+			+ (v.executionEnvironment ? theme.fg("dim", ` (${v.executionEnvironment})`) : "") + (v.closed ? theme.fg("dim", v.origin === "opened" ? "  disconnected" : "  closed") : ""));
+		if (v.turn) lines.push(theme.fg("dim", "turn ") + theme.fg("muted", v.turn.requestId) + theme.fg("dim", ` ${v.turn.status} · delivery ${v.turn.delivery}${v.turn.providerOutcome ? ` · outcome ${v.turn.providerOutcome}` : ""}`)
+			+ (v.turn.truncated ? theme.fg("warning", " · output truncated") : ""));
+		else lines.push(theme.fg("dim", "idle: attached without sending a turn"));
+	} else lines.push(theme.fg("dim", "id ") + theme.fg("muted", v.id) + theme.fg("dim", "  model ") + theme.fg("muted", `${v.model ?? ""}${v.thinking ? `:${v.thinking}` : ""}`) + theme.fg("dim", `  ${v.context ?? ""}`));
 	if (v.changedFiles?.length) lines.push(theme.fg("dim", "changed ") + theme.fg("success", v.changedFiles.join(", ")));
 	if (v.sessionFile) lines.push(theme.fg("dim", `session ${v.sessionFile}`));
 	if (v.droppedTools?.length) lines.push(theme.fg("warning", `Unavailable tools: ${v.droppedTools.join(", ")}`));
@@ -378,15 +432,14 @@ export function resultView(
 	width: number,
 ): string[] {
 	const inner = Math.max(1, width);
-	const v = result.details as RunView | undefined;
-	const single = v && typeof (v as any).id === "string" ? v : undefined;
+	const single = asRunView(result.details);
 	if (single) {
 		// Async launch stays invisible in chat; its completion message is the one outcome record.
 		if ((title === "delegate" || action === "wait") && single.status === "running") return [];
 		return resultLines(single, Boolean(opts.expanded), theme, inner);
 	}
 
-	const rows = result.details?.rows;
+	const rows = Array.isArray(result.details?.rows) && result.details?.kind === "runs" ? result.details.rows.map((r: any) => asRunView(r) ?? r) : result.details?.rows;
 	if (result.details?.kind === "runs" && Array.isArray(rows) && rows.every(isRunRow)) {
 		const running = rows.filter((r) => r.status === "running").length;
 		return [

@@ -7,7 +7,6 @@ export type WorkerKind = "oracle" | "finder" | "worker" | "free";
 export type IsolationMode = "shared" | "worktree";
 export type WorkerStatus = "spawning" | "idle" | "running" | "failed" | "closing" | "closed";
 export type RequestStatus = "running" | "completed" | "cancelled" | "timed_out" | "failed";
-export type AmpControlAction = "observe" | "append" | "steer" | "cancel";
 
 export interface WorktreeIdentity {
   worktreeRoot: string;
@@ -128,18 +127,6 @@ export interface RequestRecord {
   attempts?: number;
   delivery?: "unknown" | "accepted";
   providerOutcome?: "completed" | "cancelled" | "failed";
-}
-
-export interface AmpControlRecord {
-  id: string;
-  workerName: string;
-  action: AmpControlAction;
-  nativeSessionId: string;
-  startedAt: string;
-  finishedAt: string;
-  delivery: "accepted" | "unknown";
-  status: "completed" | "failed";
-  failure?: { code: string; message: string };
 }
 
 export interface WorkerRecord {

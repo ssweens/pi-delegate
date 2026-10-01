@@ -20,7 +20,10 @@ import { truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { keyHint } from "@earendil-works/pi-coding-agent";
 import { AgentHistory, AgentsPanel, ChildView, type LiveSource } from "./inspector.js";
 import type { ActiveTool, ChildActivity } from "./transcript.js";
-import { type AAIndices, elapsed, empty, framed, type LiveFacts, type ModelRow, type ModelsDetails, resultLines, resultView, type RunView } from "./render.js";
+import { type AAIndices, acpRowView, asRunView, elapsed, empty, framed, type LiveFacts, type ModelRow, type ModelsDetails, resultLines, resultView, type RunView } from "./render.js";
+import { type AcpRunView, type LifecycleAction, type PiStartInput, type WaitOutcome, PI_CAPABILITIES, requireAction, validateStartInput, validateSteer } from "./backend.js";
+import { AcpBackend, acpResultText, acpSummary, DelegateError, unwrap } from "./acp-backend.js";
+import { shutdownAcpCoordinator } from "./acp/instance.js";
 import { loadRoles } from "./roles.js";
 import { installTodo } from "./todo-ext.js";
 import { RunCompletion } from "./completion.js";
@@ -954,13 +957,27 @@ export default function (pi: ExtensionAPI) {
 	}
 	let owner: Owner | undefined;
 	let attachError: string | undefined;
+	// The acp backend (acp-backend.ts) over the process's one Coordinator. Its runs belong to a
+	// parent as pi runs do, and a turn that settles with no wait joined wakes that parent the same way.
+	const acp = new AcpBackend({
+		ownerKey: () => requireOwner().key,
+		changed,
+		settled: (v, ownerKey) => {
+			const target = state.owners.get(ownerKey);
+			if (!target?.binding || target.closed) return;
+			target.binding.pi.sendMessage(
+				{ customType: "delegate", content: `delegate finished\n${acpResultText(v)}`, display: true, details: v },
+				{ deliverAs: "followUp", triggerTurn: true },
+			);
+		},
+	});
 	// Canonical phased todo (transferred from pi-omp; see todo-ext.ts). The reminder reads this
 	// parent's live children: while one is unsettled its completion message re-wakes the loop,
 	// so an incomplete-todo nag at agent_end would be premature.
 	installTodo(pi, {
 		hasActiveJobs: () => {
 			if (!owner || owner.closed) return false;
-			return ownedRuns(owner).some((run) => !run.completion.settled);
+			return ownedRuns(owner).some((run) => !run.completion.settled) || acp.owned(owner.key).some((run) => run.status === "running");
 		},
 	});
 	function requireOwner(): Owner {
@@ -1037,15 +1054,23 @@ export default function (pi: ExtensionAPI) {
 		void launch(run, message).then(() => publish(completion));
 	}
 	const liveSource: LiveSource = {
-		all: () => owner ? ownedRuns(owner).map(view) : [],
-		activity: (id) => { const r = runs.get(id); return r && r.ownerKey === owner?.key ? activityOf(r) : { messages: [], activeTools: new Map() }; },
+		all: () => owner ? [...ownedRuns(owner).map(view), ...acp.owned(owner.key).map(acpRowView)] : [],
+		activity: (id) => {
+			const r = runs.get(id);
+			if (r && r.ownerKey === owner?.key) return activityOf(r);
+			return owner && acp.find(id, owner.key) ? acp.activity(id) : { messages: [], activeTools: new Map() };
+		},
 		subscribe: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
 		steer: async (id, message) => {
+			if (acp.find(id, requireOwner().key)) { await acp.steer(id, { message }); return; }
 			const r = runs.get(id);
 			if (!r || r.ownerKey !== requireOwner().key) throw new Error(`${id}: child is not owned by this parent`);
 			await steer(r, message, true); // A message typed directly by the human is an explicit restart request.
 		},
-		cancel: async (id) => { const r = runs.get(id); if (r?.ownerKey === requireOwner().key) await cancelRun(r); },
+		cancel: async (id) => {
+			if (acp.find(id, requireOwner().key)) { await acp.cancel(id, {}); return; }
+			const r = runs.get(id); if (r?.ownerKey === requireOwner().key) await cancelRun(r);
+		},
 	};
 	pi.on("message_end", (event) => {
 		if (!owner?.binding || owner.binding.pi !== pi) return;
@@ -1175,9 +1200,37 @@ export default function (pi: ExtensionAPI) {
 		return framed((width) => resultView(title, ctx.args?.action, subject(ctx.args), result, opts, theme, width));
 	};
 
+	// --- acp results. A failure is reported by its code; it never becomes a different action.
+	const failed = (error: unknown) => {
+		if (!(error instanceof DelegateError)) throw error;
+		return {
+			content: [{ type: "text" as const, text: `${error.code}: ${error.message}` }], isError: true,
+			details: { error: { code: error.code, message: error.message, ...(error.field ? { field: error.field } : {}) } },
+		};
+	};
+	const settledBadly = (v: AcpRunView) => v.status !== "running" && v.status !== "idle" && v.status !== "complete";
+	const acpRunResult = (v: AcpRunView) => ({ content: [{ type: "text" as const, text: acpResultText(v) }], details: v, isError: settledBadly(v) });
+	const acpStartText = (v: AcpRunView) => {
+		const session = `${v.session.origin === "opened" ? "opened native session" : "session"} ${v.session.nativeSessionId ?? "pending"}`;
+		if (v.status === "idle") return `${v.id} idle (acp ${v.session.agent}, ${session}); no turn sent. Use delegate_ctl steer with this runId to send one, status or result to read it, close to disconnect.`;
+		return `${v.id} running (acp ${v.session.agent}, ${session}). Completion will wake you; use delegate_ctl wait with this runId when dependent work needs the result.`;
+	};
+	const acpWaitResult = async (outcome: WaitOutcome<AcpRunView>, runIds: readonly string[], timeoutMs?: number) => {
+		const pending = await Promise.all(outcome.pending.map((id) => acp.result(id)));
+		const reports = outcome.settled.map(acpResultText);
+		const still = pending.map((v) => v.id).join(", ");
+		const head = outcome.reason === "timeout" ? `wait timed out after ${timeoutMs} ms; nothing was cancelled. Still running: ${still}`
+			: outcome.reason === "interrupted" ? `wait interrupted — queued messages are waiting for you; the runs keep going.\nAnswer the queued message(s) first, then call wait again to rejoin. Still running: ${still}`
+			: outcome.reason === "lost" ? `wait lost the ACP coordinator (it is shutting down); these runs did not settle: ${still}`
+			: pending.length ? `${outcome.settled.length} settled; still running: ${still}` : "";
+		const text = [head, ...reports, ...(outcome.reason === "settled" ? [] : pending.map(acpSummary))].filter(Boolean).join("\n\n");
+		const details = runIds.length === 1 ? (outcome.settled[0] ?? pending[0]) : { kind: "runs", rows: [...outcome.settled, ...pending], wait: { reason: outcome.reason, pending: outcome.pending } };
+		return { content: [{ type: "text" as const, text }], details, isError: outcome.reason === "lost" || (outcome.reason === "settled" && outcome.settled.some(settledBadly)) };
+	};
+
 	pi.registerTool({
 		name: "delegate",
-		renderCall: blockingCall((args) => args?.sync ? `Waiting for a new ${args.role ?? "child"} \u2014 this launch joins at once (sync)` : undefined),
+		renderCall: blockingCall((args) => args?.sync ? `Waiting for a new ${(args.backend === "acp" ? args.agent : args.role) ?? "child"} \u2014 this launch joins at once (sync)` : undefined),
 		renderResult: resultRenderer("delegate"),
 		label: "Delegate",
 		description:
@@ -1185,18 +1238,41 @@ export default function (pi: ExtensionAPI) {
 			"Delegate only for context isolation, parallelism, or a model-tier switch — if the brief would be longer than the expected diff, do the work yourself. " +
 			"Start the brief with a short task title on its own line, then objective, ownership, interfaces/constraints, verification, return shape. " +
 			'context "fork" (default) hands the child your conversation so far; "fresh" is for adversarial review. ' +
-			"Runs in the background by default \u2014 the call returns a run id at once and you are woken once, when the child finishes. There are no progress pings by design; waiting is not your work. Do other work, or use delegate_ctl wait with that runId to block without polling when nothing else can proceed, or delegate_ctl status for a single progress read when someone asks. sync:true joins at launch when explicitly needed. Children have built-in tools only. Model: run delegate_ctl models first; a role's approved default is used when model: is omitted. Proposing a model that is not the approved default is a conversation with the user, not a tool step: state the offering, price, rating and tradeoff, get their answer, then call delegate; if they want it kept, delegate_ctl action=approve. Use delegate_ctl to list roles, wait, check status, steer, or cancel.",
+			"Runs in the background by default \u2014 the call returns a run id at once and you are woken once, when the child finishes. There are no progress pings by design; waiting is not your work. Do other work, or use delegate_ctl wait with that runId to block without polling when nothing else can proceed, or delegate_ctl status for a single progress read when someone asks. sync:true joins at launch when explicitly needed. Children have built-in tools only. Model: run delegate_ctl models first; a role's approved default is used when model: is omitted. Proposing a model that is not the approved default is a conversation with the user, not a tool step: state the offering, price, rating and tradeoff, get their answer, then call delegate; if they want it kept, delegate_ctl action=approve. Use delegate_ctl to list roles, wait, check status, steer, or cancel. " +
+			'backend "acp" runs an external ACP agent session instead (agent required, e.g. "pi", "amp", "codex", "claude"): it creates a session and sends task as its first turn, or with sessionId opens that exact native session (an Amp T-ID, say) without owning it and sends task only when given. ' +
+			"An ACP child never receives your conversation (no context), and an opened session keeps its native role and model. Its report carries the agent's native session ID and each turn's request ID and delivery. Close an ACP run with delegate_ctl close when done.",
 		parameters: Type.Object({
-			role: Type.String({ description: "role name (delegate_ctl action=roles lists them)" }),
-			task: Type.String({ description: "the brief" }),
-			model: Type.Optional(Type.String({ description: "override: provider/id[:thinking]" })),
+			backend: Type.Optional(Type.String({ description: 'where the child runs: "pi" (default) is an in-process Pi child; "acp" is an external ACP agent session' })),
+			role: Type.Optional(Type.String({ description: 'pi: role name, required (delegate_ctl action=roles lists them). acp: "read-only" (default) or "writer" for a created session; not allowed with sessionId' })),
+			task: Type.Optional(Type.String({ description: "the brief. Required, except acp with sessionId, where it is the first native turn when given" })),
+			model: Type.Optional(Type.String({ description: "override. pi: provider/id[:thinking]. acp: the agent's own model ID, created sessions only" })),
 			context: Type.Optional(StringEnum(["fork", "fresh"] as const)),
 			cwd: Type.Optional(Type.String()),
 			timeoutMs: Type.Optional(Type.Number({ description: `abort the child after this many ms; default ${DEFAULT_TIMEOUT_MS / 60000} min. Size it to the work: a build, suite, or training run that takes hours needs hours here, or it is killed mid-flight` })),
 			sync: Type.Optional(Type.Boolean({ description: "block until the child finishes. Default false: the call returns at once and you are woken with the result" })),
 			reason: Type.Optional(Type.String({ description: "one line: why this model for this role; recorded in the run log" })),
+			agent: Type.Optional(Type.String({ description: "acp only: the ACP agent to run, e.g. pi, amp, codex, claude" })),
+			sessionId: Type.Optional(Type.String({ description: "acp only: open this exact provider-native session (e.g. an Amp T-ID) instead of creating one" })),
+			executionEnvironment: Type.Optional(Type.String({ description: 'acp only: "local" or "orb". Creating: where the session runs. Opening (Amp only): a verification hint' })),
 		}),
-		async execute(_id, p, signal, onUpdate, ctx) {
+		async execute(_id, params, signal, onUpdate, ctx) {
+			const start = validateStartInput(params as Record<string, unknown>);
+			if (!start.ok) return failed(new DelegateError(start.error.code, start.error.message, start.error.field));
+			if (start.value.backend === "acp") {
+				const input = start.value;
+				try {
+					requireOwner();
+					// A created session works where the parent does unless told otherwise; an opened one keeps its native workspace.
+					const cwd = input.cwd !== undefined ? realpathSync(input.cwd) : input.origin === "created" ? realpathSync(ctx.cwd) : undefined;
+					const v = await acp.start({ ...input, ...(cwd !== undefined ? { cwd } : {}) });
+					if (input.sync && v.status === "running") {
+						const outcome = await acp.wait({ runIds: [v.id], mode: "all" }, signal);
+						return acpRunResult(outcome.settled[0] ?? await acp.result(v.id));
+					}
+					return { content: [{ type: "text", text: acpStartText(v) }], details: v };
+				} catch (error) { return failed(error); }
+			}
+			const p = { ...params, role: (start.value as PiStartInput).role, task: (start.value as PiStartInput).task };
 			const owner = requireOwner();
 			const cwd = realpathSync(p.cwd ?? ctx.cwd);
 			const roles = loadRoles(cwd, ctx.isProjectTrusted());
@@ -1337,20 +1413,25 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 
 	pi.registerTool({
 		name: "delegate_ctl",
-		renderCall: blockingCall((args) => args?.action === "wait" ? `Waiting for ${args.runId ?? "a child"}` : undefined),
+		renderCall: blockingCall((args) => args?.action === "wait" ? `Waiting for ${args.runId ?? (Array.isArray(args.runIds) && args.runIds.length ? args.runIds.join(", ") : "a child")}` : undefined),
 		renderResult: resultRenderer("delegate_ctl"),
 		label: "Delegate control",
 		description:
 			"See the delegation skill for the full procedure. models: every offering across all enabled providers, verbatim from the registry (provider/id, reasoning, context, $/M), plus live OpenRouter pricing, tiered rates, expirations and Artificial Analysis indices, your cached ratings, approved defaults and drift \u2014 call before the first delegate of a session. " +
 			"rate: store quality ratings you researched, per exact offering (provider/id), so choices are grounded; stale after 14 days. approve: record a role's default model after the user agreed in conversation. " +
-			"roles: list roles. status: one run or all \u2014 a nonblocking progress read: status, current tool, tool calls so far, elapsed, remaining time budget. result: current report without waiting. wait: join an existing runId; returns its final report, immediately if finished. If queued messages arrive while waiting it returns early with the child still running — answer them, then wait again to rejoin. If the child stops without reporting completion it returns an error report instead of blocking until the run budget. Cancelling wait only detaches; the child keeps running. An attached waiter receives completion instead of a separate wake-up. steer: queue a correction or resume a finished child in the background, keeping its context; returns immediately. Use wait to join the resumed work. Saved children are restored on parent reopen without running; steer revives them with their original configuration unless you pass model:, which moves that child to another offering from the next segment on \u2014 propose it in conversation first, including when the saved offering is exhausted or gone. Explicitly stopped children require restart:true and the user's request. cancel: stop the child and prevent automatic revival.",
+			"roles: list roles. status: one run or all \u2014 a nonblocking progress read: status, current tool, tool calls so far, elapsed, remaining time budget. result: current report without waiting. wait: join an existing runId; returns its final report, immediately if finished. If queued messages arrive while waiting it returns early with the child still running — answer them, then wait again to rejoin. If the child stops without reporting completion it returns an error report instead of blocking until the run budget. Cancelling wait only detaches; the child keeps running. An attached waiter receives completion instead of a separate wake-up. steer: queue a correction or resume a finished child in the background, keeping its context; returns immediately. Use wait to join the resumed work. Saved children are restored on parent reopen without running; steer revives them with their original configuration unless you pass model:, which moves that child to another offering from the next segment on \u2014 propose it in conversation first, including when the saved offering is exhausted or gone. Explicitly stopped children require restart:true and the user's request. cancel: stop the child and prevent automatic revival. " +
+			"Runs started with backend acp take the same runId actions: status and result read the session and its latest turn; wait joins it, or several with runIds and mode any|all, and timeoutMs only ends the wait, never the runs; steer sends the next turn (a running turn must finish or be cancelled first); cancel stops only a turn this run started; close releases the session \u2014 a created one is disposed, an opened one only disconnected, never archived or deleted. close is acp only.",
 		parameters: Type.Object({
-			action: StringEnum(["models", "rate", "approve", "roles", "status", "result", "wait", "steer", "cancel"] as const),
+			action: StringEnum(["models", "rate", "approve", "roles", "status", "result", "wait", "steer", "cancel", "close"] as const),
 			role: Type.Optional(Type.String({ description: "approve: role name" })),
 			model: Type.Optional(Type.String({ description: "approve: provider/id[:thinking] the user agreed to. steer: run the next segment on this offering instead of the child's saved one; the user chooses it, you never substitute silently" })),
 			runId: Type.Optional(Type.String()),
+			runIds: Type.Optional(Type.Array(Type.String(), { description: "wait (acp runs): join several runs at once, with mode" })),
+			mode: Type.Optional(StringEnum(["any", "all"] as const, { description: "wait with runIds: any returns when the first run settles, all (default) when every one has" })),
+			force: Type.Optional(Type.Boolean({ description: "close: cancel an active turn first instead of refusing" })),
+			discardPersistentState: Type.Optional(Type.Boolean({ description: "close, created acp sessions only: do not keep the session resumable" })),
 			restart: Type.Optional(Type.Boolean({ description: "steer only: restart an explicitly stopped child, only when the user requested it" })),
-			timeoutMs: Type.Optional(Type.Number({ description: "steer: give the child this time budget instead of its saved one \u2014 re-armed at once on a running child, applied to the next segment of an inactive one" })),
+			timeoutMs: Type.Optional(Type.Number({ description: "steer: give the child this time budget instead of its saved one \u2014 re-armed at once on a running child, applied to the next segment of an inactive one. wait (acp runs): stop waiting after this many ms; the runs keep going" })),
 			message: Type.Optional(Type.String({ description: "steer: the correction. models: substring filter. approve: one-line reason the user agreed to" })),
 			ratings: Type.Optional(
 				Type.Array(
@@ -1481,11 +1562,53 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 			const owner = requireOwner();
 			if (p.action === "status" && !p.runId) {
 				const owned = ownedRuns(owner);
-				const lines = owned.map((r) => `${summary(r).split("\n")[0]}${r.status === "running" && r.lastTool ? `  last: ${r.lastTool}` : ""}`);
-				return { content: [{ type: "text", text: lines.join("\n") || "no runs" }], details: { kind: "runs", rows: owned.map(recordedView) } };
+				const external = acp.owned(owner.key);
+				const lines = [...owned.map((r) => `${summary(r).split("\n")[0]}${r.status === "running" && r.lastTool ? `  last: ${r.lastTool}` : ""}`), ...external.map((v) => acpSummary(v).split("\n")[0])];
+				return { content: [{ type: "text", text: lines.join("\n") || "no runs" }], details: { kind: "runs", rows: [...owned.map(recordedView), ...external] } };
+			}
+			if (p.action === "wait" && (p.runIds !== undefined || p.mode !== undefined)) {
+				const ids = p.runIds ?? (p.runId ? [p.runId] : []);
+				try {
+					if (!ids.length) throw new DelegateError("INPUT_INVALID", "wait with mode needs runIds", "runIds");
+					const piRun = ids.find((id) => !acp.find(id, owner.key) && runs.get(id)?.ownerKey === owner.key);
+					if (piRun) throw new DelegateError("ACTION_UNSUPPORTED", `${piRun} is a pi run: several-run wait covers acp runs; wait for a pi run alone with runId`, "runIds");
+					const outcome = await acp.wait({ runIds: ids, mode: p.mode ?? "all", ...(p.timeoutMs !== undefined ? { timeoutMs: p.timeoutMs } : {}) }, signal, () => ctx.hasPendingMessages());
+					return await acpWaitResult(outcome, ids, p.timeoutMs);
+				} catch (error) { return failed(error); }
+			}
+			if (acp.find(p.runId, owner.key)) {
+				const id = p.runId!;
+				try {
+					switch (p.action) {
+						case "status": { const v = await acp.status([id]); return { content: [{ type: "text", text: acpSummary(v[0]!) }], details: v[0] }; }
+						case "result": return acpRunResult(await acp.result(id));
+						case "wait": {
+							const outcome = await acp.wait({ runIds: [id], mode: "all", ...(p.timeoutMs !== undefined ? { timeoutMs: p.timeoutMs } : {}) }, signal, () => ctx.hasPendingMessages());
+							return await acpWaitResult(outcome, [id], p.timeoutMs);
+						}
+						case "steer": {
+							const current = await acp.result(id);
+							const request = unwrap(validateSteer({ backend: "acp", origin: current.session.origin }, p as Record<string, unknown>));
+							const v = await acp.steer(id, request);
+							return { content: [{ type: "text", text: `${id}: turn ${v.turns.at(-1)?.requestId} sent${request.model ? ` on model ${request.model}` : ""}. Completion will wake you; use wait to join.` }], details: v };
+						}
+						case "cancel": {
+							const v = await acp.cancel(id, {});
+							const turn = v.turns.at(-1);
+							return { content: [{ type: "text", text: `${id}: cancel requested; turn ${turn?.requestId} is ${turn?.status}.\n${acpSummary(v)}` }], details: v };
+						}
+						case "close": {
+							const v = await acp.close(id, { ...(p.force !== undefined ? { force: p.force } : {}), ...(p.discardPersistentState !== undefined ? { discardPersistentState: p.discardPersistentState } : {}) });
+							return { content: [{ type: "text", text: `${id}: closed; ${v.session.origin === "opened" ? "disconnected, and the native session is unchanged" : "its session was disposed"}.\n${acpSummary(v)}` }], details: v };
+						}
+					}
+				} catch (error) { return failed(error); }
 			}
 			const run = p.runId ? runs.get(p.runId) : undefined;
-			if (!run || run.ownerKey !== owner.key) throw new Error(`unknown runId ${p.runId ?? "(none)"}; known: ${ownedRuns(owner).map((r) => r.id).join(", ") || "none"}`);
+			if (!run || run.ownerKey !== owner.key) throw new Error(`unknown runId ${p.runId ?? "(none)"}; known: ${[...ownedRuns(owner).map((r) => r.id), ...acp.owned(owner.key).map((v) => v.id)].join(", ") || "none"}`);
+			// The pi backend's capability report decides what it cannot do; that fails, it never becomes another action.
+			const capability = requireAction(PI_CAPABILITIES, p.action as LifecycleAction);
+			if (!capability.ok) return failed(new DelegateError(capability.error.code, capability.error.message));
 
 			switch (p.action) {
 				case "wait":
@@ -1523,7 +1646,8 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 	pi.registerMessageRenderer("delegate", (message: any, { expanded }: any, theme: any) => {
 		const v = message.details as RunView | undefined;
 		if (!v || typeof v !== "object" || !("id" in v)) return undefined;
-		return framed((width) => resultLines(v, expanded, theme, width));
+		const shown = asRunView(v) ?? v;
+		return framed((width) => resultLines(shown, expanded, theme, width));
 	});
 
 	let panel: AgentsPanel | undefined;
@@ -1586,7 +1710,12 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 		owner = undefined;
 		if (!previous || previous.binding?.pi !== pi) return;
 		previous.binding = undefined;
-		// A reload replaces only the binding. Actual exit/session replacement settles and parks children.
-		if (event.reason !== "reload") await closeOwner(previous);
+		// A reload replaces only the binding. Actual exit/session replacement settles and parks children,
+		// and releases this parent's ACP sessions before the Coordinator shuts down.
+		if (event.reason !== "reload") {
+			await closeOwner(previous);
+			await acp.closeOwner(previous.key);
+			await shutdownAcpCoordinator();
+		}
 	});
 }

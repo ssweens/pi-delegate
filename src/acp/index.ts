@@ -1,6 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "typebox";
-import { Coordinator } from "./orchestration/coordinator.js";
+import { acpCoordinator, shutdownAcpCoordinator } from "./instance.js";
 
 const NAME_PATTERN = "^[a-z][a-z0-9-]{0,47}$";
 
@@ -14,9 +14,11 @@ interface ToolRegistration {
 
 export default function piStrings(pi: ExtensionAPI): void {
   if (process.env.PI_STRINGS_WORKER === "1" || process.env.PI_STRINGS_OPENED === "1") return;
-  const coordinator = new Coordinator(process.cwd());
-  pi.on("session_shutdown", async () => {
-    await coordinator.shutdown();
+  // The process's one Coordinator (instance.ts), shared with `delegate backend:"acp"`. A reload
+  // only replaces tool bindings, so live workers and their turns survive it.
+  pi.on("session_shutdown", async (event) => {
+    if (event.reason === "reload") return;
+    await shutdownAcpCoordinator();
   });
   const register = ({ name, label, description, parameters, action }: ToolRegistration) => {
     pi.registerTool({
@@ -25,7 +27,7 @@ export default function piStrings(pi: ExtensionAPI): void {
       description,
       parameters,
       execute: async (_toolCallId, params) => {
-        const response = await coordinator.execute({ action, ...(params as Record<string, unknown>) } as Record<string, unknown> & { action: string });
+        const response = await (await acpCoordinator()).execute({ action, ...(params as Record<string, unknown>) } as Record<string, unknown> & { action: string });
         return { content: [{ type: "text", text: JSON.stringify(response, null, 2) }], details: response };
       },
     });
@@ -71,46 +73,6 @@ export default function piStrings(pi: ExtensionAPI): void {
     action: "send",
   });
   register({
-    name: "op_observe",
-    label: "Observe Amp thread",
-    description: "Read bounded recent messages and current state from an opened exact Amp T-ID through the explicitly configured project plugin bridge. Observation never changes the thread; missing bridge responses remain unknown.",
-    parameters: Type.Object({
-      name: Type.String(),
-      limit: Type.Optional(Type.Number()),
-    }, { additionalProperties: false }),
-    action: "observe",
-  });
-  register({
-    name: "op_append",
-    label: "Append Amp message",
-    description: "Append one explicitly approved message to an opened exact Amp T-ID through the plugin bridge. Amp displays this as plugin-attributed automation; use op_send for ordinary user attribution. This is separate from steering; no automatic retry is performed.",
-    parameters: Type.Object({
-      name: Type.String(),
-      text: Type.String(),
-    }, { additionalProperties: false }),
-    action: "append",
-  });
-  register({
-    name: "op_steer",
-    label: "Steer Amp thread",
-    description: "Queue one explicitly approved, plugin-attributed steering message on an opened exact Amp T-ID through the plugin bridge. Use op_send for ordinary user attribution. Steering is provider-defined and does not claim instantaneous interruption.",
-    parameters: Type.Object({
-      name: Type.String(),
-      text: Type.String(),
-    }, { additionalProperties: false }),
-    action: "steer",
-  });
-  register({
-    name: "op_cancel_remote",
-    label: "Cancel Amp work",
-    description: "Explicitly request remote cancellation on an opened exact Amp T-ID through the plugin bridge. Disconnect, timeout, shutdown, and bridge failure never call this implicitly; accepted means the provider API accepted the request, not that the turn has finished.",
-    parameters: Type.Object({
-      name: Type.String(),
-      reason: Type.Optional(Type.String()),
-    }, { additionalProperties: false }),
-    action: "cancel_remote",
-  });
-  register({
     name: "op_wait",
     label: "Wait for turns",
     description: "Wait on a fixed snapshot; select exactly one of requestId, names, or all=true. mode \"any\" resolves on the first terminal request and returns only the terminal requests; mode \"all\" (default) waits for all selected requests. waitTimeoutMs bounds the call (default 300000); a timeout returns timedOut:true and never cancels work.",
@@ -134,8 +96,8 @@ export default function piStrings(pi: ExtensionAPI): void {
   });
   register({
     name: "op_list",
-    label: "List workers, requests, and controls",
-    description: "List live workers, their requests, and Amp work-control records. The optional names projection narrows the result to specific live workers; unknown names are an error.",
+    label: "List workers and requests",
+    description: "List live workers and their requests. The optional names projection narrows the result to specific live workers; unknown names are an error.",
     parameters: Type.Object({
       names: Type.Optional(Type.Array(Type.String())),
     }, { additionalProperties: false }),

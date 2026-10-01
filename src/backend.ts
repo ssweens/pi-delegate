@@ -224,6 +224,8 @@ export interface AcpRunView {
 	truncated: boolean;
 	capabilities: BackendCapabilities;
 	error?: string;
+	/** Set once delegate_ctl close released the session (disposed or disconnected, per capabilities.close). */
+	closed?: true;
 }
 
 export type PiRunView = RunView & { backend: "pi" };
