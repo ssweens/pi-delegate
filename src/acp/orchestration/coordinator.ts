@@ -281,15 +281,17 @@ export class Coordinator {
     }
     if (!configuredProfile) throw new StringsError("PROFILE_INVALID", `Worker ${name} has no resolved profile.`);
     const requestedModel = optionalModel(input.model);
-    const profile: Profile = requestedModel === undefined ? configuredProfile : { ...configuredProfile, model: requestedModel };
-    if ((input.mode !== undefined || input.title !== undefined) && profile.agent.toLowerCase() !== "amp") throw new StringsError("INPUT_INVALID", "mode and title are Amp-only.");
+    if ((input.mode !== undefined || input.title !== undefined) && configuredProfile.agent.toLowerCase() !== "amp") throw new StringsError("INPUT_INVALID", "mode and title are Amp-only.");
     if (input.mode !== undefined && requestedModel !== undefined) throw new StringsError("INPUT_INVALID", "On Amp, model and mode both select the agent mode; pass one.");
+    const mode = optionalString(input.mode);
+    // A caller's mode decides the agent mode: a profile's Amp model (the same option) gives way to it.
+    const { model: _profileModel, ...modeless } = configuredProfile;
+    const profile: Profile = requestedModel !== undefined ? { ...configuredProfile, model: requestedModel } : mode ? modeless : configuredProfile;
     const cwd = await realpath(typeof input.cwd === "string" ? input.cwd : this.parentCwd);
     const worktree = await this.admitWriter(profile, cwd);
     await mkdir(this.stateDir, { recursive: true, mode: 0o700 });
     const runtime = this.runtimeFactory(cwd, this.stateDir, profile);
     const executionEnvironment = optionalString(input.executionEnvironment);
-    const mode = optionalString(input.mode);
     const title = optionalString(input.title);
     let handle: RuntimeHandle | undefined;
     try {
@@ -409,6 +411,7 @@ export class Coordinator {
       });
       this.requireSameNative(worker.record.native!, native);
     }
+    if (input.model !== undefined && worker.record.mode !== undefined) throw new StringsError("INPUT_INVALID", "On Amp, model and mode both select the agent mode; this worker keeps the mode it was created with.");
     const requestedModel = opened ? undefined : input.model === undefined ? worker.record.profile.model : optionalModel(input.model);
     if (requestedModel) await this.requireSelectedModel(worker.runtime, worker.record.handle, requestedModel);
     const timeoutMs = optionalPositive(input.requestTimeoutMs, worker.record.profile.timeoutMs);
@@ -622,7 +625,8 @@ export class Coordinator {
                 }
               }
             }
-            appendTail = appendTail.then(() => this.append(request, event.type === "text" ? event.text : `\n[${event.type}] ${event.text}\n`, profile.maxOutputBytes, event));
+            // Status notifications (session, usage, command updates) are adapter metadata: logged, never part of the reply.
+            appendTail = appendTail.then(() => this.append(request, event.type === "text" ? event.text : event.type === "status" ? undefined : `\n[${event.type}] ${event.text}\n`, profile.maxOutputBytes, event));
           }
         } catch (error) {
           streamFailure = error;
@@ -660,7 +664,8 @@ export class Coordinator {
       // A created Amp session learns its native thread ID (T-ID) from its first execution, and the
       // adapter reports it with the turn's result. Record it before the request settles, so every
       // reader of the settled request also sees the native identity. The status action does the same.
-      if (worker.record.origin === "created" && !worker.record.native && worker.record.profile.agent.toLowerCase() === "amp") await this.learnNative(worker);
+      // Bounded like the stream close above: a stalled status never keeps the turn from settling.
+      if (worker.record.origin === "created" && !worker.record.native && worker.record.profile.agent.toLowerCase() === "amp") await settlesWithin(this.learnNative(worker), profile.cancellationGraceMs);
       // terminal came from turn.result (the eventDrain guard hangs when the
       // request is still running), so it is defined here.
       this.applyTerminal(worker, request, terminal as RuntimeTerminal);
@@ -732,10 +737,10 @@ export class Coordinator {
     if (worker.record.status !== "closing" && worker.record.status !== "closed") worker.record.status = "failed";
   }
 
-  private async append(request: RequestRecord, text: string, max: number, event: unknown): Promise<void> {
+  private async append(request: RequestRecord, text: string | undefined, max: number, event: unknown): Promise<void> {
     await appendFile(request.eventPath, `${JSON.stringify({ observedAt: new Date().toISOString(), event })}\n`, { encoding: "utf8", mode: 0o600 });
     await chmod(request.eventPath, 0o600);
-    if (request.status !== "running") return;
+    if (request.status !== "running" || text === undefined) return;
     const remaining = max - Buffer.byteLength(request.output);
     if (remaining <= 0) { request.truncated = true; return; }
     const chunk = Buffer.from(text);

@@ -22,7 +22,7 @@ import {
   type SessionConfigOption,
 } from "@agentclientprotocol/sdk";
 // Shared with the delegate backend's observation so both run the Amp CLI the same way.
-import { ampCommand, ampThreadExport } from "../../../src/acp/runtime/amp-cli.js";
+import { AMP_THREAD_ID, ampCommand, ampThreadExport } from "../../../src/acp/runtime/amp-cli.js";
 
 const NATIVE_SESSION_CAPABILITY = "pi-strings/native-session";
 const NATIVE_SESSION_DESCRIBE = "pi-strings/session/describe";
@@ -31,7 +31,6 @@ const PERMISSION_CONFIG = "permission";
 const MODE_CONFIG = "amp-mode";
 const EXECUTORS = ["local", "orb"] as const;
 type Executor = (typeof EXECUTORS)[number];
-const AMP_THREAD_ID = /^T-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const ACP_SESSION_ID = /^S-[a-z0-9]+-[a-z0-9]{6}$/i;
 const AMP_MODES = ["low", "medium", "high", "ultra"] as const;
 /**

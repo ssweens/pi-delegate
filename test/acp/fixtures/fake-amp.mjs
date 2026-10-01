@@ -9,7 +9,8 @@
 // `labels`; AMP_FAKE_LABEL_FAIL makes it exit 1 with that text. `threads usage <id>` prints
 // `Cost: $<cost>` (the stored thread's `cost`, default 0); a thread with `usageFail` exits 1 with
 // that text, one with `usageText` prints that instead. `--title` on a new thread's execution is
-// stored as its `title`.
+// stored as its `title`. AMP_FAKE_USAGE_AFTER_EXPORT: a marker file `threads export` creates; `threads
+// usage` waits up to 3 s for it and exits 1 without it, so a usage read that waits on the export fails.
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
 const args = process.argv.slice(2)
 if (process.env.AMP_FAKE_ARGS_LOG) appendFileSync(process.env.AMP_FAKE_ARGS_LOG, `${JSON.stringify(args)}\n`)
@@ -39,6 +40,12 @@ if (args[0] === 'threads' && args[1] === 'label') {
 if (args[0] === 'threads' && args[1] === 'usage') {
   const id = args[2] ?? ''
   if (!/^T-[0-9a-f-]{36}$/i.test(id)) process.exit(2)
+  const marker = process.env.AMP_FAKE_USAGE_AFTER_EXPORT
+  if (marker) {
+    const end = Date.now() + 3000
+    while (!existsSync(marker) && Date.now() < end) await new Promise(resolve => setTimeout(resolve, 10))
+    if (!existsSync(marker)) { process.stderr.write('usage ran before export'); process.exit(1) }
+  }
   const stored = load()[id]
   if (stored?.usageFail) { process.stderr.write(stored.usageFail); process.exit(1) }
   process.stdout.write(stored?.usageText ?? `${stored?.title ?? 'fake thread'}\nCost: $${(stored?.cost ?? 0).toFixed(2)}\nDetails: https://ampcode.com/threads/${id}/usage\n\n## Orb System Metrics\n\nSamples: 1\n`)
@@ -50,6 +57,7 @@ if (args[0] === 'threads' && args[1] === 'export') {
   const orb = id.endsWith('0002')
   const missingCwd = id.endsWith('0003')
   const noExecutor = id.endsWith('0004')
+  if (process.env.AMP_FAKE_USAGE_AFTER_EXPORT) writeFileSync(process.env.AMP_FAKE_USAGE_AFTER_EXPORT, '')
   const stored = load()[id]
   if (stored?.fail) { process.stderr.write(stored.fail); process.exit(1) }
   process.stdout.write(JSON.stringify({

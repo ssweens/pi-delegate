@@ -1276,22 +1276,25 @@ export default function (pi: ExtensionAPI) {
 				const acpViews = new Map(join.views().map((v) => [v.id, v]));
 				const rows = ids.map((id) => { const v = acpViews.get(id); return v ? acpRow(v, v.status !== "running") : piRow(piRuns.get(id)!); });
 				const settled = rows.filter((row) => row.settled);
-				const end = (reason: WaitOutcome<unknown>["reason"], lost?: string) => {
-					join.claim(settled.flatMap((row) => acpViews.has(row.id) ? [acpViews.get(row.id)!] : []));
-					return waitResult(reason, rows, ids, timeoutMs, lost);
+				const end = async (reason: WaitOutcome<unknown>["reason"], lost?: string) => {
+					const settledAcp = settled.flatMap((row) => acpViews.has(row.id) ? [acpViews.get(row.id)!] : []);
+					join.claim(settledAcp);
+					// An Amp run's thread cost is read once for its settled turn, so the result reports it.
+					const costed = new Map((await acp.withCosts(settledAcp)).map((v) => [v.id, v]));
+					return waitResult(reason, rows.map((row) => costed.has(row.id) ? acpRow(costed.get(row.id)!, true) : row), ids, timeoutMs, lost);
 				};
-				if (mode === "any" ? settled.length > 0 : settled.length === rows.length) return end("settled");
+				if (mode === "any" ? settled.length > 0 : settled.length === rows.length) return await end("settled");
 				if (signal?.aborted) { aborted = true; throw new DOMException("Wait cancelled; the runs are unaffected.", "AbortError"); }
-				if (ctx.hasPendingMessages()) return end("interrupted");
-				if (coordinatorLost) return end("lost", "the ACP coordinator (it is shutting down, or another process owns these runs); not settled");
+				if (ctx.hasPendingMessages()) return await end("interrupted");
+				if (coordinatorLost) return await end("lost", "the ACP coordinator (it is shutting down, or another process owns these runs); not settled");
 				// A terminal status that never settles is a child that stopped without reporting completion (see waitForChild).
 				for (const [id, run] of piRuns) {
 					if (run.status === "running" || run.completion.settled) { stoppedSince.delete(id); continue; }
 					if (!stoppedSince.has(id)) stoppedSince.set(id, Date.now());
-					else if (Date.now() - stoppedSince.get(id)! >= 2 * WAIT_POLL_MS) return end("lost", `${id}, which stopped without reporting completion (read its status or result; steer with restart:true if it must continue). Not settled`);
+					else if (Date.now() - stoppedSince.get(id)! >= 2 * WAIT_POLL_MS) return await end("lost", `${id}, which stopped without reporting completion (read its status or result; steer with restart:true if it must continue). Not settled`);
 				}
 				const left = deadline - Date.now();
-				if (left <= 0) return end("timeout");
+				if (left <= 0) return await end("timeout");
 				const slice = Math.min(WAIT_POLL_MS, left);
 				const pendingAcp = rows.flatMap((row) => !row.settled && acpViews.has(row.id) ? [acpViews.get(row.id)!] : []);
 				await new Promise<void>((resolve) => {
@@ -1514,7 +1517,7 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 			"Runs started with backend acp take the same runId actions: status and result read the session and its latest turn; wait joins it; steer sends the next turn (a running turn must finish or be cancelled first); cancel stops only a turn this run started; close releases the session \u2014 a created one is disposed, an opened one only disconnected, never archived or deleted. close is acp only and final. " +
 			"When the parent exits, its acp runs are parked, not closed: their sessions are released and their records stay readable after a restart; steer reopens one (an opened run by its native ID, a created run by native resume, else RUN_NOT_RESUMABLE). " +
 			"status or result with observe:true on an opened Amp run also reads its thread once (one amp threads export, never in the background) and returns only the messages after the last ones this run was shown, from any participant; a failed read is reported as unknown. Other runs fail ACTION_UNSUPPORTED. " +
-			"status or result with a runId on an Amp run also reads its thread cost once (amp threads usage); unknown when it cannot be read.",
+			"An Amp run's thread cost (amp threads usage) is read once per settled turn, which its wait result or wake-up reports, and by status or result with a runId unless the cached cost is current (a closed run, or a created run with no turn since); unknown when it was never read, and a failed read keeps the last cost with when it was read.",
 		parameters: Type.Object({
 			action: StringEnum(["models", "rate", "approve", "roles", "status", "result", "wait", "steer", "cancel", "close"] as const),
 			role: Type.Optional(Type.String({ description: "approve: role name" })),
@@ -1673,17 +1676,18 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 			}
 			if (acp.find(p.runId, owner.key)) {
 				const id = p.runId!;
+				// The cost read and an observation's export are separate Amp calls: run them together, then read the view both updated.
+				const read = async (latest: () => Promise<AcpRunView>): Promise<AcpRunView> => {
+					const [, observed] = await Promise.all([acp.refreshUsage(id), p.observe === true ? acp.observe(id) : undefined]);
+					return observed ? { ...(await latest()), ...(observed.observation ? { observation: observed.observation } : {}) } : latest();
+				};
 				try {
 					switch (p.action) {
 						case "status": {
-							await acp.refreshUsage(id);
-							const v = p.observe === true ? await acp.observe(id) : (await acp.status([id]))[0]!;
+							const v = await read(async () => (await acp.status([id]))[0]!);
 							return { content: [{ type: "text", text: acpStatusText(v) }], details: v };
 						}
-						case "result": {
-							await acp.refreshUsage(id);
-							return acpRunResult(p.observe === true ? await acp.observe(id) : await acp.result(id));
-						}
+						case "result": return acpRunResult(await read(() => acp.result(id)));
 						case "wait": {
 							const outcome = await acp.wait({ runIds: [id], mode: "all", ...(p.timeoutMs !== undefined ? { timeoutMs: p.timeoutMs } : {}) }, signal, () => ctx.hasPendingMessages());
 							return await acpWaitResult(outcome, [id], p.timeoutMs);

@@ -49,6 +49,7 @@ async function runAmp(args, cwd, options = {}) {
 function ampThreadExport(id, cwd, options = {}) {
   return runAmp(["threads", "export", id], cwd, options);
 }
+var AMP_THREAD_ID = /^T-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // vendor/amp-acp/src/index.ts
 var NATIVE_SESSION_CAPABILITY = "pi-strings/native-session";
@@ -57,7 +58,6 @@ var EXECUTION_CONFIG = "execution-environment";
 var PERMISSION_CONFIG = "permission";
 var MODE_CONFIG = "amp-mode";
 var EXECUTORS = ["local", "orb"];
-var AMP_THREAD_ID = /^T-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 var ACP_SESSION_ID = /^S-[a-z0-9]+-[a-z0-9]{6}$/i;
 var AMP_MODES = ["low", "medium", "high", "ultra"];
 var THREAD_TITLE_ENV = "amp_acp_thread_title";

@@ -215,15 +215,16 @@ export interface AcpSessionView {
 /**
  * An Amp thread's display cost, from `amp threads usage <T-ID>` (todo 058). Refreshed only by
  * delegate_ctl status/result for one run, and cached here with when it was read. Without `cost`
- * it is unknown: no thread ID yet, or the command failed. It covers the whole thread, so an opened
- * thread's cost includes other participants' work.
+ * it is unknown: no thread ID yet, or the command failed. With `cost` and `error`, the latest read
+ * failed and `cost` is the one read at `at`. It covers the whole thread, so an opened thread's cost
+ * includes other participants' work.
  */
 export interface AmpThreadUsage {
 	cost?: UsageCost;
-	/** When usage was last read (ms). */
+	/** When `cost` was read (ms); without a cost, when the read was tried. */
 	at: number;
 	threadId?: string;
-	/** Why the cost is unknown. */
+	/** Why the latest read gave no cost. */
 	error?: string;
 }
 

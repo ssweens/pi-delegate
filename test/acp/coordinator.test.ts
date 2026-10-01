@@ -384,11 +384,11 @@ test("running result exposes progress before terminal completion", async () => {
     const requestId = sent.ok ? sent.details.requestId : "";
     await waitFor(async () => {
       const current = await coordinator.execute({ action: "result", requestId });
-      return current.ok && String(current.details.output).includes("phase one") && String(current.details.output).includes("visible progress");
+      return current.ok && String(current.details.output).includes("visible progress") && String(current.details.output).includes("read package.json");
     });
     const result = await coordinator.execute({ action: "result", requestId });
     assert.equal(result.ok && result.details.status, "running");
-    assert.match(result.ok ? String(result.details.output) : "", /phase one/);
+    assert.doesNotMatch(result.ok ? String(result.details.output) : "", /phase one/, "a status line is adapter metadata, kept in the event log only");
     assert.match(result.ok ? String(result.details.output) : "", /visible progress/);
     const eventPath = result.ok ? String(result.details.eventPath) : "";
     runtimes[0]!.turns[0]!.finish({ status: "completed" });

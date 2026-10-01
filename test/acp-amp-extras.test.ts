@@ -45,7 +45,7 @@ test("a run's Amp label fits Amp's rules and names the run exactly; a title is t
 test("Amp extras through delegate: mode, native T-ID, title and labels, cost", { timeout: 120000 }, async (t) => {
 	const api = await provider();
 	const box = sandbox(api.url);
-	const keys = ["AMP_CLI_PATH", "AMP_ACP_STATE_DIR", "AMP_FAKE_ARGS_LOG", "AMP_FAKE_THREADS", "AMP_FAKE_LABEL_FAIL"];
+	const keys = ["AMP_CLI_PATH", "AMP_ACP_STATE_DIR", "AMP_FAKE_ARGS_LOG", "AMP_FAKE_THREADS", "AMP_FAKE_LABEL_FAIL", "AMP_FAKE_USAGE_AFTER_EXPORT"];
 	const saved = new Map(keys.map((key) => [key, process.env[key]]));
 	chmodSync(fakeAmp, 0o755);
 	const argsLog = join(box.root, "amp-args.ndjson"), store = join(box.root, "amp-threads.json");
@@ -108,9 +108,9 @@ test("Amp extras through delegate: mode, native T-ID, title and labels, cost", {
 			assert.equal(status.details.session.native.id, localThread);
 			assert.equal(status.details.session.native.executionEnvironment, "local");
 			assert.match(status.content[0].text, new RegExp(`\\nsession ${localThread} \\(local\\)`));
-			assert.equal(record(created.local).nativeSessionId, localThread);
+			// The record is saved once the settled turn's label and cost reads are done.
+			await until(() => record(created.local).nativeSessionId === localThread && record(created.orb).nativeSessionId === orbThread, "the T-IDs are saved");
 			assert.equal(record(created.local).last.worker.native.id, localThread);
-			assert.equal(record(created.orb).nativeSessionId, orbThread);
 		});
 
 		await t.test("a created thread is titled by its first execution and labeled once for its run", async () => {
@@ -172,7 +172,7 @@ test("Amp extras through delegate: mode, native T-ID, title and labels, cost", {
 			assert.equal((await h.ctl("status", opened.local)).details.session.labels, undefined);
 		});
 
-		await t.test("cost: one amp threads usage per status or result, cached with its time; nothing else reads it", async () => {
+		await t.test("cost: one amp threads usage per settled turn and per status or result, cached with its time; nothing else reads it", async () => {
 			setThread(localThread, { cost: 2.12 });
 			let usage = command("usage").length;
 			const status = await h.ctl("status", opened.local);
@@ -194,27 +194,38 @@ test("Amp extras through delegate: mode, native T-ID, title and labels, cost", {
 			const all = await h.ctl("status");
 			assert.match(all.content[0].text, /\$2\.12 \(Amp thread\)/, "the run list shows the cached cost");
 			await h.ctl("wait", opened.local);
+			assert.equal(command("usage").length, usage, "status without a runId, and a wait on a turn already read, read no usage");
+			setThread(localThread, { cost: 2.5 });
 			await h.ctl("steer", opened.local, { message: "and again" });
-			await h.ctl("wait", opened.local);
+			const waited = await h.ctl("wait", opened.local);
+			assert.equal(command("usage").length, usage + 1, "the steered turn's cost is read once");
+			assert.match(waited.content[0].text, / · \$2\.50 \(Amp thread\)/, "and its wait reports it");
 			await sleep(300);
-			assert.equal(command("usage").length, usage, "status without a runId, wait and steer read no usage");
+			assert.equal(command("usage").length, usage + 1);
+			setThread(localThread, { cost: 2.12 });
+			await h.ctl("status", opened.local);
 		});
 
-		await t.test("unavailable cost is unknown: it never fails or blocks a status or result", async () => {
+		await t.test("a failed cost read never fails or blocks a status or result, and keeps the last known cost", async () => {
+			const known = record(opened.local).usage;
 			setThread(localThread, { usageFail: "fake usage refused" });
 			const failed = await h.ctl("status", opened.local);
 			assert.equal(failed.isError, undefined, failed.content[0].text);
-			assert.equal(failed.details.usage.cost, undefined, "a stale cost is not reported as current");
+			assert.deepEqual(failed.details.usage.cost, { amount: 2.12, currency: "USD" }, "the cost read before stays");
+			assert.equal(failed.details.usage.at, known.at, "with when it was read");
 			assert.match(failed.details.usage.error, new RegExp(`amp threads usage ${localThread} exited 1: fake usage refused`));
-			assert.match(failed.content[0].text, / · cost unknown/);
-			assert.equal(asRunView(failed.details)!.cost, 0);
+			assert.match(failed.content[0].text, new RegExp(` · \\$2\\.12 \\(Amp thread, last read at ${new Date(known.at).toISOString().replaceAll(".", "\\.")}; the latest read failed\\)`));
+			assert.equal(asRunView(failed.details)!.cost, 2.12);
 			const result = await h.ctl("result", opened.local);
 			assert.equal(result.isError, false);
-			assert.match(result.content[0].text, /cost unknown/);
+			assert.match(result.content[0].text, /the latest read failed/);
 
 			setThread(localThread, { usageFail: undefined, usageText: "no cost here\n" });
 			assert.match((await h.ctl("status", opened.local)).details.usage.error, /printed no Cost line/);
 			setThread(localThread, { usageText: undefined });
+			const current = await h.ctl("status", opened.local);
+			assert.equal(current.details.usage.error, undefined, "a good read is current again");
+			assert.match(current.content[0].text, / · \$2\.12 \(Amp thread\)/);
 
 			// A created run whose first execution never started has no T-ID: no usage call, unknown.
 			process.env.AMP_CLI_PATH = join(box.root, "no-such-amp");
@@ -231,12 +242,34 @@ test("Amp extras through delegate: mode, native T-ID, title and labels, cost", {
 			await h.ctl("close", id);
 		});
 
+		await t.test("status and result with observe read the cost and the thread together", async () => {
+			// The fake's usage call fails unless the export starts while it runs.
+			const marker = join(box.root, "export-started");
+			process.env.AMP_FAKE_USAGE_AFTER_EXPORT = marker;
+			try {
+				for (const action of ["status", "result"]) {
+					rmSync(marker, { force: true });
+					const usage = command("usage").length, exports = command("export").length;
+					const read = await h.ctl(action, opened.local, { observe: true });
+					assert.equal(command("usage").length, usage + 1);
+					assert.equal(command("export").length, exports + 1);
+					assert.equal(read.details.usage.error, undefined, `${action}: ${read.details.usage.error}`);
+					assert.deepEqual(read.details.usage.cost, { amount: 2.12, currency: "USD" });
+					assert.ok(read.details.observation, "the observation is in the same view");
+				}
+			} finally { delete process.env.AMP_FAKE_USAGE_AFTER_EXPORT; }
+		});
+
 		await t.test("created Amp runs report cost too; other agents read none", async () => {
+			// Its cost was read as its turn settled, when the fake thread's cost was 0.
 			setThread(orbThread, { cost: 0.5 });
+			const usageCalls = command("usage").length;
 			const orb = await h.ctl("status", created.orb);
 			assert.ok(orb.details.closed, "a closed run's thread still has its cost");
-			assert.deepEqual(orb.details.usage.cost, { amount: 0.5, currency: "USD" });
-			assert.match(orb.content[0].text, /\$0\.50 \(Amp thread\)/);
+			assert.deepEqual(orb.details.usage.cost, { amount: 0, currency: "USD" });
+			assert.match(orb.content[0].text, /\$0\.00 \(Amp thread\)/);
+			await h.ctl("result", created.orb);
+			assert.equal(command("usage").length, usageCalls, "a closed run's cached cost is final: no read");
 
 			const fixture = (await delegate({ backend: "acp", agent: "fixture", task: "hello" })).details.id;
 			await h.ctl("wait", fixture);

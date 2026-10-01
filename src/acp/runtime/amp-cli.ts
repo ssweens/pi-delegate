@@ -22,7 +22,6 @@ export interface AmpRun {
   stderr: string;
   timedOut: boolean;
 }
-export type AmpExportRun = AmpRun;
 
 /**
  * One Amp CLI command in `cwd`. Rejects only when the process cannot start. With timeoutMs the
@@ -72,6 +71,9 @@ export function parseAmpCost(text: string): number | undefined {
   const amount = Number(match[1]!.replaceAll(",", ""));
   return Number.isFinite(amount) ? amount : undefined;
 }
+
+/** An Amp thread ID (T-ID). */
+export const AMP_THREAD_ID = /^T-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * Amp's label rules (the CLI's own errors): lowercase alphanumerics and hyphens, starting with an
