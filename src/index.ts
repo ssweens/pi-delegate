@@ -22,6 +22,7 @@ import { AgentHistory, AgentsPanel, ChildView, type LiveSource } from "./inspect
 import type { ActiveTool, ChildActivity } from "./transcript.js";
 import { type AAIndices, elapsed, empty, framed, type LiveFacts, type ModelRow, type ModelsDetails, resultLines, resultView, type RunView } from "./render.js";
 import { loadRoles } from "./roles.js";
+import { installTodo } from "./todo-ext.js";
 import { RunCompletion } from "./completion.js";
 import { ownedElsewhere, processOwner, readRecord, storageDir, writeRecord } from "./storage.js";
 
@@ -950,6 +951,15 @@ export default function (pi: ExtensionAPI) {
 	}
 	let owner: Owner | undefined;
 	let attachError: string | undefined;
+	// Canonical phased todo (transferred from pi-omp; see todo-ext.ts). The reminder reads this
+	// parent's live children: while one is unsettled its completion message re-wakes the loop,
+	// so an incomplete-todo nag at agent_end would be premature.
+	installTodo(pi, {
+		hasActiveJobs: () => {
+			if (!owner || owner.closed) return false;
+			return ownedRuns(owner).some((run) => !run.completion.settled);
+		},
+	});
 	function requireOwner(): Owner {
 		if (!owner || owner.closed || owner.binding?.pi !== pi) throw new Error(attachError ?? "Delegate runtime is not attached to this parent.");
 		return owner;

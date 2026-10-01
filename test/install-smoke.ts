@@ -11,7 +11,7 @@ const env = { ...process.env, HOME: root, PI_CODING_AGENT_DIR: join(root, "agent
 try {
 	const [pack] = JSON.parse(execFileSync("npm", ["pack", "--json", "--pack-destination", root], { cwd: resolve(import.meta.dirname, ".."), encoding: "utf8", timeout: 30000 }));
 	const paths = new Set(pack.files.map((file: { path: string }) => file.path));
-	for (const path of ["src/index.ts", "src/inspector.ts", "src/transcript.ts", "skills/delegation/SKILL.md", "roles/scout.md", "roles/worker.md", "roles/reviewer.md"]) assert(paths.has(path), `Missing packaged ${path}`);
+	for (const path of ["src/index.ts", "src/inspector.ts", "src/transcript.ts", "src/todo-ext.ts", "src/todo-render.ts", "src/todo.ts", "skills/delegation/SKILL.md", "roles/scout.md", "roles/worker.md", "roles/reviewer.md"]) assert(paths.has(path), `Missing packaged ${path}`);
 	const cwd = join(root, "project"); mkdirSync(cwd);
 	// Optional source exercises another real pi install route, e.g. npm:… or git:….
 	// Without one, use the current artifact—not a potentially stale published release.
@@ -29,6 +29,7 @@ try {
 	const tools = result.extensions.flatMap((extension) => [...extension.tools.keys()]);
 	assert.equal(tools.filter((name) => name === "delegate").length, 1);
 	assert.equal(tools.filter((name) => name === "delegate_ctl").length, 1);
+	assert.equal(tools.filter((name) => name === "todo").length, 1);
 	const skill = loader.getSkills().skills.find((skill) => skill.name === "delegation"); assert(skill);
 	assert.match(readFileSync(skill.filePath, "utf8"), /Model per role/);
 	const definition = result.extensions.flatMap((extension) => [...extension.tools.values()]).find((tool) => tool.definition.name === "delegate");

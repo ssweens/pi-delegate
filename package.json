@@ -1,7 +1,7 @@
 {
   "name": "@ssweens/pi-delegate",
   "version": "0.1.0",
-  "description": "Minimal delegation for pi: two tools, role files, fork context, steer, honest run log.",
+  "description": "Delegation and phased todos for pi: durable child runs, steer, honest run log, and a stock-Pi todo tool.",
   "type": "module",
   "main": "src/index.ts",
   "license": "MIT",

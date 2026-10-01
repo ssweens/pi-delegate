@@ -1,8 +1,8 @@
 # pi-delegate
 
-Install: `pi install npm:@ssweens/pi-delegate`, `pi install git:<repo>`, or `pi install ./pi-delegate`. The two tools, the `delegation` skill, and the default roles all ship in the package — nothing is copied to `~/.agents`.
+Install: `pi install npm:@ssweens/pi-delegate`, `pi install git:<repo>`, or `pi install ./pi-delegate`. The delegation tools, phased todo tool, `delegation` skill, and default roles all ship in the package — nothing is copied to `~/.agents`.
 
-Requires Pi 0.86.1 or newer. Minimal delegation for pi. Two tools, role files, fork context, steer, honest run log. Replaces pi-subagents (125 schema params, 14.8k lines, 11 tools in context) and pi-strings for the delegation you actually do.
+Requires Pi 0.86.1 or newer. Minimal delegation for pi: durable child runs, role files, fork context, steer, honest run log, and a stock-Pi phased todo list. Replaces pi-subagents (125 schema params, 14.8k lines, 11 tools in context) and pi-strings for the delegation you actually do.
 
 ## Tools
 
@@ -25,6 +25,12 @@ For OpenRouter offerings it also fetches the public API (no key; 10-minute in-me
 Models live on OpenRouter but absent from the registry are listed separately (usable after adding to `models.json`). The default view lists offerings that have a rating (yours or AA), ordered by your rating then AA intelligence index; `message=<substring>` searches every offering and every provider of a candidate.
 
 `rate` stores ratings the agent researched, keyed by exact `provider/id` (`[{model, score, source, note?}]`), in `~/.pi/agent/delegate-ratings.json`; reported stale after 14 days. Ratings appear on `models` lines.
+
+## Phased todos
+
+The `todo` tool and `/todo` command are owned by pi-delegate. They provide OMP-style phased tasks with immutable state transitions, session/branch restoration, an above-editor widget, compact/expanded tool rendering, and `TODO.md` import/export.
+
+Todo state writes use the `pi_delegate.todo` session-entry namespace. Existing `pi_omp.todo` entries are read-only migration input, so installing or reloading pi-delegate does not discard an existing plan. Reminders are bounded and suppressed when the turn was aborted, the assistant is asking a question, a prior reminder is awaiting progress, or an unsettled delegate child will wake the parent.
 
 ## Waiting for an existing child
 
@@ -157,7 +163,7 @@ Run the additional check when its boundary changes:
 | Completion, cancellation, delivery, persistence—or their assertions | Scoped mutation of the affected production behavior, after its baseline passes |
 | Docs only | Check examples/resource paths; no terminal or model run required |
 
-`check:install` packs the candidate, installs dependencies in an isolated extracted directory, runs the real `pi install`, and checks both tools, packaged roles, and the delegation skill. Pi links local directories without installing dependencies: run `npm install` in a local checkout first. npm/Git installs manage dependencies themselves. To check a published npm or Git source explicitly: `npm run check:install -- npm:@ssweens/pi-delegate@<version>` or `npm run check:install -- git:<repo>@<ref>`; that checks the named source, not uncommitted local changes.
+`check:install` packs the candidate, installs dependencies in an isolated extracted directory, runs the real `pi install`, and checks all tools, packaged roles, and the delegation skill. Pi links local directories without installing dependencies: run `npm install` in a local checkout first. npm/Git installs manage dependencies themselves. To check a published npm or Git source explicitly: `npm run check:install -- npm:@ssweens/pi-delegate@<version>` or `npm run check:install -- git:<repo>@<ref>`; that checks the named source, not uncommitted local changes.
 
 `smoke:tui` runs actual Pi and actual built-in tools with the loopback provider in a private tmux server. It checks native tool disclosure, streaming/follow vs paused scrolling, narrow resize, separate drafts, history, same-ID revival, and finished-frame removal. It prints the temporary evidence directory containing text/ANSI terminal captures, traces, and sessions; it stops only its own tmux server. Parent model wake-up is disabled in this UI fixture and verified separately by lifecycle tests.
 
