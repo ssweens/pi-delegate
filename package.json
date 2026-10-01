@@ -5,6 +5,16 @@
   "type": "module",
   "main": "src/index.ts",
   "license": "MIT",
+  "files": [
+    "src",
+    "dist",
+    "skills",
+    "roles",
+    "docs",
+    "NOTICE.md",
+    "vendor/acpx/LICENSE",
+    "vendor/pi-acp/LICENSE"
+  ],
   "engines": {
     "node": ">=22.19.0"
   },
