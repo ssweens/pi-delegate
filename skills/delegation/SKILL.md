@@ -84,6 +84,19 @@ Model research, ratings and approval (`models`, `rate`, `approve`) cover pi offe
 
 To see an agent's models, start without `model` and read `delegate_ctl status` for the run. Its `models:` line gives the current and available IDs, or `unknown`. Then `steer` with `model` to switch. Or ask the user. An opened session shows only its current model and keeps it.
 
+ACP is worth it when the agent's harness, billing, location or audience is the point, not just its model:
+
+| Reason | Example |
+|---|---|
+| Its harness: Claude Code's tools, subagents, hooks, MCP and `CLAUDE.md`; Codex's sandbox and `apply_patch` | "Have Claude Code do this with our repo's Claude setup." |
+| Subscription billing: plan quota instead of metered tokens | Long investigations or exploratory refactors on a ChatGPT or Claude plan |
+| Remote compute: an Amp Orb keeps running when this machine sleeps | Long test matrices, slow builds |
+| Humans are in the thread: an opened Amp thread shows your text as `## User` | A shared thread the user asked you to contribute to |
+| An independent second opinion: a different harness and model family | Security or architecture review before committing |
+| A long-lived native session the user will revisit in that provider's own UI | Ongoing threads |
+
+Otherwise stay on pi: a fork carries your context, model choice and cost are exact, steering and receipts are tightest, writers are locked, and scouts are cheap. On prompt caching, Claude Code may cache Anthropic models better within a long multi-turn session, but every new ACP session starts cold. Treat it as unmeasured until a run shows cached tokens per turn; billing is usually the bigger lever.
+
 Weigh before you choose:
 - An ACP agent brings its own tools and harness and gets no forked context. The brief must stand alone.
 - It may bill a flat-rate subscription. Codex reported no cost in the live smoke, so cost can show as unknown.
