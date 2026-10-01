@@ -26,6 +26,7 @@ import { AcpBackend, acpResultText, acpStatusText, acpSummary, DelegateError, se
 import { shutdownAcpCoordinator } from "./acp/instance.js";
 import { loadRoles } from "./roles.js";
 import { installTodo } from "./todo-ext.js";
+import { dealEligible, selectDeals, type DealsDetails } from "./deals.js";
 import { RunCompletion } from "./completion.js";
 import { ownedElsewhere, processOwner, readRecord, storageDir, writeRecord } from "./storage.js";
 
@@ -546,6 +547,31 @@ async function fetchEndpoints(id: string): Promise<LiveEndpoints> {
 	}
 	liveEP.set(id, r);
 	return r;
+}
+
+async function discoverDeals(ctx: ExtensionContext, filter = "", signal?: AbortSignal): Promise<DealsDetails> {
+	const live = await fetchOpenRouter();
+	if (live.error) throw new Error(`OpenRouter deal discovery unavailable: ${live.error}. Cached data was not used.`);
+	const term = filter.toLowerCase();
+	const universe = [...live.byId.values()];
+	const catalog = universe.filter((m) => dealEligible(m) && (!term || m.id.toLowerCase().includes(term)));
+	// OpenRouter has no catalog-wide endpoint-discount listing. Scan all eligible model endpoints
+	// in bounded batches; successful responses share the models view's ten-minute cache.
+	const endpoints = new Map<string, LiveEndpoints>();
+	for (let i = 0; i < catalog.length; i += 8) {
+		if (signal?.aborted) throw new DOMException("Deal discovery cancelled", "AbortError");
+		const batch = await Promise.all(catalog.slice(i, i + 8).map((m) => fetchEndpoints(m.id)));
+		batch.forEach((result, j) => endpoints.set(catalog[i + j].id, result));
+	}
+	const configured = new Set<string>((ctx.modelRegistry as any).getAvailable().filter((m: any) => m.provider === "openrouter").map((m: any) => m.id));
+	return selectDeals(catalog, endpoints, configured, new Date(), term ? universe : catalog);
+}
+
+function dealsReport(d: DealsDetails): string {
+	const row = (r: DealsDetails["discounts"][number]) => `  ${r.id}  ${r.price}  AA intel ${r.quality ?? "unrated"}${r.coding !== undefined ? ` coding ${r.coding}` : ""}  ${r.configured ? "configured" : "not configured"}  ${r.reason}`;
+	const section = (title: string, rows: DealsDetails["discounts"]) => `${title}\n${rows.length ? rows.map(row).join("\n") : "  none with available evidence"}`;
+	const partial = d.endpointFailures ? `; ${d.endpointFailures} endpoint lookups failed (promotions incomplete)` : "";
+	return `OPENROUTER DEALS evaluated ${d.evaluatedAt} (catalog and endpoint responses may be cached up to 10m) — ${d.eligible} eligible tool-capable text models; ${d.endpointsChecked} model endpoint catalogs checked${partial}.\nBasket for sorting value: 1M prompt + 250k completion tokens; free, batch and per-request-priced models excluded. AA intelligence is a proxy, not proof of fitness. Endpoint discounts require routing to that provider; their percentages do not prove the endpoint is the cheapest route.\n\n${section("ENDPOINT DISCOUNTS (four distinct models)", d.discounts)}\n\n${section("OFF-PEAK RATES (three distinct models)", d.offPeak)}\n\n${section(`FRONTIER VALUE (AA intelligence top 15%, ≥128k context; floor ${d.frontierFloor ?? "unavailable"})`, d.frontier)}\n\n${section(`LIGHT VALUE (AA intelligence top half below frontier, ≥32k context; floor ${d.lightFloor ?? "unavailable"})`, d.light)}\n\nNot configured = add the exact model id to models.json before choosing it. No model was selected or approved.`;
 }
 
 function aaOf(l: any): AAIndices | undefined {
@@ -1173,7 +1199,7 @@ export default function (pi: ExtensionAPI) {
 	// What the control call was about, in the header rather than buried in its output.
 	const subject = (args: any): string => {
 		if (!args) return "";
-		if (args.action === "models" || args.action === "roles") return args.message ? `"${args.message}"` : "";
+		if (args.action === "models" || args.action === "deals" || args.action === "roles") return args.message ? `"${args.message}"` : "";
 		if (args.action === "approve") return [args.role, args.model].filter(Boolean).join(" \u2192 ");
 		if (args.action === "rate") return `${args.ratings?.length ?? 0} offering${args.ratings?.length === 1 ? "" : "s"}`;
 		return args.runId ?? "";
@@ -1510,7 +1536,7 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 		renderResult: resultRenderer("delegate_ctl"),
 		label: "Delegate control",
 		description:
-			"See the delegation skill for the full procedure. models: every offering across all enabled providers, verbatim from the registry (provider/id, reasoning, context, $/M), plus live OpenRouter pricing, tiered rates, expirations and Artificial Analysis indices, your cached ratings, approved defaults and drift \u2014 call before the first delegate of a session. " +
+			"See the delegation skill for the full procedure. models: every offering across all enabled providers, verbatim from the registry (provider/id, reasoning, context, $/M), plus live OpenRouter pricing, tiered rates, expirations and Artificial Analysis indices, your cached ratings, approved defaults and drift \u2014 call before the first delegate of a session. deals: read-only OpenRouter promotion and price/quality shortlist for frontier and light work; does not choose or approve a model. " +
 			"rate: store quality ratings you researched, per exact offering (provider/id), so choices are grounded; stale after 14 days. approve: record a role's default model after the user agreed in conversation. " +
 			"roles: list roles. status: one run or all \u2014 a nonblocking progress read: status, current tool, tool calls so far, elapsed, remaining time budget. result: current report without waiting. wait: join an existing runId; returns its final report, immediately if finished. If queued messages arrive while waiting it returns early with the child still running — answer them, then wait again to rejoin. If the child stops without reporting completion it returns an error report instead of blocking until the run budget. Cancelling wait only detaches; the child keeps running. An attached waiter receives completion instead of a separate wake-up. steer: queue a correction or resume a finished child in the background, keeping its context; returns immediately. Use wait to join the resumed work. Saved children are restored on parent reopen without running; steer revives them with their original configuration unless you pass model:, which moves that child to another offering from the next segment on \u2014 propose it in conversation first, including when the saved offering is exhausted or gone. Explicitly stopped children require restart:true and the user's request. cancel: stop the child and prevent automatic revival. " +
 			"wait with runIds and mode any|all joins several runs of either backend at once; timeoutMs only ends that wait, never the runs. " +
@@ -1519,7 +1545,7 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 			"status or result with observe:true on an opened Amp run also reads its thread once (one amp threads export, never in the background) and returns only the messages after the last ones this run was shown, from any participant; a failed read is reported as unknown. Other runs fail ACTION_UNSUPPORTED. " +
 			"An Amp run's thread cost (amp threads usage) is read once per settled turn, which its wait result or wake-up reports, and by status or result with a runId unless the cached cost is current (a closed run, or a created run with no turn since); unknown when it was never read, and a failed read keeps the last cost with when it was read.",
 		parameters: Type.Object({
-			action: StringEnum(["models", "rate", "approve", "roles", "status", "result", "wait", "steer", "cancel", "close"] as const),
+			action: StringEnum(["models", "deals", "rate", "approve", "roles", "status", "result", "wait", "steer", "cancel", "close"] as const),
 			role: Type.Optional(Type.String({ description: "approve: role name" })),
 			model: Type.Optional(Type.String({ description: "approve: provider/id[:thinking] the user agreed to. steer: run the next segment on this offering instead of the child's saved one; the user chooses it, you never substitute silently" })),
 			runId: Type.Optional(Type.String()),
@@ -1530,7 +1556,7 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 			observe: Type.Optional(Type.Boolean({ description: "status or result with runId, opened Amp runs only: also read the native thread once and return the messages since this run's last observation" })),
 			restart: Type.Optional(Type.Boolean({ description: "steer only: restart an explicitly stopped child, only when the user requested it" })),
 			timeoutMs: Type.Optional(Type.Number({ description: "steer: give the child this time budget instead of its saved one \u2014 re-armed at once on a running child, applied to the next segment of an inactive one. wait with runIds, or on an acp run: stop waiting after this many ms; the runs keep going" })),
-			message: Type.Optional(Type.String({ description: "steer: the correction. models: substring filter. approve: one-line reason the user agreed to" })),
+			message: Type.Optional(Type.String({ description: "steer: the correction. models/deals: substring filter. approve: one-line reason the user agreed to" })),
 			ratings: Type.Optional(
 				Type.Array(
 					Type.Object({
@@ -1556,6 +1582,14 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 				if (!p.ratings?.length) return { content: [{ type: "text", text: "rate requires ratings: [{model, score, source, note?}]" }], isError: true, details: undefined };
 				const r = saveRatings(p.ratings);
 				return { content: [{ type: "text", text: `stored ${p.ratings.length}; ${Object.keys(r.entries).length} rated in total. Run models to see them applied.` }], details: undefined };
+			}
+			if (p.action === "deals") {
+				try {
+					const details = await discoverDeals(ctx, p.message, signal);
+					return { content: [{ type: "text", text: dealsReport(details) }], details };
+				} catch (e) {
+					return { content: [{ type: "text", text: String(e) }], details: undefined, isError: true };
+				}
 			}
 			if (p.action === "models") {
 				const all: any[] = (ctx.modelRegistry as any).getAvailable();
@@ -1794,6 +1828,18 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 			panel = new AgentsPanel(liveSource, theme, tui, (id) => openChild(ctx, id));
 			return panel;
 		});
+	});
+	pi.registerEntryRenderer<DealsDetails>("pi-delegate.deals", (entry, opts, theme) =>
+		framed((width) => resultView("OpenRouter", "deals", "", { content: [], details: entry.data }, opts, theme, width)));
+	pi.registerCommand("deals", {
+		description: "Find OpenRouter promotions and frontier/light value without calling a model (/deals [model substring])",
+		handler: async (args, ctx) => {
+			try {
+				const details = await discoverDeals(ctx, args.trim());
+				// Custom entries render in chat but are excluded from the model context.
+				pi.appendEntry("pi-delegate.deals", details);
+			} catch (e) { ctx.ui.notify(String(e), "error"); }
+		},
 	});
 	pi.registerCommand("agents", {
 		description: "Open finished delegate history without restarting children",

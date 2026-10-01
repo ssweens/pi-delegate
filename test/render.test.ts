@@ -141,6 +141,24 @@ test("a models report previews offerings as an aligned table, not the model's te
 	}
 });
 
+test("deals show shortlist and caution with expandable evidence at narrow widths", () => {
+	const row = { id: "openrouter/vendor/model", price: "$0.4/1/M", quality: 47, coding: 42, context: 262144, configured: false,
+		reason: "80% endpoint discount at Example Provider [fp8] (already in price)" };
+	const result = { content: [{ type: "text", text: "fallback deal text" }], details: {
+		kind: "deals", evaluatedAt: "2026-10-01T18:00:00Z", eligible: 100, endpointsChecked: 99, endpointFailures: 1,
+		frontierFloor: 45, lightFloor: 25, discounts: [row], offPeak: [], frontier: [row], light: [],
+	} };
+	for (const width of [110, 54, 40]) {
+		for (const expanded of [false, true]) {
+			const lines = resultView("OpenRouter", "deals", "", result, { expanded }, theme, width);
+			for (const line of lines) assert.ok(visibleWidth(line) <= width, `deals overflow ${width}: ${JSON.stringify(line)}`);
+			assert.match(lines.join(" "), /endpoint discounts.*off-peak rates.*frontier value.*light value/);
+			assert.match(lines.join(" "), /promotions incomplete/);
+			if (expanded) assert.match(lines.join(" "), /endpoint discount/);
+		}
+	}
+});
+
 test("a models record without usable details renders its text", () => {
 	const text = { content: [{ type: "text", text: "OFFERINGS legacy text" }] };
 	for (const details of [undefined, { kind: "models" }, { kind: "models", rows: [{}] }, models([modelRow("a/b", { live: { listed: true, notes: "oops" } })]).details]) {

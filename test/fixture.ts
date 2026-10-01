@@ -78,12 +78,14 @@ export async function harness(box: Sandbox, parent?: string, hooks: { beforeNoti
 	const sdk = await import("@earendil-works/pi-coding-agent");
 	const { default: extension } = await import("../src/index.ts");
 	const tools = new Map<string, any>();
+	const commands = new Map<string, any>();
 	let ctx: any;
 	const notices: any[] = [], errors: any[] = [];
 	const notice = deferred<any>();
 	const factory = (pi: any) => {
 		extension(new Proxy(pi, { get(target, key) {
 			if (key === "registerTool") return (tool: any) => { tools.set(tool.name, tool); target.registerTool(tool); };
+			if (key === "registerCommand") return (name: string, options: any) => { commands.set(name, options); target.registerCommand(name, options); };
 			if (key === "sendMessage") return (message: any, options: any) => { hooks.beforeNotice?.(message); notices.push(message); notice.resolve(message); return target.sendMessage(message, options); };
 			return target[key];
 		} }));
@@ -115,7 +117,7 @@ export async function harness(box: Sandbox, parent?: string, hooks: { beforeNoti
 		return result;
 	};
 	const ctl = (action: string, runId?: string, extra: any = {}, signal?: AbortSignal) => raw("delegate_ctl", { action, runId, ...extra }, signal);
-	return { sdk, runtime, errors, notices, notice, parent: manager.getSessionFile()!, ctl, ctx: () => ctx,
+	return { sdk, runtime, errors, notices, notice, commands, parent: manager.getSessionFile()!, ctl, ctx: () => ctx,
 		launch: (task: string, extra: any = {}) => raw("delegate", { role: "scout", context: "fresh", task, cwd: box.cwd, model: "fixture/fixture:off", ...extra }),
 		state: () => (globalThis as any)[Symbol.for("@ssweens/pi-delegate/runtime/1")],
 	};

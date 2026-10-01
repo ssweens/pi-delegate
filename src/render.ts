@@ -1,5 +1,6 @@
 import type { Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme, keyHint } from "@earendil-works/pi-coding-agent";
+import type { DealsDetails, DealRow } from "./deals.js";
 import { type Component, Markdown, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { AcpRunView } from "./backend.js";
 
@@ -432,6 +433,36 @@ function modelsView(title: string, subject: string, d: ModelsDetails, expanded: 
 	return out;
 }
 
+function isDealsDetails(d: any): d is DealsDetails {
+	return d?.kind === "deals" && typeof d.evaluatedAt === "string" && typeof d.eligible === "number"
+		&& typeof d.endpointsChecked === "number" && typeof d.endpointFailures === "number"
+		&& [d.discounts, d.offPeak, d.frontier, d.light].every((rows) => Array.isArray(rows) && rows.every((r: any) =>
+			typeof r?.id === "string" && typeof r.price === "string" && typeof r.reason === "string"
+			&& typeof r.context === "number" && typeof r.configured === "boolean"));
+}
+
+function dealsView(title: string, d: DealsDetails, expanded: boolean, theme: Theme, width: number): string[] {
+	const dim = (text: string) => theme.fg("dim", text);
+	const out = [theme.fg("toolTitle", theme.bold(title)) + ` ${theme.fg("accent", "deals")}`
+		+ dim(` · ${d.eligible} models · ${d.endpointsChecked} endpoint catalogs`)];
+	if (d.endpointFailures) out.push(theme.fg("warning", `  promotions incomplete: ${d.endpointFailures} failed`));
+	const group = (label: string, rows: DealRow[]) => {
+		out.push(dim(`  ${label}`));
+		if (!rows.length) { out.push(dim("    no evidenced candidates")); return; }
+		for (const r of rows) {
+			out.push(`    ${theme.fg("text", r.id)}  ${r.price}  ${r.quality === undefined ? dim("AA ?") : dim(`AA ${r.quality}`)}${r.configured ? "" : theme.fg("warning", " · add to models.json")}`);
+			if (expanded) out.push(...indented(dim(`${r.reason} · ctx ${Math.round(r.context / 1000)}k${r.coding === undefined ? "" : ` · AA coding ${r.coding}`}`), 6, width));
+		}
+	};
+	group("endpoint discounts", d.discounts);
+	group("off-peak rates", d.offPeak);
+	group(`frontier value · AA top 15% (≥${d.frontierFloor ?? "?"})`, d.frontier);
+	group(`light value · AA top half (≥${d.lightFloor ?? "?"})`, d.light);
+	if (expanded) out.push(...indented(dim(`Evaluated ${d.evaluatedAt}; catalog and endpoints may be cached up to 10m. Value sorted by 1M input + 250k output; excludes free, batch and per-request-priced models. Discounts are endpoint-specific, not guaranteed by model routing. AA is a quality proxy, not a recommendation. No model was selected.`), 2, width));
+	else out.push(...indented(keyHint("app.tools.expand", "for source, timing, context and caveats"), 2, width));
+	return out.map((line) => truncateToWidth(line, width, "…"));
+}
+
 export function resultView(
 	title: string,
 	action: string | undefined,
@@ -493,6 +524,9 @@ export function resultView(
 	// the terminal has after a reload. The view wraps to fit; the clamp makes that a guarantee.
 	if (action === "models" && isModelsDetails(result.details)) {
 		return modelsView(title, subject, result.details, Boolean(opts.expanded), theme, inner).map((l) => truncateToWidth(l, inner, "\u2026"));
+	}
+	if (action === "deals" && isDealsDetails(result.details)) {
+		return dealsView(title, result.details, Boolean(opts.expanded), theme, inner);
 	}
 
 	const blocks = Array.isArray(result.content) ? result.content : [];
