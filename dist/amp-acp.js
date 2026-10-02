@@ -152,6 +152,22 @@ function nativeBinding(params) {
     ...typeof value.model === "string" ? { model: value.model } : {}
   };
 }
+function ampErrorMessage(value, fallback) {
+  if (value instanceof Error && value.message.trim()) return value.message;
+  if (typeof value === "string" && value.trim()) return value;
+  if (value !== void 0) {
+    try {
+      const serialized = JSON.stringify(value);
+      if (serialized && serialized !== "{}") return serialized;
+    } catch {
+    }
+  }
+  return fallback;
+}
+function ampError(value, fallback) {
+  const message = ampErrorMessage(value, fallback);
+  return RequestError.internalError({ details: message }, message);
+}
 function ampArgs(options) {
   const args = options.continue ? ["threads", "continue", options.continue] : [];
   args.push("--execute", "--stream-json", "--no-archive-after-execute");
@@ -384,7 +400,7 @@ var AmpAcpAgent = class {
           const text = typeof content === "string" ? content : Array.isArray(content) ? content.filter((item) => typeof item === "object" && item !== null && item.type === "text" && typeof item.text === "string").map((item) => item.text).join("") : "";
           if (text) await this.client.sessionUpdate({ sessionId: params.sessionId, update: { sessionUpdate: stream.type === "assistant" ? "agent_message_chunk" : "user_message_chunk", content: { type: "text", text } } });
         }
-        if (stream.type === "result" && stream.is_error) throw new Error(typeof stream.error === "string" ? stream.error : "Amp returned an error result");
+        if (stream.type === "result" && stream.is_error) throw ampError(stream.error, "Amp returned an error result");
       }
       const nativeSession = state.threadId ? {
         id: state.threadId,
@@ -399,7 +415,8 @@ var AmpAcpAgent = class {
       };
     } catch (error) {
       if (state.cancelled || error instanceof Error && (error.name === "AbortError" || /aborted/i.test(error.message))) return { stopReason: "cancelled" };
-      throw error;
+      if (error instanceof RequestError) throw error;
+      throw ampError(error, "Amp execution failed");
     } finally {
       state.controller = null;
       state.cancelled = false;

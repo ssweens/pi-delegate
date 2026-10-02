@@ -76,8 +76,10 @@ if (args[0] === 'threads' && args[1] === 'export') {
   let input = ''
   process.stdin.setEncoding('utf8')
   process.stdin.on('data', chunk => { input += chunk })
-  process.stdin.on('end', () => {
+  process.stdin.on('end', async () => {
     if (process.env.AMP_FAKE_INPUT_LOG) appendFileSync(process.env.AMP_FAKE_INPUT_LOG, `${JSON.stringify({ threadId, input })}\n`)
+    if (input.includes('SLOW')) await new Promise(resolve => setTimeout(resolve, 250))
+    if (input.includes('EXIT_FAILURE')) { process.stderr.write('thread already open and active in another Amp'); process.exit(1) }
     const reply = orb ? 'AMP_ORB_OK' : 'AMP_LOCAL_OK'
     if (storePath) {
       const store = load()

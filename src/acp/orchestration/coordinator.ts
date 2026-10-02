@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { appendFile, chmod, mkdir, realpath } from "node:fs/promises";
+import { setTimeout as sleep } from "node:timers/promises";
 import { join, resolve } from "node:path";
 import type { Profile, RequestRecord, RuntimeHandle, RuntimePort, RuntimeStatus, RuntimeTerminal, RuntimeTurn, StringsResponse, TurnUsage, UsageBreakdown, UsageCost, WorkerKind, WorkerRecord, WorktreeIdentity, NativeSessionDescription, SessionOrigin } from "../domain/types.js";
 import { failure, StringsError } from "../domain/errors.js";
@@ -8,7 +9,7 @@ import { requireCwdUnowned, requireIsolatedWriter, requireWriterUnowned } from "
 import { acceptanceContract, parseAcceptanceReport, roleContract, WORKER_CONTRACT } from "../domain/roles.js";
 import { AcpxRuntimePort } from "../runtime/acpx-runtime.js";
 import { StateStore, type SessionProvenance, type StoredWorker } from "../persistence/state-store.js";
-import { Claims, sessionClaim, writerClaims, type Claim } from "../persistence/claims.js";
+import { Claims, nativeTurnClaim, sessionClaim, writerClaims, type Claim } from "../persistence/claims.js";
 import { coordinatorHome, describeOwner, legacyStateDir, processStateDir, stateDirHolder } from "../persistence/home.js";
 
 const NAME = /^[a-z][a-z0-9-]{0,47}$/;
@@ -24,7 +25,7 @@ interface CoordinatorTerminal {
 type Action = Record<string, unknown> & { action: string };
 
 /** claims: the machine-wide claims this worker holds (its writer cwd, its native session), released when it closes. */
-interface LiveWorker { record: WorkerRecord; runtime: RuntimePort; claims?: string[]; turn?: RuntimeTurn; deadline?: NodeJS.Timeout; stopObservation?: () => void }
+interface LiveWorker { record: WorkerRecord; runtime: RuntimePort; claims?: string[]; turn?: RuntimeTurn; pending?: { requestId: string }; deadline?: NodeJS.Timeout; stopObservation?: () => void }
 type RuntimeFactory = (cwd: string, stateDir: string, profile: Profile, origin?: SessionOrigin) => RuntimePort;
 const ownedSessionKey = (session: SessionProvenance) => JSON.stringify([session.agent, session.profileName, session.role, session.cwd, session.sessionId]);
 const nativeSessionKey = (agent: string, native: NativeSessionDescription) => JSON.stringify([agent.toLowerCase(), native.scope, native.id]);
@@ -32,8 +33,13 @@ const nativeSessionKey = (agent: string, native: NativeSessionDescription) => JS
 const boundSessionId = (record: WorkerRecord): string | undefined => record.origin === "opened" ? record.native?.id : record.handle.agentSessionId ?? record.handle.backendSessionId;
 /** The codes a claim fails with when another live process holds it. */
 const HELD_ELSEWHERE = new Set(["WRITER_CWD_OWNED", "WRITER_WORKTREE_OWNED", "SESSION_IN_USE"]);
+/** In-process tail gates complement the machine-wide native-turn claim. */
+const nativeTurnQueues = new Map<string, Promise<void>>();
+
 const workerClaims = (record: WorkerRecord): Claim[] => {
-  const session = boundSessionId(record);
+  // Opened Amp sessions are shared observations; only an active turn takes the short-lived
+  // native-turn claim. Created sessions remain exclusively owned for resume/identity safety.
+  const session = record.origin === "opened" && record.profile.agent.toLowerCase() === "amp" ? undefined : boundSessionId(record);
   return [...(record.role === "writer" ? writerClaims(record.cwd, record.worktree) : []), ...(session ? [sessionClaim(record.profile.agent, session)] : [])];
 };
 
@@ -398,13 +404,15 @@ export class Coordinator {
       throw new StringsError("NATIVE_OPEN_UNSUPPORTED", "Amp could not establish the native thread executor; provide a provider lookup with executor metadata.");
     }
     if (input.cwd !== undefined && await realpath(requiredString(input.cwd, "cwd")) !== native.cwd) throw new StringsError("SESSION_WORKSPACE_MISMATCH", "cwd does not match the native workspace.");
-    for (const worker of this.workers.values()) {
-      const duplicate = worker.record.native
-        ? nativeSessionKey(worker.record.profile.agent, worker.record.native) === nativeSessionKey(agent, native)
-        : worker.record.profile.agent.toLowerCase() === agent.toLowerCase() && (worker.record.handle.agentSessionId ?? worker.record.handle.backendSessionId) === sessionId;
-      if (duplicate) throw new StringsError("SESSION_IN_USE", `Native session is already bound to ${worker.record.name}.`);
+    if (agent.toLowerCase() !== "amp") {
+      for (const worker of this.workers.values()) {
+        const duplicate = worker.record.native
+          ? nativeSessionKey(worker.record.profile.agent, worker.record.native) === nativeSessionKey(agent, native)
+          : worker.record.profile.agent.toLowerCase() === agent.toLowerCase() && (worker.record.handle.agentSessionId ?? worker.record.handle.backendSessionId) === sessionId;
+        if (duplicate) throw new StringsError("SESSION_IN_USE", `Native session is already bound to ${worker.record.name}.`);
+      }
     }
-    const claims = await this.claims.acquireAll([sessionClaim(agent, native.id)]);
+    const claims = agent.toLowerCase() === "amp" ? [] : await this.claims.acquireAll([sessionClaim(agent, native.id)]);
     try {
       const handle = await runtime.openSession({ name, agent, native });
       if (handle.agentSessionId !== sessionId) {
@@ -538,6 +546,16 @@ export class Coordinator {
     worker.record.activeRequestId = requestId;
     worker.record.updatedAt = new Date().toISOString();
     const decorated = opened ? prompt : this.decoratePrompt(worker.record.profile, prompt);
+    if (opened && worker.record.profile.agent.toLowerCase() === "amp") {
+      // Opened Amp attachments are shared: enqueue the native execution immediately, then let
+      // the per-TID gate acquire Amp's short-lived execution lease before starting the ACP turn.
+      worker.pending = { requestId };
+      const observationEnd = new Promise<void>(resolve => { worker.stopObservation = resolve; });
+      const completion = this.runQueuedOpenedRequest(worker, record, prompt, timeoutMs);
+      this.completions.set(requestId, Promise.race([completion, observationEnd]));
+      await this.persist();
+      return { ok: true, action: "send", details: { requestId, worker: worker.record.name, status: "queued", lineageId, attempt, session: worker.record.handle.backendSessionId ?? worker.record.handle.agentSessionId, decoratedPromptSuffix: "" } };
+    }
     let turn: RuntimeTurn;
     try {
       turn = worker.runtime.startTurn({ handle: worker.record.handle, prompt: decorated, requestId, timeoutMs });
@@ -568,6 +586,104 @@ export class Coordinator {
       requireWriterUnowned(peers, current, worker.record.name);
     } else {
       requireCwdUnowned(peers, worker.record.cwd, worker.record.name);
+    }
+  }
+
+  private nativeTurnKey(worker: LiveWorker): string {
+    const native = worker.record.native;
+    if (!native) throw new StringsError("SESSION_IDENTITY_CHANGED", `Worker ${worker.record.name} has no native session identity.`);
+    return `${worker.record.profile.agent.toLowerCase()}:${native.scope}:${native.id}`;
+  }
+
+  /** Run one opened Amp request after every earlier request for the same T-ID has settled. */
+  private async withNativeTurn(worker: LiveWorker, request: RequestRecord, deadline: number, task: (remainingMs: number) => Promise<void>): Promise<void> {
+    const key = this.nativeTurnKey(worker);
+    const previous = nativeTurnQueues.get(key) ?? Promise.resolve();
+    let releaseLocal!: () => void;
+    const gate = new Promise<void>(resolve => { releaseLocal = resolve; });
+    const tail = previous.then(() => gate);
+    nativeTurnQueues.set(key, tail);
+    try {
+      const previousRemaining = deadline - Date.now();
+      if (previousRemaining <= 0 || !(await settlesWithin(previous, previousRemaining))) {
+        this.settleQueuedTimeout(worker, request);
+        return;
+      }
+      let claims: string[] | undefined;
+      while (request.status === "running") {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) {
+          this.settleQueuedTimeout(worker, request);
+          return;
+        }
+        try {
+          claims = await this.claims.acquireAll([nativeTurnClaim(worker.record.profile.agent, worker.record.native!.id)]);
+          if (Date.now() >= deadline || request.status !== "running") {
+            await this.claims.release(claims);
+            claims = undefined;
+            if (request.status === "running") this.settleQueuedTimeout(worker, request);
+            return;
+          }
+          break;
+        } catch (error) {
+          if (!(error instanceof StringsError) || error.code !== "SESSION_TURN_BUSY") throw error;
+          await sleep(Math.min(100, remaining));
+        }
+      }
+      if (request.status !== "running") return;
+      try { await task(Math.max(1, deadline - Date.now())); }
+      finally { if (claims) await this.claims.release(claims); }
+    } finally {
+      releaseLocal();
+      if (nativeTurnQueues.get(key) === tail) nativeTurnQueues.delete(key);
+    }
+  }
+
+  private settleQueuedTimeout(worker: LiveWorker, request: RequestRecord): void {
+    if (request.status !== "running") return;
+    request.status = "timed_out";
+    request.finishedAt = new Date().toISOString();
+    request.stopReason = "timed_out";
+    request.failure = { code: "TURN_TIMEOUT", message: "Coordinator deadline exceeded before the queued native turn started.", retryable: false };
+    if (worker.record.status !== "closing" && worker.record.status !== "closed") worker.record.status = "idle";
+    delete worker.record.activeRequestId;
+    worker.stopObservation?.();
+    delete worker.stopObservation;
+    worker.record.updatedAt = new Date().toISOString();
+  }
+
+  private settleQueuedFailure(worker: LiveWorker, request: RequestRecord, error: unknown): void {
+    if (request.status !== "running") return;
+    request.status = "failed";
+    request.finishedAt = new Date().toISOString();
+    request.failure = { code: "TURN_START_FAILED", message: error instanceof Error ? error.message : String(error), retryable: false };
+    if (worker.record.status !== "closing" && worker.record.status !== "closed") worker.record.status = "idle";
+    delete worker.record.activeRequestId;
+    worker.record.updatedAt = new Date().toISOString();
+  }
+
+  private async runQueuedOpenedRequest(worker: LiveWorker, request: RequestRecord, prompt: string, timeoutMs: number): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    try {
+      await this.withNativeTurn(worker, request, deadline, async remainingMs => {
+        if (request.status !== "running") return;
+        let turn: RuntimeTurn;
+        try {
+          turn = worker.runtime.startTurn({ handle: worker.record.handle, prompt, requestId: request.id, timeoutMs: remainingMs });
+        } catch (error) {
+          this.settleQueuedFailure(worker, request, error);
+          return;
+        }
+        worker.turn = turn;
+        void turn.result.then(() => this.terminalSignals.add(request.id), () => this.terminalSignals.add(request.id));
+        await this.runRequest(worker, request, turn, prompt, remainingMs);
+      });
+    } catch (error) {
+      this.settleQueuedFailure(worker, request, error);
+    } finally {
+      if (worker.pending?.requestId === request.id) delete worker.pending;
+      await this.persist();
+      this.completions.delete(request.id);
     }
   }
 
@@ -930,10 +1046,23 @@ export class Coordinator {
   }
 
   private async cancelWorker(worker: LiveWorker, reason: string, discardPersistentState: boolean): Promise<{ requestId: string; escalated: boolean }> {
-    if (!worker.turn || !worker.record.activeRequestId) throw new StringsError("WORKER_NOT_RUNNING", `Worker ${worker.record.name} has no active turn.`);
+    if (!worker.record.activeRequestId) throw new StringsError("WORKER_NOT_RUNNING", `Worker ${worker.record.name} has no active turn.`);
     const requestId = worker.record.activeRequestId;
-    const turn = worker.turn;
     const request = this.requests.get(requestId);
+    if (!worker.turn && worker.pending?.requestId === requestId && request?.status === "running") {
+      request.cancellationRequestedAt = new Date().toISOString();
+      request.status = "cancelled";
+      request.finishedAt = new Date().toISOString();
+      request.stopReason = "cancelled";
+      worker.record.status = "idle";
+      delete worker.record.activeRequestId;
+      worker.stopObservation?.();
+      delete worker.stopObservation;
+      await this.persist();
+      return { requestId, escalated: false };
+    }
+    if (!worker.turn) throw new StringsError("WORKER_NOT_RUNNING", `Worker ${worker.record.name} has no active turn.`);
+    const turn = worker.turn;
     if (request) request.cancellationRequestedAt = new Date().toISOString();
     await this.persist();
     const cancelAcknowledged = await settlesWithin(turn.cancel(reason), worker.record.profile.cancellationGraceMs).catch(() => false);

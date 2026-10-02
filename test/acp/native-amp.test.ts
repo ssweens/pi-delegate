@@ -98,8 +98,11 @@ test("Amp opens the exact native T-ID with an explicit executor hint and never r
     }
 
     const duplicate = await coordinator.execute({ action: "spawn", name: "duplicate", agent: "amp", sessionId: localThread, cwd: root, executionEnvironment: "local" });
-    assert.equal(duplicate.ok, false);
-    if (!duplicate.ok) assert.equal(duplicate.error.code, "SESSION_IN_USE");
+    assert.equal(duplicate.ok, true, JSON.stringify(duplicate));
+    if (duplicate.ok) {
+      assert.equal(duplicate.details.nativeSessionId, localThread);
+      assert.ok((await coordinator.execute({ action: "close", name: "duplicate" })).ok);
+    }
 
     const failed = await coordinator.execute({ action: "send", name: "existing", prompt: "FAIL" });
     assert.equal(failed.ok, true, JSON.stringify(failed));

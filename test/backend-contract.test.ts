@@ -156,8 +156,6 @@ test("unsupported actions fail explicitly with the backend's reason", () => {
 	assert.equal(open.code, "ACTION_UNSUPPORTED");
 	assert.equal(errorOf(requireAction(PI_CAPABILITIES, "close")).code, "ACTION_UNSUPPORTED");
 	assert.equal(requireAction(PI_CAPABILITIES, "steer").ok, true);
-	assert.equal(errorOf(requireAction(acpCapabilities({ origin: "created", agent: "amp" }), "observe")).code, "ACTION_UNSUPPORTED");
-	assert.equal(requireAction(acpCapabilities({ origin: "opened", agent: "amp" }), "observe").ok, true);
 });
 
 test("ACP cancel covers only turns this run started", () => {

@@ -121,7 +121,7 @@ export interface CloseRequest {
 // ---------------------------------------------------------------------------------------------
 // Capabilities
 
-export const LIFECYCLE_ACTIONS = ["create", "open", "steer", "wait", "result", "status", "cancel", "close", "observe"] as const;
+export const LIFECYCLE_ACTIONS = ["create", "open", "steer", "wait", "result", "status", "cancel", "close"] as const;
 export type LifecycleAction = (typeof LIFECYCLE_ACTIONS)[number];
 
 export type Unsupported = { supported: false; reason: string };
@@ -142,8 +142,6 @@ export interface BackendCapabilities {
 	status: Capability;
 	cancel: Capability<{ scope: CancelScope }>;
 	close: Capability<{ effect: CloseEffect }>;
-	/** Seeing turns from other participants in a shared native session. */
-	observe: Capability;
 }
 
 export const PI_CAPABILITIES: Readonly<BackendCapabilities> = {
@@ -156,7 +154,6 @@ export const PI_CAPABILITIES: Readonly<BackendCapabilities> = {
 	status: { supported: true },
 	cancel: { supported: true, scope: "run", note: "stops the child and disables automatic revival" },
 	close: { supported: false, reason: "an in-process run holds no external process or session; use cancel" },
-	observe: { supported: false, reason: "an in-process child has no other participants" },
 };
 
 /** The capability report for one ACP run. Cancel never reaches a turn someone else started. */
@@ -175,9 +172,6 @@ export function acpCapabilities(run: { origin: SessionOrigin; agent: string }): 
 		status: { supported: true },
 		cancel: { supported: true, scope: "own-turns", note: "ACP session cancel, with grace" },
 		close: opened ? { supported: true, effect: "disconnect" } : { supported: true, effect: "dispose" },
-		observe: opened && amp
-			? { supported: true, note: "on demand only: one `amp threads export` per status/result call, messages after the last messageId returned" }
-			: { supported: false, reason: opened ? `no observation path for agent ${run.agent}` : "a created session has no other participants" },
 	};
 }
 
@@ -273,7 +267,7 @@ export interface AcpRunView {
 	parked?: { at: number; interruptedTurn?: string };
 	/** Owned by another live Pi process: a read-only snapshot here. */
 	foreign?: { ownerPid: number; ownerHost: string };
-	/** Present only when this status/result call asked to observe (opened Amp runs): what that one export showed. */
+	/** Present on status/result for an opened Amp run: what that call's one export showed. */
 	observation?: AmpObservation;
 	/** Amp runs: the thread's cost as last read. It fills the run's cost; absent means it was never read. */
 	usage?: AmpThreadUsage;

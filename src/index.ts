@@ -1542,9 +1542,9 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 			"rate: store quality ratings you researched, per exact offering (provider/id), so choices are grounded; stale after 14 days. approve: record a role's default model after the user agreed in conversation. " +
 			"roles: list roles. status: one run or all \u2014 a nonblocking progress read: status, current tool, tool calls so far, elapsed, remaining time budget. result: current report without waiting. wait: join an existing runId; returns its final report, immediately if finished. If queued messages arrive while waiting it returns early with the child still running — answer them, then wait again to rejoin. If the child stops without reporting completion it returns an error report instead of blocking until the run budget. Cancelling wait only detaches; the child keeps running. An attached waiter receives completion instead of a separate wake-up. steer: queue a correction or resume a finished child in the background, keeping its context; returns immediately. Use wait to join the resumed work. Saved children are restored on parent reopen without running; steer revives them with their original configuration unless you pass model:, which moves that child to another offering from the next segment on \u2014 propose it in conversation first, including when the saved offering is exhausted or gone. Explicitly stopped children require restart:true and the user's request. cancel: stop the child and prevent automatic revival. " +
 			"wait with runIds and mode any|all joins several runs of either backend at once; timeoutMs only ends that wait, never the runs. " +
-			"Runs started with backend acp take the same runId actions: status and result read the session and its latest turn; wait joins it; steer sends the next turn (a running turn must finish or be cancelled first); cancel stops only a turn this run started; close releases the session \u2014 a created one is disposed, an opened one only disconnected, never archived or deleted. close is acp only and final. " +
+			"Runs started with backend acp take the same runId actions: status and result read the session and its latest turn; wait joins it; steer sends the next turn, queued behind another attachment's active Amp turn when needed; cancel stops only a turn this run started; close releases the session \u2014 a created one is disposed, an opened one only disconnected, never archived or deleted. close is acp only and final. " +
 			"When the parent exits, its acp runs are parked, not closed: their sessions are released and their records stay readable after a restart; steer reopens one (an opened run by its native ID, a created run by native resume, else RUN_NOT_RESUMABLE). " +
-			"status or result with observe:true on an opened Amp run also reads its thread once (one amp threads export, never in the background) and returns only the messages after the last ones this run was shown, from any participant; a failed read is reported as unknown. Other runs fail ACTION_UNSUPPORTED. " +
+			"status and result on an open Amp run read the native thread once by default (one amp threads export, never in the background) and return only messages after the last ones this attachment showed, from any participant; a failed read is reported as unknown. Other runs do not observe a native thread. " +
 			"An Amp run's thread cost (amp threads usage) is read once per settled turn, which its wait result or wake-up reports, and by status or result with a runId unless the cached cost is current (a closed run, or a created run with no turn since); unknown when it was never read, and a failed read keeps the last cost with when it was read.",
 		parameters: Type.Object({
 			action: StringEnum(["models", "deals", "rate", "approve", "roles", "status", "result", "wait", "steer", "cancel", "close"] as const),
@@ -1555,7 +1555,6 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 			mode: Type.Optional(StringEnum(["any", "all"] as const, { description: "wait with runIds: any returns when the first run settles, all (default) when every one has" })),
 			force: Type.Optional(Type.Boolean({ description: "close: cancel an active turn first instead of refusing" })),
 			discardPersistentState: Type.Optional(Type.Boolean({ description: "close, created acp sessions only: do not keep the session resumable" })),
-			observe: Type.Optional(Type.Boolean({ description: "status or result with runId, opened Amp runs only: also read the native thread once and return the messages since this run's last observation" })),
 			restart: Type.Optional(Type.Boolean({ description: "steer only: restart an explicitly stopped child, only when the user requested it" })),
 			timeoutMs: Type.Optional(Type.Number({ description: "steer: give the child this time budget instead of its saved one \u2014 re-armed at once on a running child, applied to the next segment of an inactive one. wait with runIds, or on an acp run: stop waiting after this many ms; the runs keep going" })),
 			message: Type.Optional(Type.String({ description: "steer: the correction. models/deals: substring filter. approve: one-line reason the user agreed to" })),
@@ -1694,9 +1693,6 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 				return { content: [{ type: "text", text: lines.join("\n") || "no roles found" }], details: { kind: "roles", rows } };
 			}
 			const owner = requireOwner();
-			if (p.observe === true && (p.action !== "status" && p.action !== "result" || !p.runId)) {
-				return failed(new DelegateError("INPUT_INVALID", "observe applies to status or result with one runId", "observe"));
-			}
 			if (p.action === "status" && !p.runId) {
 				const owned = ownedRuns(owner);
 				const external = acp.owned(owner.key);
@@ -1713,8 +1709,10 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 			if (acp.find(p.runId, owner.key)) {
 				const id = p.runId!;
 				// The cost read, an observation's export and the model read are separate calls: run them together, then read the view they updated.
+				const attached = acp.find(id, owner.key);
+				const shouldObserve = (p.action === "status" || p.action === "result") && attached !== undefined && attached.closedAt === undefined && attached.origin === "opened" && attached.agent.toLowerCase() === "amp";
 				const read = async (latest: () => Promise<AcpRunView>): Promise<AcpRunView> => {
-					const [, observed, models] = await Promise.all([acp.refreshUsage(id), p.observe === true ? acp.observe(id) : undefined, acp.models(id)]);
+					const [, observed, models] = await Promise.all([acp.refreshUsage(id), shouldObserve ? acp.observe(id) : undefined, acp.models(id)]);
 					const v = observed ? { ...(await latest()), ...(observed.observation ? { observation: observed.observation } : {}) } : await latest();
 					return models ? { ...v, models } : v;
 				};
@@ -1733,7 +1731,8 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 							const current = await acp.result(id);
 							const request = unwrap(validateSteer({ backend: "acp", origin: current.session.origin, agent: current.session.agent }, p as Record<string, unknown>));
 							const v = await acp.steer(id, request);
-							return { content: [{ type: "text", text: `${id}: turn ${v.turns.at(-1)?.requestId} sent${request.model ? ` on model ${request.model}` : ""}. Completion will wake you; use wait to join.` }], details: v };
+							const queued = v.session.origin === "opened" && v.session.agent.toLowerCase() === "amp" && v.turns.at(-1)?.status === "running";
+							return { content: [{ type: "text", text: `${id}: turn ${v.turns.at(-1)?.requestId} ${queued ? "queued" : "sent"}${request.model ? ` on model ${request.model}` : ""}. Completion will wake you; use wait to join.` }], details: v };
 						}
 						case "cancel": {
 							const v = await acp.cancel(id, {});
@@ -1750,7 +1749,7 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 			const run = p.runId ? runs.get(p.runId) : undefined;
 			if (!run || run.ownerKey !== owner.key) return failed(new DelegateError("RUN_NOT_FOUND", `unknown runId ${p.runId ?? "(none)"}; known: ${[...ownedRuns(owner).map((r) => r.id), ...acp.owned(owner.key).map((v) => v.id)].join(", ") || "none"}`, "runId"));
 			// The pi backend's capability report decides what it cannot do; that fails, it never becomes another action.
-			const capability = requireAction(PI_CAPABILITIES, p.observe === true ? "observe" : p.action as LifecycleAction);
+			const capability = requireAction(PI_CAPABILITIES, p.action as LifecycleAction);
 			if (!capability.ok) return failed(new DelegateError(capability.error.code, capability.error.message));
 
 			switch (p.action) {

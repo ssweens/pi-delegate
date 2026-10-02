@@ -23,8 +23,8 @@
  * the worker, the run is RUN_OWNED_ELSEWHERE. A record without a dir predates per-process state:
  * its worker is in the legacy single dir.
  *
- * Opened Amp runs can also be observed (todo 044, amp-observe.ts): status/result with observe reads
- * the thread through one `amp threads export`, on demand, and the cursor is saved with the record.
+ * Opened Amp runs share native observation (todo 044, amp-observe.ts): status/result reads the
+ * thread through one `amp threads export` by default, on demand, and each attachment's cursor is saved.
  *
  * Amp extras (todo 058). A created Amp run takes Amp's agent mode (`amp --mode`) and titles its new
  * thread with the brief's first line. Once its T-ID is known (the Coordinator records it as the first
@@ -665,15 +665,16 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 	}
 
 	/**
-	 * Observe an opened Amp run's thread for one status/result call: one `amp threads export`, on
-	 * demand, returning only the messages after the last one this run was shown. It needs no session,
+	 * Read an opened Amp run's shared thread for one status/result call: one `amp threads export`,
+	 * on demand, returning only the messages after the last one this attachment was shown. It needs no session,
 	 * so a parked run is observed without reopening it. A failed export is an unknown observation,
 	 * not an error, and leaves the cursor where it was.
 	 */
 	async observe(runId: string): Promise<AcpRunView> {
 		const run = this.get(runId);
-		unwrap(requireAction(acpCapabilities(run), "observe"));
-		this.writable(run);
+		if (run.origin !== "opened" || !isAmp(run)) throw new DelegateError("RUN_NOT_OBSERVABLE", `${run.id} has no shared Amp thread to read`);
+		// Observation is read-only and intentionally works for a foreign attachment. Its cursor is
+		// process-local there because the owning process's durable record is not ours to write.
 		if (run.closedAt !== undefined) throw new DelegateError("RUN_CLOSED", `${run.id} is closed, and its observation ended with it; open the thread again with delegate sessionId`);
 		const next = (run.observing ?? Promise.resolve()).catch(() => undefined).then(() => this.observeOnce(run));
 		run.observing = next;

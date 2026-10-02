@@ -242,7 +242,7 @@ test("Amp extras through delegate: mode, native T-ID, title and labels, cost", {
 			await h.ctl("close", id);
 		});
 
-		await t.test("status and result with observe read the cost and the thread together", async () => {
+		await t.test("status and result read the cost and the shared thread together", async () => {
 			// The fake's usage call fails unless the export starts while it runs.
 			const marker = join(box.root, "export-started");
 			process.env.AMP_FAKE_USAGE_AFTER_EXPORT = marker;
@@ -250,7 +250,7 @@ test("Amp extras through delegate: mode, native T-ID, title and labels, cost", {
 				for (const action of ["status", "result"]) {
 					rmSync(marker, { force: true });
 					const usage = command("usage").length, exports = command("export").length;
-					const read = await h.ctl(action, opened.local, { observe: true });
+					const read = await h.ctl(action, opened.local);
 					assert.equal(command("usage").length, usage + 1);
 					assert.equal(command("export").length, exports + 1);
 					assert.equal(read.details.usage.error, undefined, `${action}: ${read.details.usage.error}`);

@@ -90,7 +90,9 @@ test("native Amp sessions and observation through delegate", { timeout: 120000 }
 			assert.equal(local.details.session.executionEnvironment, "local");
 			assert.equal(local.details.status, "idle");
 
-			assert.equal(codeOf(await delegate({ backend: "acp", agent: "amp", sessionId: localThread, cwd: undefined, executionEnvironment: "local" })), "SESSION_IN_USE", "one binding per native thread");
+			const shared = await delegate({ backend: "acp", agent: "amp", sessionId: localThread, cwd: undefined, executionEnvironment: "local" });
+			assert.equal(shared.isError, undefined, shared.content[0].text);
+			opened.shared = shared.details.id;
 			const mismatch = await delegate({ backend: "acp", agent: "amp", sessionId: orbThread, cwd: undefined, executionEnvironment: "local" });
 			assert.equal(codeOf(mismatch), "NATIVE_LOOKUP_FAILED", "a hint never overrides the executor Amp reports");
 			assert.match(mismatch.content[0].text, /executor does not match/);
@@ -123,10 +125,20 @@ test("native Amp sessions and observation through delegate", { timeout: 120000 }
 			const posted = threads()[localThread].messages.at(-2);
 			assert.deepEqual([posted.role, posted.content[0].text], ["user", "exact words, as typed"], "the thread shows it as a user message, not automation");
 
+			// A native session must survive a longer sequence of independent turns; the
+			// adapter owns one Amp execution per steer and must not lose the thread identity.
+			for (let turnNumber = 1; turnNumber <= 8; turnNumber += 1) {
+				await h.ctl("steer", opened.local, { message: `long exchange turn ${turnNumber}` });
+				const continued = await h.ctl("wait", opened.local);
+				assert.equal(continued.details.status, "complete", continued.content[0].text);
+				assert.equal(continued.details.output, "AMP_LOCAL_OK");
+			}
+			const beforeFailure = executions().length;
 			await h.ctl("steer", opened.hinted, { message: "please FAIL" });
 			const failed = await h.ctl("wait", opened.hinted);
 			assert.equal(failed.details.status, "error", "is_error is never reported as success");
-			assert.equal(executions().length, before + 2, "a failed native send is not retried");
+			assert.match(failed.content[0].text, /fake amp failure/, "the provider error is not reduced to ACP's generic Internal error");
+			assert.equal(executions().length, beforeFailure + 1, "a failed native send is not retried");
 
 			await h.ctl("steer", opened.orb, { message: "orb exact" });
 			assert.equal((await h.ctl("wait", opened.orb)).details.output, "AMP_ORB_OK");
@@ -135,12 +147,44 @@ test("native Amp sessions and observation through delegate", { timeout: 120000 }
 			assert.equal(orbArgs.includes("--orb-execute"), true, "the Orb thread keeps its remote executor");
 			assert.equal(orbArgs[orbArgs.indexOf("--mode") + 1], "high", "and its native mode");
 			assert.equal(codeOf(await h.ctl("steer", opened.orb, { message: "x", model: "low" })), "OPEN_OVERRIDE_FORBIDDEN");
+
+			await h.ctl("steer", opened.orb, { message: "busy thread EXIT_FAILURE" });
+			const busy = await h.ctl("wait", opened.orb);
+			assert.equal(busy.details.status, "error");
+			assert.match(busy.content[0].text, /thread already open and active in another Amp/);
+		});
+
+		await t.test("shared opened attachments queue native turns and return before the queue drains", async () => {
+			const before = executions().length;
+			await h.ctl("steer", opened.local, { message: "SLOW first shared turn" });
+			for (let i = 0; i < 20 && executions().length < before + 1; i += 1) await sleep(10);
+			assert.equal(executions().length, before + 1, "the first native turn started");
+			await h.ctl("steer", opened.shared, { message: "second shared turn" });
+			assert.equal(executions().length, before + 1, "the second attachment is queued, not concurrent");
+			const first = await h.ctl("wait", opened.local);
+			const second = await h.ctl("wait", opened.shared);
+			assert.equal(first.details.status, "complete", first.content[0].text);
+			assert.equal(second.details.status, "complete", second.content[0].text);
+			assert.deepEqual(lines(inputLog).slice(-2).map((entry: any) => entry.input), ["SLOW first shared turn", "second shared turn"], "turns execute in injection order");
+		});
+
+		await t.test("a queued native turn can be cancelled without stopping the active turn", async () => {
+			const before = executions().length;
+			await h.ctl("steer", opened.local, { message: "SLOW active turn" });
+			for (let i = 0; i < 20 && executions().length < before + 1; i += 1) await sleep(10);
+			await h.ctl("steer", opened.shared, { message: "SLOW queued cancellation" });
+			const cancelled = await h.ctl("cancel", opened.shared);
+			assert.equal(cancelled.details.turns.at(-1).status, "cancelled");
+			assert.equal((await h.ctl("wait", opened.local)).details.status, "complete");
+			await h.ctl("wait", opened.shared);
+			await sleep(300);
+			assert.equal(executions().length, before + 1, "the cancelled queued turn never reached Amp");
 		});
 
 		await t.test("close only disconnects: nothing is archived, deleted or cancelled", async () => {
 			const before = amp().length;
 			assert.equal(codeOf(await h.ctl("close", opened.orb, { discardPersistentState: true })), "OPEN_OVERRIDE_FORBIDDEN");
-			for (const id of [opened.orb, opened.hinted]) {
+			for (const id of [opened.orb, opened.hinted, opened.shared]) {
 				const closed = await h.ctl("close", id);
 				assert.match(closed.content[0].text, /closed; disconnected, and the native session is unchanged/);
 			}
@@ -150,7 +194,7 @@ test("native Amp sessions and observation through delegate", { timeout: 120000 }
 			assert.ok(threads()[orbThread], "the thread is still there");
 		});
 
-		await t.test("observe: one export on demand, only messages after the last returned, v/updatedAt for no change", async () => {
+		await t.test("status and result observe a shared Amp thread by default, one export per call", async () => {
 			const thread = threads()[localThread];
 			const others = [message(101, "user", "a teammate asks: status?"), message(102, "assistant", "Amp answers the teammate")];
 			thread.messages.push(...others); thread.v += 1; thread.updatedAt = "2026-09-30T12:00:00.000Z";
@@ -158,11 +202,7 @@ test("native Amp sessions and observation through delegate", { timeout: 120000 }
 			const total = thread.messages.length;
 
 			const exportsBefore = exportsOf(localThread);
-			await h.ctl("status", opened.local);
-			await sleep(300);
-			assert.equal(exportsOf(localThread), exportsBefore, "status without observe reads nothing; nothing polls in the background");
-
-			const first = await h.ctl("status", opened.local, { observe: true });
+			const first = await h.ctl("status", opened.local);
 			assert.equal(first.isError, undefined, first.content[0].text);
 			assert.equal(exportsOf(localThread), exportsBefore + 1, "one export per request");
 			const o1 = first.details.observation;
@@ -175,7 +215,7 @@ test("native Amp sessions and observation through delegate", { timeout: 120000 }
 			assert.match(first.content[0].text, /----- T-0+-0+-0+-0+-0+1 messages, verbatim -----\n#1 user · author unknown · .*\nexact words, as typed\n/);
 			assert.equal(first.details.status, "complete", "the run's own status is unchanged by observing");
 
-			const second = await h.ctl("status", opened.local, { observe: true });
+			const second = await h.ctl("status", opened.local);
 			assert.equal(second.details.observation.state, "unchanged");
 			assert.deepEqual(second.details.observation.messages, []);
 			assert.match(second.content[0].text, /: no change since the last observation\.$/);
@@ -184,14 +224,14 @@ test("native Amp sessions and observation through delegate", { timeout: 120000 }
 			grown[localThread].messages.push(message(103, "user", "the teammate again"));
 			grown[localThread].v += 1; grown[localThread].updatedAt = "2026-09-30T12:05:00.000Z";
 			writeThreads(grown);
-			const third = await h.ctl("result", opened.local, { observe: true });
+			const third = await h.ctl("result", opened.local);
 			assert.deepEqual(third.details.observation.messages.map((m: any) => m.text), ["the teammate again"], "only what is new since the last observation");
 			assert.match(third.content[0].text, /----- amp-.* reported, verbatim -----/, "result keeps the run's own report");
 			assert.match(third.content[0].text, /#103 user · author unknown · .*\nthe teammate again\n----- end of messages -----$/);
 
 			await h.ctl("steer", opened.local, { message: "my own turn" });
 			await h.ctl("wait", opened.local);
-			const own = await h.ctl("status", opened.local, { observe: true });
+			const own = await h.ctl("status", opened.local);
 			assert.deepEqual(own.details.observation.messages.map((m: any) => [m.role, m.text]), [["user", "my own turn"], ["assistant", "AMP_LOCAL_OK"]]);
 		});
 
@@ -200,29 +240,29 @@ test("native Amp sessions and observation through delegate", { timeout: 120000 }
 			grown[localThread].messages.push(message(201, "assistant", "x".repeat(300_000)), message(202, "user", "after the big one"));
 			grown[localThread].v += 1;
 			writeThreads(grown);
-			const big = await h.ctl("status", opened.local, { observe: true });
+			const big = await h.ctl("status", opened.local);
 			const o = big.details.observation;
 			assert.deepEqual([o.messages.length, o.remaining, o.truncated, o.maxBytes], [1, 1, true, 256_000]);
 			assert.equal(o.messages[0].truncated, true);
 			assert.ok(Buffer.byteLength(JSON.stringify(o.messages)) <= 256_000 + 1_000, "the observed text stays within the bound");
 			assert.match(big.content[0].text, /1 more after these were left out by the 256000-byte bound; observe again to read them/);
-			const rest = await h.ctl("status", opened.local, { observe: true });
+			const rest = await h.ctl("status", opened.local);
 			assert.equal(rest.details.observation.state, "unchanged", "the thread did not change; what the bound left follows");
 			const [more, after] = rest.details.observation.messages;
 			assert.deepEqual([more.messageId, more.continued, after.text], ["201", true, "after the big one"]);
 			assert.equal(o.messages[0].text + more.text, "x".repeat(300_000), "the saved cursor resumes the cut message where it was cut");
-			assert.equal((await h.ctl("status", opened.local, { observe: true })).details.observation.state, "unchanged");
+			assert.equal((await h.ctl("status", opened.local)).details.observation.state, "unchanged");
 		});
 
 		await t.test("a failed export is an unknown observation, not a failed status; the cursor stays", async () => {
 			writeThreads({ ...threads(), [localThread]: { ...threads()[localThread], fail: "fake export refused" } });
-			const failed = await h.ctl("status", opened.local, { observe: true });
+			const failed = await h.ctl("status", opened.local);
 			assert.equal(failed.isError, undefined, "status still answers");
 			assert.equal(failed.details.id, opened.local);
 			assert.equal(failed.details.observation.state, "unknown");
 			assert.match(failed.details.observation.error, /amp threads export exited 1: fake export refused/);
 			assert.match(failed.content[0].text, /: unknown, amp threads export exited 1: fake export refused\. The observation cursor did not move\./);
-			const asResult = await h.ctl("result", opened.local, { observe: true });
+			const asResult = await h.ctl("result", opened.local);
 			assert.equal(asResult.details.observation.state, "unknown");
 
 			const restored = threads();
@@ -230,7 +270,7 @@ test("native Amp sessions and observation through delegate", { timeout: 120000 }
 			restored[localThread].messages.push(message(301, "user", "sent while the export failed"));
 			restored[localThread].v += 1;
 			writeThreads(restored);
-			const after = await h.ctl("status", opened.local, { observe: true });
+			const after = await h.ctl("status", opened.local);
 			assert.deepEqual(after.details.observation.messages.map((m: any) => m.text), ["sent while the export failed"], "nothing was lost or repeated");
 		});
 
@@ -247,32 +287,27 @@ test("native Amp sessions and observation through delegate", { timeout: 120000 }
 			h = await harness(box, parent);
 			assert.deepEqual(amp().slice(parkedArgs), [], "parking and restoring run no Amp command");
 
-			const back = await h.ctl("status", opened.local, { observe: true });
+			const back = await h.ctl("status", opened.local);
 			assert.ok(back.details.parked, "observed while parked, without reopening");
 			assert.equal(existingAcpCoordinator(), undefined, "observation needs no ACP session");
 			assert.deepEqual(back.details.observation.messages.map((m: any) => m.text), ["while Pi was away"], "only what came after the saved cursor");
-			assert.equal((await h.ctl("status", opened.local, { observe: true })).details.observation.state, "unchanged");
+			assert.equal((await h.ctl("status", opened.local)).details.observation.state, "unchanged");
 		});
 
-		await t.test("observe is only for opened Amp runs and only on status or result", async () => {
+		await t.test("ordinary status does not observe created or Pi runs, and close ends Amp observation", async () => {
 			const created = (await delegate({ backend: "acp", agent: "fixture", task: "hello" })).details.id;
 			await h.ctl("wait", created);
-			const notOpened = await h.ctl("status", created, { observe: true });
-			assert.equal(codeOf(notOpened), "ACTION_UNSUPPORTED");
-			assert.match(notOpened.content[0].text, /observe is not supported on the acp backend: a created session has no other participants/);
-			assert.equal(codeOf(await h.ctl("result", created, { observe: true })), "ACTION_UNSUPPORTED");
+			assert.equal((await h.ctl("status", created)).details.observation, undefined);
 			const createdAmp = (await delegate({ backend: "acp", agent: "amp", task: "hi", executionEnvironment: "local" })).details.id;
 			await h.ctl("wait", createdAmp);
-			assert.equal(codeOf(await h.ctl("status", createdAmp, { observe: true })), "ACTION_UNSUPPORTED", "a created Amp run has no other participants");
+			assert.equal((await h.ctl("status", createdAmp)).details.observation, undefined, "a created Amp run has no shared native attachment");
 			api.script("Pi child", { text: "PI-OK" });
 			const pi = (await h.launch("Pi child", { sync: true })).details.id;
-			const piObserve = await h.ctl("status", pi, { observe: true });
-			assert.equal(codeOf(piObserve), "ACTION_UNSUPPORTED");
-			assert.match(piObserve.content[0].text, /observe is not supported on the pi backend/);
-			assert.equal(codeOf(await h.ctl("status", undefined, { observe: true })), "INPUT_INVALID", "one export per request: observe needs one runId");
-			assert.equal(codeOf(await h.ctl("wait", opened.local, { observe: true })), "INPUT_INVALID");
+			assert.equal((await h.ctl("status", pi)).details.observation, undefined);
 			await h.ctl("close", opened.local);
-			assert.equal(codeOf(await h.ctl("status", opened.local, { observe: true })), "RUN_CLOSED", "close ends the observation with the run");
+			const closed = await h.ctl("status", opened.local);
+			assert.equal(closed.details.closed, true, "close ends the observation with the run");
+			assert.equal(closed.details.observation, undefined);
 			for (const id of [created, createdAmp]) await h.ctl("close", id);
 		});
 

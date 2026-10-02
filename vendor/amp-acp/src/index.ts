@@ -169,6 +169,23 @@ type AmpStreamMessage = {
   message?: { content?: unknown };
 };
 
+function ampErrorMessage(value: unknown, fallback: string): string {
+  if (value instanceof Error && value.message.trim()) return value.message;
+  if (typeof value === "string" && value.trim()) return value;
+  if (value !== undefined) {
+    try {
+      const serialized = JSON.stringify(value);
+      if (serialized && serialized !== "{}") return serialized;
+    } catch { /* fall through to the stable fallback */ }
+  }
+  return fallback;
+}
+
+function ampError(value: unknown, fallback: string): RequestError {
+  const message = ampErrorMessage(value, fallback);
+  return RequestError.internalError({ details: message }, message);
+}
+
 function ampArgs(options: AmpExecution): string[] {
   const args = options.continue ? ["threads", "continue", options.continue] : [];
   args.push("--execute", "--stream-json", "--no-archive-after-execute");
@@ -389,7 +406,7 @@ class AmpAcpAgent implements Agent {
           const text = typeof content === "string" ? content : Array.isArray(content) ? content.filter((item): item is { type: "text"; text: string } => typeof item === "object" && item !== null && (item as { type?: unknown }).type === "text" && typeof (item as { text?: unknown }).text === "string").map(item => item.text).join("") : "";
           if (text) await this.client.sessionUpdate({ sessionId: params.sessionId, update: { sessionUpdate: stream.type === "assistant" ? "agent_message_chunk" : "user_message_chunk", content: { type: "text", text } } });
         }
-        if (stream.type === "result" && stream.is_error) throw new Error(typeof stream.error === "string" ? stream.error : "Amp returned an error result");
+        if (stream.type === "result" && stream.is_error) throw ampError(stream.error, "Amp returned an error result");
       }
       const nativeSession = state.threadId ? {
         id: state.threadId,
@@ -404,7 +421,8 @@ class AmpAcpAgent implements Agent {
       };
     } catch (error) {
       if (state.cancelled || (error instanceof Error && (error.name === "AbortError" || /aborted/i.test(error.message)))) return { stopReason: "cancelled" };
-      throw error;
+      if (error instanceof RequestError) throw error;
+      throw ampError(error, "Amp execution failed");
     } finally {
       state.controller = null;
       state.cancelled = false;

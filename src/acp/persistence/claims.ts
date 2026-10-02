@@ -2,7 +2,8 @@
  * Machine-wide claims, under <home>/locks/. Each Pi process has its own Coordinator and state dir,
  * so what one Coordinator's in-memory checks enforced for the whole machine is claimed here:
  * one live writer per canonical cwd (and per linked worktree), and one live binding per native
- * session. A claim is a small file naming its holder (PID, host, process token, state dir).
+ * session for created or non-shareable workers. Opened Amp attachments share the binding and take
+ * a short-lived turn claim instead. A claim is a small file naming its holder (PID, host, process token, state dir).
  * proper-lockfile serializes the read-check-write of one claim. It is held for milliseconds, so
  * its staleness is the shortest proper-lockfile allows, and a lock attempt waits longer than that:
  * a process killed inside the window delays the claim by seconds, never blocks it.
@@ -36,6 +37,10 @@ export const writerClaims = (cwd: string, worktree?: WorktreeIdentity): Claim[] 
 
 export const sessionClaim = (agent: string, sessionId: string): Claim =>
   ({ key: `session:${agent.toLowerCase()}:${sessionId}`, code: "SESSION_IN_USE", subject: `Native session ${sessionId} (${agent})` });
+
+/** Held only while a native turn executes. Multiple opened observers may share the session between turns. */
+export const nativeTurnClaim = (agent: string, sessionId: string): Claim =>
+  ({ key: `session-turn:${agent.toLowerCase()}:${sessionId}`, code: "SESSION_TURN_BUSY", subject: `Native session turn ${sessionId} (${agent})` });
 
 export class Claims {
   /** This holder's ID in every claim file it writes: a file with another ID was taken over. */

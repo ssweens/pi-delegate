@@ -34,7 +34,8 @@ function machine(t: { after(fn: () => unknown): void }) {
 	mkdirSync(cwd, { recursive: true });
 	chmodSync(fakeAmp, 0o755);
 	// PI_AGENT_DIR too, so a Coordinator that reads only it (before per-process state) stays in the sandbox.
-	const env = { ...process.env, HOME: root, PI_CODING_AGENT_DIR: agent, PI_AGENT_DIR: agent, AMP_CLI_PATH: fakeAmp, AMP_ACP_STATE_DIR: join(root, "amp-state") };
+	const inputLog = join(root, "amp-input.ndjson");
+	const env = { ...process.env, HOME: root, PI_CODING_AGENT_DIR: agent, PI_AGENT_DIR: agent, AMP_CLI_PATH: fakeAmp, AMP_ACP_STATE_DIR: join(root, "amp-state"), AMP_FAKE_INPUT_LOG: inputLog };
 	const children: ChildProcess[] = [];
 	t.after(() => {
 		for (const child of children) if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
@@ -62,7 +63,7 @@ function machine(t: { after(fn: () => unknown): void }) {
 		};
 	};
 	const record = (id: string) => JSON.parse(readFileSync(join(runDir, `${encodeURIComponent(id)}.json`), "utf8"));
-	return { root, agent, home: join(agent, "pi-strings"), cwd, pi, record };
+	return { root, agent, home: join(agent, "pi-strings"), cwd, pi, record, inputLog };
 }
 
 const created = (cwd: string, task: string, extra: Record<string, unknown> = {}) => ({ origin: "created", agent: "fake", task, cwd, ...extra });
@@ -114,16 +115,37 @@ test("a claim whose holder died is reclaimed at once; parking releases one", { t
 	assert.ok((await c.ask("start", created(m.cwd, "WAIT", { role: "writer" }))).ok, "a parked run holds no claim");
 });
 
-test("two processes cannot both open one native session; the refusal names the holder's PID", { timeout: 90000 }, async (t) => {
+test("multiple processes observe one native session and serialize its turns", { timeout: 90000 }, async (t) => {
 	const m = machine(t);
 	const [a, b] = await Promise.all([m.pi("acpx"), m.pi("acpx")]);
-	const opened = await a.call("start", { origin: "opened", agent: "amp", sessionId: localThread });
-	const refused = await b.ask("start", { origin: "opened", agent: "amp", sessionId: localThread });
-	assert.equal(refused.code, "SESSION_IN_USE", refused.message);
-	assert.match(refused.message!, new RegExp(`held by Pi process ${a.pid} `));
+	const [openedA, openedB] = await Promise.all([
+		a.call("start", { origin: "opened", agent: "amp", sessionId: localThread }),
+		b.call("start", { origin: "opened", agent: "amp", sessionId: localThread }),
+	]);
+	assert.equal(openedA.session.nativeSessionId, localThread);
+	assert.equal(openedB.session.nativeSessionId, localThread);
+	await b.call("restore");
+	const foreign = (await b.call("status", { ids: [openedA.id] }))[0];
+	assert.equal(foreign.foreign.ownerPid, a.pid, "a second process can inspect the other attachment");
 
-	await a.call("close", { id: opened.id });
-	assert.ok((await b.ask("start", { origin: "opened", agent: "amp", sessionId: localThread })).ok, "disconnect releases the binding");
+	await a.call("steer", { id: openedA.id, message: "SLOW first process turn" });
+	await new Promise(resolve => setTimeout(resolve, 50));
+	const beforeSecond = existsSync(m.inputLog) ? readFileSync(m.inputLog, "utf8").trim().split("\n").filter(Boolean).length : 0;
+	await b.call("steer", { id: openedB.id, message: "second process turn" });
+	const duringFirst = existsSync(m.inputLog) ? readFileSync(m.inputLog, "utf8").trim().split("\n").filter(Boolean).length : 0;
+	assert.equal(duringFirst, beforeSecond, "the second process is queued while the first native turn runs");
+
+	const [first, second] = await Promise.all([
+		a.call("wait", { ids: [openedA.id] }),
+		b.call("wait", { ids: [openedB.id] }),
+	]);
+	assert.equal(first.settled[0].status, "complete");
+	assert.equal(second.settled[0].status, "complete");
+	const inputs = readFileSync(m.inputLog, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line).input);
+	assert.deepEqual(inputs.slice(-2), ["SLOW first process turn", "second process turn"], "native turns execute in injection order");
+
+	await a.call("close", { id: openedA.id });
+	await b.call("close", { id: openedB.id });
 });
 
 test("park in one process, exit, and revive in another: created and opened runs", { timeout: 120000 }, async (t) => {

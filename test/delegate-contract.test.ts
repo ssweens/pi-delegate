@@ -5,7 +5,7 @@
  *   the run's report marks unsupported fails ACTION_UNSUPPORTED with the report's reason, and an
  *   action it marks supported never does;
  * - every ContractErrorCode is reachable through `delegate`/`delegate_ctl`, and none starts a session;
- * - cancel never reaches a turn this run did not start;
+ * - cancel never reaches a turn this run did not start; opened Amp observation is automatic on status/result.
  * - the backend's own failure paths: a run that cannot be recorded (RUN_NOT_PERSISTED), and a parked
  *   opened run whose native session changed (SESSION_IDENTITY_CHANGED).
  * The ACP runtime is an in-process fake that creates and opens sessions for any agent name, so Amp
@@ -70,7 +70,7 @@ function nativeRuntime(natives: Map<string, NativeSessionDescription>) {
 
 /** The run-level actions, each as the one tool call that performs it, in the order the table runs them. */
 type RunAction = Exclude<LifecycleAction, "create" | "open">;
-const RUN_ACTIONS = ["status", "result", "wait", "observe", "steer", "cancel", "close"] as const satisfies readonly RunAction[];
+const RUN_ACTIONS = ["status", "result", "wait", "steer", "cancel", "close"] as const satisfies readonly RunAction[];
 type Missing = Exclude<RunAction, (typeof RUN_ACTIONS)[number]>;
 // A lifecycle action added to the contract without a row here fails the typecheck.
 const everyRunAction: [Missing] extends [never] ? true : Missing = true;
@@ -97,7 +97,6 @@ test("the delegate contract, by backend, origin and agent, through delegate and 
 		status: (id) => h.ctl("status", id),
 		result: (id) => h.ctl("result", id),
 		wait: (id) => h.ctl("wait", id),
-		observe: (id) => h.ctl("status", id, { observe: true }),
 		steer: (id) => h.ctl("steer", id, { message: "WAIT hold" }),
 		cancel: (id) => h.ctl("cancel", id),
 		close: (id) => h.ctl("close", id, { force: true }),
@@ -127,7 +126,6 @@ test("the delegate contract, by backend, origin and agent, through delegate and 
 						assert.equal(codeOf(result), "ACTION_UNSUPPORTED", `${row.name} ${action} is unsupported: ${result.content[0].text}`);
 						assert.equal(result.content[0].text, `ACTION_UNSUPPORTED: ${action} is not supported on the ${report.backend} backend: ${capability.reason}`);
 					}
-					if (action === "observe" && capability.supported) assert.equal(result.details.observation?.state, "unknown", "the export could not run, so nothing is inferred");
 					if (action === "cancel" && report.backend === "acp") assert.equal(result.details.status, "cancelled", "cancel stopped the turn this run's steer started");
 				}
 				// open is a start action: on pi, a sessionId fails before any action is chosen.
