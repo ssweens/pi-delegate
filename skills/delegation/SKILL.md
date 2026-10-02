@@ -76,7 +76,7 @@ Rules that differ from pi:
 - A `wait` timeout never cancels. `timeoutMs` on `delegate` or `steer` is the turn budget: on a created session it ends the turn as `timeout` and the session must be closed (a later `steer` fails `RUN_UNUSABLE`); on an opened session it only stops your wait.
 - Steer needs the current turn to be finished or cancelled. `cancel` stops only a turn this run started; on a shared Amp thread, a turn someone else started is never cancelled; with no turn of this run active, cancel fails `WORKER_NOT_RUNNING`. Cancel stops the turn, not the run.
 - `close` is ACP-only and final. It disposes a created session and only disconnects an opened one; it never archives or deletes a thread. Pass `force: true` only to cancel an active turn first. Close every ACP run you finish with.
-- On an opened Amp run, `status` with `observe: true` and one `runId` reads the thread: one export per call, only messages since the last read. A plain `status` doesn't read it. One read is not a poll loop.
+- On an opened Amp run, `status` or `result` with one `runId` observes the native thread by default: one export per call, only messages since this attachment's last read, including messages from every participant. There is no observe flag. Sending a turn is separate and serialized per native T-ID; other attachments may observe while one turn is active.
 - After the parent restarts, ACP runs are parked: `status`, `result` and `wait` read their records, and `steer` reopens them. A created run whose adapter cannot resume fails `RUN_NOT_RESUMABLE`; tell the user and start a new run rather than retrying.
 
 ### Choosing between a pi child and an ACP agent

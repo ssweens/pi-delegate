@@ -58,12 +58,12 @@ export async function provider() {
 		async close() { for (const res of sockets) res.destroy(); server.close(); await once(server, "close"); },
 	};
 }
-export function sandbox(url: string, root = mkdtempSync(join(tmpdir(), "pi-delegate-qc-"))) {
+export function sandbox(url: string, root = mkdtempSync(join(tmpdir(), "pi-delegate-qc-")), options: { retry?: Record<string, unknown> } = {}) {
 	const cwd = join(root, "project"), agentDir = join(root, "agent");
 	mkdirSync(cwd, { recursive: true }); mkdirSync(agentDir, { recursive: true });
 	// Pi 0.99 sends strict tool schemas only to endpoints that advertise support; the loopback accepts them, as real strict-capable providers do.
 	writeFileSync(join(agentDir, "models.json"), JSON.stringify({ providers: { fixture: { api: "openai-completions", baseUrl: url, apiKey: "loopback-only", models: [{ id: "fixture", name: "Deterministic fixture", reasoning: false, input: ["text"], contextWindow: 32768, maxTokens: 4096, compat: { supportsStrictMode: true }, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }] } } }));
-	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ defaultProvider: "fixture", defaultModel: "fixture", defaultThinkingLevel: "off", retry: { enabled: false }, compaction: { enabled: false }, defaultProjectTrust: "full", quietStartup: true, hideThinkingBlock: true }));
+	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ defaultProvider: "fixture", defaultModel: "fixture", defaultThinkingLevel: "off", retry: options.retry ?? { enabled: false }, compaction: { enabled: false }, defaultProjectTrust: "full", quietStartup: true, hideThinkingBlock: true }));
 	return { root, cwd, agentDir, env: { ...process.env, HOME: root, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", PI_TELEMETRY: "0", DO_NOT_TRACK: "1" } };
 }
 export type Sandbox = ReturnType<typeof sandbox>;

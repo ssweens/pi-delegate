@@ -47,6 +47,10 @@ const WRITE_TOOLS = new Set(["edit", "write"]);
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 const MAX_RETAINED_SESSIONS = 8;
 const OUTPUT_CAP = 40_000;
+// Provider retries are not task work. Keep Pi's automatic retry loop from consuming an entire
+// delegate segment before the child gets a chance to use its tools.
+const MAX_PROVIDER_RETRIES = 3;
+const MAX_PROVIDER_RETRY_MS = 120_000;
 /** Parent-session event bus only. No model turn or worker tool is created by a milestone. */
 export const DELEGATE_MILESTONE_EVENT = "pi-delegate:milestone.v1";
 export interface DelegateMilestone {
@@ -114,6 +118,8 @@ interface Run {
 	output: string;
 	failedAttempts: number;
 	lastAttemptError?: string;
+	providerRetryMs: number;
+	providerRetry?: { attempt: number; maxAttempts: number; delayMs: number; errorMessage: string; startedAt: number };
 	error?: string;
 	lastTool?: string;
 	toolCalls: { name: string; args: Record<string, unknown>; at: number }[];
@@ -221,6 +227,7 @@ function restoreRun(path: string, owner: Owner): Run {
 	// Parent message_end hooks run before Pi appends the message. Only its transcript
 	// can establish durable delivery after a crash; never trust a saved in-memory acknowledgement.
 	const run: Run = { ...record, recordPath: path, acknowledged: false, completion: new RunCompletion(), activeTools: new Map() };
+	run.providerRetryMs ??= 0;
 	if (ownedElsewhere(record)) {
 		// Its live owner is still running or delivering it: show a snapshot, never write or re-deliver it.
 		run.foreign = true;
@@ -760,6 +767,8 @@ function view(run: Run): RunView {
 		droppedTools: run.droppedTools,
 		failedAttempts: run.failedAttempts,
 		lastAttemptError: run.lastAttemptError,
+		providerRetryMs: run.providerRetryMs,
+		...(run.providerRetry ? { providerRetry: run.providerRetry } : {}),
 		toolCalls: run.toolCalls,
 		activeTool: run.activeTools.values().next().value,
 		// A synchronous launch is a blocked parent too, but only while it is actually running:
@@ -791,6 +800,11 @@ function summary(run: Run): string {
 		run.cost ? `$${run.cost.toFixed(4)}` : "",
 	].filter(Boolean);
 	let s = parts.join(" · ");
+	if (run.providerRetry) {
+		const elapsed = Math.max(0, Date.now() - run.providerRetry.startedAt);
+		s += `\nprovider retrying · retry ${run.providerRetry.attempt}/${run.providerRetry.maxAttempts} · backoff ${run.providerRetry.delayMs}ms · ${Math.round(elapsed / 1000)}s elapsed (last: ${run.providerRetry.errorMessage})`;
+	}
+	if (run.providerRetryMs) s += `\nprovider retry wall ${Math.round(run.providerRetryMs / 1000)}s; separate from task and tool time.`;
 	if (run.failedAttempts) s += `\n${run.failedAttempts} provider attempt${run.failedAttempts === 1 ? "" : "s"} failed and were retried before this (last: ${run.lastAttemptError}) — that wall clock and any tokens are included above.`;
 	if (run.sessionFile) s += `\nsession: ${run.sessionFile}`;
 	if (run.droppedTools.length) s += `\ntools the child could not have (children get built-ins only): ${run.droppedTools.join(", ")}`;
@@ -830,7 +844,12 @@ function retire(keep: Run) {
 }
 
 function finish(run: Run, status: Status, error?: string) {
+	if (run.completion.settled) return;
 	if (run.timer) clearTimeout(run.timer);
+	if (run.providerRetry) {
+		run.providerRetryMs += Math.max(0, Date.now() - run.providerRetry.startedAt);
+		run.providerRetry = undefined;
+	}
 	run.timer = undefined;
 	run.endedAt = Date.now();
 	run.status = status;
@@ -1146,6 +1165,27 @@ export default function (pi: ExtensionAPI) {
 				if (ev.message?.role === "assistant") run.streamingMessage = ev.message;
 			}
 			if (ev.type === "message_end") run.streamingMessage = undefined;
+			if (ev.type === "auto_retry_start") {
+				const now = Date.now();
+				const retryWall = run.providerRetryMs + (run.providerRetry ? Math.max(0, now - run.providerRetry.startedAt) : 0);
+				if (run.providerRetry) {
+					run.providerRetryMs = retryWall;
+					run.providerRetry = undefined;
+				}
+				run.lastAttemptError = ev.errorMessage;
+				if (ev.attempt > MAX_PROVIDER_RETRIES || retryWall + ev.delayMs > MAX_PROVIDER_RETRY_MS) {
+					run.status = "error";
+					run.error = `Provider retry ceiling exceeded after ${ev.attempt} retries and ${Math.round(retryWall / 1000)}s; last error: ${ev.errorMessage}`;
+					finish(run, "error", run.error);
+					void session.abort();
+				} else {
+					run.providerRetry = { attempt: ev.attempt, maxAttempts: Math.min(ev.maxAttempts, MAX_PROVIDER_RETRIES), delayMs: ev.delayMs, errorMessage: ev.errorMessage, startedAt: Date.now() };
+				}
+			}
+			if (ev.type === "auto_retry_end" && run.providerRetry) {
+				run.providerRetryMs += Math.max(0, Date.now() - run.providerRetry.startedAt);
+				run.providerRetry = undefined;
+			}
 			if (ev.type === "tool_execution_start") {
 				run.lastTool = ev.toolName;
 				run.activeTools.set(ev.toolCallId, { name: ev.toolName, args: ev.args ?? {} });
@@ -1159,6 +1199,10 @@ export default function (pi: ExtensionAPI) {
 			if (ev.type === "tool_execution_end") run.activeTools.delete(ev.toolCallId);
 			run.revision++;
 			if (ev.type === "message_end") {
+				if (ev.message?.role === "assistant") {
+					try { harvest(run); }
+					catch (error) { run.status = "error"; run.error = `Cannot read child transcript: ${String(error)}`; void session.abort(); }
+				}
 				try { saveRun(run); }
 				catch (error) { run.status = "error"; run.error = `Cannot save child state: ${String(error)}`; void session.abort(); }
 				if (run.status === "running" && ev.message?.role === "assistant") {
@@ -1193,7 +1237,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			finish(run, run.status === "running" ? "complete" : run.status);
 		} catch (e: any) {
-			finish(run, run.status === "running" ? "error" : run.status, String(e?.message ?? e));
+			finish(run, run.status === "running" ? "error" : run.status, run.error ?? String(e?.message ?? e));
 		} finally { signal?.removeEventListener("abort", abort); run.ready = undefined; }
 	}
 
@@ -1459,6 +1503,7 @@ export default function (pi: ExtensionAPI) {
 				startIdx: inherited.length,
 				forkedMessages: context === "fork" ? inherited.length : undefined,
 				writer: isWriter, syncJoined: p.sync === true,
+				providerRetryMs: 0,
 				toolCalls: [],
 				activeTools: new Map(),
 				revision: 0,
@@ -1757,7 +1802,7 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 					return await waitForChild(run, ctx, signal);
 				case "status":
 					if (run.session && run.status === "running") harvest(run);
-					return { content: [{ type: "text", text: `${summary(run)}${run.status === "running" ? `\nnow: ${run.activeTools.values().next().value?.name ?? (run.lastTool ? `thinking after ${run.lastTool}` : "thinking")} \u00b7 ${run.toolCalls.length} tool call${run.toolCalls.length === 1 ? "" : "s"} so far \u00b7 ${Math.round((run.timeoutMs - (Date.now() - run.startedAt)) / 60000)} min of its budget left` : ""}` }], details: recordedView(run) };
+					return { content: [{ type: "text", text: `${summary(run)}${run.status === "running" ? `\nnow: ${run.providerRetry ? `provider retry ${run.providerRetry.attempt}/${run.providerRetry.maxAttempts}` : run.activeTools.values().next().value?.name ?? (run.lastTool ? `thinking after ${run.lastTool}` : "thinking")} \u00b7 ${run.toolCalls.length} tool call${run.toolCalls.length === 1 ? "" : "s"} so far \u00b7 ${Math.round((run.timeoutMs - (Date.now() - run.startedAt)) / 60000)} min of its budget left` : ""}` }], details: recordedView(run) };
 				case "result":
 					return run.completion.settled ? finalResult(run) : { content: [{ type: "text", text: resultText(run) }], details: recordedView(run) };
 				case "cancel":

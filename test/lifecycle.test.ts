@@ -447,3 +447,37 @@ test("real SDK delegation lifecycle (loopback provider, no credentials)", { time
 		assert.deepEqual(h.errors, []); assert.deepEqual(api.errors, []);
 	} finally { await h.runtime.dispose(); await api.close(); rmSync(box.root, { recursive: true, force: true }); }
 });
+
+test("provider retry status is live and bounded separately from task work", { timeout: 60000 }, async () => {
+	const api = await provider();
+	const box = sandbox(api.url, undefined, { retry: { enabled: true, maxRetries: 10, baseDelayMs: 250 } });
+	const h = await harness(box);
+	try {
+		api.script("Bound provider retries", { error: 503 }, { error: 503 }, { error: 503 }, { error: 503 });
+		const started = await h.launch("Bound provider retries", { timeoutMs: 60000 });
+		const id = started.details.id;
+		const run = h.state().runs.get(id);
+		assert.ok(run?.ready, "child session setup is observable before its prompt begins");
+		await run.ready;
+		const retryStarted = deferred<any>();
+		const unsubscribe = run.session.subscribe((event: any) => {
+			if (event.type === "auto_retry_start") retryStarted.resolve(event);
+		});
+		try {
+			const event = await retryStarted.promise;
+			assert.equal(event.attempt, 1);
+			const live = await h.ctl("status", id);
+			assert.equal(live.details.status, "running");
+			assert.equal(live.details.providerRetry.attempt, 1);
+			assert.match(live.content[0].text, /provider retrying/);
+			const done = await h.ctl("wait", id);
+			assert.equal(done.details.status, "error", done.content[0].text);
+			assert.match(done.details.error, /Provider retry ceiling exceeded/);
+			assert.ok(done.details.providerRetryMs > 0, "provider retry wall time is recorded separately");
+			assert.equal(api.requests.length, 4, "the independent retry ceiling stops before the fifth provider request");
+		} finally { unsubscribe(); }
+		assert.deepEqual(h.errors, []);
+	} finally {
+		await h.runtime.dispose(); await api.close(); rmSync(box.root, { recursive: true, force: true });
+	}
+});

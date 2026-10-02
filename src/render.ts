@@ -29,6 +29,8 @@ export interface RunView {
 	droppedTools: string[];
 	failedAttempts?: number;
 	lastAttemptError?: string;
+	providerRetryMs?: number;
+	providerRetry?: { attempt: number; maxAttempts: number; delayMs: number; errorMessage: string; startedAt: number };
 	toolCalls: { name: string; args: Record<string, unknown>; at?: number }[];
 	activeTool?: { name: string; args: Record<string, unknown> };
 	joinedWaiters?: number;
@@ -125,6 +127,7 @@ export function runLine(v: RunView, theme: Theme, width: number, now = Date.now(
 		dim(elapsed(v.durationMs ?? 0)),
 		v.turns ? dim(`${v.turns} turn${v.turns === 1 ? "" : "s"}`) : "",
 		v.cost ? theme.fg("muted", `$${(v.cost ?? 0).toFixed(4)}`) : "",
+		v.providerRetry ? theme.fg("warning", `retry ${v.providerRetry.attempt}/${v.providerRetry.maxAttempts}`) : "",
 		v.failedAttempts ? theme.fg("warning", `${v.failedAttempts} failed`) : "",
 		v.changedFiles?.length ? theme.fg("success", `${v.changedFiles.length} changed`) : "",
 	].filter(Boolean);
@@ -143,6 +146,8 @@ export function resultLines(v: RunView, expanded: boolean, theme: Theme, width: 
 		const output = new Markdown(outputText.trim(), 0, 0, getMarkdownTheme()).render(Math.max(1, width - 2));
 		lines.push(...output.map((l) => `  ${l}`));
 	}
+	if (v.providerRetry) lines.push(theme.fg("warning", `provider retrying · retry ${v.providerRetry.attempt}/${v.providerRetry.maxAttempts} · backoff ${v.providerRetry.delayMs}ms · last: ${v.providerRetry.errorMessage}`));
+	if (v.providerRetryMs) lines.push(theme.fg("dim", `provider retry wall ${Math.round(v.providerRetryMs / 1000)}s`));
 	if (v.failedAttempts) lines.push(theme.fg("warning", `${v.failedAttempts} failed provider attempt${v.failedAttempts === 1 ? "" : "s"} before this (last: ${v.lastAttemptError})`));
 	if (v.error) lines.push(...wrapTextWithAnsi(theme.fg("error", String(v.error)), Math.max(1, width)));
 	if (v.backend === "acp") {
