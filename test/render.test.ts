@@ -11,7 +11,8 @@ process.env.PI_CODING_AGENT_DIR = join(process.env.HOME, "agent");
 // keyHint styles through the real theme singleton, which the app initializes at startup.
 const { initTheme } = await import("@earendil-works/pi-coding-agent");
 initTheme();
-const { previewLines, resultView } = await import("../src/render.ts");
+const { previewLines, resultView, displayDealProvider, displayDealRate, displayDealWindow } = await import("../src/render.ts");
+const { DealSheet } = await import("../src/deals-sheet.ts");
 
 const theme: any = { fg: (_color: string, text: string) => text, bold: (text: string) => text, italic: (text: string) => text, bg: (_color: string, text: string) => text };
 // Flattened, since assertions about phrases must survive ordinary line wrapping.
@@ -141,22 +142,131 @@ test("a models report previews offerings as an aligned table, not the model's te
 	}
 });
 
-test("deals show shortlist and caution with expandable evidence at narrow widths", () => {
-	const row = { id: "openrouter/vendor/model", price: "$0.4/1/M", quality: 47, coding: 42, context: 262144, configured: false,
-		reason: "80% endpoint discount at Example Provider [fp8] (already in price)" };
-	const result = { content: [{ type: "text", text: "fallback deal text" }], details: {
-		kind: "deals", evaluatedAt: "2026-10-01T18:00:00Z", eligible: 100, endpointsChecked: 99, endpointFailures: 1,
-		frontierFloor: 45, lightFloor: 25, discounts: [row], offPeak: [], frontier: [row], light: [],
-	} };
+const dealRow = (id: string, extra: any = {}) => ({ id: `openrouter/vendor/${id}`, price: "$0.1554/0.4884/M", input: 0.1554, output: 0.4884, basket: 0.2775,
+	provider: "Baidu [baidu/fp8]", discount: 0.889, quality: 44.8, coding: 40.2, context: 1048576, configured: false,
+	reason: "88.9% endpoint discount at Baidu [baidu/fp8] (already in price)", ...extra });
+const dealDetails = (discounts: any[] = [dealRow("model")]) => ({ kind: "deals" as const, evaluatedAt: "2026-10-01T18:00:00Z", eligible: 100,
+	endpointsChecked: 99, endpointFailures: 1, frontierFloor: 45, lightFloor: 25, discounts, offPeak: [], frontier: [dealRow("model")], light: [] });
+
+test("deals render percentage and both AA columns in aligned rows at every width", () => {
+	const result = { content: [{ type: "text", text: "fallback deal text" }], details: dealDetails() };
 	for (const width of [110, 54, 40]) {
 		for (const expanded of [false, true]) {
 			const lines = resultView("OpenRouter", "deals", "", result, { expanded }, theme, width);
 			for (const line of lines) assert.ok(visibleWidth(line) <= width, `deals overflow ${width}: ${JSON.stringify(line)}`);
-			assert.match(lines.join(" "), /endpoint discounts.*off-peak rates.*frontier value.*light value/);
-			assert.match(lines.join(" "), /promotions incomplete/);
-			if (expanded) assert.match(lines.join(" "), /endpoint discount/);
+			const flat = lines.join(" ");
+			assert.match(flat, /provider discounts.*timed rates.*frontier value.*light value/);
+			assert.match(flat, /88\.9%/);
+			assert.match(flat, /44\.8/);
+			assert.match(flat, /40\.2/);
+			assert.match(flat, /promotions incomplete/);
 		}
 	}
+});
+
+test("timed sheet opens the populated group and keeps both Pacific windows visible", () => {
+	const off = { start: "2026-10-01T16:00:00Z", end: "2026-10-02T00:00:00Z", input: 2, output: 4, period: "off-peak" };
+	const peak = { start: "2026-10-01T00:00:00Z", end: "2026-10-01T16:00:00Z", input: 4, output: 8, period: "peak" };
+	const offPeak = dealRow("scheduled", { saving: 0.5, period: "peak", currentPrice: "$4/8/M", currentInput: 4, currentOutput: 8, input: 2, output: 4,
+		timing: { off, peak, windows: [peak, off] }, reason: "peak at scan; cheaper window Thu, Oct 1, 09:00 PDT–Thu, Oct 1, 17:00 PDT" });
+	const data = { ...dealDetails([]), evaluatedAt: "2026-10-01T15:00:00Z", offPeak: [offPeak] };
+	const tui: any = { terminal: { rows: 22 }, requestRender: () => {} };
+	const sheet = new DealSheet(data, "", theme, tui, () => {}, async () => data);
+	for (const width of [110, 54, 40]) {
+		const lines = sheet.render(width);
+		assert.ok(lines.length <= tui.terminal.rows);
+		for (const line of lines) assert.ok(visibleWidth(line) <= width);
+		const view = lines.join(" ");
+		assert.match(view, /Timed rates.*Peak(?: at scan)?.*Off Thu 1 09–17 PDT.*Peak Wed 30 17–Thu 1 09 PDT/s);
+		assert.doesNotMatch(view, /openrouter\/vendor\/scheduled|\$2\.0000/);
+	}
+	sheet.handleInput("\r");
+	assert.match(sheet.render(110).join(" "), /At scan: Peak · In 4\.00 · Out 8\.00 USD\/M.*Next off-peak: Thu 1 09–17 PDT.*Exact offering: openrouter\/vendor\/scheduled/s);
+	sheet.handleInput("\x1b");
+	const report = { content: [{ type: "text", text: "fallback deal text" }], details: data };
+	assert.match(resultView("OpenRouter", "deals", "", report, { expanded: true }, theme, 110).join(" "), /Peak.*Off Thu 1 09–17 PDT.*Peak Wed 30 17–Thu 1 09 PDT/s);
+});
+
+test("medium-width provider offers keep their provider identity", () => {
+	const data = dealDetails([dealRow("same", { provider: "Baidu [baidu/fp8]" }), dealRow("same", { provider: "SiliconFlow [siliconflow/fp8]" })]);
+	const sheet = new DealSheet(data, "", theme, { terminal: { rows: 24 }, requestRender: () => {} } as any, () => {}, async () => data);
+	const view = sheet.render(80).join(" ");
+	assert.match(view, /Baidu.*SiliconFlow/s);
+	for (const line of sheet.render(80)) assert.ok(visibleWidth(line) <= 80);
+});
+
+test("refresh from details keeps the same provider selected and shows its new rate", async () => {
+	const original = dealDetails([dealRow("same", { provider: "Baidu" }), dealRow("same", { provider: "SiliconFlow", input: 0.7, output: 2.2, discount: 0.5 })]);
+	const updated = dealDetails([dealRow("same", { provider: "Baidu" }), dealRow("same", { provider: "SiliconFlow", input: 0.4, output: 1.1, discount: 0.6 })]);
+	let refreshes = 0;
+	const sheet = new DealSheet(original, "", theme, { terminal: { rows: 24 }, requestRender: () => {} } as any, () => {}, async () => { refreshes++; return updated; });
+	sheet.render(110);
+	sheet.handleInput("\x1b[B"); sheet.handleInput("\r");
+	assert.match(sheet.render(110).join(" "), /SiliconFlow.*In 0\.70 · Out 2\.20 USD\/M/s);
+	sheet.handleInput("r");
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(refreshes, 1);
+	assert.match(sheet.render(110).join(" "), /SiliconFlow.*Updated Thu, Oct 1, 11:00 PDT.*In 0\.40 · Out 1\.10 USD\/M/s);
+});
+
+test("a disappeared offer exits details instead of showing another provider", async () => {
+	const initial = dealDetails([dealRow("same", { provider: "Baidu" }), dealRow("same", { provider: "SiliconFlow", discount: 0.5 })]);
+	const updated = dealDetails([dealRow("same", { provider: "Baidu" })]);
+	const sheet = new DealSheet(initial, "", theme, { terminal: { rows: 24 }, requestRender: () => {} } as any, () => {}, async () => updated);
+	sheet.render(110); sheet.handleInput("\x1b[B"); sheet.handleInput("\r"); sheet.handleInput("r");
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.match(sheet.render(110).join(" "), /Deals › Provider discounts.*this offer is no longer listed/s);
+	assert.doesNotMatch(sheet.render(110).join(" "), /Deal details/);
+});
+
+test("display prices are rounded, truthful below a cent, and windows survive Pacific DST", () => {
+	assert.equal(displayDealRate(0.1554), "0.16");
+	assert.equal(displayDealRate(0.001), "<0.01");
+	assert.equal(displayDealRate(0), "0");
+	assert.equal(displayDealProvider("DeepSeek [deepseek]"), "DeepSeek");
+	assert.equal(displayDealProvider("Baidu [baidu/fp8]"), "Baidu · fp8");
+	assert.equal(displayDealWindow("2026-03-08T09:00:00Z", "2026-03-08T11:00:00Z"), "Sun 8 01–04 PST→PDT");
+});
+
+test("interactive deal sheet pages all offers, sorts, filters, shows details and retains refreshed data", async () => {
+	const discounts = [dealRow("low", { discount: 0.1, coding: undefined, reason: "10% endpoint discount at Baidu [baidu/fp8] (already in price)" }), dealRow("high"), ...Array.from({ length: 24 }, (_, n) => dealRow(`extra-${n}`, { discount: 0.2 }))];
+	const data = dealDetails(discounts);
+	const updated = dealDetails([dealRow("refreshed", { discount: 0.05675 })]);
+	let saved: any, renders = 0, refreshes = 0;
+	const tui: any = { terminal: { rows: 22 }, requestRender: () => { renders++; } };
+	const sheet = new DealSheet(data, "", theme, tui, (v) => { saved = v; }, async () => { refreshes++; return updated; });
+	const screen = (width = 110) => sheet.render(width).join("\n");
+	assert.match(screen(), /Provider discounts 26.*vendor\/high.*0\.16.*0\.49.*88\.9%.*44\.8.*40\.2/s);
+	assert.match(screen(), /AA I.*AA C/);
+	assert.doesNotMatch(screen(), /openrouter\/vendor\/high|\$0\.1554/, "no repeated provider prefix, dollar sign or four decimals in the sheet");
+	assert.doesNotMatch(screen(), /extra-23/, "later rows wait for scrolling");
+	sheet.handleInput("\x1b[F");
+	assert.match(screen(), /extra-23/);
+	sheet.handleInput("c");
+	assert.match(screen(), /AA Code ↓/);
+	sheet.handleInput("/"); sheet.handleInput("low"); sheet.handleInput("\r");
+	assert.match(screen(), /Provider discounts · 1 offer.*Filter low.*vendor\/low/s);
+	assert.match(screen(), /AA I.*AA C.*—/s);
+	sheet.handleInput("\r");
+	assert.match(screen(), /Deal details.*Provider discount: 10% · already in price/s);
+	tui.terminal.rows = 20;
+	const narrowDetail = sheet.render(40);
+	assert.ok(narrowDetail.length <= tui.terminal.rows);
+	assert.match(narrowDetail.join(" "), /Esc\/Enter back/);
+	assert.match(narrowDetail.join(" "), /In 0\.16 · Out 0\.49 USD\/M/);
+	sheet.handleInput("\x1b[6~");
+	assert.match(sheet.render(40).join(" "), /routing to that provider/);
+	sheet.handleInput("\x1b");
+	sheet.handleInput("r");
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	assert.equal(refreshes, 1);
+	sheet.handleInput("/"); sheet.handleInput("\x15"); sheet.handleInput("\r");
+	assert.match(screen(), /refreshed/);
+	assert.match(screen(), /5\.68%/);
+	for (const line of sheet.render(40)) assert.ok(visibleWidth(line) <= 40, `sheet overflows 40: ${JSON.stringify(line)}`);
+	sheet.handleInput("\x1b");
+	assert.equal(saved, updated);
+	assert.ok(renders > 0);
 });
 
 test("a models record without usable details renders its text", () => {

@@ -1,8 +1,22 @@
 // Read-only OpenRouter deal discovery. Prices are USD per token in the API;
 // the comparison basket is 1M prompt + 250k completion tokens, not a bill forecast.
+export interface TimedWindow { start: string; end: string; input: number; output: number; period: "peak" | "off-peak" }
+export interface DealTiming { off: TimedWindow; peak: TimedWindow; windows: TimedWindow[] }
 export interface DealRow {
 	id: string;
 	price: string;
+	input?: number;
+	output?: number;
+	basket?: number;
+	provider?: string;
+	discount?: number;
+	saving?: number;
+	/** Active pricing window at evaluatedAt, not a claim about the current clock after the scan. */
+	period?: "peak" | "off-peak" | "unlisted";
+	currentPrice?: string;
+	currentInput?: number;
+	currentOutput?: number;
+	timing?: DealTiming;
 	quality?: number;
 	coding?: number;
 	context: number;
@@ -45,38 +59,69 @@ function money(pricing: any): { input: number; output: number; basket: number; t
 const PRICE_KEYS = new Set(["prompt", "completion", "request", "image", "image_output", "web_search", "internal_reasoning", "input_cache_read", "input_cache_write", "input_cache_write_1h", "audio", "audio_output", "input_audio_cache"]);
 const CONDITIONS = new Set(["utc_start", "utc_end", "utc_days", "min_prompt_tokens"]);
 const DAYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
-const clock = (n: number) => `${String(Math.floor(n / 100)).padStart(2, "0")}:${String(n % 100).padStart(2, "0")}`;
+const pacific = new Intl.DateTimeFormat("en-US", { timeZone: "America/Los_Angeles", weekday: "short", month: "short", day: "numeric",
+	hour: "2-digit", minute: "2-digit", hourCycle: "h23", timeZoneName: "short" });
+export const formatPacific = (date: Date): string => Number.isNaN(date.valueOf()) ? "unknown time" : pacific.format(date);
+const validClock = (n: number) => Number.isInteger(n) && n >= 0 && n < 2400 && n % 100 < 60;
 
-function schedule(pricing: any, now: Date): { saving: number; description: string } | undefined {
-	const windows = (Array.isArray(pricing?.overrides) ? pricing.overrides : []).filter((o: any) => {
+/** UTC weekday conditions belong to the window's start day, including when it ends on the next day. */
+function occurrences(o: any, now: Date): { start: number; end: number }[] {
+	const start = Number(o.utc_start ?? 0), end = Number(o.utc_end ?? 0);
+	if (!validClock(start) || !validClock(end) || (o.utc_days && (!Array.isArray(o.utc_days) || !o.utc_days.every((d: any) => DAYS.includes(d))))) return [];
+	const day = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+	const result: { start: number; end: number }[] = [];
+	for (let offset = -1; offset <= 7; offset++) {
+		const date = day + offset * 86_400_000;
+		if (o.utc_days && !o.utc_days.includes(DAYS[new Date(date).getUTCDay()])) continue;
+		const begins = date + (Math.floor(start / 100) * 60 + start % 100) * 60_000;
+		const ends = date + (Math.floor(end / 100) * 60 + end % 100) * 60_000 + (end <= start ? 86_400_000 : 0);
+		result.push({ start: begins, end: ends });
+	}
+	return result;
+}
+
+const percentFormatter = new Intl.NumberFormat("en-US", { style: "percent", maximumFractionDigits: 2 });
+export const formatPercent = (fraction: number): string => fraction > 0 && fraction < 0.00005 ? "<0.01%" : percentFormatter.format(fraction);
+
+function schedule(pricing: any, now: Date): { saving: number; period: NonNullable<DealRow["period"]>; currentPrice?: string;
+	currentInput?: number; currentOutput?: number; timing: DealTiming;
+	description: string; price: NonNullable<ReturnType<typeof money>> } | undefined {
+	const windows: any[] = (Array.isArray(pricing?.overrides) ? pricing.overrides : []).filter((o: any) => {
 		if (!o || typeof o !== "object" || o.min_prompt_tokens !== undefined) return false;
 		if (Object.keys(o).some((key) => !PRICE_KEYS.has(key) && !CONDITIONS.has(key))) return false;
 		return o.utc_start !== undefined || o.utc_end !== undefined || Array.isArray(o.utc_days);
 	});
-	const priced = windows.map((o: any) => ({ override: o, price: money({ ...pricing, ...o }) }))
-		.filter((x: any) => x.price && Number(x.override.request ?? pricing.request ?? 0) === 0);
+	const priced = windows.filter((o: any) => Number(o.request ?? pricing.request ?? 0) === 0)
+		.map((o: any): { price: ReturnType<typeof money>; times: ReturnType<typeof occurrences> } => ({ price: money({ ...pricing, ...o }), times: occurrences(o, now) }))
+		.filter((x) => x.price && x.times.length);
 	if (priced.length < 2) return undefined;
-	const high = priced.reduce((a: any, b: any) => b.price.basket > a.price.basket ? b : a);
-	const current = now.getUTCHours() * 100 + now.getUTCMinutes();
-	const active = (o: any) => {
-		if (o.utc_days && !o.utc_days.includes(DAYS[now.getUTCDay()])) return false;
-		if (o.utc_start === undefined && o.utc_end === undefined) return true;
-		const start = Number(o.utc_start ?? 0), end = Number(o.utc_end ?? 0);
-		return end > start ? current >= start && current < end : current >= start || current < end;
-	};
-	const cheaper = priced.filter((x: any) => x.price.basket < high.price.basket);
+	const high = priced.reduce((a, b) => b.price!.basket > a.price!.basket ? b : a);
+	const cheaper = priced.filter((x) => x.price!.basket < high.price!.basket);
 	if (!cheaper.length) return undefined;
-	// Equal-price weekday and weekend windows are distinct: name the one active now,
-	// rather than reporting "later this weekend" while the lower rate already applies.
-	const availableNow = cheaper.filter((x: any) => active(x.override));
-	const low = (availableNow.length ? availableNow : cheaper).reduce((a: any, b: any) => b.price.basket < a.price.basket ? b : a);
-	const o = low.override;
-	const days = o.utc_days?.map((d: string) => d.slice(0, 3)).join(",") ?? "daily";
-	const start = Number(o.utc_start ?? 0), end = Number(o.utc_end ?? 0);
-	if (![start, end].every(Number.isFinite)) return undefined;
-	const time = o.utc_start !== undefined || o.utc_end !== undefined ? ` ${clock(start)}–${end === 0 ? "24:00" : clock(end)}Z` : "";
-	return { saving: (high.price.basket - low.price.basket) / high.price.basket,
-		description: `${availableNow.length ? "off-peak now" : "off-peak later"} ${days}${time}: ${low.price.text} vs peak ${high.price.text}` };
+	const at = now.getTime();
+	const active = priced.filter((x) => x.times.some((t) => t.start <= at && at < t.end))
+		.sort((a, b) => a.price!.basket - b.price!.basket);
+	const next = (x: typeof priced[number]) => x.times.find((t) => t.start <= at && at < t.end) ?? x.times.find((t) => t.start > at);
+	const discounted = active.find((x) => x.price!.basket < high.price!.basket);
+	// For equally cheap windows, show the next one rather than an arbitrary weekend rate.
+	const low = discounted ?? cheaper.reduce((a, b) => b.price!.basket < a.price!.basket ||
+		(b.price!.basket === a.price!.basket && (next(b)?.start ?? Infinity) < (next(a)?.start ?? Infinity)) ? b : a);
+	const slot = next(low);
+	const highs = priced.filter((x) => x.price!.basket === high.price!.basket);
+	const peak = highs.reduce((a, b) => (next(b)?.start ?? Infinity) < (next(a)?.start ?? Infinity) ? b : a);
+	const peakSlot = next(peak);
+	if (!slot || !peakSlot) return undefined;
+	const period = active.length ? active[0].price!.basket < high.price!.basket ? "off-peak" : "peak" : "unlisted";
+	const label = period === "unlisted" ? "no listed rate at scan" : `${period} at scan`;
+	const window = (x: typeof priced[number], t: { start: number; end: number }): TimedWindow => ({
+		start: new Date(t.start).toISOString(), end: new Date(t.end).toISOString(), input: x.price!.input, output: x.price!.output,
+		period: x.price!.basket < high.price!.basket ? "off-peak" : "peak",
+	});
+	const timing: DealTiming = { off: window(low, slot), peak: window(peak, peakSlot),
+		windows: priced.flatMap((x) => { const t = next(x); return t ? [window(x, t)] : []; }).sort((a, b) => a.start.localeCompare(b.start)) };
+	return { saving: (high.price!.basket - low.price!.basket) / high.price!.basket, price: low.price!, period,
+		currentPrice: active[0]?.price?.text, currentInput: active[0]?.price?.input, currentOutput: active[0]?.price?.output, timing,
+		description: `${label}; cheaper window ${formatPacific(new Date(slot.start))}–${formatPacific(new Date(slot.end))}: ${low.price!.text} vs peak ${high.price!.text}` };
 }
 
 function qualityOf(model: any): { intel?: number; coding?: number } {
@@ -88,8 +133,8 @@ function qualityOf(model: any): { intel?: number; coding?: number } {
 /** Endpoint discounts are already included in the endpoint's listed price. Never infer them from the model's top-provider price. */
 export function selectDeals(models: any[], endpoints: Map<string, { endpoints: any[]; error?: string }>, configured: Set<string>, now: Date, universe = models): DealsDetails {
 	const eligible = models.filter((model) => dealEligible(model, now));
-	const discounts: { row: DealRow; saving: number }[] = [];
-	const offPeak: { row: DealRow; saving: number }[] = [];
+	const discounts: DealRow[] = [];
+	const offPeak: DealRow[] = [];
 	const scored: { row: DealRow; basket: number; intel: number }[] = [];
 	let endpointFailures = 0, endpointsChecked = 0;
 	for (const model of eligible) {
@@ -98,10 +143,10 @@ export function selectDeals(models: any[], endpoints: Map<string, { endpoints: a
 		const common = { id: `openrouter/${model.id}`, quality: quality.intel, coding: quality.coding,
 			context: model.context_length ?? 0, configured: configured.has(model.id) };
 		if (base && base.basket > 0 && Number(model.pricing?.request ?? 0) === 0 && quality.intel !== undefined) {
-			scored.push({ row: { ...common, price: base.text, reason: "listed model price" }, basket: base.basket, intel: quality.intel });
+			scored.push({ row: { ...common, price: base.text, input: base.input, output: base.output, basket: base.basket, reason: "listed model price" }, basket: base.basket, intel: quality.intel });
 		}
 		const timed = schedule(model.pricing, now);
-		if (base && timed) offPeak.push({ row: { ...common, price: base.text, reason: timed.description }, saving: timed.saving });
+		if (timed) offPeak.push({ ...common, price: timed.price.text, input: timed.price.input, output: timed.price.output, basket: timed.price.basket, saving: timed.saving, period: timed.period, currentPrice: timed.currentPrice, currentInput: timed.currentInput, currentOutput: timed.currentOutput, timing: timed.timing, reason: timed.description });
 		const ep = endpoints.get(model.id);
 		if (!ep) continue;
 		if (ep.error) endpointFailures++;
@@ -113,23 +158,14 @@ export function selectDeals(models: any[], endpoints: Map<string, { endpoints: a
 			const label = `${provider.provider_name ?? "provider"}${provider.tag ? ` [${provider.tag}]` : ""}`;
 			const discount = Number(provider.pricing?.discount);
 			if (Number.isFinite(discount) && discount > 0 && discount <= 1) {
-				discounts.push({ row: { ...common, price: price.text, reason: `${Math.round(discount * 100)}% endpoint discount at ${label} (already in price)${provider.quantization && provider.quantization !== "unknown" ? ` · ${provider.quantization}` : ""}` }, saving: discount });
+				discounts.push({ ...common, price: price.text, input: price.input, output: price.output, basket: price.basket, provider: label, discount, reason: `${formatPercent(discount)} endpoint discount at ${label} (already in price)${provider.quantization && provider.quantization !== "unknown" ? ` · ${provider.quantization}` : ""}` });
 			}
 			const providerTime = schedule(provider.pricing, now);
-			if (providerTime) offPeak.push({ row: { ...common, price: price.text, reason: `${label}: ${providerTime.description}` }, saving: providerTime.saving });
+			if (providerTime) offPeak.push({ ...common, price: providerTime.price.text, input: providerTime.price.input, output: providerTime.price.output, basket: providerTime.price.basket, provider: label, saving: providerTime.saving, period: providerTime.period, currentPrice: providerTime.currentPrice, currentInput: providerTime.currentInput, currentOutput: providerTime.currentOutput, timing: providerTime.timing, reason: `${label}: ${providerTime.description}` });
 		}
 	}
-	const bestPerModel = (offers: { row: DealRow; saving: number }[], cap: number) => {
-		offers.sort((a, b) => b.saving - a.saving || (b.row.quality ?? -1) - (a.row.quality ?? -1) || a.row.id.localeCompare(b.row.id));
-		const seen = new Set<string>(), rows: DealRow[] = [];
-		for (const offer of offers) {
-			if (seen.has(offer.row.id)) continue;
-			seen.add(offer.row.id);
-			rows.push(offer.row);
-			if (rows.length === cap) break;
-		}
-		return rows;
-	};
+	const bySaving = (field: "discount" | "saving") => (a: DealRow, b: DealRow) =>
+		(b[field] ?? 0) - (a[field] ?? 0) || (b.quality ?? -1) - (a.quality ?? -1) || a.id.localeCompare(b.id) || (a.provider ?? "").localeCompare(b.provider ?? "");
 	// A tier is relative to today's scored tool-capable catalog, not a claim of frontier parity.
 	const scores = universe === models ? scored.map((x) => x.intel) : [] as number[];
 	if (universe !== models) for (const m of universe) {
@@ -142,9 +178,9 @@ export function selectDeals(models: any[], endpoints: Map<string, { endpoints: a
 	const frontierFloor = scores.length ? scores[Math.floor((scores.length - 1) * 0.15)] : undefined;
 	const lightFloor = scores.length ? scores[Math.floor((scores.length - 1) * 0.5)] : undefined;
 	const byPrice = (a: typeof scored[number], b: typeof scored[number]) => a.basket - b.basket || b.intel - a.intel || a.row.id.localeCompare(b.row.id);
-	const frontier = scored.filter((x) => frontierFloor !== undefined && x.intel >= frontierFloor && x.row.context >= 128_000).sort(byPrice).slice(0, 2);
-	const light = scored.filter((x) => lightFloor !== undefined && frontierFloor !== undefined && x.intel >= lightFloor && x.intel < frontierFloor && x.row.context >= 32_000).sort(byPrice).slice(0, 2);
+	const frontier = scored.filter((x) => frontierFloor !== undefined && x.intel >= frontierFloor && x.row.context >= 128_000).sort(byPrice);
+	const light = scored.filter((x) => lightFloor !== undefined && frontierFloor !== undefined && x.intel >= lightFloor && x.intel < frontierFloor && x.row.context >= 32_000).sort(byPrice);
 	return { kind: "deals", evaluatedAt: now.toISOString(), eligible: eligible.length, endpointsChecked, endpointFailures,
-		frontierFloor, lightFloor, discounts: bestPerModel(discounts, 4), offPeak: bestPerModel(offPeak, 3),
+		frontierFloor, lightFloor, discounts: discounts.sort(bySaving("discount")), offPeak: offPeak.sort(bySaving("saving")),
 		frontier: frontier.map((x) => x.row), light: light.map((x) => x.row) };
 }

@@ -1,6 +1,6 @@
 import type { Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme, keyHint } from "@earendil-works/pi-coding-agent";
-import type { DealsDetails, DealRow } from "./deals.js";
+import { formatPercent, type DealsDetails, type DealRow } from "./deals.js";
 import { type Component, Markdown, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { AcpRunView } from "./backend.js";
 
@@ -441,25 +441,92 @@ function isDealsDetails(d: any): d is DealsDetails {
 			&& typeof r.context === "number" && typeof r.configured === "boolean"));
 }
 
+export type DealMetric = "discount" | "saving" | "basket";
+export const displayDealId = (id: string): string => id.startsWith("openrouter/") ? id.slice("openrouter/".length) : id;
+export const displayDealProvider = (provider: string | undefined): string => {
+	if (!provider) return "listed rate";
+	const tag = /^(.*?) \[([^\]]+)\]$/.exec(provider);
+	if (!tag) return provider;
+	const suffix = tag[2].split("/").at(-1)!;
+	return tag[1].toLowerCase().replace(/[^a-z0-9]/g, "") === suffix.toLowerCase().replace(/[^a-z0-9]/g, "") ? tag[1] : `${tag[1]} · ${suffix}`;
+};
+/** UI-only rounding. Exact numeric rates and provider identifiers remain in the saved details. */
+export const displayDealRate = (n: number | undefined): string => n === undefined ? "—" : n === 0 ? "0" : n > 0 && n < 0.01 ? "<0.01" : n.toFixed(2);
+const windowClock = new Intl.DateTimeFormat("en-US", { timeZone: "America/Los_Angeles", weekday: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hourCycle: "h23", timeZoneName: "short" });
+export function displayDealWindow(start: string, end: string): string {
+	const point = (iso: string) => {
+		const date = new Date(iso);
+		if (Number.isNaN(date.valueOf())) return undefined;
+		const parts = windowClock.formatToParts(date);
+		const get = (key: Intl.DateTimeFormatPartTypes) => parts.find((part) => part.type === key)?.value ?? "";
+		return { day: `${get("weekday")} ${get("day")}`, hour: `${get("hour")}${get("minute") === "00" ? "" : `:${get("minute")}`}`, zone: get("timeZoneName") };
+	};
+	const a = point(start), b = point(end);
+	if (!a || !b) return "time unavailable";
+	return `${a.day} ${a.hour}–${a.day === b.day ? "" : `${b.day} `}${b.hour} ${a.zone === b.zone ? a.zone : `${a.zone}→${b.zone}`}`;
+}
+export const dealRowHeight = (width: number, metric: DealMetric): number => metric === "saving" ? width < 103 ? 5 : 2 : metric === "discount" ? width < 92 ? 3 : 1 : width < 76 ? 3 : 1;
+
+/** The model/provider identity leads; timed rows reserve their second line for visible Pacific hours. */
+export function dealTableLines(rows: DealRow[], metric: DealMetric, theme: Theme, width: number, selected = -1): string[] {
+	const score = (n: number | undefined) => n === undefined ? "—" : String(n);
+	const value = (r: DealRow) => metric === "basket" ? displayDealRate(r.basket) : (metric === "discount" ? r.discount : r.saving) === undefined ? "—" : formatPercent((metric === "discount" ? r.discount : r.saving)!);
+	const state = (r: DealRow) => r.period === "off-peak" ? "Off" : r.period === "peak" ? "Peak" : r.period === "unlisted" ? "No rate" : "—";
+	const windows = (r: DealRow) => r.timing ? [
+		`Off ${displayDealWindow(r.timing.off.start, r.timing.off.end)}`,
+		`Peak ${displayDealWindow(r.timing.peak.start, r.timing.peak.end)}`,
+	] : [r.reason, ""];
+	const fit = (s: string, size: number, right = false) => {
+		const clipped = truncateToWidth(s, Math.max(1, size), "…");
+		const gap = " ".repeat(Math.max(0, size - visibleWidth(clipped)));
+		return right ? gap + clipped : clipped + gap;
+	};
+	const narrow = width < (metric === "saving" ? 103 : metric === "discount" ? 92 : 76);
+	const label = metric === "discount" ? "Disc" : metric === "saving" ? "Save" : "Basket";
+	if (narrow) {
+		const out = [theme.fg("dim", metric === "saving" ? "  Model · next windows (Pacific)" : "  Model · USD/M in/out · AA I/C")];
+		for (const [i, r] of rows.entries()) {
+			const [off, peak] = windows(r);
+			out.push(theme.fg(i === selected ? "accent" : "text", `${i === selected ? "› " : "  "}${displayDealId(r.id)}`));
+			out.push(theme.fg("muted", `  ${metric === "saving" ? `${state(r)} at scan · ${value(r)} saved · ${displayDealProvider(r.provider)}` : `${label} ${value(r)} · ${displayDealProvider(r.provider)}`}`));
+			if (metric === "saving") out.push(theme.fg("muted", `  ${off}`), theme.fg("muted", `  ${peak}`));
+			out.push(theme.fg("text", `  In ${displayDealRate(r.input)}  Out ${displayDealRate(r.output)}  · AA ${score(r.quality)}/${score(r.coding)}`));
+		}
+		return out.map((line) => truncateToWidth(line, width, "…"));
+	}
+	const rateWidth = Math.max(6, ...rows.flatMap((r) => [displayDealRate(r.input).length, displayDealRate(r.output).length]));
+	const providerWidth = width >= (metric === "saving" ? 103 : 92) ? 16 : 0;
+	const columns = [providerWidth, rateWidth, rateWidth, 7, 6, 6, ...(metric === "saving" ? [8] : [])].filter((w) => w > 0);
+	const modelWidth = Math.min(44, width - 2 - columns.reduce((sum, n) => sum + n, 0) - 2 * columns.length);
+	const cols = (model: string, provider: string, input: string, output: string, amount: string, intel: string, coding: string, status: string) =>
+		`  ${fit(model, modelWidth)}${providerWidth ? `  ${fit(provider, providerWidth)}` : ""}  ${fit(input, rateWidth, true)}  ${fit(output, rateWidth, true)}  ${fit(amount, 7, true)}  ${fit(intel, 6, true)}  ${fit(coding, 6, true)}${metric === "saving" ? `  ${fit(status, 8)}` : ""}`;
+	const out = [theme.fg("dim", cols("Model", "Provider", "In", "Out", label, "AA I", "AA C", "At scan"))];
+	for (const [i, r] of rows.entries()) {
+		out.push(cols(theme.fg(i === selected ? "accent" : "text", `${i === selected ? "›" : " "}${displayDealId(r.id)}`),
+			displayDealProvider(r.provider), displayDealRate(r.input), displayDealRate(r.output), value(r), score(r.quality), score(r.coding), state(r)));
+		if (metric === "saving") out.push(theme.fg("muted", `    ${windows(r).filter(Boolean).join("  ·  ")}`));
+	}
+	return out.map((line) => truncateToWidth(line, width, "…"));
+}
+
 function dealsView(title: string, d: DealsDetails, expanded: boolean, theme: Theme, width: number): string[] {
 	const dim = (text: string) => theme.fg("dim", text);
 	const out = [theme.fg("toolTitle", theme.bold(title)) + ` ${theme.fg("accent", "deals")}`
 		+ dim(` · ${d.eligible} models · ${d.endpointsChecked} endpoint catalogs`)];
 	if (d.endpointFailures) out.push(theme.fg("warning", `  promotions incomplete: ${d.endpointFailures} failed`));
-	const group = (label: string, rows: DealRow[]) => {
-		out.push(dim(`  ${label}`));
-		if (!rows.length) { out.push(dim("    no evidenced candidates")); return; }
-		for (const r of rows) {
-			out.push(`    ${theme.fg("text", r.id)}  ${r.price}  ${r.quality === undefined ? dim("AA ?") : dim(`AA ${r.quality}`)}${r.configured ? "" : theme.fg("warning", " · add to models.json")}`);
-			if (expanded) out.push(...indented(dim(`${r.reason} · ctx ${Math.round(r.context / 1000)}k${r.coding === undefined ? "" : ` · AA coding ${r.coding}`}`), 6, width));
-		}
+	const group = (label: string, rows: DealRow[], metric: DealMetric, cap: number) => {
+		const shown = rows.slice(0, expanded ? 12 : cap);
+		out.push(dim(`  ${label} · ${rows.length} offer${rows.length === 1 ? "" : "s"}${rows.length > shown.length ? ` · ${rows.length - shown.length} more in /deals` : ""}`));
+		if (!rows.length) { out.push(dim("    none with available evidence")); return; }
+		out.push(...dealTableLines(shown, metric, theme, width));
+		if (expanded) for (const r of shown) out.push(...indented(dim(`${displayDealId(r.id)} · ${r.reason} · ctx ${Math.round(r.context / 1000)}k${r.configured ? "" : " · add to models.json"}`), 4, width));
 	};
-	group("endpoint discounts", d.discounts);
-	group("off-peak rates", d.offPeak);
-	group(`frontier value · AA top 15% (≥${d.frontierFloor ?? "?"})`, d.frontier);
-	group(`light value · AA top half (≥${d.lightFloor ?? "?"})`, d.light);
-	if (expanded) out.push(...indented(dim(`Evaluated ${d.evaluatedAt}; catalog and endpoints may be cached up to 10m. Value sorted by 1M input + 250k output; excludes free, batch and per-request-priced models. Discounts are endpoint-specific, not guaranteed by model routing. AA is a quality proxy, not a recommendation. No model was selected.`), 2, width));
-	else out.push(...indented(keyHint("app.tools.expand", "for source, timing, context and caveats"), 2, width));
+	group("provider discounts (already in endpoint price)", d.discounts, "discount", 4);
+	group("timed rates (next Pacific off-peak / peak)", d.offPeak, "saving", 3);
+	group(`frontier value · AA top 15% (≥${d.frontierFloor ?? "?"})`, d.frontier, "basket", 2);
+	group(`light value · AA next 35% (≥${d.lightFloor ?? "?"})`, d.light, "basket", 2);
+	if (expanded) out.push(...indented(dim(`AA = Artificial Analysis Intelligence / Coding indices, not percentages. Endpoint discount % is already in that provider's price, not a comparison to the model-wide price. Off-peak saving % is against the highest-priced UTC window; off-peak $/M is the cheaper window's rate, not necessarily the active rate. At scan means the active rate when evaluated. Window times are Pacific (PDT/PST). Evaluated ${d.evaluatedAt}; catalog/endpoints may be cached up to 10m. Basket = 1M input + 250k output. No model selected.`), 2, width));
+	else out.push(...indented(dim("/deals opens the full sortable sheet · ") + keyHint("app.tools.expand", "for evidence"), 2, width));
 	return out.map((line) => truncateToWidth(line, width, "…"));
 }
 

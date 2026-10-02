@@ -26,7 +26,8 @@ import { AcpBackend, acpResultText, acpStatusText, acpSummary, DelegateError, se
 import { shutdownAcpCoordinator } from "./acp/instance.js";
 import { loadRoles } from "./roles.js";
 import { installTodo } from "./todo-ext.js";
-import { dealEligible, selectDeals, type DealsDetails } from "./deals.js";
+import { dealEligible, formatPercent, selectDeals, type DealsDetails } from "./deals.js";
+import { DealSheet } from "./deals-sheet.js";
 import { RunCompletion } from "./completion.js";
 import { ownedElsewhere, processOwner, readRecord, storageDir, writeRecord } from "./storage.js";
 
@@ -451,8 +452,8 @@ interface LiveOR {
 }
 let liveOR: LiveOR | undefined;
 
-async function fetchOpenRouter(): Promise<LiveOR> {
-	if (liveOR && !liveOR.error && Date.now() - liveOR.at < OPENROUTER_TTL_MS) return liveOR;
+async function fetchOpenRouter(force = false): Promise<LiveOR> {
+	if (!force && liveOR && !liveOR.error && Date.now() - liveOR.at < OPENROUTER_TTL_MS) return liveOR;
 	try {
 		const res = await fetch(OPENROUTER_MODELS_URL, { signal: AbortSignal.timeout(OPENROUTER_TIMEOUT_MS) });
 		if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -532,9 +533,9 @@ interface LiveEndpoints {
 }
 const liveEP = new Map<string, LiveEndpoints>();
 
-async function fetchEndpoints(id: string): Promise<LiveEndpoints> {
+async function fetchEndpoints(id: string, force = false): Promise<LiveEndpoints> {
 	const c = liveEP.get(id);
-	if (c && !c.error && Date.now() - c.at < OPENROUTER_TTL_MS) return c;
+	if (!force && c && !c.error && Date.now() - c.at < OPENROUTER_TTL_MS) return c;
 	let r: LiveEndpoints;
 	try {
 		const res = await fetch(`https://openrouter.ai/api/v1/models/${id}/endpoints`, { signal: AbortSignal.timeout(OPENROUTER_TIMEOUT_MS) });
@@ -549,8 +550,8 @@ async function fetchEndpoints(id: string): Promise<LiveEndpoints> {
 	return r;
 }
 
-async function discoverDeals(ctx: ExtensionContext, filter = "", signal?: AbortSignal): Promise<DealsDetails> {
-	const live = await fetchOpenRouter();
+async function discoverDeals(ctx: ExtensionContext, filter = "", signal?: AbortSignal, force = false): Promise<DealsDetails> {
+	const live = await fetchOpenRouter(force);
 	if (live.error) throw new Error(`OpenRouter deal discovery unavailable: ${live.error}. Cached data was not used.`);
 	const term = filter.toLowerCase();
 	const universe = [...live.byId.values()];
@@ -560,7 +561,7 @@ async function discoverDeals(ctx: ExtensionContext, filter = "", signal?: AbortS
 	const endpoints = new Map<string, LiveEndpoints>();
 	for (let i = 0; i < catalog.length; i += 8) {
 		if (signal?.aborted) throw new DOMException("Deal discovery cancelled", "AbortError");
-		const batch = await Promise.all(catalog.slice(i, i + 8).map((m) => fetchEndpoints(m.id)));
+		const batch = await Promise.all(catalog.slice(i, i + 8).map((m) => fetchEndpoints(m.id, force)));
 		batch.forEach((result, j) => endpoints.set(catalog[i + j].id, result));
 	}
 	const configured = new Set<string>((ctx.modelRegistry as any).getAvailable().filter((m: any) => m.provider === "openrouter").map((m: any) => m.id));
@@ -568,10 +569,10 @@ async function discoverDeals(ctx: ExtensionContext, filter = "", signal?: AbortS
 }
 
 function dealsReport(d: DealsDetails): string {
-	const row = (r: DealsDetails["discounts"][number]) => `  ${r.id}  ${r.price}  AA intel ${r.quality ?? "unrated"}${r.coding !== undefined ? ` coding ${r.coding}` : ""}  ${r.configured ? "configured" : "not configured"}  ${r.reason}`;
-	const section = (title: string, rows: DealsDetails["discounts"]) => `${title}\n${rows.length ? rows.map(row).join("\n") : "  none with available evidence"}`;
+	const row = (r: DealsDetails["discounts"][number]) => `  ${r.id}  ${r.provider ?? "model rate"}  ${r.price}  ${r.discount !== undefined ? formatPercent(r.discount) : r.saving !== undefined ? `${formatPercent(r.saving)} vs peak · ${r.reason}${r.currentPrice ? ` (current ${r.currentPrice})` : ""}` : ""}  AA intel ${r.quality ?? "—"} coding ${r.coding ?? "—"}  ${r.configured ? "configured" : "not configured"}`;
+	const section = (title: string, rows: DealsDetails["discounts"], cap: number) => `${title} (${rows.length} offers)\n${rows.length ? rows.slice(0, cap).map(row).join("\n") : "  none with available evidence"}${rows.length > cap ? `\n  … ${rows.length - cap} more; /deals opens the sortable sheet` : ""}`;
 	const partial = d.endpointFailures ? `; ${d.endpointFailures} endpoint lookups failed (promotions incomplete)` : "";
-	return `OPENROUTER DEALS evaluated ${d.evaluatedAt} (catalog and endpoint responses may be cached up to 10m) — ${d.eligible} eligible tool-capable text models; ${d.endpointsChecked} model endpoint catalogs checked${partial}.\nBasket for sorting value: 1M prompt + 250k completion tokens; free, batch and per-request-priced models excluded. AA intelligence is a proxy, not proof of fitness. Endpoint discounts require routing to that provider; their percentages do not prove the endpoint is the cheapest route.\n\n${section("ENDPOINT DISCOUNTS (four distinct models)", d.discounts)}\n\n${section("OFF-PEAK RATES (three distinct models)", d.offPeak)}\n\n${section(`FRONTIER VALUE (AA intelligence top 15%, ≥128k context; floor ${d.frontierFloor ?? "unavailable"})`, d.frontier)}\n\n${section(`LIGHT VALUE (AA intelligence top half below frontier, ≥32k context; floor ${d.lightFloor ?? "unavailable"})`, d.light)}\n\nNot configured = add the exact model id to models.json before choosing it. No model was selected or approved.`;
+	return `OPENROUTER DEALS evaluated ${d.evaluatedAt} (catalog and endpoint responses may be cached up to 10m) — ${d.eligible} eligible tool-capable text models; ${d.endpointsChecked} model endpoint catalogs checked${partial}.\nBasket for sorting value: 1M prompt + 250k completion tokens; free, batch and per-request-priced models excluded. AA is Artificial Analysis, a quality proxy. Endpoint discount percentages are already included in provider prices, not a comparison to the model-wide price. Peak/off-peak state is at evaluation time; window times are Pacific (PDT/PST). Off-peak $/M is the cheaper window's rate, not necessarily the active rate.\n\n${section("ENDPOINT DISCOUNTS", d.discounts, 4)}\n\n${section("OFF-PEAK RATES", d.offPeak, 3)}\n\n${section(`FRONTIER VALUE (AA intelligence top 15%, ≥128k context; floor ${d.frontierFloor ?? "unavailable"})`, d.frontier, 2)}\n\n${section(`LIGHT VALUE (AA intelligence top half below frontier, ≥32k context; floor ${d.lightFloor ?? "unavailable"})`, d.light, 2)}\n\nNot configured = add the exact model id to models.json before choosing it. No model was selected or approved.`;
 }
 
 function aaOf(l: any): AAIndices | undefined {
@@ -1607,7 +1608,7 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 					offers = all.filter((m) => modelKey(m).toLowerCase().includes(f));
 					scope = `matching "${p.message}"`;
 					const orIds = offers.filter((m) => m.provider === "openrouter" && live.byId.has(m.id)).map((m) => m.id);
-					await Promise.all(orIds.slice(0, EP_CAP).map(fetchEndpoints));
+					await Promise.all(orIds.slice(0, EP_CAP).map((id) => fetchEndpoints(id)));
 					if (orIds.length > EP_CAP) {
 						endpointCap = EP_CAP;
 						scope += ` (endpoints fetched for the first ${EP_CAP} OpenRouter matches; narrow the filter for the rest)`;
@@ -1836,7 +1837,13 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 		description: "Find OpenRouter promotions and frontier/light value without calling a model (/deals [model substring])",
 		handler: async (args, ctx) => {
 			try {
-				const details = await discoverDeals(ctx, args.trim());
+				const filter = args.trim();
+				let details = await discoverDeals(ctx, filter);
+				if (ctx.mode === "tui") {
+					details = await ctx.ui.custom<DealsDetails>((tui, theme, _keys, done) =>
+						new DealSheet(details, filter, theme, tui, done, () => discoverDeals(ctx, filter, undefined, true)),
+						{ overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left", margin: 0 } });
+				}
 				// Custom entries render in chat but are excluded from the model context.
 				pi.appendEntry("pi-delegate.deals", details);
 			} catch (e) { ctx.ui.notify(String(e), "error"); }
