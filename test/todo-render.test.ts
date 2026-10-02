@@ -111,10 +111,11 @@ test("widget keeps the active phase visible while bounding its task preview", ()
 
 	const lines = renderTodoWidgetLines(s, stubTheme, 80);
 
-	// Agents-panel frame: the "Todos · 1/2" header sits in the top border.
+	// Agents-panel frame: the "Todos · 1/10" header sits in the top border
+	// (1 done of 10 total — the count always rides in the top border).
 	assert.ok(lines[0]!.startsWith("⟨borderMuted›╭─"));
 	assert.ok(lines[0]!.includes("Todos"));
-	assert.ok(lines[0]!.includes("1/2"));
+	assert.ok(lines[0]!.includes("1/10"));
 
 	assert.ok(lines[1]!.includes("I. Research"));
 	assert.ok(lines[2]!.includes("Research task 4"));
@@ -131,9 +132,27 @@ test("widget renders the Agents panel frame: header in the top border, tree insi
 
 	const lines = renderTodoWidgetLines(s, plainTheme, 40);
 
-	assert.ok(lines[0]!.startsWith("╭─ Todos · 1/2"));
+	// Multi-phase header: `Todos · 0/2` (0 done of 2 total) in the top border.
+	assert.ok(lines[0]!.startsWith("╭─ Todos · 0/2"));
 	assert.ok(lines[0]!.endsWith("─╮"));
 	assert.ok(lines[1]!.startsWith("│ ├─ I. Research"));
+	assert.equal(lines.at(-1), `╰${"─".repeat(38)}╯`);
+	assert.ok(lines.every((line) => visibleWidth(line) === 40));
+});
+
+test("widget renders a single-phase tree directly, Agents style — no phase row", () => {
+	let s = emptyState();
+	for (let i = 1; i <= 4; i++) s = addTask(s, "Tasks", `Task ${i}`);
+	s = completeTask(s, "Task 1");
+	s = startTask(s, "Task 2");
+
+	const lines = renderTodoWidgetLines(s, plainTheme, 40);
+
+	// Single-phase header: `Todos · done/total` in the top border, always.
+	assert.ok(lines[0]!.startsWith("╭─ Todos · 1/4"));
+	// Direct task rows from lines[1] — no `Tasks · N/M` phase row.
+	assert.ok(lines[1]!.startsWith("│ ├─ ☐ Task 2"));
+	assert.ok(!lines.some((line) => line.includes("Tasks ·")));
 	assert.equal(lines.at(-1), `╰${"─".repeat(38)}╯`);
 	assert.ok(lines.every((line) => visibleWidth(line) === 40));
 });

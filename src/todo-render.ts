@@ -4,10 +4,13 @@
  * the tree, status colors, and caps are faithful to omp's todo panel:
  *
  * - **Widget** (above editor): the same rounded frame with the bold-accent
- *   `Todos · 1/N` header embedded in the top border and the nested tree —
- *   phases as outer `├─`/`└─` nodes carrying `· done/total` progress, tasks as
- *   inner `├─`/`└─` nodes — as the framed body. Active phase is accent-bold;
- *   others are muted.
+ *   `Todos · done/total` header embedded in the top border — the Agents
+ *   panel's `Agents · N active` shape, the muted count always riding in the
+ *   border — and the task tree as the framed body. Single phase: the task
+ *   tree stands alone at the top level (no phase row, like the tool-result
+ *   body's single-phase rule). Multi-phase: phases as outer `├─`/`└─` nodes
+ *   carrying `· done/total` progress, tasks as inner `├─`/`└─` nodes; the
+ *   active phase is accent-bold, others are muted.
  * - **Tool result** (scrollback): the same rounded frame (`╭─ ☑ Todo · N tasks ─╮`)
  *   with the status-line header embedded in the top border, dim border, no
  *   background fill, and the flat task tree body inside.
@@ -245,6 +248,8 @@ function widgetTaskPreview(tasks: TodoItem[], cap: number): { tasks: TodoItem[];
  * Render the nested tree body for the widget: phases as outer `├─`/`└─` nodes
  * (with `· done/total`), tasks as inner `├─`/`└─` nodes under the active phase.
  * Non-active phases are one-line headers (collapsed) or full subtrees (expanded).
+ * Single phase: no phase header — the task tree stands alone at the top level
+ * (like the tool-result body's single-phase rule and the Agents panel's rows).
  *
  * `width` is the budget for the tree lines themselves (no outer indent — the
  * widget adds that).
@@ -266,6 +271,25 @@ function renderNestedTree(
 
 	const activeIndex = currentPhaseIndex(phases);
 	const multiPhase = phases.length > 1;
+
+	// Single phase: no phase header — the active phase's task tree stands alone
+	// at the top level (Agents-style direct rows).
+	if (!multiPhase) {
+		const single: string[] = [];
+		const budget = width - PREFIX_WIDTH;
+		const { tasks: taskList, hidden } = selectTasks(phases[0]!.tasks, expanded, ACTIVE_TASK_CAP);
+		for (let t = 0; t < taskList.length; t++) {
+			const isLastTask = t === taskList.length - 1 && hidden === 0;
+			const branch = theme.fg("dim", treeBranchPrefix(isLastTask));
+			single.push(`${branch}${renderTodoTaskLine(taskList[t]!, theme, budget)}`);
+		}
+		if (hidden > 0) {
+			const summary = `… ${hidden} more task${hidden === 1 ? "" : "s"}`;
+			const last = theme.fg("dim", treeBranchPrefix(true));
+			single.push(`${last}${theme.fg("muted", clip(summary, budget))}`);
+		}
+		return single;
+	}
 
 	// Determine the phase slice.
 	const start = expanded ? 0 : activeIndex;
@@ -441,9 +465,10 @@ function renderFramedBlock(
 
 /**
  * Render the bounded above-editor widget framed like the Agents panel: the
- * bold-accent `Todos · N/M` header embedded in the top border and the nested
- * tree of phases — the active phase's open tasks as inner `├─`/`└─`
- * continuation lines — as the framed body.
+ * bold-accent `Todos` title with a muted ` · done/total` count — the Agents
+ * panel's `Agents · N active` shape, the count always riding in the top
+ * border — and the nested tree of phases — the active phase's open tasks as
+ * inner `├─`/`└─` continuation lines — as the framed body.
  */
 export function renderTodoWidgetLines(state: TodoState, theme: TodoStyler, width: number): string[] {
 	const phases = state.phases.filter((phase) => phase.tasks.length > 0);
@@ -451,11 +476,10 @@ export function renderTodoWidgetLines(state: TodoState, theme: TodoStyler, width
 	const open = countOpen(allTasks);
 	if (open === 0) return [];
 
-	const activeIndex = currentPhaseIndex(phases);
-	const multiPhase = phases.length > 1;
-
-	// Bold-accent "Todos" + dim " · 1/N", embedded in the top border.
-	const header = theme.bold(theme.fg("accent", "Todos")) + (multiPhase ? theme.fg("dim", ` · ${activeIndex + 1}/${phases.length}`) : "");
+	// Agents-panel header shape: bold-accent "Todos" + muted " · done/total",
+	// always in the top border (`Agents · N active` always carries its count).
+	const done = allTasks.filter((task) => task.status === "completed").length;
+	const header = theme.bold(theme.fg("accent", "Todos")) + theme.fg("muted", ` · ${done}/${allTasks.length}`);
 
 	// The frame's rows give the tree its budget: `│ ` + line + ` │`.
 	const tree = renderNestedTree(state, theme, Math.max(0, width - 4), false, true);
