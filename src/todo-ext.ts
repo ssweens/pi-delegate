@@ -175,8 +175,9 @@ export function installTodo(pi: ExtensionAPI, options: TodoInstallOptions = {}):
 			"Manage a phased todo list. Ops: init, add (content, phase), start (content), done (content), drop/rm (content), block/unblock (content, blocker), view. Tasks are addressed by their content string; one task is in_progress; completing auto-promotes the next open task.",
 		promptSnippet: "todo(op, content?, phase?, blocker?) — manage phased todos",
 		parameters: PARAMS,
-		// omp renders its own framed block (rounded border with header in the top
-		// border); self-framing keeps pi's default bg-colored Box shell off.
+		// The todo panel renders its own framed block (the Agents frame
+		// construction, src/render.ts); self-framing keeps pi's default
+		// bg-colored Box shell off.
 		renderShell: "self",
 		executionMode: "sequential",
 		execute: async (_toolCallId, params: TodoParams, _signal, _onUpdate, ctx) => {

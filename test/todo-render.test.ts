@@ -42,7 +42,7 @@ test("renderTodoLines emits a status header plus flat task tree with status-styl
 
 	const lines = renderTodoLines(s, stubTheme, 80);
 
-	// Framed status header in the top border: `╭─── ☑ Todo · N tasks ───╮`.
+	// Framed status header in the top border: `╭─ ☑ Todo · N tasks ─╮`.
 	assert.ok(lines[0]!.includes("Todo"));
 	assert.ok(lines[0]!.includes("3 tasks"));
 
@@ -57,6 +57,17 @@ test("renderTodoLines emits a status header plus flat task tree with status-styl
 	// Blocked task: warning + blocker note.
 	assert.ok(lines[3]!.includes("⟨warning›"));
 	assert.ok(lines[3]!.includes("(blocked: waiting on API)"));
+});
+
+test("tool result frame matches the Agents panel frame construction", () => {
+	const s = addTask(emptyState(), "Base", "One");
+	const lines = renderTodoLines(s, plainTheme, 40);
+	// Top border: `╭─` lead, header label, dashes to the right corner.
+	assert.ok(lines[0]!.startsWith("╭─ ☑ Todo 1 task"));
+	assert.ok(lines[0]!.endsWith("─╮"));
+	// Bottom border: plain `╰` corner and a full dash run — no omp `╰───` cap.
+	assert.equal(lines.at(-1), `╰${"─".repeat(38)}╯`);
+	assert.ok(lines.every((line) => visibleWidth(line) === 40));
 });
 
 test("renderTodoLines clips a long task label to width with an ellipsis", () => {
@@ -100,16 +111,31 @@ test("widget keeps the active phase visible while bounding its task preview", ()
 
 	const lines = renderTodoWidgetLines(s, stubTheme, 80);
 
-	// Leading blank line, then the omp-style header: "Todos · 1/2".
-	assert.equal(lines[0], "");
-	assert.ok(lines[1]!.includes("Todos"));
-	assert.ok(lines[1]!.includes("1/2"));
+	// Agents-panel frame: the "Todos · 1/2" header sits in the top border.
+	assert.ok(lines[0]!.startsWith("⟨borderMuted›╭─"));
+	assert.ok(lines[0]!.includes("Todos"));
+	assert.ok(lines[0]!.includes("1/2"));
 
-	assert.ok(lines[2]!.includes("I. Research"));
-	assert.ok(lines[3]!.includes("Research task 4"));
+	assert.ok(lines[1]!.includes("I. Research"));
+	assert.ok(lines[2]!.includes("Research task 4"));
 	assert.ok(!lines.some((line) => line.includes("Research task 1")));
 	assert.ok(lines.some((line) => line.includes("2 more tasks")));
 	assert.ok(lines.some((line) => line.includes("II. Verify")));
+});
+
+test("widget renders the Agents panel frame: header in the top border, tree inside", () => {
+	let s = emptyState();
+	s = addTask(s, "Research", "Call the API");
+	s = startTask(s, "Call the API");
+	s = addTask(s, "Verify", "Check the response");
+
+	const lines = renderTodoWidgetLines(s, plainTheme, 40);
+
+	assert.ok(lines[0]!.startsWith("╭─ Todos · 1/2"));
+	assert.ok(lines[0]!.endsWith("─╮"));
+	assert.ok(lines[1]!.startsWith("│ ├─ I. Research"));
+	assert.equal(lines.at(-1), `╰${"─".repeat(38)}╯`);
+	assert.ok(lines.every((line) => visibleWidth(line) === 40));
 });
 
 test("widget keeps blocked work in the active phase", () => {
@@ -119,7 +145,7 @@ test("widget keeps blocked work in the active phase", () => {
 	s = completeTask(s, "Already complete");
 
 	const lines = renderTodoWidgetLines(s, stubTheme, 80);
-	assert.ok(lines[2]!.includes("I. Blocked"));
+	assert.ok(lines[1]!.includes("I. Blocked"));
 	assert.ok(lines.some((line) => line.includes("Wait for CI")));
 });
 

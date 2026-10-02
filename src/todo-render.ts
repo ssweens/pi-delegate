@@ -1,14 +1,16 @@
 /**
  * Colored todo-panel rendering for the `todo` tool result and the `/todo` widget.
- * Faithful to omp's todo panel:
+ * The frame matches the Agents panel's `frame()` construction (src/render.ts);
+ * the tree, status colors, and caps are faithful to omp's todo panel:
  *
- * - **Widget** (above editor): leading blank line, bold-accent `Todos · 1/N` header,
- *   then a nested tree — phases as outer `├─`/`└─` nodes carrying `· done/total`
- *   progress, tasks as inner `├─`/`└─` nodes. Active phase is accent-bold; others
- *   are muted.
- * - **Tool result** (scrollback): a self-drawn rounded border (`╭─ ☑ Todo · N tasks ─╮`)
+ * - **Widget** (above editor): the same rounded frame with the bold-accent
+ *   `Todos · 1/N` header embedded in the top border and the nested tree —
+ *   phases as outer `├─`/`└─` nodes carrying `· done/total` progress, tasks as
+ *   inner `├─`/`└─` nodes — as the framed body. Active phase is accent-bold;
+ *   others are muted.
+ * - **Tool result** (scrollback): the same rounded frame (`╭─ ☑ Todo · N tasks ─╮`)
  *   with the status-line header embedded in the top border, dim border, no
- *   background fill, and the same nested tree body inside.
+ *   background fill, and the flat task tree body inside.
  *
  * Per-status colors: done = success + strikethrough, in-progress = accent,
  * blocked = warning, abandoned = error + strikethrough, pending = dim.
@@ -50,16 +52,10 @@ export const TREE_BRANCH = "├─";
 export const TREE_LAST = "└─";
 export const TREE_VERTICAL = "│";
 
-// --- Box drawing (omp rounded border) ---
+// --- Box drawing (Agents panel frame construction, src/render.ts) ---
 
-const BOX_TL = "╭";
-const BOX_TR = "╮";
-const BOX_BL = "╰";
-const BOX_BR = "╯";
 const BOX_H = "─";
 const BOX_V = "│";
-/** Three-dash cap after each corner, matching omp's `framedBlock`. */
-const BOX_CAP = BOX_H.repeat(3);
 
 const SEP_DOT = " · ";
 /** Visible width of a single tree prefix (`├─ ` / `└─ ` / `│  ` / `   `). */
@@ -407,15 +403,18 @@ function selectTasks(
 	return widgetTaskPreview(tasks, cap);
 }
 
-// --- Framed block (omp framedBlock port) ---
+// --- Framed block (Agents panel frame construction, src/render.ts) ---
 
 /**
- * Render a self-drawn rounded border with the header embedded in the top border,
- * matching omp's `framedBlock`. Dim border, no background fill.
+ * Render a rounded frame with the header embedded in the top border, matching
+ * the Agents panel's `frame()`: a `╭─` lead, the header label, dashes to the
+ * right corner, `│`-wrapped body rows, and a plain `╰` bottom. Dim border, no
+ * background fill. Widths too narrow to frame fall back to bare clipped lines,
+ * exactly like `frame()`.
  *
- *   ╭─── <header> ───────╮
- *   │  <body line>        │
- *   ╰─────────────────────╯
+ *   ╭─ <header> ───────────╮
+ *   │  <body line>          │
+ *   ╰───────────────────────╯
  */
 function renderFramedBlock(
 	header: string,
@@ -424,50 +423,27 @@ function renderFramedBlock(
 	width: number,
 	borderColor: TodoColor = "borderMuted",
 ): string[] {
-	const w = Math.max(0, width);
+	if (width < 6) return [header, ...bodyLines].map((l) => truncateToWidth(l, Math.max(0, width), ""));
 	const border = (text: string) => theme.fg(borderColor, text);
-	const leftWidth = visibleWidth(BOX_TL) + visibleWidth(BOX_CAP); // ╭───  = 4
-	const rightWidth = visibleWidth(BOX_TR); // ╮  = 1
-
-	// Top border with header embedded.
-	let topLine: string;
-	if (w <= 0) {
-		topLine = border(`${BOX_TL}${BOX_CAP}`) + border(BOX_TR);
-	} else if (!header) {
-		const fill = Math.max(0, w - leftWidth - rightWidth);
-		topLine = `${border(`${BOX_TL}${BOX_CAP}`)}${border(BOX_H.repeat(fill))}${border(BOX_TR)}`;
-	} else {
-		const rawLabel = ` ${header} `;
-		const maxLabel = Math.max(0, w - leftWidth - rightWidth);
-		const trimmed = clip(rawLabel, maxLabel);
-		const labelW = visibleWidth(trimmed);
-		const fill = Math.max(0, w - leftWidth - labelW - rightWidth);
-		topLine = `${border(`${BOX_TL}${BOX_CAP}`)}${trimmed}${border(BOX_H.repeat(fill))}${border(BOX_TR)}`;
-	}
-
-	// Content: │ <line> │  (1-char padding each side, no background).
-	const contentWidth = Math.max(0, w - 2 * visibleWidth(BOX_V) - 2);
-	const lines = [topLine];
+	const inner = width - 4;
+	const label = clip(` ${header} `, width - 4);
+	const rows = [border("╭─") + label + border(`${BOX_H.repeat(Math.max(0, width - 3 - visibleWidth(label)))}╮`)];
 	for (const body of bodyLines) {
-		const clipped = clip(body, contentWidth);
-		const pad = Math.max(0, contentWidth - visibleWidth(clipped));
-		lines.push(`${border(BOX_V)} ${clipped}${" ".repeat(pad)} ${border(BOX_V)}`);
+		const clipped = clip(body, inner);
+		const pad = Math.max(0, inner - visibleWidth(clipped));
+		rows.push(`${border(BOX_V)} ${clipped}${" ".repeat(pad)} ${border(BOX_V)}`);
 	}
-
-	// Bottom border.
-	const bottomFill = Math.max(0, w - leftWidth - rightWidth);
-	const bottomLine = `${border(`${BOX_BL}${BOX_CAP}`)}${border(BOX_H.repeat(bottomFill))}${border(BOX_BR)}`;
-	lines.push(bottomLine);
-
-	return lines;
+	rows.push(border(`╰${BOX_H.repeat(width - 2)}╯`));
+	return rows;
 }
 
 // --- Widget (above-editor, collapsed, open tasks only) ---
 
 /**
- * Render the bounded above-editor widget: a leading blank line, a bold-accent
- * `Todos · N/M` header, then a nested tree of phases with the active phase's
- * open tasks as inner `├─`/`└─` continuation lines.
+ * Render the bounded above-editor widget framed like the Agents panel: the
+ * bold-accent `Todos · N/M` header embedded in the top border and the nested
+ * tree of phases — the active phase's open tasks as inner `├─`/`└─`
+ * continuation lines — as the framed body.
  */
 export function renderTodoWidgetLines(state: TodoState, theme: TodoStyler, width: number): string[] {
 	const phases = state.phases.filter((phase) => phase.tasks.length > 0);
@@ -478,14 +454,12 @@ export function renderTodoWidgetLines(state: TodoState, theme: TodoStyler, width
 	const activeIndex = currentPhaseIndex(phases);
 	const multiPhase = phases.length > 1;
 
-	// omp-style header: bold-accent "Todos" + dim " · 1/N".
-	const root = theme.bold(theme.fg("accent", "Todos")) + (multiPhase ? theme.fg("dim", ` · ${activeIndex + 1}/${phases.length}`) : "");
+	// Bold-accent "Todos" + dim " · 1/N", embedded in the top border.
+	const header = theme.bold(theme.fg("accent", "Todos")) + (multiPhase ? theme.fg("dim", ` · ${activeIndex + 1}/${phases.length}`) : "");
 
-	// Tree lines get a 1-space outer indent (omp: ` ${line}`).
-	const treeWidth = Math.max(0, width - 1);
-	const tree = renderNestedTree(state, theme, treeWidth, false, true);
-
-	return ["", root, ...tree.map((line) => ` ${line}`)];
+	// The frame's rows give the tree its budget: `│ ` + line + ` │`.
+	const tree = renderNestedTree(state, theme, Math.max(0, width - 4), false, true);
+	return renderFramedBlock(header, tree, theme, width);
 }
 
 // --- Tool result (framed block, scrollback) ---
