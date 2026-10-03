@@ -42,7 +42,7 @@ test("delegate dispatches to the acp backend; no backend is today's pi path", { 
 	try {
 		await t.test("no backend: the call, its result and its side effects are today's", async () => {
 			api.script("Default work", { text: "DEFAULT-OK" });
-			const result = await h.launch("Default work", { sync: true });
+			const result = await h.waitLaunch("Default work");
 			assert.equal(result.isError, false, result.content[0].text);
 			assert.equal(result.details.status, "complete");
 			assert.equal(result.details.output, "DEFAULT-OK");
@@ -51,7 +51,7 @@ test("delegate dispatches to the acp backend; no backend is today's pi path", { 
 			assert.match(result.content[0].text, /^complete · scout-[0-9a-f-]{36} · role scout · model fixture\/fixture:off · context fresh/);
 			piRunId = result.details.id;
 			api.script("Explicit pi", { text: "EXPLICIT-OK" });
-			const explicit = await h.launch("Explicit pi", { backend: "pi", sync: true });
+			const explicit = await h.waitLaunch("Explicit pi", { backend: "pi" });
 			assert.equal(explicit.details.output, "EXPLICIT-OK");
 			assert.equal(existingAcpCoordinator(), undefined, "pi delegation never constructs the Coordinator");
 			const closed = await h.ctl("close", piRunId);

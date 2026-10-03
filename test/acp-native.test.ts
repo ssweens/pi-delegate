@@ -302,7 +302,7 @@ test("native Amp sessions and observation through delegate", { timeout: 120000 }
 			await h.ctl("wait", createdAmp);
 			assert.equal((await h.ctl("status", createdAmp)).details.observation, undefined, "a created Amp run has no shared native attachment");
 			api.script("Pi child", { text: "PI-OK" });
-			const pi = (await h.launch("Pi child", { sync: true })).details.id;
+			const pi = (await h.waitLaunch("Pi child")).details.id;
 			assert.equal((await h.ctl("status", pi)).details.observation, undefined);
 			await h.ctl("close", opened.local);
 			const closed = await h.ctl("status", opened.local);

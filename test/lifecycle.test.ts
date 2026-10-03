@@ -21,12 +21,12 @@ test("real SDK delegation lifecycle (loopback provider, no credentials)", { time
 			const native = h.runtime.session.modelRuntime.getProvider("fixture")!;
 			h.runtime.session.modelRuntime.registerNativeProvider({ ...native, id: "fixture-native", getModels: () => native.getModels().map((model) => ({ ...model, provider: "fixture-native" })) });
 			api.script("Alias work", { text: "ALIAS-OK" });
-			const result = await h.launch("Alias work", { model: "fixture-alias/fixture:off", sync: true });
+			const result = await h.waitLaunch("Alias work", { model: "fixture-alias/fixture:off" });
 			assert.equal(result.details.status, "complete", result.content[0].text);
 			assert.equal(result.details.output, "ALIAS-OK");
 			assert.equal(result.details.model, "fixture-alias/fixture");
 			api.script("Native provider work", { text: "NATIVE-PROVIDER-OK" });
-			const fromNative = await h.launch("Native provider work", { model: "fixture-native/fixture:off", sync: true });
+			const fromNative = await h.waitLaunch("Native provider work", { model: "fixture-native/fixture:off" });
 			assert.equal(fromNative.details.status, "complete", fromNative.content[0].text);
 			assert.equal(fromNative.details.output, "NATIVE-PROVIDER-OK");
 			assert.equal(fromNative.details.model, "fixture-native/fixture");
@@ -36,7 +36,7 @@ test("real SDK delegation lifecycle (loopback provider, no credentials)", { time
 				models: [{ id: "fixture", name: "Registered after the first child", reasoning: false, input: ["text"], contextWindow: 32768, maxTokens: 4096, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
 			});
 			api.script("Late provider work", { text: "LATE-PROVIDER-OK" });
-			const late = await h.launch("Late provider work", { model: "fixture-late/fixture:off", sync: true });
+			const late = await h.waitLaunch("Late provider work", { model: "fixture-late/fixture:off" });
 			assert.equal(late.details.status, "complete", late.content[0].text);
 			assert.equal(late.details.output, "LATE-PROVIDER-OK");
 			// A provider the parent drops stops serving children that must reopen their session;
@@ -150,7 +150,7 @@ test("real SDK delegation lifecycle (loopback provider, no credentials)", { time
 			await h.runtime.session.reload();
 			assert.equal(state().owners.get(owner.key), owner, "the same parent object, so live children stay attached");
 			api.script("After version reload", { text: "UPGRADED-OK" });
-			const result = await h.launch("After version reload", { sync: true });
+			const result = await h.waitLaunch("After version reload");
 			assert.equal(result.details.status, "complete", result.content[0].text);
 			assert.equal(result.details.output, "UPGRADED-OK");
 			assert.ok(existsSync(join(owner.dir, `${encodeURIComponent(result.details.id)}.json`)), "new runs get their pointer file");
@@ -177,7 +177,7 @@ test("real SDK delegation lifecycle (loopback provider, no credentials)", { time
 			manager.appendCustomMessageEntry("delegate", "DELEGATE-COMPLETION-NOTICE", true, { id: "noise" });
 			manager.appendCustomMessageEntry("other-extension", "KEPT-CUSTOM-MESSAGE", true, undefined);
 			const arrived = api.script("Clean fork", { text: "CLEAN-FORK-OK" });
-			await h.launch("Clean fork", { context: "fork", sync: true });
+			await h.waitLaunch("Clean fork", { context: "fork" });
 			const inherited = JSON.stringify((await arrived).messages);
 			// The parent's own work survives: only this package's orchestration records are dropped.
 			for (const kept of [/ORDINARY-PARENT-TEXT/, /KEPT-TOOL-ARGUMENT/, /KEPT-TOOL-RESULT/, /KEPT-TEXT-BESIDE-CONTROL/, /KEPT-CUSTOM-MESSAGE/, /"name":"read"/]) assert.match(inherited, kept);
@@ -191,7 +191,7 @@ test("real SDK delegation lifecycle (loopback provider, no credentials)", { time
 		});
 		await t.test("the child's report is quoted, never blended into this tool's own reporting", async () => {
 			api.script("Quoted report", { text: "CHILD-WORDS" });
-			const result = await h.launch("Quoted report", { sync: true });
+			const result = await h.waitLaunch("Quoted report");
 			assert.equal(result.details.joinedWaiters, 0);
 			const [summary, report] = result.content[0].text.split(/^----- \S+ reported, verbatim -----$/m);
 			assert.match(summary, /^complete \u00b7 scout-[\w-]+ \u00b7 role scout \u00b7 model fixture\/fixture:off \u00b7 context fresh \u00b7 1 turn in \d+s \u00b7 tokens in \d/);
@@ -238,7 +238,7 @@ test("real SDK delegation lifecycle (loopback provider, no credentials)", { time
 		});
 		await t.test("reviving on another offering applies from the next segment and persists", async () => {
 			api.script("Switch work", { text: "FIRST-MODEL" });
-			const { details: { id } } = await h.launch("Switch work", { sync: true });
+			const { details: { id } } = await h.waitLaunch("Switch work");
 			const run = state().runs.get(id), file = run.sessionFile, segment = run.segment;
 			// A named provider is the choice; it never resolves to the same id on another provider.
 			await assert.rejects(h.ctl("steer", id, { message: "Nope", model: "fixture-typo/fixture" }), /model not found: fixture-typo\/fixture/);
@@ -275,7 +275,7 @@ test("real SDK delegation lifecycle (loopback provider, no credentials)", { time
 				models: [{ id: "spare", name: "Distinguishable by request", reasoning: false, input: ["text"], contextWindow: 32768, maxTokens: 4096, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
 			});
 			api.script("Exhausted work", { error: 429 });
-			const failed = await h.launch("Exhausted work", { sync: true });
+			const failed = await h.waitLaunch("Exhausted work");
 			assert.equal(failed.details.status, "error", failed.content[0].text);
 			assert.equal(failed.details.turns, 0);
 			const id = failed.details.id, file = failed.details.sessionFile;
@@ -291,7 +291,7 @@ test("real SDK delegation lifecycle (loopback provider, no credentials)", { time
 		});
 		await t.test("cancel during real SDK preflight never dispatches a model request", async () => {
 			api.script("Preflight seed", { text: "SEED" });
-			const { details: { id } } = await h.launch("Preflight seed", { sync: true });
+			const { details: { id } } = await h.waitLaunch("Preflight seed");
 			const run = state().runs.get(id), child = run.session;
 			const entered = deferred(), release = deferred();
 			const original = child.extensionRunner.emitBeforeAgentStart.bind(child.extensionRunner);
@@ -325,19 +325,19 @@ test("real SDK delegation lifecycle (loopback provider, no credentials)", { time
 		});
 		await t.test("timeout and provider failure preserve terminal status", async () => {
 			api.script("Timeout work", { text: "Waiting", gate: deferred() });
-			const timeout = await h.launch("Timeout work", { timeoutMs: 200, sync: true });
+			const timeout = await h.waitLaunch("Timeout work", { timeoutMs: 200 });
 			assert.equal(timeout.details.status, "timeout");
 			assert.match(timeout.details.error, /Stopped after its 0 min budget \(timeoutMs, default 15 min\)\. Its work up to that point stands/);
 
 			assert.match(timeout.details.error, /Give it a larger timeoutMs only if the work genuinely needs longer/);
 			api.script("Provider failure", { error: 400 });
-			const failure = await h.launch("Provider failure", { sync: true });
+			const failure = await h.waitLaunch("Provider failure");
 			assert.equal(failure.details.status, "error");
 			assert.match(failure.details.error, /Fixture provider failure/);
 		});
 		await t.test("a failed provider attempt is reported as an attempt, not as a turn of work", async () => {
 			api.script("Stalled provider", { error: 503 });
-			const failed = await h.launch("Stalled provider", { sync: true });
+			const failed = await h.waitLaunch("Stalled provider");
 			const id = failed.details.id;
 			assert.equal(failed.details.status, "error");
 			assert.equal(failed.details.failedAttempts, 1);
@@ -352,7 +352,7 @@ test("real SDK delegation lifecycle (loopback provider, no credentials)", { time
 			assert.match(done.content[0].text, /1 provider attempt failed and were retried before this \(last: [^)]*Fixture provider failure/);
 			// And a timeout whose budget went to failed attempts points at the provider, not at the budget.
 			api.script("Stall then hang", { error: 503 }, { text: "Waiting", gate: deferred() });
-			const hung = await h.launch("Stall then hang", { sync: true, timeoutMs: 400 });
+			const hung = await h.waitLaunch("Stall then hang", { timeoutMs: 400 });
 			assert.equal(hung.details.status, "error");
 			api.onUnscripted(() => ({ text: "Waiting", gate: deferred() }));
 			await h.ctl("steer", hung.details.id, { message: "Hang now", timeoutMs: 600 });
@@ -364,7 +364,7 @@ test("real SDK delegation lifecycle (loopback provider, no credentials)", { time
 		});
 		await t.test("missing transcript and failed snapshot leave the previous segment intact", async () => {
 			api.script("Transactional seed", { text: "SAVED" });
-			const { details: { id } } = await h.launch("Transactional seed", { sync: true });
+			const { details: { id } } = await h.waitLaunch("Transactional seed");
 			const run = state().runs.get(id), completion = run.completion, segment = run.segment;
 			renameSync(run.sessionFile, run.sessionFile + ".held");
 			try { await assert.rejects(h.ctl("steer", id, { message: "No history" }), /missing/); }

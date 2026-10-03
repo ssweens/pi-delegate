@@ -31,7 +31,7 @@ Children run in the background by default. Keep the returned run id and do indep
 ## While a child runs
 You are woken **once**, when the child finishes. There are no mid-run progress pings, by design: an interrupt per tool call would cost a parent turn for information you did not ask for. The human already sees live progress in the pinned Agents frame.
 
-Launching never blocks your turn; joining does, on purpose. While you are joined, the transcript carries a live `⏳ Waiting for …` line and the Agents frame says `parent blocked in wait`. If the user's message shows up queued as **Steering**, that is why: your turn is busy inside `wait` or a `sync: true` launch, not because children are synchronous. Aborting the tool detaches the wait and leaves the child running. Do not join a child you have no dependent work on.
+Launching never blocks your turn. Resource preparation also runs after the durable handoff, so a slow loader cannot make launch synchronous. An explicit `wait` blocks your turn; while joined, the transcript carries a live `⏳ Waiting for …` line and the Agents frame says `parent blocked in wait`. Aborting the tool detaches the wait and leaves the child running. Do not join a child you have no dependent work on.
 
 So waiting is never your job:
 
@@ -49,7 +49,7 @@ Distinguish the three in your own words when you report to the user: the child's
 
 `wait` returns immediately for a finished run. Cancelling it only detaches the waiter; use `cancel` to stop the child. An attached waiter receives the report instead of a redundant completion wake-up. Check the returned terminal status before acting on the report.
 
-`sync: true` remains available when joining at launch is explicitly needed; a dependency discovered later is not a reason to require it upfront. Parallel lanes are several background calls with disjoint `cwd` or ownership — one writer per tree.
+There is no synchronous launch mode. If a dependency is discovered later, use `delegate_ctl wait` for that run. Parallel lanes are several background calls with disjoint `cwd` or ownership — one writer per tree.
 
 If automatic continuation fails, distinguish child completion, notification delivery, and parent continuation using the transcript and runtime errors. Do not claim the cause from configuration alone or work around it by switching every launch to synchronous.
 

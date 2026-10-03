@@ -59,8 +59,10 @@ test("pi rejects every ACP-only field, including when backend is omitted", () =>
 });
 
 test("pi keeps today's fields and requires a role name and a task", () => {
-	const ok = validateStartInput({ backend: "pi", role: "worker", task: "do it", model: "openai/gpt-5:high", context: "fresh", cwd: "/repo", timeoutMs: 60_000, sync: true, reason: "cheap" });
-	assert.deepEqual(ok, { ok: true, value: { backend: "pi", role: "worker", task: "do it", model: "openai/gpt-5:high", context: "fresh", cwd: "/repo", timeoutMs: 60_000, sync: true, reason: "cheap" } });
+	const ok = validateStartInput({ backend: "pi", role: "worker", task: "do it", model: "openai/gpt-5:high", context: "fresh", cwd: "/repo", timeoutMs: 60_000, reason: "cheap" });
+	assert.deepEqual(ok, { ok: true, value: { backend: "pi", role: "worker", task: "do it", model: "openai/gpt-5:high", context: "fresh", cwd: "/repo", timeoutMs: 60_000, reason: "cheap" } });
+	const sync = validateStartInput({ backend: "pi", role: "worker", task: "do it", sync: true });
+	assert.deepEqual(sync, { ok: false, error: { code: "INPUT_INVALID", message: "delegate always launches in the background; remove sync", field: "sync" } });
 	assert.equal(errorOf(validateStartInput({ task: "t" })).field, "role");
 	assert.equal(errorOf(validateStartInput({ role: "scout" })).field, "task");
 	assert.equal(errorOf(validateStartInput({ role: "scout", task: "t", context: "shared" })).field, "context");

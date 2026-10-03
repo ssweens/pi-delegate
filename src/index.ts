@@ -130,11 +130,12 @@ interface Run {
 	contextWindow?: number;
 	session?: any;
 	ready?: Promise<void>;
+	/** Resource preparation is part of the background launch, not the parent tool call. */
+	preparing?: Promise<void>;
 	startIdx: number;
 	segmentStartedAt: number;
 	forkedMessages?: number;
 	writer: boolean;
-	syncJoined?: boolean;
 	dirtyBefore?: Map<string, number>;
 	timer?: ReturnType<typeof setTimeout>;
 	sessionFile?: string;
@@ -197,10 +198,10 @@ function runRecordPaths(owner: Owner): string[] {
 	return [...new Set(paths)];
 }
 
-type RunRecord = Omit<Run, "completion" | "session" | "timer" | "streamingMessage" | "activeTools" | "activityCache" | "dirtyBefore" | "ready" | "acknowledged" | "foreign"> & { version: 1; savedAt: number };
+type RunRecord = Omit<Run, "completion" | "session" | "timer" | "streamingMessage" | "activeTools" | "activityCache" | "dirtyBefore" | "ready" | "preparing" | "acknowledged" | "foreign"> & { version: 1; savedAt: number };
 function saveRun(run: Run): void {
 	if (run.foreign) throw foreignError(run);
-	const { completion, session, timer, streamingMessage, activeTools, activityCache, dirtyBefore, ready, acknowledged, foreign, ...record } = run;
+	const { completion, session, timer, streamingMessage, activeTools, activityCache, dirtyBefore, ready, preparing, acknowledged, foreign, ...record } = run;
 	writeRecord(run.recordPath, { ...record, version: 1, savedAt: Date.now() });
 }
 function messagesOf(run: Run): any[] {
@@ -215,7 +216,10 @@ function openTranscript(run: Run): SessionManager {
 	return manager;
 }
 function finalResult(run: Run): RunResult {
-	return { content: [{ type: "text", text: resultText(run) }], details: { ...recordedView(run), settled: true, completionReceipt: true }, isError: run.status !== "complete" };
+	const details = { ...recordedView(run), settled: true as const, completionReceipt: true as const };
+	// The result is the settlement record, not a snapshot of the waiter that received it.
+	details.joinedWaiters = 0;
+	return { content: [{ type: "text", text: resultText(run) }], details, isError: run.status !== "complete" };
 }
 function restoreRun(path: string, owner: Owner): Run {
 	const record = readRecord<RunRecord>(path);
@@ -771,9 +775,7 @@ function view(run: Run): RunView {
 		...(run.providerRetry ? { providerRetry: run.providerRetry } : {}),
 		toolCalls: run.toolCalls,
 		activeTool: run.activeTools.values().next().value,
-		// A synchronous launch is a blocked parent too, but only while it is actually running:
-		// the recorded outcome should not claim someone is still waiting on it.
-		joinedWaiters: run.completion.waiting + (run.syncJoined && run.status === "running" ? 1 : 0),
+		joinedWaiters: run.completion.waiting,
 		revision: run.revision,
 		lastTool: run.lastTool,
 		error: run.error,
@@ -1085,8 +1087,9 @@ export default function (pi: ExtensionAPI) {
 		requireOwner();
 		if (run.foreign) throw foreignError(run);
 		if (run.status === "running") {
+			await run.preparing;
 			await run.ready;
-			if (run.status === "running") {
+			if (run.status === "running" && run.session) {
 				// A live turn is already bound to its model. Never swap it underneath running work.
 				if (replacement?.model) throw new Error(`${run.id} is running on ${run.model}; a different offering applies to its next segment. Wait for it or cancel it, then steer with model.`);
 				if (replacement?.timeoutMs !== undefined) {
@@ -1214,13 +1217,15 @@ export default function (pi: ExtensionAPI) {
 		});
 	}
 
-	async function launch(run: Run, task: string, signal?: AbortSignal, onUpdate?: (u: any) => void, preparedLoader?: DefaultResourceLoader) {
-		const abort = () => { if (run.status === "running") { run.status = "cancelled"; run.stopped = true; void run.session?.abort(); } };
-		signal?.addEventListener("abort", abort, { once: true });
+	async function launch(run: Run, task: string, onUpdate?: (u: any) => void, preparedLoader?: DefaultResourceLoader) {
+		const sessionReady = (async () => {
+			await run.preparing;
+			run.preparing = undefined;
+			await openSession(run, onUpdate, preparedLoader);
+		})();
+		run.ready = sessionReady;
 		try {
-			if (signal?.aborted) abort();
-			run.ready = openSession(run, onUpdate, preparedLoader);
-			await run.ready;
+			await sessionReady;
 			if (run.status === "running") {
 				milestone(run, { kind: "started", task: task.slice(0, 600) });
 				run.dirtyBefore = snapshotDirty(run.cwd);
@@ -1238,7 +1243,7 @@ export default function (pi: ExtensionAPI) {
 			finish(run, run.status === "running" ? "complete" : run.status);
 		} catch (e: any) {
 			finish(run, run.status === "running" ? "error" : run.status, run.error ?? String(e?.message ?? e));
-		} finally { signal?.removeEventListener("abort", abort); run.ready = undefined; }
+		} finally { run.ready = undefined; run.preparing = undefined; }
 	}
 
 	// What the control call was about, in the header rather than buried in its output.
@@ -1258,15 +1263,13 @@ export default function (pi: ExtensionAPI) {
 		// Settlement is read from the run itself: the call renders before the result in the same
 		// pass, and forcing an extra pass reprints the whole block in regular mode. Once the
 		// outcome line exists it is the record, and a stale "waiting" above it would lie.
-		const run = runs.get(args?.runId ?? syncLaunches.get(ctx.toolCallId) ?? "");
+		const run = runs.get(args?.runId ?? "");
 		if (!text || run?.completion.settled) { stopTicking(ctx); return empty(); }
 		state.startedAt ??= Date.now();
 		state.interval ??= setInterval(() => ctx.invalidate(), 1000);
 		const child = run ? ` \u00b7 ${run.status === "running" ? run.activeTools.values().next().value?.name ?? "thinking" : run.status}` : "";
 		return framed((width) => [truncateToWidth(theme.fg("accent", `\u23f3 ${text}`) + theme.fg("dim", `${child} \u00b7 ${elapsed(Date.now() - state.startedAt!)} \u00b7 abort to stop waiting; the child keeps running`), width, "\u2026")]);
 	};
-	// A synchronous launch has no run id in its arguments; its row needs one to know when to stop.
-	const syncLaunches = new Map<string, string>();
 	const stopTicking = (ctx: any) => {
 		const state = ctx?.state as { interval?: ReturnType<typeof setInterval> } | undefined;
 		if (state?.interval) { clearInterval(state.interval); state.interval = undefined; }
@@ -1394,7 +1397,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "delegate",
-		renderCall: blockingCall((args) => args?.sync ? `Waiting for a new ${(args.backend === "acp" ? args.agent : args.role) ?? "child"} \u2014 this launch joins at once (sync)` : undefined),
+		renderCall: () => empty(),
 		renderResult: resultRenderer("delegate"),
 		label: "Delegate",
 		description:
@@ -1403,7 +1406,7 @@ export default function (pi: ExtensionAPI) {
 			"Delegate only for context isolation, parallelism, or a model-tier switch — if the brief would be longer than the expected diff, do the work yourself. " +
 			"Start the brief with a short task title on its own line, then objective, ownership, interfaces/constraints, verification, return shape. " +
 			'context "fork" (default) hands the child your conversation so far; "fresh" is for adversarial review. ' +
-			"Runs in the background by default \u2014 the call returns a run id at once and you are woken once, when the child finishes. There are no progress pings by design; waiting is not your work. Do other work, or use delegate_ctl wait with that runId to block without polling when nothing else can proceed, or delegate_ctl status for a single progress read when someone asks. sync:true joins at launch when explicitly needed. Children have built-in tools only. Model: run delegate_ctl models first; a role's approved default is used when model: is omitted. Proposing a model that is not the approved default is a conversation with the user, not a tool step: state the offering, price, rating and tradeoff, get their answer, then call delegate; if they want it kept, delegate_ctl action=approve. Use delegate_ctl to list roles, wait, check status, steer, or cancel. " +
+			"Runs in the background by default \u2014 the call returns a run id at once and you are woken once, when the child finishes. There are no progress pings by design; waiting is not your work. Do other work, or use delegate_ctl wait with that runId to block without polling when nothing else can proceed, or delegate_ctl status for a single progress read when someone asks. A launch never joins the child; use delegate_ctl wait only when dependent work needs its result. Children have built-in tools only. Model: run delegate_ctl models first; a role's approved default is used when model: is omitted. Proposing a model that is not the approved default is a conversation with the user, not a tool step: state the offering, price, rating and tradeoff, get their answer, then call delegate; if they want it kept, delegate_ctl action=approve. Use delegate_ctl to list roles, wait, check status, steer, or cancel. " +
 			'backend "acp" runs an external ACP agent session instead (agent required, e.g. "pi", "amp", "codex", "claude"): it creates a session and sends task as its first turn, or with sessionId opens that exact native session (an Amp T-ID, say) without owning it and sends task only when given. ' +
 			"An ACP child never receives your conversation (no context), and an opened session keeps its native role and model. Its report carries the agent's native session ID and each turn's request ID and delivery. Close an ACP run with delegate_ctl close when done.",
 		parameters: Type.Object({
@@ -1414,14 +1417,13 @@ export default function (pi: ExtensionAPI) {
 			context: Type.Optional(StringEnum(["fork", "fresh"] as const)),
 			cwd: Type.Optional(Type.String()),
 			timeoutMs: Type.Optional(Type.Number({ description: `abort the child after this many ms; default ${DEFAULT_TIMEOUT_MS / 60000} min. Size it to the work: a build, suite, or training run that takes hours needs hours here, or it is killed mid-flight` })),
-			sync: Type.Optional(Type.Boolean({ description: "block until the child finishes. Default false: the call returns at once and you are woken with the result" })),
 			reason: Type.Optional(Type.String({ description: "one line: why this model for this role; recorded in the run log" })),
 			agent: Type.Optional(Type.String({ description: "acp only: the ACP agent to run, e.g. pi, amp, codex, claude" })),
 			sessionId: Type.Optional(Type.String({ description: "acp only: open this exact provider-native session (e.g. an Amp T-ID) instead of creating one" })),
 			executionEnvironment: Type.Optional(Type.String({ description: 'acp only: "local" or "orb". Creating: where the session runs. Opening (Amp only): a verification hint' })),
 			mode: Type.Optional(Type.String({ description: 'acp + amp only, created threads: Amp\'s agent mode (low, medium, high, ultra or a plugin mode), used for every turn. Not with model or sessionId' })),
 		}),
-		async execute(_id, params, signal, onUpdate, ctx) {
+		async execute(_id, params, _signal, onUpdate, ctx) {
 			const start = validateStartInput(params as Record<string, unknown>);
 			if (!start.ok) return failed(new DelegateError(start.error.code, start.error.message, start.error.field));
 			if (start.value.backend === "acp") {
@@ -1431,10 +1433,6 @@ export default function (pi: ExtensionAPI) {
 					// A created session works where the parent does unless told otherwise; an opened one keeps its native workspace.
 					const cwd = input.cwd !== undefined ? realpathSync(input.cwd) : input.origin === "created" ? realpathSync(ctx.cwd) : undefined;
 					const v = await acp.start({ ...input, ...(cwd !== undefined ? { cwd } : {}) });
-					if (input.sync && v.status === "running") {
-						const outcome = await acp.wait({ runIds: [v.id], mode: "all" }, signal);
-						return acpRunResult(outcome.settled[0] ?? await acp.result(v.id));
-					}
 					return { content: [{ type: "text", text: acpStartText(v) }], details: v };
 				} catch (error) {
 					const details = error instanceof DelegateError && error.runId ? await acp.result(error.runId).catch(() => undefined) : undefined;
@@ -1466,8 +1464,6 @@ export default function (pi: ExtensionAPI) {
 			const systemPrompt = role.systemPrompt + (role.systemPrompt.includes("STATUS:") ? "" : CONTRACT_FOOTER) + (context === "fork" ? FORK_FOOTER : "");
 			const loader = new DefaultResourceLoader({ cwd, agentDir: AGENT_DIR, systemPrompt,
 				noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true });
-			await loader.reload();
-			requireOwner(); // Setup may have yielded through a parent session replacement.
 			if (isWriter) {
 				const clash = [...runs.values()].find((r) => !r.completion.settled && r.writer && r.cwd === cwd);
 				if (clash) return { content: [{ type: "text", text: `refused: ${clash.id} (${clash.role}) is already writing in ${cwd}. One writer per tree — wait, cancel it, or give this child its own cwd/worktree.` }], isError: true, details: undefined };
@@ -1486,7 +1482,7 @@ export default function (pi: ExtensionAPI) {
 			const run: Run = {
 				id, ownerKey: owner.key, recordPath: join(dir, `${encodeURIComponent(id)}.json`),
 				segment: 1, stopped: false, acknowledged: false,
-				systemPrompt, contextFiles: loader.getAgentsFiles().agentsFiles, appendSystemPrompt: loader.getAppendSystemPrompt(),
+				systemPrompt, contextFiles: [], appendSystemPrompt: [],
 				tools, timeoutMs,
 				sessionFile, sessionId: manager.getSessionId(),
 				completion: new RunCompletion<RunResult>(),
@@ -1506,7 +1502,7 @@ export default function (pi: ExtensionAPI) {
 				output: "",
 				startIdx: inherited.length,
 				forkedMessages: context === "fork" ? inherited.length : undefined,
-				writer: isWriter, syncJoined: p.sync === true,
+				writer: isWriter,
 				providerRetryMs: 0,
 				toolCalls: [],
 				activeTools: new Map(),
@@ -1519,16 +1515,17 @@ export default function (pi: ExtensionAPI) {
 			runs.set(run.id, run);
 			changed();
 			const completion = run.completion;
-			if (p.sync) syncLaunches.set(_id, run.id);
-			const work = launch(run, p.task, p.sync ? signal : undefined, onUpdate, loader);
-
-			if (!p.sync) {
-				void work.then(() => publish(completion));
-				return { content: [{ type: "text", text: `${run.id} running (${run.context}, ${run.model}). Completion will wake you; use delegate_ctl wait with this runId when dependent work needs the result.` }], details: recordedView(run) };
-			}
-
-			await work;
-			return completion.result;
+			// Preparation starts after the run is durable. A slow settings/package scan must not
+			// turn an asynchronous delegate call into a blocked parent turn.
+			run.preparing = Promise.resolve().then(() => loader.reload()).then(() => {
+				requireOwner();
+				run.contextFiles = loader.getAgentsFiles().agentsFiles;
+				run.appendSystemPrompt = loader.getAppendSystemPrompt();
+				saveRun(run);
+				changed();
+			});
+			void launch(run, p.task, onUpdate, loader).then(() => publish(completion));
+			return { content: [{ type: "text", text: `${run.id} running (${run.context}, ${run.model}). Completion will wake you; use delegate_ctl wait with this runId when dependent work needs the result.` }], details: recordedView(run) };
 		},
 	});
 

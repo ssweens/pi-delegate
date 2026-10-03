@@ -15,6 +15,7 @@ export interface Reply {
 	text?: string;
 	after?: string;
 	tool?: { name: string; arguments: Record<string, unknown> };
+	tools?: { name: string; arguments: Record<string, unknown> }[];
 	gate?: ReturnType<typeof deferred<void>>;
 	error?: number;
 }
@@ -44,8 +45,9 @@ export async function provider() {
 			if (reply.gate) await Promise.race([reply.gate.promise, once(res, "close")]);
 			if (res.destroyed) return;
 			if (reply.after) chunk({ content: reply.after });
-			if (reply.tool) chunk({ tool_calls: [{ index: 0, id: `call-${requests.length}`, type: "function", function: { name: reply.tool.name, arguments: JSON.stringify(reply.tool.arguments) } }] });
-			chunk({}, reply.tool ? "tool_calls" : "stop");
+			const tools = reply.tools ?? (reply.tool ? [reply.tool] : []);
+			if (tools.length) chunk({ tool_calls: tools.map((tool, index) => ({ index, id: `call-${requests.length}${index ? `-${index}` : ""}`, type: "function", function: { name: tool.name, arguments: JSON.stringify(tool.arguments) } })) });
+			chunk({}, tools.length ? "tool_calls" : "stop");
 			res.end("data: [DONE]\n\n");
 		} catch (error) { errors.push(String(error)); res.writeHead(500); res.end(String(error)); }
 	});
@@ -68,7 +70,7 @@ export function sandbox(url: string, root = mkdtempSync(join(tmpdir(), "pi-deleg
 }
 export type Sandbox = ReturnType<typeof sandbox>;
 
-export async function harness(box: Sandbox, parent?: string, hooks: { beforeNotice?: (message: any) => void; register?: (pi: any) => void } = {}) {
+export async function harness(box: Sandbox, parent?: string, hooks: { beforeNotice?: (message: any) => void; register?: (pi: any) => void; tools?: string[] } = {}) {
 	// Import after isolation: Pi and the extension resolve configuration paths on first load.
 	process.env.HOME = box.root;
 	process.env.PI_CODING_AGENT_DIR = box.agentDir;
@@ -105,7 +107,7 @@ export async function harness(box: Sandbox, parent?: string, hooks: { beforeNoti
 			noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
 			systemPrompt: "Deterministic verification parent.", extensionFactories: [factory],
 		} });
-		const result = await sdk.createAgentSessionFromServices({ services, sessionManager: options.sessionManager, sessionStartEvent: options.sessionStartEvent, model, thinkingLevel: "off", tools: ["delegate", "delegate_ctl"] });
+		const result = await sdk.createAgentSessionFromServices({ services, sessionManager: options.sessionManager, sessionStartEvent: options.sessionStartEvent, model, thinkingLevel: "off", tools: hooks.tools ?? ["delegate", "delegate_ctl"] });
 		return { ...result, services, diagnostics: services.diagnostics };
 	}, { cwd: box.cwd, agentDir: box.agentDir, sessionManager: manager });
 	await runtime.session.bindExtensions({ onError: (error) => errors.push(error) });
@@ -117,8 +119,12 @@ export async function harness(box: Sandbox, parent?: string, hooks: { beforeNoti
 		return result;
 	};
 	const ctl = (action: string, runId?: string, extra: any = {}, signal?: AbortSignal) => raw("delegate_ctl", { action, runId, ...extra }, signal);
-	return { sdk, runtime, errors, notices, notice, commands, parent: manager.getSessionFile()!, ctl, ctx: () => ctx,
-		launch: (task: string, extra: any = {}) => raw("delegate", { role: "scout", context: "fresh", task, cwd: box.cwd, model: "fixture/fixture:off", ...extra }),
+	const launch = (task: string, extra: any = {}) => raw("delegate", { role: "scout", context: "fresh", task, cwd: box.cwd, model: "fixture/fixture:off", ...extra });
+	const waitLaunch = async (task: string, extra: any = {}) => {
+		const started = await launch(task, extra);
+		return started.details?.id ? ctl("wait", started.details.id) : started;
+	};
+	return { sdk, runtime, errors, notices, notice, commands, parent: manager.getSessionFile()!, ctl, ctx: () => ctx, launch, waitLaunch,
 		state: () => (globalThis as any)[Symbol.for("@ssweens/pi-delegate/runtime/1")],
 	};
 }

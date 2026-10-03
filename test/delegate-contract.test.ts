@@ -103,7 +103,7 @@ test("the delegate contract, by backend, origin and agent, through delegate and 
 	};
 	try {
 		const rows: { name: string; start: () => Promise<any>; report: (details: any) => BackendCapabilities }[] = [
-			{ name: "pi", start: () => h.launch("pi matrix", { sync: true }), report: () => PI_CAPABILITIES },
+			{ name: "pi", start: () => h.waitLaunch("pi matrix"), report: () => PI_CAPABILITIES },
 			{ name: "acp created (pi)", start: () => delegate({ backend: "acp", agent: "pi", task: "hello", cwd }), report: () => acpCapabilities({ origin: "created", agent: "pi" }) },
 			{ name: "acp created (amp)", start: () => delegate({ backend: "acp", agent: "amp", task: "hello", cwd, executionEnvironment: "local" }), report: () => acpCapabilities({ origin: "created", agent: "amp" }) },
 			{ name: "acp opened (pi)", start: () => delegate({ backend: "acp", agent: "pi", sessionId: "pi-matrix", task: "hello" }), report: () => acpCapabilities({ origin: "opened", agent: "pi" }) },
@@ -148,7 +148,7 @@ test("the delegate contract, by backend, origin and agent, through delegate and 
 				FIELD_REQUIRES_AMP: () => delegate({ backend: "acp", agent: "pi", task: "x", mode: "high" }),
 				OPEN_OVERRIDE_FORBIDDEN: () => delegate({ backend: "acp", agent: "amp", sessionId: "T-codes", model: "high" }),
 				INPUT_INVALID: () => delegate({ backend: "acp", task: "x" }),
-				ACTION_UNSUPPORTED: async () => h.ctl("close", (await h.launch("pi codes", { sync: true })).details.id),
+				ACTION_UNSUPPORTED: async () => h.ctl("close", (await h.waitLaunch("pi codes")).details.id),
 			};
 			for (const [code, call] of Object.entries(reach)) {
 				const result = await call();

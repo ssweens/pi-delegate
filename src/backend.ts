@@ -39,7 +39,6 @@ interface CommonStartInput {
 	cwd?: string;
 	/** Per-turn budget. On acp this is the request timeout of each turn. */
 	timeoutMs?: number;
-	sync?: boolean;
 	reason?: string;
 }
 
@@ -421,10 +420,7 @@ function commonFields(raw: Record<string, unknown>): Validated<CommonStartInput>
 		if (typeof raw.timeoutMs !== "number" || !Number.isFinite(raw.timeoutMs) || raw.timeoutMs <= 0) return fail("INPUT_INVALID", "timeoutMs must be a positive number", "timeoutMs");
 		out.timeoutMs = raw.timeoutMs;
 	}
-	if (raw.sync !== undefined) {
-		if (typeof raw.sync !== "boolean") return fail("INPUT_INVALID", "sync must be a boolean", "sync");
-		out.sync = raw.sync;
-	}
+	if (raw.sync !== undefined) return fail("INPUT_INVALID", "delegate always launches in the background; remove sync", "sync");
 	if (raw.reason !== undefined) {
 		if (typeof raw.reason !== "string") return fail("INPUT_INVALID", "reason must be a string", "reason");
 		out.reason = raw.reason;

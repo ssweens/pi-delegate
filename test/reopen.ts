@@ -12,7 +12,7 @@ try {
 		const theirs = [...h.state().runs.values()] as any[];
 		assert(theirs.length > 0 && theirs.every((run) => run.foreign), "the live parent's runs are foreign here");
 		for (const run of theirs) await assert.rejects(h.ctl("steer", run.id, { message: "Not mine" }), /owned by another live Pi process/);
-		const { details: { id } } = await h.launch("Shared child", { sync: true });
+		const { details: { id } } = await h.waitLaunch("Shared child");
 		assert.equal(h.state().runs.get(id).status, "complete");
 		assert.equal(h.state().runs.get(id).foreign, undefined);
 		console.log("SHARED-PARENT-OK");
