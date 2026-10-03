@@ -49,6 +49,17 @@ test("acpx fixture preserves session context across turns and runtime reconnect"
   await replacement.close({ handle: resumed, reason: "done", discardPersistentState: true });
 });
 
+test("acpx fixture exposes native model choices and selects through session/set_model", async () => {
+  const { runtime } = await runtimeHarness();
+  const handle = await runtime.ensureSession({ sessionKey: "models", agent: "fixture", mode: "persistent", cwd: process.cwd() });
+  const before = await runtime.getStatus({ handle });
+  assert.deepEqual(before.models, { currentModelId: "fixture-default", availableModelIds: ["fixture-default", "fixture-fast"] });
+  await runtime.setModel?.({ handle, model: "fixture-fast" });
+  const after = await runtime.getStatus({ handle });
+  assert.equal(after.models?.currentModelId, "fixture-fast");
+  await runtime.close({ handle, reason: "done", discardPersistentState: true });
+});
+
 test("acpx fixture cancellation settles a blocked turn as cancelled", async () => {
   const { runtime } = await runtimeHarness();
   const handle = await runtime.ensureSession({ sessionKey: "cancel", agent: "fixture", mode: "persistent", cwd: process.cwd() });

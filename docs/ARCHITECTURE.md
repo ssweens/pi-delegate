@@ -38,11 +38,11 @@ Responses carry `ok`, `action` and structured details. Errors carry a stable cod
 
 ### `status`
 
-The Coordinator reports origin, native identity and capabilities when opened, and advertised model IDs. Created-worker model discovery needs ACPX `getStatus`; unsupported discovery fails `MODEL_DISCOVERY_UNSUPPORTED`. `delegate_ctl` status/result for one ACP run show it as a `models:` line: one Coordinator `status` per call, bounded at 3 s, never on render; unsupported, failed or slow discovery reads `models: unknown`, and an opened session shows only its current model. On Claude, Codex and Amp, whose own IDs have no slash, a `model` with `/` is a pi `provider/id` and fails `INPUT_INVALID`; pi-acp (`provider/id`), OpenCode (`provider/model`) and the other agents pass it through. On an opened Amp run, `status` or `result` with `observe: true` reads the thread: one `amp threads export` per call, returning only messages after the persisted cursor (todo 044). A plain status never exports.
+The Coordinator reports origin, native identity and model choices when opened or inspected. Native ACP `configOptions` are parsed into model IDs, labels and descriptions. When an adapter omits discovery, a maintained catalog covers Claude aliases, known Codex IDs and Amp modes; the response marks it `source: fallback`, and provider rejection remains an explicit selection failure. `delegate_ctl models` without a run ID keeps the global pi offering catalog; with an ACP `runId` it returns the detailed per-agent catalog. One-run `status`/`result` show a compact `models:` line, one bounded Coordinator status read per call, never on render. Unsupported, failed or slow discovery on an agent without a fallback reads `models: unknown`; an opened session shows only its current model. On Claude, Codex and Amp, whose own IDs have no slash, a `model` with `/` is a pi `provider/id` and fails `INPUT_INVALID`; pi-acp (`provider/id`), OpenCode (`provider/model`) and the other agents pass it through. On an opened Amp run, `status` or `result` with `observe: true` reads the thread: one `amp threads export` per call, returning only messages after the persisted cursor (todo 044). A plain status never exports.
 
 ### `send`
 
-`prompt` is required; the backend passes `task` or the steer `message`. An optional `model` is checked against live discovery and selected before the turn; unavailable IDs and unsupported discovery or selection fail explicitly. The selected `requestedModel` is kept in request provenance. `send` is accepted only for an idle worker and starts exactly one prompt turn. A later `send` after terminal completion continues the same persistent session. A second prompt is never submitted while a turn is active.
+`prompt` is required; the backend passes `task` or the steer `message`. An optional `model` is checked against the native or maintained catalog and selected before the turn through ACP's model control; unavailable IDs and provider selection failures fail explicitly. The selected `requestedModel` is kept in request provenance. `send` is accepted only for an idle worker and starts exactly one prompt turn. A later `send` after terminal completion continues the same persistent session. A second prompt is never submitted while a turn is active.
 
 The Coordinator starts ACPX turns with timeout `0` and runs the turn deadline itself. On a created session's deadline it records `timed_out` (`TURN_TIMEOUT`), gates late output, attempts cooperative cancellation, closes the stream and runtime within bounded grace, and marks the worker failed and unusable until closed. On an opened session the deadline only stops local observation; the native turn keeps running.
 
@@ -164,12 +164,12 @@ The vendored Pi and Amp adapters are ACP executable adapters, not second runtime
 
 ## 8. Observability and failure table
 
-Coordinator `status` exposes live model discovery (`currentModelId`, `availableModelIds`); its `list` and `result` expose worker/request status, IDs, timestamps, bounded output, event paths, model provenance, and diagnostics. Raw ACP tool payloads are not retained by the runtime facade. tmux is optional human observation only.
+Coordinator `status` exposes model discovery (`currentModelId`, `availableModelIds`, and native/fallback option metadata); its `list` and `result` expose worker/request status, IDs, timestamps, bounded output, event paths, model provenance, and diagnostics. `delegate_ctl models runId` is the detailed per-agent catalog; raw ACP tool payloads are not retained by the runtime facade. tmux is optional human observation only.
 
 | Failure | Required behavior |
 |---|---|
 | Missing/invalid agent | Spawn fails without registering a worker |
-| Model discovery unsupported | Coordinator `status` or a requested model fails explicitly with `MODEL_DISCOVERY_UNSUPPORTED` |
+| Model discovery unsupported | Coordinator uses a maintained per-agent fallback when available; otherwise `status` or a requested model fails explicitly with `MODEL_DISCOVERY_UNSUPPORTED` |
 | Model unavailable | Spawn/send fails explicitly with `MODEL_UNAVAILABLE`; no turn starts |
 | Model selection unsupported/fails | Requested spawn/send fails explicitly with `MODEL_SELECTION_UNSUPPORTED` or `MODEL_SELECTION_FAILED` |
 | Provider error (retryable) | Request retries on fallback model if configured; otherwise `failed` with provider diagnostic |

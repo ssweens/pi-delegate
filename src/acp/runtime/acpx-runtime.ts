@@ -4,6 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { AcpxRuntime, createAgentRegistry, createFileSessionStore, type AcpRuntimeEvent, type AcpRuntimeHandle, type NativeSessionBinding, type NativeSessionDescription } from "../../../dist/acpx-runtime/runtime.js";
 import type { NormalizedEvent, Profile, RuntimeHandle, RuntimePort, RuntimeStatus, RuntimeTerminal, RuntimeTurn, TurnUsage } from "../domain/types.js";
+import { nativeModelOptions, optionIds } from "../model-catalog.js";
 import { StringsError } from "../domain/errors.js";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -69,6 +70,7 @@ export function acpAgentNames(overrides: AgentOverrides = {}): string[] {
 export class AcpxRuntimePort implements RuntimePort {
   private readonly runtime: AcpxRuntime;
   private readonly sessionStore: ReturnType<typeof createFileSessionStore>;
+  private openedNative?: NativeSessionDescription;
 
   constructor(cwd: string, private readonly stateDir: string, profile: Profile, private readonly origin: "created" | "opened" = "created", agentOverrides: AgentOverrides = {}) {
     const piAdapterArgv = origin === "opened"
@@ -135,6 +137,7 @@ export class AcpxRuntimePort implements RuntimePort {
       await this.runtime.disconnect({ handle });
       throw new Error("Runtime did not verify the requested native identity.");
     }
+    this.openedNative = input.native;
     return toHandle(handle);
   }
 
@@ -215,18 +218,37 @@ export class AcpxRuntimePort implements RuntimePort {
   }
 
   async getStatus(handle: RuntimeHandle): Promise<RuntimeStatus> {
-    if (this.origin === "opened") return { modelDiscoverySupported: false, availableModelIds: [] };
+    if (this.origin === "opened") {
+      return {
+        modelDiscoverySupported: this.openedNative?.model !== undefined,
+        ...(this.openedNative?.model ? { currentModelId: this.openedNative.model } : {}),
+        availableModelIds: [],
+        ...(this.openedNative ? { native: this.openedNative } : {}),
+      };
+    }
     const status = await this.runtime.getStatus({ handle: fromHandle(handle) });
     const native = nativeDescriptionFromBinding(status.nativeSession);
-    if (!status.models) return { modelDiscoverySupported: false, availableModelIds: [], ...(native ? { native } : {}) };
-    const configOptions = status.details?.configOptions as Array<{ id: string; category?: string }> | undefined;
-    const modelConfigId = configOptions?.find(option => option.category === "model")?.id;
+    const configOptions = status.details?.configOptions;
+    const nativeModels = nativeModelOptions(configOptions);
+    const reportedCurrent = status.models?.currentModelId?.trim();
+    const currentModelId = reportedCurrent && reportedCurrent.toLowerCase() !== "unknown" ? reportedCurrent : nativeModels?.current;
+    const availableModelIds = status.models?.availableModelIds?.length ? status.models.availableModelIds : optionIds(nativeModels?.options ?? []);
+    if (!nativeModels && !status.models?.availableModelIds.length) {
+      return {
+        modelDiscoverySupported: false,
+        ...(status.models?.currentModelId ? { currentModelId: status.models.currentModelId } : {}),
+        availableModelIds: [],
+        ...(native ? { native } : {}),
+      };
+    }
     return {
-      ...(modelConfigId ? { modelConfigId } : {}),
+      ...(nativeModels?.configId ? { modelConfigId: nativeModels.configId } : {}),
       modelDiscoverySupported: true,
+      modelSource: "native",
       ...(native ? { native } : {}),
-      ...(status.models.currentModelId ? { currentModelId: status.models.currentModelId } : {}),
-      availableModelIds: [...status.models.availableModelIds],
+      ...(currentModelId ? { currentModelId } : {}),
+      availableModelIds: [...availableModelIds],
+      ...(nativeModels?.options ? { modelOptions: nativeModels.options } : {}),
     };
   }
 
@@ -251,6 +273,11 @@ export class AcpxRuntimePort implements RuntimePort {
       cancel: (reason) => turn.cancel(reason ? { reason } : undefined),
       closeStream: (reason) => turn.closeStream(reason ? { reason } : undefined),
     };
+  }
+
+  async setModel(input: { handle: RuntimeHandle; model: string }): Promise<void> {
+    if (!this.runtime.setModel) throw new StringsError("MODEL_SELECTION_UNSUPPORTED", "The ACP runtime does not support model selection.");
+    await this.runtime.setModel({ handle: fromHandle(input.handle), model: input.model });
   }
 
   async setConfigOption(input: { handle: RuntimeHandle; key: string; value: string }): Promise<void> {

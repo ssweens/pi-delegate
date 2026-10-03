@@ -22,7 +22,7 @@ import { AgentHistory, AgentsPanel, ChildView, type LiveSource } from "./inspect
 import type { ActiveTool, ChildActivity } from "./transcript.js";
 import { type AAIndices, acpRowView, asRunView, elapsed, empty, framed, type LiveFacts, type ModelRow, type ModelsDetails, resultLines, resultView, type RunView } from "./render.js";
 import { type AcpRunView, type LifecycleAction, type PiStartInput, type WaitOutcome, PI_CAPABILITIES, requireAction, validateStartInput, validateSteer } from "./backend.js";
-import { AcpBackend, acpResultText, acpStatusText, acpSummary, DelegateError, sessionLabel, unwrap } from "./acp-backend.js";
+import { AcpBackend, acpModelsText, acpResultText, acpStatusText, acpSummary, DelegateError, sessionLabel, unwrap } from "./acp-backend.js";
 import { shutdownAcpCoordinator } from "./acp/instance.js";
 import { loadRoles } from "./roles.js";
 import { installTodo } from "./todo-ext.js";
@@ -1587,7 +1587,7 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 		renderResult: resultRenderer("delegate_ctl"),
 		label: "Delegate control",
 		description:
-			"Before using this tool, read skills/delegation/SKILL.md if you have not read it in this session. models: every offering across all enabled providers, verbatim from the registry (provider/id, reasoning, context, $/M), plus live OpenRouter pricing, tiered rates, expirations and Artificial Analysis indices, your cached ratings, approved defaults and drift \u2014 call before the first delegate of a session. deals: read-only OpenRouter promotion and price/quality shortlist for frontier and light work; does not choose or approve a model. " +
+			"Before using this tool, read skills/delegation/SKILL.md if you have not read it in this session. models without runId: every offering across all enabled providers, verbatim from the registry (provider/id, reasoning, context, $/M), plus live OpenRouter pricing, tiered rates, expirations and Artificial Analysis indices, your cached ratings, approved defaults and drift \u2014 call before the first delegate of a session. models with an ACP runId list that agent's current model and selectable native/fallback IDs with labels and descriptions. One-run status/result show the same catalog compactly. deals: read-only OpenRouter promotion and price/quality shortlist for frontier and light work; does not choose or approve a model. " +
 			"rate: store quality ratings you researched, per exact offering (provider/id), so choices are grounded; stale after 14 days. approve: record a role's default model after the user agreed in conversation. " +
 			"roles: list roles. status: one run or all \u2014 a nonblocking progress read: status, current tool, tool calls so far, elapsed, remaining time budget. result: current report without waiting. wait: join an existing runId; returns its final report, immediately if finished. If queued messages arrive while waiting it returns early with the child still running — answer them, then wait again to rejoin. If the child stops without reporting completion it returns an error report instead of blocking until the run budget. Cancelling wait only detaches; the child keeps running. An attached waiter receives completion instead of a separate wake-up. steer: queue a correction or resume a finished child in the background, keeping its context; returns immediately. Use wait to join the resumed work. Saved children are restored on parent reopen without running; steer revives them with their original configuration unless you pass model:, which moves that child to another offering from the next segment on \u2014 propose it in conversation first, including when the saved offering is exhausted or gone. Explicitly stopped children require restart:true and the user's request. cancel: stop the child and prevent automatic revival. " +
 			"wait with runIds and mode any|all joins several runs of either backend at once; timeoutMs only ends that wait, never the runs. " +
@@ -1606,7 +1606,7 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 			discardPersistentState: Type.Optional(Type.Boolean({ description: "close, created acp sessions only: do not keep the session resumable" })),
 			restart: Type.Optional(Type.Boolean({ description: "steer only: restart an explicitly stopped child, only when the user requested it" })),
 			timeoutMs: Type.Optional(Type.Number({ description: "steer: give the child this time budget instead of its saved one \u2014 re-armed at once on a running child, applied to the next segment of an inactive one. wait with runIds, or on an acp run: stop waiting after this many ms; the runs keep going" })),
-			message: Type.Optional(Type.String({ description: "steer: the correction. models/deals: substring filter. approve: one-line reason the user agreed to" })),
+			message: Type.Optional(Type.String({ description: "steer: the correction. global models/deals: substring filter. approve: one-line reason the user agreed to" })),
 			ratings: Type.Optional(
 				Type.Array(
 					Type.Object({
@@ -1640,6 +1640,25 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 				} catch (e) {
 					return { content: [{ type: "text", text: String(e) }], details: undefined, isError: true };
 				}
+			}
+			if (p.action === "models" && p.runId) {
+				const owner = requireOwner();
+				const target = acp.find(p.runId, owner.key);
+				if (!target) return failed(new DelegateError("RUN_NOT_FOUND", `unknown ACP runId ${p.runId}`, "runId"));
+				const models = await acp.models(p.runId);
+				if (!models) return failed(new DelegateError("MODEL_DISCOVERY_UNSUPPORTED", `${p.runId} has no live ACP session to inspect.`, "runId"));
+				const run = (await acp.status([p.runId]))[0]!;
+				const rows = models.options?.length
+					? models.options.map((option) => `  ${option.id}  ${option.name}${option.description ? ` — ${option.description}` : ""}${option.id === models.current ? "  * current" : ""}`)
+					: (models.available ?? []).map((id) => `  ${id}${id === models.current ? "  * current" : ""}`);
+				const text = [
+					`${p.runId} ACP model catalog`,
+					`agent: ${run.session.agent}`,
+					acpModelsText(models),
+					models.source ? `source: ${models.source}` : "",
+					...rows,
+				].filter(Boolean).join("\n");
+				return { content: [{ type: "text", text }], details: { kind: "acp-models", runId: p.runId, agent: run.session.agent, ...models } };
 			}
 			if (p.action === "models") {
 				const all: any[] = (ctx.modelRegistry as any).getAvailable();

@@ -13,13 +13,15 @@ import { acpRowView, resultLines, runLine } from "../src/render.ts";
 import { provider, sandbox, harness } from "./fixture.ts";
 
 const CODEX_MODELS = ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"];
+const CLAUDE_FALLBACK_MODELS = ["default", "best", "fable", "opus", "opus[1m]", "sonnet", "sonnet[1m]", "haiku", "opusplan"];
+const NATIVE_OPTIONS = CODEX_MODELS.map((id) => ({ id, name: id === "gpt-5.5" ? "GPT-5.5" : id, description: `native ${id}` }));
 const theme: any = { fg: (_color: string, text: string) => text, bold: (text: string) => text, italic: (text: string) => text, bg: (_color: string, text: string) => text };
 
-/** codex: discovery on gpt-5.5. claude: no discovery. slow: answers after the bound. Opened sessions report their current model. */
+/** codex: native discovery on gpt-5.5. claude: fallback catalog. slow: answers after the bound. Opened sessions report their current model. */
 function modelRuntime(native: NativeSessionDescription) {
 	const calls = { status: [] as string[] };
 	const port = (agent: string, opened: boolean): RuntimePort => {
-		let current = "gpt-5.5";
+		let current: string | undefined = agent === "claude" ? undefined : "gpt-5.5";
 		return {
 			async ensureSession(input) { return { sessionKey: `fake:${input.name}`, backend: "fake", runtimeSessionName: input.name, backendSessionId: `sess-${input.name}` }; },
 			async describeNativeSession() { return { ...native }; },
@@ -35,7 +37,8 @@ function modelRuntime(native: NativeSessionDescription) {
 			async getStatus(): Promise<RuntimeStatus> {
 				calls.status.push(agent);
 				if (opened) return { modelDiscoverySupported: false, currentModelId: "high", availableModelIds: [] };
-				if (agent === "claude") return { modelDiscoverySupported: false, availableModelIds: [] };
+				if (agent === "claude") return { modelDiscoverySupported: false, ...(current ? { currentModelId: current } : {}), availableModelIds: [] };
+				if (agent === "native") return { modelDiscoverySupported: true, currentModelId: current, availableModelIds: CODEX_MODELS, modelSource: "native", modelOptions: NATIVE_OPTIONS };
 				if (agent === "slow") await new Promise((resolve) => setTimeout(resolve, 4_000));
 				return { modelDiscoverySupported: true, currentModelId: current, availableModelIds: CODEX_MODELS };
 			},
@@ -83,13 +86,32 @@ test("ACP model IDs: status/result for one run read them, bounded; nothing else 
 			assert.doesNotMatch(closed.content[0].text, /models:/, "a closed run has no session to ask");
 		});
 
-		await t.test("an adapter without model discovery shows models unknown, and status still succeeds", async () => {
+		await t.test("native metadata keeps labels and descriptions in the ACP catalog", async () => {
+			const id = (await delegate({ backend: "acp", agent: "native", task: "hello", cwd })).details.id;
+			await h.ctl("wait", id);
+			const catalog = await h.ctl("models", id);
+			assert.equal(catalog.details.source, "native");
+			assert.match(catalog.content[0].text, /gpt-5\.5  GPT-5\.5 — native gpt-5\.5/);
+			await h.ctl("close", id);
+		});
+
+		await t.test("an adapter without model discovery uses the maintained fallback catalog", async () => {
 			const id = (await delegate({ backend: "acp", agent: "claude", task: "hello", cwd })).details.id;
 			await h.ctl("wait", id);
 			const status = await h.ctl("status", id);
 			assert.notEqual(status.isError, true, status.content[0].text);
-			assert.match(status.content[0].text, /\nmodels: unknown(\n|$)/);
-			assert.match(status.details.models.error, /MODEL_DISCOVERY_UNSUPPORTED/);
+			assert.match(status.content[0].text, /\nmodels: current unknown; available default \(Default\)/);
+			assert.match(status.content[0].text, /source fallback/);
+			assert.deepEqual(status.details.models.available, CLAUDE_FALLBACK_MODELS);
+			assert.equal(status.details.models.source, "fallback");
+			assert.equal(status.details.models.options[2].id, "fable");
+			const catalog = await h.ctl("models", id);
+			assert.equal(catalog.details.kind, "acp-models");
+			assert.match(catalog.content[0].text, /fable  Fable — Claude's long-running reasoning alias/);
+			await h.ctl("steer", id, { message: "switch", model: "opus" });
+			await h.ctl("wait", id);
+			const switched = await h.ctl("status", id);
+			assert.match(switched.content[0].text, /models: current opus;/);
 			await h.ctl("close", id);
 		});
 
@@ -110,7 +132,12 @@ test("ACP model IDs: status/result for one run read them, bounded; nothing else 
 			const status = await h.ctl("status", id);
 			assert.match(status.content[0].text, /\nmodels: current high(\n|$)/);
 			assert.doesNotMatch(status.content[0].text, /available/);
-			assert.deepEqual(status.details.models, { current: "high" });
+			assert.deepEqual(status.details.models, { current: "high", options: [
+				{ id: "low", name: "Low", description: "Amp's low-effort mode." },
+				{ id: "medium", name: "Medium", description: "Amp's medium-effort mode." },
+				{ id: "high", name: "High", description: "Amp's high-effort mode." },
+				{ id: "ultra", name: "Ultra", description: "Amp's ultra-effort mode." },
+			], source: "fallback" });
 			assert.equal((await h.ctl("steer", id, { message: "x", model: "low" })).details?.error?.code, "OPEN_OVERRIDE_FORBIDDEN");
 			await h.ctl("close", id);
 		});

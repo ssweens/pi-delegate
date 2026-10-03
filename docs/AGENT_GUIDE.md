@@ -22,7 +22,7 @@ Create a session. `agent` is required. `role` is `read-only` (the default) or `w
 {"backend":"acp","agent":"amp","executionEnvironment":"orb","task":"Profile the build\n…"}
 ```
 
-A new Amp session needs `executionEnvironment` `local` or `orb`. `model`, when given, is the agent's own model ID; unavailable models fail explicitly.
+A new Amp session needs `executionEnvironment` `local` or `orb`. `model`, when given, is the agent's own model ID; unavailable models fail explicitly. Before choosing one, call `delegate_ctl` with `action: "models", runId: "<acp-run>"` after the run exists. The result lists IDs, labels, descriptions, and whether the catalog is native or a maintained fallback. One-run `status` and `result` show the same choices compactly. Claude aliases, Codex IDs, and Amp modes have fallbacks when their adapter omits discovery; the provider remains authoritative when a fallback is selected.
 
 Open an existing native session with `sessionId`. Without a `task` the run is `idle` and sends nothing:
 
@@ -39,7 +39,7 @@ Send a later turn with steer. The current turn must be finished or cancelled fir
 {"action":"steer","runId":"<run id>","message":"Now check the error paths."}
 ```
 
-Steer may pass `timeoutMs` for that turn, and `model` on a created session only. On an opened session your text goes in exactly as written and is never retried.
+Steer may pass `timeoutMs` for that turn, and `model` on a created session only. On an opened session your text goes in exactly as written and is never retried. Selection uses the native ACP model control when advertised, otherwise the agent's supported legacy control; a provider rejection is surfaced, never hidden.
 
 Wait and read results:
 

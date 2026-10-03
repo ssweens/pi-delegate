@@ -808,9 +808,17 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 		if (!response.ok) return { error: `${response.error.code}: ${response.error.message}` };
 		const current = typeof response.details.currentModelId === "string" ? response.details.currentModelId : undefined;
 		const available = Array.isArray(response.details.availableModelIds) ? response.details.availableModelIds.filter((id): id is string => typeof id === "string") : [];
-		if (run.origin === "opened") return current ? { current } : { error: "the opened session does not report its model" };
+		const options = Array.isArray(response.details.modelOptions)
+			? response.details.modelOptions.filter((option): option is NonNullable<AcpModelsView["options"]>[number] => Boolean(option && typeof option === "object" && typeof (option as { id?: unknown }).id === "string" && typeof (option as { name?: unknown }).name === "string"))
+			: undefined;
+		const source = response.details.modelSource === "native" || response.details.modelSource === "fallback" ? response.details.modelSource : undefined;
+		if (run.origin === "opened") {
+			if (!current && !available.length) return { error: "the opened session does not report its model or available choices" };
+			if (current) return { current, ...(options ? { options } : {}), ...(source ? { source } : {}) };
+			return { available, ...(options ? { options } : {}), ...(source ? { source } : {}) };
+		}
 		if (!current && !available.length) return { error: "the adapter reported no model IDs" };
-		return { ...(current ? { current } : {}), available };
+		return { ...(current ? { current } : {}), available, ...(options ? { options } : {}), ...(source ? { source } : {}) };
 	}
 
 	async status(runIds?: readonly string[]): Promise<AcpRunView[]> {
@@ -963,12 +971,18 @@ function turnText(v: AcpRunView): string | undefined {
 	return `turn ${t.requestId}: ${t.status}, delivery ${t.delivery}${t.providerOutcome ? `, provider outcome ${t.providerOutcome}` : ""}${cause}${t.truncated ? ", output truncated" : ""}`;
 }
 
-/** The agent's own model IDs, as one status/result read them. */
-function modelsText(models: AcpModelsView): string {
+/** The agent's own model choices, as one status/result read them. */
+export function acpModelsText(models: AcpModelsView): string {
 	if (!models.current && !models.available?.length) return "models: unknown";
 	if (!models.available) return `models: current ${models.current}`;
-	return `models: current ${models.current ?? "unknown"}; available ${models.available.join(", ") || "none"}`;
+	const labels = models.options?.length
+		? models.options.map((option) => option.name === option.id ? option.id : `${option.id} (${option.name})`).join(", ")
+		: models.available.join(", ");
+	const source = models.source ? `; source ${models.source}` : "";
+	return `models: current ${models.current ?? "unknown"}; available ${labels || "none"}${source}`;
 }
+
+const modelsText = acpModelsText;
 
 export function acpSummary(v: AcpRunView): string {
 	const dur = elapsed((v.endedAt ?? Date.now()) - v.startedAt);

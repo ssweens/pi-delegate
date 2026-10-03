@@ -12,7 +12,7 @@ export { REQUESTED_MODEL_UNSUPPORTED_ERROR_CODE, REQUESTED_MODEL_UNSUPPORTED_REA
 export { decodeAcpxRuntimeHandleState, encodeAcpxRuntimeHandleState, } from "./runtime/public/handle-state.js";
 export const ACPX_BACKEND_ID = "acpx";
 const ACPX_CAPABILITIES = {
-    controls: ["session/set_mode", "session/set_config_option", "session/status"],
+    controls: ["session/set_mode", "session/set_model", "session/set_config_option", "session/status"],
 };
 export function createAgentRegistry(params) {
     const overrides = normalizeRegistryOverrides(params?.overrides);
@@ -192,6 +192,11 @@ export class AcpxRuntime {
         const { handle, state } = this.resolveManagerHandle(input.handle);
         const manager = await this.getManager();
         await manager.setMode(handle, input.mode, state.mode);
+    }
+    async setModel(input) {
+        const { handle, state } = this.resolveManagerHandle(input.handle);
+        const manager = await this.getManager();
+        await manager.setModel(handle, input.model, state.mode);
     }
     async setConfigOption(input) {
         const { handle, state } = this.resolveManagerHandle(input.handle);

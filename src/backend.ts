@@ -12,7 +12,7 @@
  *   delivery and the provider outcome as separate fields. Accepted is not finished.
  * - An action a backend cannot do fails with ACTION_UNSUPPORTED. It never degrades to a different action.
  */
-import type { NativeSessionDescription, RequestRecord, RuntimeHandle, SessionOrigin, UsageCost, WorkerRole } from "./acp/domain/types.js";
+import type { AcpModelOption, AcpModelSource, NativeSessionDescription, RequestRecord, RuntimeHandle, SessionOrigin, UsageCost, WorkerRole } from "./acp/domain/types.js";
 import type { RunView } from "./render.js";
 
 // ---------------------------------------------------------------------------------------------
@@ -233,6 +233,10 @@ export interface AcpModelsView {
 	current?: string;
 	/** Created sessions only: the IDs steer `model` can switch to. */
 	available?: string[];
+	/** Labels and descriptions for the available IDs, when the adapter or fallback catalog has them. */
+	options?: AcpModelOption[];
+	/** Whether the choices came from ACP metadata or a maintained agent catalog. */
+	source?: AcpModelSource;
 	error?: string;
 }
 

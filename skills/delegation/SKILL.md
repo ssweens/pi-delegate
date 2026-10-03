@@ -80,9 +80,9 @@ Rules that differ from pi:
 - After the parent restarts, ACP runs are parked: `status`, `result` and `wait` read their records, and `steer` reopens them. A created run whose adapter cannot resume fails `RUN_NOT_RESUMABLE`; tell the user and start a new run rather than retrying.
 
 ### Choosing between a pi child and an ACP agent
-Model research, ratings and approval (`models`, `rate`, `approve`) cover pi offerings only. For ACP you choose an agent, not an offering. Use one when the user names it, or when its own harness or subscription is the point. Then `model` is that agent's own model ID, never a pi `provider/id`; on Claude, Codex and Amp a `provider/id` fails `INPUT_INVALID`.
+Model research, ratings and approval (`models` without `runId`, `rate`, `approve`) cover pi offerings only. `models` with an ACP `runId` lists that agent's own selectable IDs, labels and descriptions. For ACP you choose an agent, not a pi offering. Use one when the user names it, or when its own harness or subscription is the point. Then `model` is that agent's own model ID, never a pi `provider/id`; on Claude, Codex and Amp a `provider/id` fails `INPUT_INVALID`.
 
-To see an agent's models, start without `model` and read `delegate_ctl status` for the run. Its `models:` line gives the current and available IDs, or `unknown`. Then `steer` with `model` to switch. Or ask the user. An opened session shows only its current model and keeps it.
+To see an agent's models, start without `model`, then call `delegate_ctl {"action":"models","runId":"<run>"}`. It lists native ACP choices when advertised, or a maintained Claude/Codex/Amp fallback catalog with `source: fallback`; status/result also show a compact `models:` line. Then `steer` with `model` to switch. The provider can still reject a fallback ID. An opened session keeps its native settings and never accepts a model override.
 
 ACP is worth it when the agent's harness, billing, location or audience is the point, not just its model:
 

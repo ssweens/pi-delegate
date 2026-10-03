@@ -16,7 +16,7 @@ import { buildAgentSpawnOptions, readEnvCredential, resolveConfiguredAuthCredent
 import { asAbsoluteCwd, isoNow, isChildProcessRunning, requireAgentStdio, resolveAgentCommandParts, resolveAgentSessionCwd, waitForChildExit, waitForSpawn, } from "./client-process.js";
 import { extractAcpError } from "./error-shapes.js";
 import { isAcpMessageObject, isSessionUpdateNotification } from "./jsonrpc.js";
-import { modelStateFromConfigOptions, modelStateFromSessionResponse, RequestedModelUnsupportedError, resolveRequestedModelId, } from "./model-support.js";
+import { modelStateFromConfigOptions, modelStateFromSessionResponse, RequestedModelUnsupportedError, resolveRequestedModelId, supportsLegacyClaudeCodeModelMetadata, } from "./model-support.js";
 import { formatSessionControlAcpSummary, maybeWrapSessionControlError, } from "./session-control-errors.js";
 import { TerminalManager } from "./terminal-manager.js";
 export { buildSpawnCommandOptions };
@@ -592,7 +592,7 @@ export class AcpClient {
         this.loadedSessionId = result.sessionId;
         const configOptions = normalizeResponseConfigOptions(result);
         const models = modelStateFromSessionResponse({ configOptions, response: result });
-        this.rememberSessionModels(result.sessionId, models);
+        this.rememberSessionModelsForAgent(result.sessionId, models);
         return {
             sessionId: result.sessionId,
             agentSessionId: extractRuntimeSessionId(result._meta),
@@ -818,6 +818,20 @@ export class AcpClient {
         }
         return this.legacyModelSessionIds.has(sessionId) ? { kind: "legacy_set_model" } : undefined;
     }
+    rememberSessionModelsForAgent(sessionId, models) {
+        if (models) {
+            this.rememberSessionModels(sessionId, models);
+            return;
+        }
+        // Claude ACP accepts its documented model aliases through session/set_model
+        // even when older adapters omit both configOptions and legacy models metadata.
+        if (supportsLegacyClaudeCodeModelMetadata(this.options.agentCommand)) {
+            this.modelConfigIds.delete(sessionId);
+            this.legacyModelSessionIds.add(sessionId);
+            return;
+        }
+        this.rememberSessionModels(sessionId, undefined);
+    }
     rememberSessionModels(sessionId, models) {
         if (!models) {
             this.modelConfigIds.delete(sessionId);
@@ -836,6 +850,10 @@ export class AcpClient {
         const explicitConfigRemoval = result.configOptionsPresent && this.modelConfigIds.has(sessionId);
         if (result.models || result.legacyModelMetadataPresent || explicitConfigRemoval) {
             this.rememberSessionModels(sessionId, result.models);
+        }
+        else if (supportsLegacyClaudeCodeModelMetadata(this.options.agentCommand)) {
+            this.modelConfigIds.delete(sessionId);
+            this.legacyModelSessionIds.add(sessionId);
         }
     }
     async cancel(sessionId) {

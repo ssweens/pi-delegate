@@ -291,7 +291,10 @@ function statusSummary(record: SessionRecord): string {
 
 function buildModelsField(record: SessionRecord): { models?: AcpRuntimeSessionModels } {
   const available = record.acpx?.available_models;
-  const currentModelId = record.acpx?.current_model_id;
+  // A model passed at session creation is persisted even when the adapter has no
+  // discovery metadata (Claude ACP). It is the runtime's current selection unless
+  // a later provider response recorded a more authoritative value.
+  const currentModelId = record.acpx?.current_model_id ?? record.acpx?.session_options?.model;
   if (!available || available.length === 0) {
     return currentModelId === undefined
       ? {}
@@ -1392,6 +1395,36 @@ export class AcpRuntimeManager {
     }
     setDesiredModeId(targetRecord, mode);
     await this.options.sessionStore.save(targetRecord);
+  }
+
+  async setModel(
+    handle: AcpRuntimeHandle,
+    model: string,
+    sessionMode: "persistent" | "oneshot" = "persistent",
+  ): Promise<void> {
+    const record = await this.requireRecord(handle.acpxRecordId ?? handle.sessionKey);
+    const controller = this.activeControllers.get(record.acpxRecordId);
+    if (controller) {
+      const response = await controller.setSessionModel(model);
+      applyConfigOptionsToRecord(record, response);
+      setDesiredModelId(record, model, modelStateFromConfigOptions(record.acpx?.config_options)?.configId);
+      setCurrentModelId(record, currentModelIdFromSetModelResponse(response, model));
+      await this.options.sessionStore.save(record);
+      return;
+    }
+
+    const result = await this.withRuntimeControlSession(
+      record,
+      sessionMode,
+      async ({ client, sessionId, record: connectedRecord }) => {
+        const models = advertisedModelState(connectedRecord.acpx);
+        const response = await client.setSessionModel(sessionId, model, models);
+        applyConfigOptionsToRecord(connectedRecord, response);
+        setDesiredModelId(connectedRecord, model, models?.configId ?? modelStateFromConfigOptions(connectedRecord.acpx?.config_options)?.configId);
+        setCurrentModelId(connectedRecord, currentModelIdFromSetModelResponse(response, model));
+      },
+    );
+    await this.options.sessionStore.save(result.record);
   }
 
   async setConfigOption(

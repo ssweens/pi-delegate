@@ -1,5 +1,7 @@
 import type { NativeSessionDescription } from "../../../dist/acpx-runtime/runtime.js";
+import type { AcpModelOption, AcpModelSource } from "../model-catalog.js";
 export type { NativeSessionDescription } from "../../../dist/acpx-runtime/runtime.js";
+export type { AcpModelOption, AcpModelSource } from "../model-catalog.js";
 export type SessionOrigin = "created" | "opened";
 
 export type WorkerRole = "read-only" | "writer";
@@ -73,6 +75,8 @@ export interface RuntimeStatus {
   currentModelId?: string;
   availableModelIds: string[];
   modelConfigId?: string;
+  modelOptions?: AcpModelOption[];
+  modelSource?: AcpModelSource;
 }
 
 export type NormalizedEvent =
@@ -105,6 +109,7 @@ export interface RuntimePort {
   adoptSession?(input: { name: string; fromStateDir: string }): Promise<void>;
   startTurn(input: { handle: RuntimeHandle; prompt: string; requestId: string; timeoutMs: number }): RuntimeTurn;
   getStatus?(handle: RuntimeHandle): Promise<RuntimeStatus>;
+  setModel?(input: { handle: RuntimeHandle; model: string }): Promise<void>;
   setConfigOption?(input: { handle: RuntimeHandle; key: string; value: string }): Promise<void>;
   close(handle: RuntimeHandle, reason: string, discardPersistentState: boolean): Promise<void>;
 }

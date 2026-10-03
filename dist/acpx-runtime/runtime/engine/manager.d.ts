@@ -80,6 +80,7 @@ export declare class AcpRuntimeManager {
     }): AsyncIterable<AcpRuntimeEvent>;
     getStatus(handle: AcpRuntimeHandle): Promise<AcpRuntimeStatus>;
     setMode(handle: AcpRuntimeHandle, mode: string, sessionMode?: "persistent" | "oneshot"): Promise<void>;
+    setModel(handle: AcpRuntimeHandle, model: string, sessionMode?: "persistent" | "oneshot"): Promise<void>;
     setConfigOption(handle: AcpRuntimeHandle, key: string, value: string, sessionMode?: "persistent" | "oneshot"): Promise<void>;
     cancel(handle: AcpRuntimeHandle): Promise<void>;
     disconnect(handle: AcpRuntimeHandle): Promise<void>;

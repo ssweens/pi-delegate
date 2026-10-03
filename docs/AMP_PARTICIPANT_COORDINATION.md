@@ -133,7 +133,7 @@ The upstream `amp-acp` source creates an `S-...` session with no arbitrary nativ
 Two additional issues must be addressed in the retained ACP integration:
 
 1. Non-auth `result.is_error` is emitted as text and the prompt can still return `end_turn` if transport ends normally. A coordinator must not treat this as successful execution. This is source evidence, not a reproduced provider failure. See [error handling][adapter-errors].
-2. Amp advertises model-category option `amp-mode`, while the Coordinator's existing-worker model change requests literal key `model`. The vendored generic setter does not alias that key. The earlier blanket claim that all Amp mode changes already worked was too broad; creation-time selection and later changes are different paths.
+2. Amp advertises model-category option `amp-mode`. ACPX now exposes a provider-neutral `session/set_model` control, so Coordinator model changes resolve the native model selector instead of sending the literal key `model`; creation-time selection and later changes use the same path.
 
 ## Amp participation requirements
 

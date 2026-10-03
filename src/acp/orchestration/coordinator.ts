@@ -8,6 +8,7 @@ import { loadProfiles } from "../domain/config.js";
 import { requireCwdUnowned, requireIsolatedWriter, requireWriterUnowned } from "../domain/worktree.js";
 import { acceptanceContract, parseAcceptanceReport, roleContract, WORKER_CONTRACT } from "../domain/roles.js";
 import { AcpxRuntimePort } from "../runtime/acpx-runtime.js";
+import { fallbackModelOptions, optionIds } from "../model-catalog.js";
 import { StateStore, type SessionProvenance, type StoredWorker } from "../persistence/state-store.js";
 import { Claims, nativeTurnClaim, sessionClaim, writerClaims, type Claim } from "../persistence/claims.js";
 import { coordinatorHome, describeOwner, legacyStateDir, processStateDir, stateDirHolder } from "../persistence/home.js";
@@ -347,7 +348,7 @@ export class Coordinator {
       let handle: RuntimeHandle | undefined;
       try {
         handle = await runtime.ensureSession({ name, agent: profile.agent, cwd, profile, ...(executionEnvironment ? { executionEnvironment } : {}), ...(mode ? { mode } : {}), ...(title ? { title } : {}) });
-        if (profile.model) await this.requireSelectedModel(runtime, handle, profile.model);
+        if (profile.model) await this.requireSelectedModel(runtime, handle, profile.model, profile.agent);
       } catch (error) {
         if (handle) await runtime.close(handle, "model selection failed", true).catch(() => undefined);
         if (profile.model && isRequestedModelUnsupported(error)) {
@@ -523,7 +524,7 @@ export class Coordinator {
     }
     if (input.model !== undefined && worker.record.mode !== undefined) throw new StringsError("INPUT_INVALID", "On Amp, model and mode both select the agent mode; this worker keeps the mode it was created with.");
     const requestedModel = opened ? undefined : input.model === undefined ? worker.record.profile.model : optionalModel(input.model);
-    if (requestedModel) await this.requireSelectedModel(worker.runtime, worker.record.handle, requestedModel);
+    if (requestedModel) await this.requireSelectedModel(worker.runtime, worker.record.handle, requestedModel, worker.record.profile.agent);
     const timeoutMs = optionalPositive(input.requestTimeoutMs, worker.record.profile.timeoutMs);
     const requestId = `req_${randomUUID()}`;
     const requestDir = join(this.stateDir, "requests");
@@ -745,7 +746,7 @@ export class Coordinator {
         if (attempt > 1 && !model) break;
         if (attempt > 1 && model) {
           try {
-            await this.requireSelectedModel(worker.runtime, worker.record.handle, model);
+            await this.requireSelectedModel(worker.runtime, worker.record.handle, model, worker.record.profile.agent);
           } catch (error) {
             if (request.status === "running") {
               request.status = "failed";
@@ -969,9 +970,7 @@ export class Coordinator {
 
   private async status(input: Action): Promise<StringsResponse> {
     const worker = this.getWorker(requiredString(input.name, "name"));
-    const status = worker.record.origin === "opened"
-      ? await worker.runtime.getStatus?.(worker.record.handle)
-      : await this.readModelStatus(worker.runtime, worker.record.handle);
+    const status = await this.readModelStatus(worker.runtime, worker.record.handle, worker.record.profile.agent, worker.record.origin === "opened");
     if (status?.native && worker.record.origin === "created") {
       worker.record.native = status.native;
       worker.record.updatedAt = new Date().toISOString();
@@ -985,32 +984,49 @@ export class Coordinator {
         worker: worker.record.name,
         currentModelId: status?.currentModelId,
         availableModelIds: status?.availableModelIds ?? [],
+        ...(status?.modelOptions ? { modelOptions: status.modelOptions } : {}),
+        ...(status?.modelSource ? { modelSource: status.modelSource } : {}),
       },
     };
   }
 
-  private async readModelStatus(runtime: RuntimePort, handle: RuntimeHandle): Promise<RuntimeStatus> {
-    if (!runtime.getStatus) throw new StringsError("MODEL_DISCOVERY_UNSUPPORTED", "The worker runtime does not support model discovery.");
+  private async readModelStatus(runtime: RuntimePort, handle: RuntimeHandle, agent: string, allowUnsupported = false): Promise<RuntimeStatus> {
+    if (!runtime.getStatus) {
+      if (allowUnsupported) return { modelDiscoverySupported: false, availableModelIds: [] };
+      throw new StringsError("MODEL_DISCOVERY_UNSUPPORTED", "The worker runtime does not support model discovery.");
+    }
     try {
       const status = await runtime.getStatus(handle);
-      if (!status.modelDiscoverySupported) throw new StringsError("MODEL_DISCOVERY_UNSUPPORTED", "The worker runtime did not advertise model discovery.");
-      return status;
+      if (status.modelDiscoverySupported) return status;
+      const fallback = fallbackModelOptions(agent);
+      if (!fallback.length) {
+        if (allowUnsupported) return status;
+        throw new StringsError("MODEL_DISCOVERY_UNSUPPORTED", "The worker runtime did not advertise model discovery.");
+      }
+      return {
+        ...status,
+        modelDiscoverySupported: true,
+        modelSource: "fallback",
+        modelOptions: [...fallback],
+        availableModelIds: optionIds(fallback),
+      };
     } catch (error) {
       if (error instanceof StringsError) throw error;
       throw new StringsError("MODEL_DISCOVERY_FAILED", `Model discovery failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
-  private async requireSelectedModel(runtime: RuntimePort, handle: RuntimeHandle, model: string): Promise<void> {
-    let status = await this.readModelStatus(runtime, handle);
+  private async requireSelectedModel(runtime: RuntimePort, handle: RuntimeHandle, model: string, agent: string): Promise<void> {
+    let status = await this.readModelStatus(runtime, handle, agent);
     if (!status.availableModelIds.includes(model)) {
       throw new StringsError("MODEL_UNAVAILABLE", `Requested model ${model} is not available for this worker. Available models: ${status.availableModelIds.join(", ") || "none advertised"}.`);
     }
     if (status.currentModelId === model) return;
-    if (!runtime.setConfigOption) throw new StringsError("MODEL_SELECTION_UNSUPPORTED", "The worker runtime does not support model selection.");
+    if (!runtime.setModel && !runtime.setConfigOption) throw new StringsError("MODEL_SELECTION_UNSUPPORTED", "The worker runtime does not support model selection.");
     try {
-      await runtime.setConfigOption({ handle, key: status.modelConfigId ?? "model", value: model });
-      status = await this.readModelStatus(runtime, handle);
+      if (runtime.setModel) await runtime.setModel({ handle, model });
+      else await runtime.setConfigOption!({ handle, key: status.modelConfigId ?? "model", value: model });
+      status = await this.readModelStatus(runtime, handle, agent);
     } catch (error) {
       if (error instanceof StringsError) throw error;
       throw new StringsError("MODEL_SELECTION_FAILED", `Model selection failed for ${model}: ${error instanceof Error ? error.message : String(error)}`);

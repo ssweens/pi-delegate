@@ -126,6 +126,7 @@ export declare class AcpClient {
     private setSessionModelThroughLegacyMethod;
     private throwSessionModelError;
     private resolveModelControl;
+    private rememberSessionModelsForAgent;
     private rememberSessionModels;
     private updateRememberedSessionModels;
     cancel(sessionId: string): Promise<void>;

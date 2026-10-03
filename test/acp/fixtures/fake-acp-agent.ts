@@ -7,7 +7,14 @@ if (!stateArgument) throw new Error("state path is required");
 const statePath: string = stateArgument;
 // "no-load": an agent that cannot resume or load a session, so a closed session cannot be reopened.
 const canLoad = process.argv[3] !== "no-load";
-type FixtureState = Record<string, { nonce?: string }>;
+type FixtureState = Record<string, { nonce?: string; model?: string }>;
+const MODEL_OPTIONS = [
+  { value: "fixture-default", name: "Fixture Default", description: "The default fixture model." },
+  { value: "fixture-fast", name: "Fixture Fast", description: "A faster fixture model." },
+] as const;
+function modelConfig(current: string = MODEL_OPTIONS[0].value) {
+  return [{ type: "select", id: "model", name: "Model", category: "model", currentValue: current, options: MODEL_OPTIONS }];
+}
 async function load(): Promise<FixtureState> { try { return JSON.parse(await readFile(statePath, "utf8")) as FixtureState; } catch { return {}; } }
 async function save(state: FixtureState): Promise<void> { await writeFile(statePath, JSON.stringify(state)); }
 
@@ -19,13 +26,13 @@ const agent: any = {
   },
   async newSession() {
     const sessionId = `fixture-${randomUUID()}`;
-    const state = await load(); state[sessionId] = {}; await save(state);
-    return { sessionId, configOptions: [], models: [], modes: { currentModeId: "default", availableModes: [{ id: "default", name: "Default" }] } };
+    const state = await load(); state[sessionId] = { model: MODEL_OPTIONS[0].value }; await save(state);
+    return { sessionId, configOptions: modelConfig(), modes: { currentModeId: "default", availableModes: [{ id: "default", name: "Default" }] } };
   },
   async loadSession(params: any) {
     const state = await load();
     if (!state[params.sessionId]) throw new Error(`unknown session ${params.sessionId}`);
-    return { configOptions: [], models: [], modes: { currentModeId: "default", availableModes: [{ id: "default", name: "Default" }] } };
+    return { configOptions: modelConfig(state[params.sessionId]?.model), modes: { currentModeId: "default", availableModes: [{ id: "default", name: "Default" }] } };
   },
   async prompt(params: any) {
     const text = params.prompt.map((block: any) => block.type === "text" ? block.text : "").join("");
@@ -54,7 +61,14 @@ const agent: any = {
   async closeSession() { return {}; },
   async authenticate() {},
   async setSessionMode() {},
-  async setSessionConfigOption() { return {}; },
+  async setSessionConfigOption(params: any) {
+    if (params.configId !== "model") return { configOptions: modelConfig() };
+    const state = await load();
+    const session = state[params.sessionId] ??= {};
+    session.model = params.value;
+    await save(state);
+    return { configOptions: modelConfig(session.model) };
+  },
 };
 
 const input = new WritableStream<Uint8Array>({ write(chunk) { process.stdout.write(chunk); } });

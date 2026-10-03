@@ -106,6 +106,7 @@ import {
   modelStateFromSessionResponse,
   RequestedModelUnsupportedError,
   resolveRequestedModelId,
+  supportsLegacyClaudeCodeModelMetadata,
   type SessionModelState,
 } from "./model-support.js";
 import {
@@ -963,7 +964,7 @@ export class AcpClient {
     this.loadedSessionId = result.sessionId;
     const configOptions = normalizeResponseConfigOptions(result);
     const models = modelStateFromSessionResponse({ configOptions, response: result });
-    this.rememberSessionModels(result.sessionId, models);
+    this.rememberSessionModelsForAgent(result.sessionId, models);
 
     return {
       sessionId: result.sessionId,
@@ -1265,6 +1266,21 @@ export class AcpClient {
     return this.legacyModelSessionIds.has(sessionId) ? { kind: "legacy_set_model" } : undefined;
   }
 
+  private rememberSessionModelsForAgent(sessionId: string, models: SessionModelState | undefined): void {
+    if (models) {
+      this.rememberSessionModels(sessionId, models);
+      return;
+    }
+    // Claude ACP accepts its documented model aliases through session/set_model
+    // even when older adapters omit both configOptions and legacy models metadata.
+    if (supportsLegacyClaudeCodeModelMetadata(this.options.agentCommand)) {
+      this.modelConfigIds.delete(sessionId);
+      this.legacyModelSessionIds.add(sessionId);
+      return;
+    }
+    this.rememberSessionModels(sessionId, undefined);
+  }
+
   private rememberSessionModels(sessionId: string, models: SessionModelState | undefined): void {
     if (!models) {
       this.modelConfigIds.delete(sessionId);
@@ -1284,6 +1300,9 @@ export class AcpClient {
     const explicitConfigRemoval = result.configOptionsPresent && this.modelConfigIds.has(sessionId);
     if (result.models || result.legacyModelMetadataPresent || explicitConfigRemoval) {
       this.rememberSessionModels(sessionId, result.models);
+    } else if (supportsLegacyClaudeCodeModelMetadata(this.options.agentCommand)) {
+      this.modelConfigIds.delete(sessionId);
+      this.legacyModelSessionIds.add(sessionId);
     }
   }
 

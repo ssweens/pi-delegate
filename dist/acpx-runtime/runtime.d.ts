@@ -73,6 +73,10 @@ export declare class AcpxRuntime implements AcpxRuntimeLike {
         handle: AcpRuntimeHandle;
         mode: string;
     }): Promise<void>;
+    setModel(input: {
+        handle: AcpRuntimeHandle;
+        model: string;
+    }): Promise<void>;
     setConfigOption(input: {
         handle: AcpRuntimeHandle;
         key: string;
