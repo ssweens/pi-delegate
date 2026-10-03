@@ -3,7 +3,7 @@
 Status: Pi and Amp create/open paths are implemented through the common ACPX runtime and exposed through `delegate backend:"acp"` ([ADR 0001](adr/0001-delegate-backends.md)). Amp native opening uses authenticated export metadata for executor, owner scope, cwd, and mode when available; `cwd` and `executionEnvironment` remain optional verification hints. Live account/executor and lifecycle proofs remain acceptance gates. Amp owns participant identity, presence, queueing, and cross-user attribution; those are not acceptance gates here. Arbitrary history-page/character limits are not part of the shared contract.
 
 This record was written when the surface was pi-strings' `op_*` tools. Those tools are retired. The public contract below now names the `delegate` calls; the sections after it keep the original design reasoning.
-Tracked by [019](../../todos/019-complete-amp-participant-boundary.md) and [hub 018](../../todos/018-ready-amp-participant-coordination.md).
+Tracked by [019](../../todos/pi-delegate/019-complete-amp-participant-boundary.md) and [hub 018](../../todos/pi-delegate/018-ready-amp-participant-coordination.md).
 
 ## Decision
 
@@ -110,11 +110,11 @@ Evidence below predates the move into pi-delegate.
 
 Fresh Codex-2 Astra review (`reviewer-610408d9-9283-4215-9fde-93a9aabe7cda`) accepted this implementation contract. Its probe finding was corrected: reject only the exact unknown-session error, not any exception, and inventory the full isolated native session tree. Parent reran the corrected real probe successfully; reviewer independently checked syntax/source, not live provider behavior. Active-turn disconnect, process disposal, and all-provider capabilities remain proof gates.
 
-- [020](../../todos/020-complete-amp-readonly-participant.md): common contract/persistence/lifecycle plus native Pi vertical slice.
-- [026](../../todos/026-ready-codex-native-opening.md), [027](../../todos/027-ready-claude-native-opening.md), [028](../../todos/028-ready-opencode-native-opening.md): Codex, Claude, OpenCode create/open/continue evidence.
-- [029](../../todos/029-ready-amp-native-opening.md): Amp local/Orb creation and exact native opening/observation; [021](../../todos/021-ready-amp-approved-contribution.md) then proves an approved contribution.
-- [030](../../todos/030-ready-remaining-native-provider-coverage.md): remaining 17 provider delivery routes and bounded children; decision closure is not delivery of those providers.
-- [022](../../todos/022-complete-amp-multiplayer-recovery.md) and [024](../../todos/024-ready-amp-evidence-handoff.md): multiplayer scope decision and evidence handoff. [023](../../todos/023-complete-amp-plugin-bridge.md) built a plugin bridge; ADR 0001 later removed it in favor of native paths.
+- [020](../../todos/pi-delegate/020-complete-amp-readonly-participant.md): common contract/persistence/lifecycle plus native Pi vertical slice.
+- [026](../../todos/pi-delegate/026-ready-codex-native-opening.md), [027](../../todos/pi-delegate/027-ready-claude-native-opening.md), [028](../../todos/pi-delegate/028-ready-opencode-native-opening.md): Codex, Claude, OpenCode create/open/continue evidence.
+- [029](../../todos/pi-delegate/029-ready-amp-native-opening.md): Amp local/Orb creation and exact native opening/observation; [021](../../todos/pi-delegate/021-ready-amp-approved-contribution.md) then proves an approved contribution.
+- [030](../../todos/pi-delegate/030-ready-remaining-native-provider-coverage.md): remaining 17 provider delivery routes and bounded children; decision closure is not delivery of those providers.
+- [022](../../todos/pi-delegate/022-complete-amp-multiplayer-recovery.md) and [024](../../todos/pi-delegate/024-ready-amp-evidence-handoff.md): multiplayer scope decision and evidence handoff. [023](../../todos/pi-delegate/023-complete-amp-plugin-bridge.md) built a plugin bridge; ADR 0001 later removed it in favor of native paths.
 
 019 closed in user-approved main-branch commit `382b9e9`; dependent 020 and 030 were authorized to start. Production implementation and live provider proofs are still outstanding.
 

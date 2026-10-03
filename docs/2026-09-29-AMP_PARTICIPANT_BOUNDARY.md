@@ -1,7 +1,7 @@
 # Native Amp participant boundary
 
 Status: superseded proposal. The user clarified that every agent integration must support creating new sessions and opening existing provider-native threads/sessions through the same tool surface. Separate Amp extension/package and `amp_*` tool-family recommendations below are rejected, not awaiting approval. Replan around provider adapters and explicit session lifecycle semantics; Amp local/Orb execution is an independent configuration choice. The probe evidence below remains valid; native attachment and shared-thread guarantees remain unproven.
-Replaced by [the unified native-opening contract](NATIVE_SESSION_OPENING.md), tracked by [019](../../todos/019-complete-amp-participant-boundary.md) under [018](../../todos/018-ready-amp-participant-coordination.md). Sections below record the rejected proposal and its probe evidence, not current implementation instructions.
+Replaced by [the unified native-opening contract](NATIVE_SESSION_OPENING.md), tracked by [019](../../todos/pi-delegate/019-complete-amp-participant-boundary.md) under [018](../../todos/pi-delegate/018-ready-amp-participant-coordination.md). Sections below record the rejected proposal and its probe evidence, not current implementation instructions.
 
 ## Context
 
