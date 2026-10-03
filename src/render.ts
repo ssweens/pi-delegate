@@ -545,7 +545,7 @@ export function resultView(
 	width: number,
 ): string[] {
 	const inner = Math.max(1, width);
-	const single = asRunView(result.details);
+	const single = asRunView(result.details) ?? asRunView(result.details?.run);
 	if (single) {
 		// Async launch stays invisible in chat; its completion message is the one outcome record.
 		if ((title === "delegate" || action === "wait") && single.status === "running") return [];

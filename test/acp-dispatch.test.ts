@@ -26,7 +26,10 @@ test("delegate dispatches to the acp backend; no backend is today's pi path", { 
 	process.env.AMP_CLI_PATH = fakeAmp;
 	process.env.AMP_ACP_STATE_DIR = join(box.root, "amp-state");
 	// The ACP agent runs in the child's cwd, so the tsx loader is passed by absolute URL.
-	configureAcpCoordinator({ stateDir: join(box.root, "acp-state"), agentOverrides: { fixture: [process.execPath, "--import", import.meta.resolve("tsx"), fakeAcpAgent, join(box.root, "fixture-state.json")] } });
+	configureAcpCoordinator({ stateDir: join(box.root, "acp-state"), agentOverrides: {
+		fixture: [process.execPath, "--import", import.meta.resolve("tsx"), fakeAcpAgent, join(box.root, "fixture-state.json")],
+		claude: [process.execPath, "-e", "process.exit(23)"],
+	} });
 	const h = await harness(box);
 	const { initTheme } = await import("@earendil-works/pi-coding-agent");
 	initTheme();
@@ -70,6 +73,21 @@ test("delegate dispatches to the acp backend; no backend is today's pi path", { 
 			assert.equal(codeOf(await delegate({ backend: "acp", agent: "amp", sessionId: localThread, model: "high" })), "OPEN_OVERRIDE_FORBIDDEN");
 			assert.equal(codeOf(await delegate({ backend: "acp", agent: "amp", sessionId: localThread, role: "writer" })), "OPEN_OVERRIDE_FORBIDDEN");
 			assert.equal(codeOf(await delegate({ backend: "acp", agent: "fixture", sessionId: "s-1", executionEnvironment: "orb" })), "OPEN_OVERRIDE_FORBIDDEN", "only Amp takes an executor hint when opening");
+		});
+
+		await t.test("a failed Claude ACP start remains a transcript and history record", async () => {
+			const failed = await delegate({ backend: "acp", agent: "claude", task: "Claude ACP launch" });
+			assert.equal(failed.isError, true, failed.content[0].text);
+			assert.equal(failed.details.run.backend, "acp");
+			assert.equal(failed.details.run.status, "error");
+			assert.match(failed.details.run.id, /^claude-/);
+			assert.match(failed.details.run.error, /claude-/);
+			const listed = await h.ctl("status");
+			assert.ok(listed.details.rows.some((row: any) => row.id === failed.details.run.id && row.status === "error"));
+			const rendered = resultView("delegate", undefined, "", failed, { expanded: false }, theme, 120).join("\n");
+			assert.match(rendered, /Claude ACP launch/);
+			assert.match(rendered, /✗/);
+			assert.match(rendered, /error/);
 		});
 
 		let created = "";

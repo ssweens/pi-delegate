@@ -1278,11 +1278,12 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	// --- acp results. A failure is reported by its code; it never becomes a different action.
-	const failed = (error: unknown) => {
+	const failed = (error: unknown, details?: AcpRunView) => {
 		if (!(error instanceof DelegateError)) throw error;
+		const info = { error: { code: error.code, message: error.message, ...(error.field ? { field: error.field } : {}) } };
 		return {
 			content: [{ type: "text" as const, text: `${error.code}: ${error.message}` }], isError: true,
-			details: { error: { code: error.code, message: error.message, ...(error.field ? { field: error.field } : {}) } },
+			details: details ? { ...info, run: details } : info,
 		};
 	};
 	const settledBadly = (v: AcpRunView) => v.status !== "running" && v.status !== "idle" && v.status !== "complete";
@@ -1435,7 +1436,10 @@ export default function (pi: ExtensionAPI) {
 						return acpRunResult(outcome.settled[0] ?? await acp.result(v.id));
 					}
 					return { content: [{ type: "text", text: acpStartText(v) }], details: v };
-				} catch (error) { return failed(error); }
+				} catch (error) {
+					const details = error instanceof DelegateError && error.runId ? await acp.result(error.runId).catch(() => undefined) : undefined;
+					return failed(error, details);
+				}
 			}
 			const p = { ...params, role: (start.value as PiStartInput).role, task: (start.value as PiStartInput).task };
 			const owner = requireOwner();

@@ -70,7 +70,7 @@ import type { ChildActivity } from "./transcript.js";
 
 /** A failure the tool layer reports by code: a contract violation, or a Coordinator error passed through. */
 export class DelegateError extends Error {
-	constructor(readonly code: string, message: string, readonly field?: string) {
+	constructor(readonly code: string, message: string, readonly field?: string, readonly runId?: string) {
 		super(message);
 		this.name = "DelegateError";
 	}
@@ -106,6 +106,8 @@ interface AcpRunRecord extends Partial<RunOwner> {
 	usage?: AmpThreadUsage;
 	/** Side effects that failed without failing the run. */
 	notes?: string[];
+	/** The session/first-turn launch failed before a provider request could be recorded. */
+	startError?: { code: string; message: string; at: number };
 	/** Per-turn budget from delegate; steer reuses it unless it passes its own. */
 	timeoutMs?: number;
 	/** How an opened run was opened, so reopening it targets exactly that native session. */
@@ -239,7 +241,7 @@ function view(run: AcpRunRecord): AcpRunView {
 	const turns = requests.map(turnView);
 	const latest = requests.at(-1);
 	const finishedAt = latest?.finishedAt ? Date.parse(latest.finishedAt) : undefined;
-	const status = acpRunStatus(turns);
+	const status = run.startError ? "error" : acpRunStatus(turns);
 	const handle = worker?.handle;
 	// A created Amp run learns its T-ID after creation; the record keeps it once seen. Any other created
 	// session is named by the session ID its runtime holds from creation (Codex: its rollout's ID). An
@@ -280,12 +282,13 @@ function view(run: AcpRunRecord): AcpRunView {
 	if (run.mode) v.mode = run.mode;
 	if (run.usage) v.usage = { ...run.usage, ...(run.usage.cost ? { cost: { ...run.usage.cost } } : {}) };
 	if (run.notes?.length) v.notes = [...run.notes];
-	const endedAt = run.closedAt ?? (status === "running" || status === "idle" ? undefined : finishedAt);
+	const endedAt = run.closedAt ?? run.startError?.at ?? (status === "running" || status === "idle" ? undefined : finishedAt);
 	if (endedAt !== undefined) v.endedAt = endedAt;
 	if (run.closedAt !== undefined) v.closed = true;
 	else if (run.parkedAt !== undefined) v.parked = { at: run.parkedAt, ...(run.interruptedTurn ? { interruptedTurn: run.interruptedTurn } : {}) };
 	if (run.foreign) v.foreign = { ownerPid: run.ownerPid ?? 0, ownerHost: run.ownerHost ?? "" };
-	if (latest?.failure) v.error = `${latest.failure.code}: ${latest.failure.message}`;
+	if (run.startError) v.error = `${run.startError.code}: ${run.startError.message}`;
+	else if (latest?.failure) v.error = `${latest.failure.code}: ${latest.failure.message}`;
 	return v;
 }
 
@@ -386,7 +389,7 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 			if (run.notes !== undefined && (!Array.isArray(run.notes) || run.notes.some((note) => typeof note !== "string"))) delete run.notes;
 			if (ownedElsewhere(run)) { run.foreign = true; restored.push(run); continue; }
 			Object.assign(run, processOwner());
-			if (run.closedAt === undefined && run.parkedAt === undefined) {
+			if (run.closedAt === undefined && run.parkedAt === undefined && !run.startError) {
 				// Its process ended without parking it: nothing released its session, and nothing holds it now.
 				run.parkedAt = savedAt;
 				run.unreleased = true;
@@ -432,6 +435,22 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 		return acpCapabilities(run ? run.session : { origin: "created", agent: "" });
 	}
 
+	private async recordStartFailure(run: AcpRunRecord, coordinator: Coordinator | undefined, error: unknown): Promise<never> {
+		const failure = error instanceof DelegateError
+			? error
+			: new DelegateError("ACP_START_FAILED", error instanceof Error ? error.message : String(error));
+		if (coordinator) {
+			await coordinator.execute({ action: "close", name: run.worker, force: true }).catch(() => undefined);
+			try { run.last = coordinator.snapshot(run.worker); } catch { /* the failed spawn left no worker */ }
+		}
+		const message = failure.message.startsWith(`${run.id}:`) ? failure.message : `${run.id}: ${failure.message}`;
+		run.startError = { code: failure.code, message, at: Date.now() };
+		registry().set(run.id, run);
+		this.saveQuietly(run);
+		this.hooks.changed();
+		throw new DelegateError(failure.code, message, failure.field, run.id);
+	}
+
 	async start(input: AcpStartInput): Promise<AcpRunView> {
 		const ownerKey = this.hooks.ownerKey();
 		const agent = acpAgentName(input.agent);
@@ -458,28 +477,28 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 			if (agent === "amp") { const title = ampThreadTitle(input.task); if (title) spawn.title = title; }
 			if (input.executionEnvironment) run.executionEnvironment = input.executionEnvironment;
 		}
-		const coordinator = await acpCoordinator();
-		const spawned = await coordinator.execute(spawn);
-		if (!spawned.ok) throw coordinatorError(spawned, run);
-		run.stateDir = coordinator.stateDir;
-		run.last = coordinator.snapshot(run.worker);
-		registry().set(run.id, run);
-		if (input.task !== undefined) {
-			const sent = await coordinator.execute({ action: "send", name: run.worker, prompt: input.task, ...(input.timeoutMs !== undefined ? { requestTimeoutMs: input.timeoutMs } : {}) });
-			if (!sent.ok) {
-				// The run never got its first turn: release the session instead of leaving a half-started run.
-				registry().delete(run.id);
-				await coordinator.execute({ action: "close", name: run.worker, force: true }).catch(() => undefined);
-				throw coordinatorError(sent, run);
+		let coordinator: Coordinator | undefined;
+		try {
+			coordinator = await acpCoordinator();
+			const spawned = await coordinator.execute(spawn);
+			if (!spawned.ok) throw coordinatorError(spawned, run);
+			run.stateDir = coordinator.stateDir;
+			run.last = coordinator.snapshot(run.worker);
+			registry().set(run.id, run);
+			if (input.task !== undefined) {
+				const sent = await coordinator.execute({ action: "send", name: run.worker, prompt: input.task, ...(input.timeoutMs !== undefined ? { requestTimeoutMs: input.timeoutMs } : {}) });
+				if (!sent.ok) throw coordinatorError(sent, run);
+				run.prompts[String(sent.details.requestId)] = input.task;
+				this.watch(run, String(sent.details.requestId));
 			}
-			run.prompts[String(sent.details.requestId)] = input.task;
-			this.watch(run, String(sent.details.requestId));
+		} catch (error) {
+			return await this.recordStartFailure(run, coordinator, error);
 		}
 		try { this.save(run); }
 		catch (error) {
 			// An unrecorded run could not be found again after a restart: refuse it rather than run it untracked.
 			registry().delete(run.id);
-			await coordinator.execute({ action: "close", name: run.worker, force: true }).catch(() => undefined);
+			await coordinator!.execute({ action: "close", name: run.worker, force: true }).catch(() => undefined);
 			throw new DelegateError("RUN_NOT_PERSISTED", `${run.id} could not be recorded, so it was released: ${String(error)}`);
 		}
 		this.hooks.changed();
