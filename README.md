@@ -117,7 +117,7 @@ The message goes in exactly as written, and Amp shows it as an ordinary `## User
 {"action":"wait","runIds":["scout-…","codex-…"],"mode":"any","timeoutMs":600000}
 ```
 
-`mode: "all"` (the default) waits for every run. `runIds` can mix pi and acp runs. A timeout ends the wait only; the runs keep going.
+Omit `mode` to return when the first run settles; pass `mode: "all"` when every result is required. `runIds` can mix pi and acp runs. A timeout ends the wait only; the runs keep going.
 
 ### Status, cancel and close
 

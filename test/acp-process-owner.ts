@@ -6,6 +6,7 @@
  * argv: runDir ownerKey runtime [fixtureStatePath]
  * A request is { id, op, args }; the reply is { id, ok, value } or { id, ok: false, code, message }.
  */
+import { setTimeout as sleep } from "node:timers/promises";
 import { acpCoordinator, configureAcpCoordinator, shutdownAcpCoordinator } from "../src/acp/instance.ts";
 import { AcpBackend, DelegateError } from "../src/acp-backend.ts";
 import { fakeRuntime } from "./acp-fake-runtime.ts";
@@ -16,8 +17,18 @@ if (runtime === "fake") configureAcpCoordinator({ profiles: {}, runtimeFactory: 
 else configureAcpCoordinator({ profiles: {}, agentOverrides: { fixture: [process.execPath, "--import", import.meta.resolve("tsx"), fakeAcpAgent, fixtureState!] } });
 const backend = new AcpBackend({ ownerKey: () => ownerKey, changed() {}, settled() {}, runDir: () => runDir });
 
+async function startReady(input: any): Promise<unknown> {
+	const started = await backend.start({ backend: "acp", ...input });
+	// The process-driver tests assert Coordinator ownership after start. Production callers use
+	// backend.start directly and receive the running/starting view immediately.
+	for (;;) {
+		const [current] = await backend.status([started.id]);
+		if (current.status !== "running" || current.turns.length > 0) return current;
+		await sleep(1);
+	}
+}
 const ops: Record<string, (args: any) => Promise<unknown>> = {
-	start: (input) => backend.start({ backend: "acp", ...input }),
+	start: startReady,
 	steer: ({ id, message }) => backend.steer(id, { message }),
 	wait: ({ ids, timeoutMs }) => backend.wait({ runIds: ids, mode: "all", ...(timeoutMs ? { timeoutMs } : {}) }),
 	status: ({ ids }) => backend.status(ids),

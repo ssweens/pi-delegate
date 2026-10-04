@@ -36,7 +36,7 @@ test("native Amp sessions and observation through delegate", { timeout: 120000 }
 	configureAcpCoordinator({ stateDir: join(box.root, "acp-state"), agentOverrides: { fixture: [process.execPath, "--import", import.meta.resolve("tsx"), fakeAcpAgent, join(box.root, "fixture-state.json")] } });
 	let h = await harness(box);
 	api.onUnscripted(() => ({ text: "ACK" }));
-	const delegate = (args: Record<string, unknown>) => h.launch(args.task as string, { role: undefined, context: undefined, model: undefined, ...args });
+	const delegate = (args: Record<string, unknown>) => h.launchReady(args.task as string, { role: undefined, context: undefined, model: undefined, ...args });
 	const codeOf = (result: any) => result.details?.error?.code;
 	const lines = (path: string) => existsSync(path) ? readFileSync(path, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)) : [];
 	const amp = () => lines(argsLog) as string[][];

@@ -31,7 +31,15 @@ function setup(t: { after(fn: () => unknown): void }, factory = fakeRuntime().fa
 		rmSync(root, { recursive: true, force: true });
 	});
 	const record = (id: string) => JSON.parse(readFileSync(join(runDir, `${encodeURIComponent(id)}.json`), "utf8"));
-	return { backend, cwd, settled, record, start: (agent: string, task: string, extra: Record<string, unknown> = {}) => backend.start({ backend: "acp", origin: "created", agent, task, cwd, ...extra } as never) };
+	const start = async (agent: string, task: string, extra: Record<string, unknown> = {}) => {
+		const started = await backend.start({ backend: "acp", origin: "created", agent, task, cwd, ...extra } as never);
+		for (;;) {
+			const [current] = await backend.status([started.id]);
+			if (current.status !== "running" || current.turns.length > 0) return current;
+			await sleep(1);
+		}
+	};
+	return { backend, cwd, settled, record, start };
 }
 
 const codeOf = async (work: Promise<unknown>) => work.then(() => undefined, (error) => error instanceof DelegateError ? error.code : String(error));

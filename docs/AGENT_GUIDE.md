@@ -49,7 +49,7 @@ Wait and read results:
 {"action":"result","runId":"<run id>"}
 ```
 
-A wait timeout returns control without cancelling work. Only `complete` is success; handle `cancelled`, `timeout` and `error` separately. Each turn reports its request ID, `delivery` and provider outcome. `delivery: accepted` means the provider reported the turn complete; anything else is `unknown`.
+Omit `mode` to return when the first of several runs settles; pass `mode: "all"` when every result is required. A wait timeout returns control without cancelling work. Only `complete` is success; handle `cancelled`, `timeout` and `error` separately. Each turn reports its request ID, `delivery` and provider outcome. `delivery: accepted` means the provider reported the turn complete; anything else is `unknown`.
 
 Cancel and close explicitly:
 

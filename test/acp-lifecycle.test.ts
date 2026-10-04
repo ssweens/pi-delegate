@@ -30,7 +30,7 @@ test("acp lifecycle: outcomes, mixed-backend wait, and runs that survive a paren
 	configureAcpCoordinator({ stateDir: join(box.root, "acp-state"), agentOverrides: { fixture: agent(), "fixture-noload": agent("no-load") } });
 	let h = await harness(box);
 	api.onUnscripted(() => ({ text: "ACK" }));
-	const delegate = (args: Record<string, unknown>) => h.launch(args.task as string, { role: undefined, context: undefined, model: undefined, ...args });
+	const delegate = (args: Record<string, unknown>) => h.launchReady(args.task as string, { role: undefined, context: undefined, model: undefined, ...args });
 	const codeOf = (result: any) => result.details?.error?.code;
 	const parentId = h.ctx().sessionManager.getSessionId();
 	const recordDir = () => join(realpathSync(box.cwd), ".agents", "pi", "subsessions", "owners", parentId, "acp");
@@ -76,7 +76,9 @@ test("acp lifecycle: outcomes, mixed-backend wait, and runs that survive a paren
 			assert.match(failed.content[0].text, /provider outcome failed, cause /);
 			await h.ctl("close", created);
 
-			const opened = (await delegate({ backend: "acp", agent: "amp", sessionId: localThread, cwd: undefined })).details.id;
+			const openedStart = (await delegate({ backend: "acp", agent: "amp", sessionId: localThread, cwd: undefined })).details.id;
+			await h.waitReady(openedStart);
+			const opened = openedStart;
 			await h.ctl("steer", opened, { message: "please FAIL" });
 			const native = await h.ctl("wait", opened);
 			assert.equal(native.details.status, "error", native.content[0].text);
@@ -113,7 +115,7 @@ test("acp lifecycle: outcomes, mixed-backend wait, and runs that survive a paren
 		await t.test("wait across pi and acp runs: any, all, timeout and abort never cancel", async () => {
 			const gate = deferred();
 			const arrived = api.script("Mixed pi child", { text: "PI-MIXED-OK", gate });
-			const pi = (await h.launch("Mixed pi child")).details.id;
+			const pi = (await h.launchReady("Mixed pi child")).details.id;
 			await arrived;
 			const acp = (await delegate({ backend: "acp", agent: "fixture", task: "WAIT" })).details.id;
 			const quick = (await delegate({ backend: "acp", agent: "fixture", task: "quick" })).details.id;

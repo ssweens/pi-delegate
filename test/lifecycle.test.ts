@@ -100,6 +100,48 @@ test("real SDK delegation lifecycle (loopback provider, no credentials)", { time
 			assert.equal(done.details.status, "complete");
 			assert.equal(done.details.output, "WAKE-OK");
 		});
+		await t.test("a parent follow-up message runs while a delegate child is still executing", async () => {
+			const gate = deferred();
+			const arrived = api.script("Intercom child", { text: "CHILD-DONE", gate });
+			const started = await h.launch("Intercom child");
+			const id = started.details.id;
+			await arrived;
+			api.onUnscripted(() => ({ text: "INTERCOM-ACK" }));
+			const sentAt = Date.now();
+			const result = h.sendMessage({ customType: "intercom_message", content: "**From peer**\\n\\ncontinue", display: true, details: { source: "pi-intercom-test" } }, { deliverAs: "followUp", triggerTurn: true });
+			assert.equal(result, undefined, "the Pi message send is enqueue-only");
+			await h.runtime.session.agent.waitForIdle();
+			assert.ok(Date.now() - sentAt < 1_000, "the parent handled the peer message without joining the child");
+			assert.equal(h.state().runs.get(id).status, "running", "the child kept running while the parent handled the message");
+			gate.resolve();
+			assert.equal((await h.ctl("wait", id)).details.output, "CHILD-DONE");
+			api.onUnscripted();
+		});
+		await t.test("a Pi Intercom-style steer queues while the parent is launching a child", async () => {
+			const childGate = deferred();
+			const childArrived = api.script("Intercom active child", { text: "ACTIVE-CHILD-DONE", gate: childGate });
+			const parentArrived = api.script("Parent launches child", {
+				tools: [{ name: "delegate", arguments: { role: "scout", context: "fresh", task: "Intercom active child", cwd: box.cwd, model: "fixture/fixture:off" } }],
+			});
+			api.onUnscripted(() => ({ text: "PARENT-DONE" }));
+			const parentWork = h.runtime.session.prompt("Parent launches child");
+			await parentArrived;
+			assert.equal(h.runtime.session.isIdle, false, "the parent is still in the model/tool turn");
+			const sent = h.sendMessage(
+				{ customType: "intercom_message", content: "**From peer**\n\nkeep going", display: true, details: { source: "pi-intercom-test" } },
+				{ deliverAs: "steer" },
+			);
+			assert.equal(sent, undefined, "Pi Intercom's sendMessage bridge is enqueue-only");
+			await childArrived;
+			await h.runtime.session.agent.waitForIdle();
+			const child = [...h.state().runs.values()].find((run: any) => run.task === "Intercom active child" && run.status === "running");
+			assert.ok(child, "a peer send did not wait for child completion");
+			const childWait = h.ctl("wait", child.id);
+			childGate.resolve();
+			await childWait;
+			await parentWork;
+			api.onUnscripted();
+		});
 		await t.test("wait reports a child that stops without reporting completion, and a real completion still wins", async () => {
 			const gate = deferred();
 			const arrived = api.script("Crash watch work", { text: "CRASH-OK", gate });
@@ -446,6 +488,36 @@ test("real SDK delegation lifecycle (loopback provider, no credentials)", { time
 		});
 		assert.deepEqual(h.errors, []); assert.deepEqual(api.errors, []);
 	} finally { await h.runtime.dispose(); await api.close(); rmSync(box.root, { recursive: true, force: true }); }
+});
+
+test("a long pi fork launch returns before copying parent history", { timeout: 60000 }, async () => {
+	const api = await provider();
+	const box = sandbox(api.url);
+	const h = await harness(box);
+	try {
+		const parent = h.ctx().sessionManager;
+		for (let i = 0; i < 2_000; i++) parent.appendMessage({ role: "user", content: `long-parent-exchange-${i}`, timestamp: Date.now() });
+		const gate = deferred();
+		const arrived = api.script("Long fork child", { text: "LONG-FORK-DONE", gate });
+		const startedAt = Date.now();
+		const started = await h.launch("Long fork child", { context: "fork" });
+		assert.ok(Date.now() - startedAt < 250, `delegate launch took ${Date.now() - startedAt}ms`);
+		assert.equal(started.details.status, "running");
+		const id = started.details.id;
+		const beforePreparation = h.state().runs.get(id);
+		assert.equal(beforePreparation.forkedMessages, 0, "fork history is not copied in the parent tool call");
+		assert.equal(beforePreparation.session, undefined, "the child session is not opened in the parent tool call");
+		await arrived;
+		assert.equal(h.state().runs.get(id).status, "running");
+		assert.ok(h.state().runs.get(id).forkedMessages >= 2_000);
+		gate.resolve();
+		const done = await h.ctl("wait", id);
+		assert.equal(done.details.output, "LONG-FORK-DONE");
+	} finally {
+		await h.runtime.dispose();
+		await api.close();
+		rmSync(box.root, { recursive: true, force: true });
+	}
 });
 
 test("provider retry status is live and bounded separately from task work", { timeout: 60000 }, async () => {

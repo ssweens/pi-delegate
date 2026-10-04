@@ -109,7 +109,14 @@ function setup(t: { after(fn: () => unknown): void }, options: { getStatus?: () 
 	const flag = (name: string, on = true) => { const path = join(ampDir, name); if (on) writeFileSync(path, ""); else rmSync(path, { force: true }); };
 	const recordPath = (id: string) => join(runDir, `${encodeURIComponent(id)}.json`);
 	const until = async (check: () => boolean, what: string, ms = 10_000) => { const end = Date.now() + ms; while (!check()) { if (Date.now() > end) assert.fail(`timed out: ${what}`); await sleep(10); } };
-	const start = (extra: Record<string, unknown> = {}) => backend.start({ backend: "acp", origin: "created", agent: "amp", task: "Race check\n…", cwd, executionEnvironment: "local", ...extra } as never) as Promise<AcpRunView>;
+	const start = async (extra: Record<string, unknown> = {}) => {
+		const started = await backend.start({ backend: "acp", origin: "created", agent: "amp", task: "Race check\n…", cwd, executionEnvironment: "local", ...extra } as never) as AcpRunView;
+		for (;;) {
+			const [current] = await backend.status([started.id]);
+			if (current.status !== "running" || current.turns.length > 0) return current;
+			await sleep(1);
+		}
+	};
 	return { root, cwd, ampDir, ownerKey, backend, hooks, runtime, amp, calls, flag, recordPath, until, start, write: (name: string, text: string) => writeFileSync(join(ampDir, name), text) };
 }
 

@@ -82,9 +82,11 @@ export async function harness(box: Sandbox, parent?: string, hooks: { beforeNoti
 	const tools = new Map<string, any>();
 	const commands = new Map<string, any>();
 	let ctx: any;
+	let extensionApi: any;
 	const notices: any[] = [], errors: any[] = [];
 	const notice = deferred<any>();
 	const factory = (pi: any) => {
+		extensionApi = pi;
 		extension(new Proxy(pi, { get(target, key) {
 			if (key === "registerTool") return (tool: any) => { tools.set(tool.name, tool); target.registerTool(tool); };
 			if (key === "registerCommand") return (name: string, options: any) => { commands.set(name, options); target.registerCommand(name, options); };
@@ -120,11 +122,30 @@ export async function harness(box: Sandbox, parent?: string, hooks: { beforeNoti
 	};
 	const ctl = (action: string, runId?: string, extra: any = {}, signal?: AbortSignal) => raw("delegate_ctl", { action, runId, ...extra }, signal);
 	const launch = (task: string, extra: any = {}) => raw("delegate", { role: "scout", context: "fresh", task, cwd: box.cwd, model: "fixture/fixture:off", ...extra });
+	const waitReady = async (id: string) => {
+		for (;;) {
+			const current = await ctl("status", id);
+			if (current.details?.backend !== "acp" || current.details.turns?.length || current.details.status !== "running") return current;
+			await new Promise((resolve) => setImmediate(resolve));
+		}
+	};
+	const launchReady = async (task: string, extra: any = {}) => {
+		const started = await launch(task, extra);
+		if (!started.details?.backend || !started.details.id) return started;
+		const ready = await waitReady(started.details.id);
+		if (ready.details.status === "error" && typeof ready.details.error === "string") {
+			const separator = ready.details.error.indexOf(":");
+			const code = separator < 0 ? ready.details.error : ready.details.error.slice(0, separator);
+			const message = separator < 0 ? ready.details.error : ready.details.error.slice(separator + 1).trim();
+			return { ...started, isError: true, content: [{ type: "text", text: `${code}: ${message}` }], details: { ...ready.details, error: { code, message } } };
+		}
+		return { ...started, details: ready.details };
+	};
 	const waitLaunch = async (task: string, extra: any = {}) => {
 		const started = await launch(task, extra);
 		return started.details?.id ? ctl("wait", started.details.id) : started;
 	};
-	return { sdk, runtime, errors, notices, notice, commands, parent: manager.getSessionFile()!, ctl, ctx: () => ctx, launch, waitLaunch,
+	return { sdk, runtime, errors, notices, notice, commands, parent: manager.getSessionFile()!, ctl, ctx: () => ctx, sendMessage: (message: any, options: any) => extensionApi.sendMessage(message, options), launch, launchReady, waitReady, waitLaunch,
 		state: () => (globalThis as any)[Symbol.for("@ssweens/pi-delegate/runtime/1")],
 	};
 }
