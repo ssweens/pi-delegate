@@ -56,7 +56,7 @@ test("Amp extras through delegate: mode, native T-ID, title and labels, cost", {
 	configureAcpCoordinator({ stateDir: join(box.root, "acp-state"), agentOverrides: { fixture: [process.execPath, "--import", import.meta.resolve("tsx"), fakeAcpAgent, join(box.root, "fixture-state.json")] } });
 	let h = await harness(box);
 	api.onUnscripted(() => ({ text: "ACK" }));
-	const delegate = (args: Record<string, unknown>) => h.launch(args.task as string, { role: undefined, context: undefined, model: undefined, ...args });
+	const delegate = (args: Record<string, unknown>) => h.launchReady(args.task as string, { role: undefined, context: undefined, model: undefined, ...args });
 	const codeOf = (result: any) => result.details?.error?.code;
 	const amp = (): string[][] => existsSync(argsLog) ? readFileSync(argsLog, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)) : [];
 	const executions = () => amp().filter((args) => args.includes("--execute"));
@@ -69,7 +69,7 @@ test("Amp extras through delegate: mode, native T-ID, title and labels, cost", {
 	const created: Record<string, string> = {};
 	try {
 		await t.test("mode: fails explicitly off Amp, on pi, on an opened thread, and beside model; nothing runs", async () => {
-			assert.equal(codeOf(await h.launch("x", { mode: "high" })), "FIELD_REQUIRES_ACP");
+			assert.equal(codeOf(await h.launchReady("x", { mode: "high" })), "FIELD_REQUIRES_ACP");
 			const other = await delegate({ backend: "acp", agent: "fixture", task: "x", mode: "high" });
 			assert.deepEqual([codeOf(other), other.details.error.field], ["FIELD_REQUIRES_AMP", "mode"]);
 			assert.equal(codeOf(await delegate({ backend: "acp", agent: "amp", sessionId: localThread, cwd: undefined, mode: "high" })), "OPEN_OVERRIDE_FORBIDDEN");

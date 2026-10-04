@@ -91,7 +91,7 @@ test("the delegate contract, by backend, origin and agent, through delegate and 
 	configureAcpCoordinator({ stateDir: join(box.root, "acp-state"), profiles: {}, runtimeFactory: fake.factory });
 	api.onUnscripted(() => ({ text: "ACK" }));
 	let h = await harness(box);
-	const delegate = (args: Record<string, unknown>) => h.launch("", { role: undefined, context: undefined, model: undefined, cwd: undefined, task: undefined, ...args });
+	const delegate = (args: Record<string, unknown>) => h.launchReady("", { role: undefined, context: undefined, model: undefined, cwd: undefined, task: undefined, ...args });
 	const codeOf = (result: any): string | undefined => result.details?.error?.code;
 	const invoke: Record<RunAction, (id: string) => Promise<any>> = {
 		status: (id) => h.ctl("status", id),
@@ -182,7 +182,7 @@ test("the delegate contract, by backend, origin and agent, through delegate and 
 				const closes = fake.calls.close.length;
 				const refused = await other.launch("hello", { backend: "acp", agent: "pi", role: undefined, context: undefined, model: undefined, cwd });
 				assert.equal(codeOf(refused), "RUN_NOT_PERSISTED", refused.content[0].text);
-				assert.equal(fake.calls.close.length, closes + 1, "its session was released, not left running untracked");
+				assert.equal(fake.calls.close.length, closes, "nothing was spawned before the durable record failed");
 				const listed = await other.ctl("status");
 				assert.equal(listed.details.rows.some((row: any) => row.backend === "acp"), false, "nothing to find again after a restart");
 			} finally { await other.runtime.dispose(); }

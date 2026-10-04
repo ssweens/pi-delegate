@@ -60,11 +60,11 @@ test("ACP model IDs: status/result for one run read them, bounded; nothing else 
 	configureAcpCoordinator({ stateDir: join(box.root, "acp-state"), profiles: {}, runtimeFactory: fake.factory as never });
 	api.onUnscripted(() => ({ text: "ACK" }));
 	const h = await harness(box);
-	const delegate = (args: Record<string, unknown>) => h.launch("", { role: undefined, context: undefined, model: undefined, cwd: undefined, task: undefined, ...args });
+	const delegate = (args: Record<string, unknown>) => h.launchReady("", { role: undefined, context: undefined, model: undefined, cwd: undefined, task: undefined, ...args });
 	try {
 		await t.test("a created run shows its current and available model IDs, and steer switches", async () => {
 			const reads = fake.calls.status.length;
-			const id = (await delegate({ backend: "acp", agent: "codex", task: "hello", cwd })).details.id;
+			const id = (await h.launch("", { backend: "acp", agent: "codex", task: "hello", cwd, role: undefined, context: undefined, model: undefined })).details.id;
 			await h.ctl("wait", id);
 			await h.ctl("status");
 			assert.equal(fake.calls.status.length, reads, "launch, wait and the run list read no models");

@@ -93,8 +93,10 @@ test("two processes cannot both hold a writer in one cwd; the refusal names the 
 	const [a, b] = await Promise.all([m.pi(), m.pi()]);
 	const writer = await a.call("start", created(m.cwd, "WAIT", { role: "writer" }));
 	const refused = await b.ask("start", created(m.cwd, "WAIT", { role: "writer" }));
-	assert.equal(refused.code, "WRITER_CWD_OWNED", refused.message);
-	assert.match(refused.message!, new RegExp(`held by Pi process ${a.pid} `));
+	assert.equal(refused.ok, true, `the refused launch is still recorded in its transcript: ${refused.code}: ${refused.message}`);
+	assert.equal(refused.value.status, "error");
+	assert.match(refused.value.error, /WRITER_CWD_OWNED/);
+	assert.match(refused.value.error, new RegExp(`held by Pi process ${a.pid} `));
 	assert.ok((await b.ask("start", created(m.cwd, "hello"))).ok, "a read-only run in the same cwd is not a writer");
 
 	await a.call("close", { id: writer.id, force: true });
@@ -269,8 +271,10 @@ test("two workers in one process that share a writer claim keep it until the las
 	assert.ok((await here.execute({ action: "close", name: "w1" })).ok);
 	const b = await m.pi();
 	const refused = await b.ask("start", created(wt, "WAIT", { role: "writer" }));
-	assert.equal(refused.code, "WRITER_CWD_OWNED", `w2 still writes in ${wt}: ${refused.code}: ${refused.message}`);
-	assert.match(refused.message!, new RegExp(`held by Pi process ${process.pid} `));
+	assert.equal(refused.ok, true, `w2 refusal remains a recorded run: ${refused.code}: ${refused.message}`);
+	assert.equal(refused.value.status, "error");
+	assert.match(refused.value.error, /WRITER_CWD_OWNED/);
+	assert.match(refused.value.error, new RegExp(`held by Pi process ${process.pid} `));
 	assert.ok((await here.execute({ action: "close", name: "w2" })).ok);
 	assert.ok((await b.ask("start", created(wt, "WAIT", { role: "writer" }))).ok, "the last holder's close releases it");
 	await here.shutdown();

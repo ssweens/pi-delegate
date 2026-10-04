@@ -1504,8 +1504,6 @@ export default function (pi: ExtensionAPI) {
 			// header now so a crash before the first response still leaves a resumable identity.
 			writeFileSync(sessionFile, `${JSON.stringify(created.getHeader())}\n`, { flag: "wx", mode: 0o600 });
 			const manager = SessionManager.open(sessionFile);
-			const inherited = context === "fork" ? convertToLlm(trimDangling(stripDelegation(buildSessionContext(ctx.sessionManager.buildContextEntries()).messages))) : [];
-			for (const message of inherited) manager.appendMessage(message);
 			const id = newId(role.name);
 			const run: Run = {
 				id, ownerKey: owner.key, recordPath: join(dir, `${encodeURIComponent(id)}.json`),
@@ -1528,9 +1526,11 @@ export default function (pi: ExtensionAPI) {
 				changedFiles: [],
 				droppedTools: wantedTools.filter((t) => !BUILTIN_TOOLS.includes(t)),
 				output: "",
-				startIdx: inherited.length,
-				segmentStartIdx: inherited.length,
-				forkedMessages: context === "fork" ? inherited.length : undefined,
+				// Fork context is materialized by the background preparation below. Until then the
+				// durable child contains only its header and has no child messages to harvest.
+				startIdx: 0,
+				segmentStartIdx: 0,
+				forkedMessages: context === "fork" ? 0 : undefined,
 				writer: isWriter,
 				providerRetryMs: 0,
 				segmentFailedAttempts: 0,
@@ -1546,15 +1546,30 @@ export default function (pi: ExtensionAPI) {
 			runs.set(run.id, run);
 			changed();
 			const completion = run.completion;
-			// Preparation starts after the run is durable. A slow settings/package scan must not
-			// turn an asynchronous delegate call into a blocked parent turn.
-			run.preparing = Promise.resolve().then(() => loader.reload()).then(() => {
+			// Preparation starts after the run is durable. A slow settings/package scan or a long
+			// forked parent transcript must not turn an asynchronous delegate call into a blocked
+			// parent turn. Yield once before the sync transcript copy so queued Intercom/follow-up
+			// messages can be delivered before large history is materialized.
+			run.preparing = (async () => {
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				requireOwner();
+				const inherited = context === "fork"
+					? convertToLlm(trimDangling(stripDelegation(buildSessionContext(ctx.sessionManager.buildContextEntries()).messages)))
+					: [];
+				for (let i = 0; i < inherited.length; i++) {
+					manager.appendMessage(inherited[i]);
+					if ((i + 1) % 32 === 0) await new Promise<void>((resolve) => setImmediate(resolve));
+				}
+				run.startIdx = inherited.length;
+				run.segmentStartIdx = inherited.length;
+				run.forkedMessages = context === "fork" ? inherited.length : undefined;
+				await loader.reload();
 				requireOwner();
 				run.contextFiles = loader.getAgentsFiles().agentsFiles;
 				run.appendSystemPrompt = loader.getAppendSystemPrompt();
 				saveRun(run);
 				changed();
-			});
+			})();
 			void launch(run, p.task, onUpdate, loader).then(() => publish(completion));
 			return { content: [{ type: "text", text: `${run.id} running (${run.context}, ${run.model}). Completion will wake you; use delegate_ctl wait with this runId when dependent work needs the result.` }], details: recordedView(run) };
 		},
@@ -1618,7 +1633,7 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 			"Before using this tool, read skills/delegation/SKILL.md if you have not read it in this session. models without runId: every offering across all enabled providers, verbatim from the registry (provider/id, reasoning, context, $/M), plus live OpenRouter pricing, tiered rates, expirations and Artificial Analysis indices, your cached ratings, approved defaults and drift \u2014 call before the first delegate of a session. models with an ACP runId list that agent's current model and selectable native/fallback IDs with labels and descriptions. One-run status/result show the same catalog compactly. deals: read-only OpenRouter promotion and price/quality shortlist for frontier and light work; does not choose or approve a model. " +
 			"rate: store quality ratings you researched, per exact offering (provider/id), so choices are grounded; stale after 14 days. approve: record a role's default model after the user agreed in conversation. " +
 			"roles: list roles. status: one run or all \u2014 a nonblocking progress read: status, current tool, tool calls so far, elapsed, remaining time budget. result: current report without waiting. wait: join an existing runId; returns its final report, immediately if finished. If queued messages arrive while waiting it returns early with the child still running — answer them, then wait again to rejoin. If the child stops without reporting completion it returns an error report instead of blocking until the run budget. Cancelling wait only detaches; the child keeps running. An attached waiter receives completion instead of a separate wake-up. steer: queue a correction or resume a finished child in the background, keeping its context; returns immediately. Use wait to join the resumed work. Saved children are restored on parent reopen without running; steer revives them with their original configuration unless you pass model:, which moves that child to another offering from the next segment on \u2014 propose it in conversation first, including when the saved offering is exhausted or gone. Explicitly stopped children require restart:true and the user's request. cancel: stop the child and prevent automatic revival. " +
-			"wait with runIds and mode any|all joins several runs of either backend at once; timeoutMs only ends that wait, never the runs. " +
+			"wait with runIds joins several runs of either backend at once and returns when the first settles by default; pass mode=\"all\" when every result is required. timeoutMs only ends that wait, never the runs. " +
 			"Runs started with backend acp take the same runId actions: status and result read the session and its latest turn; wait joins it; steer sends the next turn, queued behind another attachment's active Amp turn when needed; cancel stops only a turn this run started; close releases the session \u2014 a created one is disposed, an opened one only disconnected, never archived or deleted. close is acp only and final. " +
 			"When the parent exits, its acp runs are parked, not closed: their sessions are released and their records stay readable after a restart; steer reopens one (an opened run by its native ID, a created run by native resume, else RUN_NOT_RESUMABLE). " +
 			"status and result on an open Amp run read the native thread once by default (one amp threads export, never in the background) and return only messages after the last ones this attachment showed, from any participant; a failed read is reported as unknown. Other runs do not observe a native thread. " +
@@ -1629,7 +1644,7 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 			model: Type.Optional(Type.String({ description: "approve: provider/id[:thinking] the user agreed to. steer: run the next segment on this offering instead of the child's saved one; the user chooses it, you never substitute silently" })),
 			runId: Type.Optional(Type.String()),
 			runIds: Type.Optional(Type.Array(Type.String(), { description: "wait: join several runs at once, pi and acp alike, with mode" })),
-			mode: Type.Optional(StringEnum(["any", "all"] as const, { description: "wait with runIds: any returns when the first run settles, all (default) when every one has" })),
+			mode: Type.Optional(StringEnum(["any", "all"] as const, { description: "wait with runIds: any (default) returns when the first run settles; all waits for every run" })),
 			force: Type.Optional(Type.Boolean({ description: "close: cancel an active turn first instead of refusing" })),
 			discardPersistentState: Type.Optional(Type.Boolean({ description: "close, created acp sessions only: do not keep the session resumable" })),
 			restart: Type.Optional(Type.Boolean({ description: "steer only: restart an explicitly stopped child, only when the user requested it" })),
@@ -1799,7 +1814,7 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 				const ids = [...new Set(p.runIds ?? (p.runId ? [p.runId] : []))];
 				try {
 					if (!ids.length) throw new DelegateError("INPUT_INVALID", "wait with mode needs runIds", "runIds");
-					return await waitRuns(owner, ids, p.mode ?? "all", ctx, signal, p.timeoutMs);
+					return await waitRuns(owner, ids, p.mode ?? "any", ctx, signal, p.timeoutMs);
 				} catch (error) { return failed(error); }
 			}
 			if (acp.find(p.runId, owner.key)) {

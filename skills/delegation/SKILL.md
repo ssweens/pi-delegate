@@ -47,7 +47,7 @@ Before buying more time, read what the time was spent on. A report that says `N 
 
 Distinguish the three in your own words when you report to the user: the child's work, the provider's failures, and your own budget. Never state one as another.
 
-`wait` returns immediately for a finished run. Cancelling it only detaches the waiter; use `cancel` to stop the child. An attached waiter receives the report instead of a redundant completion wake-up. Check the returned terminal status before acting on the report.
+`wait` returns immediately for a finished run. With several `runIds`, it returns when the first settles unless you pass `mode: "all"`; use `all` only when every result is required. Cancelling it only detaches the waiter; use `cancel` to stop the child. An attached waiter receives the report instead of a redundant completion wake-up. Check the returned terminal status before acting on the report.
 
 There is no synchronous launch mode. If a dependency is discovered later, use `delegate_ctl wait` for that run. Parallel lanes are several background calls with disjoint `cwd` or ownership — one writer per tree.
 

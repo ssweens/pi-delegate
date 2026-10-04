@@ -76,18 +76,22 @@ test("delegate dispatches to the acp backend; no backend is today's pi path", { 
 		});
 
 		await t.test("a failed Claude ACP start remains a transcript and history record", async () => {
-			const failed = await delegate({ backend: "acp", agent: "claude", task: "Claude ACP launch" });
+			const started = await delegate({ backend: "acp", agent: "claude", task: "Claude ACP launch" });
+			assert.equal(started.isError, undefined, started.content[0].text);
+			assert.equal(started.details.status, "running");
+			assert.match(started.details.id, /^claude-/);
+			const failed = await h.ctl("wait", started.details.id);
 			assert.equal(failed.isError, true, failed.content[0].text);
-			assert.equal(failed.details.run.backend, "acp");
-			assert.equal(failed.details.run.status, "error");
-			assert.match(failed.details.run.id, /^claude-/);
-			assert.match(failed.details.run.error, /claude-/);
+			assert.equal(failed.details.backend, "acp");
+			assert.equal(failed.details.status, "error");
+			assert.match(failed.details.error, /claude-/);
 			const listed = await h.ctl("status");
-			assert.ok(listed.details.rows.some((row: any) => row.id === failed.details.run.id && row.status === "error"));
-			const rendered = resultView("delegate", undefined, "", failed, { expanded: false }, theme, 120).join("\n");
+			assert.ok(listed.details.rows.some((row: any) => row.id === started.details.id && row.status === "error"));
+			const rendered = resultView("delegate_ctl", "wait", started.details.id, failed, { expanded: false }, theme, 120).join("\n");
 			assert.match(rendered, /Claude ACP launch/);
 			assert.match(rendered, /✗/);
 			assert.match(rendered, /error/);
+			await h.runtime.session.agent.waitForIdle();
 		});
 
 		let created = "";
@@ -97,8 +101,8 @@ test("delegate dispatches to the acp backend; no backend is today's pi path", { 
 			created = started.details.id;
 			assert.match(created, /^fixture-[0-9a-f-]{36}$/);
 			assert.equal(started.details.backend, "acp");
-			assert.equal(started.details.session.origin, "created");
-			assert.equal(started.details.turns.length, 1);
+			assert.equal(started.details.status, "running");
+			assert.equal(started.details.turns.length, 0, "the ACP launch returns before its first request exists");
 			assert.notEqual(started.details.session.worker, created, "the worker name is not the run ID");
 			assert.doesNotMatch(started.content[0].text, new RegExp(started.details.session.worker), "no internal worker name in text");
 
@@ -167,7 +171,7 @@ test("delegate dispatches to the acp backend; no backend is today's pi path", { 
 		await t.test("wait any/all across runs; a timeout ends the wait, never the run", async () => {
 			const slow = (await delegate({ backend: "acp", agent: "fixture", task: "WAIT" })).details.id;
 			const fast = (await delegate({ backend: "acp", agent: "fixture", task: "quick" })).details.id;
-			const any = await h.ctl("wait", undefined, { runIds: [slow, fast], mode: "any" });
+			const any = await h.ctl("wait", undefined, { runIds: [slow, fast] });
 			assert.equal(any.details.kind, "runs");
 			assert.deepEqual(any.details.wait, { reason: "settled", pending: [slow] });
 			assert.deepEqual(any.details.rows.map((row: any) => [row.id, row.status]), [[fast, "complete"], [slow, "running"]]);
@@ -204,16 +208,17 @@ test("delegate dispatches to the acp backend; no backend is today's pi path", { 
 		});
 
 		await t.test("open: an exact Amp T-ID, idle without a task, native send by steer, close only disconnects", async () => {
-			const opened = await delegate({ backend: "acp", agent: "amp", sessionId: localThread, cwd: undefined });
-			assert.equal(opened.isError, undefined, opened.content[0].text);
-			const id = opened.details.id;
+			const openedStart = await delegate({ backend: "acp", agent: "amp", sessionId: localThread, cwd: undefined });
+			assert.equal(openedStart.isError, undefined, openedStart.content[0].text);
+			const id = openedStart.details.id;
+			const opened = await h.ctl("wait", id);
 			assert.equal(opened.details.status, "idle");
 			assert.equal(opened.details.turns.length, 0);
 			assert.equal(opened.details.session.origin, "opened");
 			assert.equal(opened.details.session.nativeSessionId, localThread);
 			assert.equal(opened.details.session.executionEnvironment, "local");
 			assert.equal(opened.details.capabilities.close.effect, "disconnect");
-			assert.match(opened.content[0].text, new RegExp(`^${id} idle \\(acp amp, opened native session ${localThread}\\); no turn sent`));
+			assert.match(openedStart.content[0].text, new RegExp(`^${id} running \\(acp amp, opened native session pending\\)`));
 
 			const shown = resultView("delegate", undefined, "", opened, { expanded: true }, theme, 120).join("\n");
 			assert.match(shown, /○ acp amp/);
@@ -233,9 +238,10 @@ test("delegate dispatches to the acp backend; no backend is today's pi path", { 
 			const closed = await h.ctl("close", id);
 			assert.match(closed.content[0].text, /closed; disconnected, and the native session is unchanged/);
 
-			const withTask = await delegate({ backend: "acp", agent: "amp", sessionId: orbThread, executionEnvironment: "orb", task: "orb exact", cwd: undefined });
+			const withTaskStart = await delegate({ backend: "acp", agent: "amp", sessionId: orbThread, executionEnvironment: "orb", task: "orb exact", cwd: undefined });
+			const withTask = await h.ctl("wait", withTaskStart.details.id);
 			assert.equal(withTask.details.session.executionEnvironment, "orb");
-			const orb = await h.ctl("wait", withTask.details.id);
+			const orb = withTask;
 			assert.equal(orb.details.output, "AMP_ORB_OK");
 			await h.ctl("close", withTask.details.id);
 		});

@@ -9,6 +9,7 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { setTimeout as sleep } from "node:timers/promises";
 import { acpCoordinator, configureAcpCoordinator, shutdownAcpCoordinator } from "../src/acp/instance.ts";
 import { AcpBackend, DelegateError } from "../src/acp-backend.ts";
 import { fakeRuntime } from "./acp-fake-runtime.ts";
@@ -88,6 +89,11 @@ test("a run parked while its turn could not be released is restored as lost, not
 		rmSync(root, { recursive: true, force: true });
 	});
 	const run = await backend.start({ backend: "acp", origin: "created", agent: "fake", task: "WAIT", cwd });
+	for (;;) {
+		const [current] = await backend.status([run.id]);
+		if (current.turns.length > 0) break;
+		await sleep(1);
+	}
 	assert.equal(run.status, "running");
 	// The Coordinator goes away before this parent parks its run, so the release cannot happen here.
 	await shutdownAcpCoordinator();
