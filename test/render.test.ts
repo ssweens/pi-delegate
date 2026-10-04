@@ -11,7 +11,7 @@ process.env.PI_CODING_AGENT_DIR = join(process.env.HOME, "agent");
 // keyHint styles through the real theme singleton, which the app initializes at startup.
 const { initTheme } = await import("@earendil-works/pi-coding-agent");
 initTheme();
-const { previewLines, resultView, displayDealProvider, displayDealRate, displayDealWindow } = await import("../src/render.ts");
+const { previewLines, resultView, acpRowView, displayDealProvider, displayDealRate, displayDealWindow } = await import("../src/render.ts");
 const { DealSheet } = await import("../src/deals-sheet.ts");
 
 const theme: any = { fg: (_color: string, text: string) => text, bold: (text: string) => text, italic: (text: string) => text, bg: (_color: string, text: string) => text };
@@ -64,6 +64,20 @@ test("a current roles record renders as a table, with the prose behind the expan
 	assert.match(expanded, /Read-only recon of code the parent has not seen\./);
 	assert.match(expanded, /scout\s+read grep find ls bash/);
 	assert.match(expanded, /~\/roles\/scout\.md/);
+});
+
+test("agent duration reports the current task, not the persistent run lifetime", () => {
+	const row = acpRowView({
+		backend: "acp", id: "acp-1", status: "complete", task: "Current task", cwd: "/repo", startedAt: Date.parse("2026-01-01T00:00:00.000Z"),
+		session: { agent: "codex", origin: "created", worker: "w-1", handle: { runtimeSessionName: "session" } },
+		turns: [
+			{ requestId: "req-1", delivery: "accepted", status: "completed", startedAt: "2026-01-01T00:00:00.000Z", finishedAt: "2026-01-01T00:01:00.000Z", truncated: false },
+			{ requestId: "req-2", delivery: "accepted", status: "completed", startedAt: "2026-01-01T00:10:00.000Z", finishedAt: "2026-01-01T00:10:05.000Z", truncated: false },
+		],
+		output: "done", truncated: false, capabilities: {} as any,
+	} as any);
+	assert.equal(row.durationMs, 5_000);
+	assert.equal(row.segmentDurationMs, 5_000);
 });
 
 test("child rows tolerate records missing later fields", () => {

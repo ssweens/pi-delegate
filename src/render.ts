@@ -24,9 +24,9 @@ export interface RunView {
 	turns: number;
 	tokens: { input: number; output: number; cacheRead: number; cacheWrite: number };
 	cost: number;
-	/** Lifetime wall time from the first segment. */
+	/** Wall time spent on the current task/segment. */
 	durationMs: number;
-	/** Wall time in the current segment; resets when a completed run is resumed. */
+	/** Compatibility alias for the current task duration. */
 	segmentDurationMs: number;
 	changedFiles: string[];
 	droppedTools: string[];
@@ -70,14 +70,24 @@ export function acpUsage(v: Pick<AcpRunView, "turns" | "usage">): Pick<RunView, 
 }
 
 /** An ACP run in the shape every run surface draws: one line, the Agents frame, history, the child view. */
+export function currentAcpTaskDurationMs(v: Pick<AcpRunView, "turns">): number {
+	const latest = v.turns.at(-1);
+	if (!latest) return 0;
+	const started = Date.parse(latest.startedAt);
+	if (!Number.isFinite(started)) return 0;
+	const finished = latest.finishedAt ? Date.parse(latest.finishedAt) : Date.now();
+	return Math.max(0, (Number.isFinite(finished) ? finished : Date.now()) - started);
+}
+
 export function acpRowView(v: AcpRunView): RunView {
 	const latest = v.turns.at(-1);
 	const { tokens, cost } = acpUsage(v);
+	const taskDurationMs = currentAcpTaskDurationMs(v);
 	return {
 		id: v.id, segment: v.turns.length, stopped: false, settled: v.status !== "running",
 		role: `acp ${v.session.agent}`, model: v.model ?? "", cwd: v.cwd, thinking: "", context: "fresh",
 		status: v.status, task: v.task ?? "", output: v.output, turns: v.turns.length, tokens, cost,
-		durationMs: (v.endedAt ?? Date.now()) - v.startedAt, segmentDurationMs: (v.endedAt ?? Date.now()) - (v.turns.at(-1)?.startedAt ? Date.parse(v.turns.at(-1)!.startedAt) : v.startedAt), changedFiles: [], droppedTools: [], toolCalls: [],
+		durationMs: taskDurationMs, segmentDurationMs: taskDurationMs, changedFiles: [], droppedTools: [], toolCalls: [],
 		revision: v.turns.length * 1_000_003 + v.output.length * 2 + (v.status === "running" ? 0 : 1),
 		...(v.error ? { error: v.error } : {}),
 		backend: "acp", agent: v.session.agent, origin: v.session.origin,

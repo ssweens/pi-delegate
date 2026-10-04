@@ -236,7 +236,7 @@ test("real SDK delegation lifecycle (loopback provider, no credentials)", { time
 			const result = await h.waitLaunch("Quoted report");
 			assert.equal(result.details.joinedWaiters, 0);
 			const [summary, report] = result.content[0].text.split(/^----- \S+ reported for segment \d+, verbatim -----$/m);
-			assert.match(summary, /^complete \u00b7 scout-[\w-]+ \u00b7 role scout \u00b7 model fixture\/fixture:off \u00b7 context fresh \u00b7 1 turn in \d+s lifetime \u00b7 tokens in \d/);
+			assert.match(summary, /^complete \u00b7 scout-[\w-]+ \u00b7 role scout \u00b7 model fixture\/fixture:off \u00b7 context fresh \u00b7 1 turn · \d+s current task \u00b7 tokens in \d/);
 			// Progress is a read the parent can take at any time, not something it must wait for.
 			const gate = deferred(), arrived = api.script("Progress read", { text: "WORKING", gate });
 			const { details: { id } } = await h.launch("Progress read", { timeoutMs: 600000 });
@@ -360,9 +360,10 @@ test("real SDK delegation lifecycle (loopback provider, no credentials)", { time
 			const status = await h.ctl("status", run.id);
 			assert.match(status.content[0].text, /current segment budget left/);
 			assert.ok(status.details.segmentDurationMs < 60000, `segment duration was ${status.details.segmentDurationMs}`);
-			assert.ok(status.details.durationMs >= 10 * 60 * 1000, "lifetime duration remains historical");
+			assert.ok(status.details.durationMs < 60000, `task duration was ${status.details.durationMs}`);
 			const done = await h.ctl("wait", run.id);
 			assert.equal(done.details.output, "RESUMED");
+			assert.ok(done.details.durationMs < 60000, `settled task duration was ${done.details.durationMs}`);
 		});
 		await t.test("a running child's time budget can be extended, and a spent one is refused", async () => {
 			const gate = deferred(), arrived = api.script("Budget work", { text: "WORKING", gate });

@@ -763,6 +763,7 @@ function fmtTokens(n: number): string {
 const MAX_TOOL_CALLS = 200;
 
 function view(run: Run): RunView {
+	const taskDurationMs = (run.status === "running" ? Date.now() : (run.endedAt ?? Date.now())) - run.segmentStartedAt;
 	return {
 		id: run.id,
 		segment: run.segment,
@@ -781,8 +782,10 @@ function view(run: Run): RunView {
 		turns: run.turns,
 		tokens: run.tokens,
 		cost: run.cost,
-		durationMs: (run.endedAt ?? Date.now()) - run.startedAt,
-		segmentDurationMs: (run.status === "running" ? Date.now() : (run.endedAt ?? Date.now())) - run.segmentStartedAt,
+		// The UI and tool details describe the current task, not the persistent run lifetime.
+		// `segmentDurationMs` remains as a compatibility alias for consumers of older details.
+		durationMs: taskDurationMs,
+		segmentDurationMs: taskDurationMs,
 		changedFiles: run.changedFiles,
 		droppedTools: run.droppedTools,
 		failedAttempts: run.failedAttempts,
@@ -806,14 +809,13 @@ function recordedView(run: Run): RunView {
 }
 
 function summary(run: Run): string {
-	const dur = ((run.endedAt ?? Date.now()) - run.startedAt) / 1000;
+	const dur = ((run.status === "running" ? Date.now() : (run.endedAt ?? Date.now())) - run.segmentStartedAt) / 1000;
 	const parts = [
 		`${run.status} · ${run.id}`,
 		`role ${run.role}`,
 		`model ${run.model}${run.thinking ? `:${run.thinking}` : ""}`,
 		run.context === "fork" ? `context forked from ${run.forkedMessages ?? 0} parent messages` : "context fresh",
-		`${run.turns} turn${run.turns === 1 ? "" : "s"} in ${dur.toFixed(0)}s lifetime`,
-		run.status === "running" ? `current segment ${Math.max(0, (Date.now() - run.segmentStartedAt) / 1000).toFixed(0)}s` : "",
+		`${run.turns} turn${run.turns === 1 ? "" : "s"} · ${dur.toFixed(0)}s current task`,
 		`tokens in ${fmtTokens(run.tokens.input)}, out ${fmtTokens(run.tokens.output)}` +
 			(run.tokens.cacheRead ? `, cached ${fmtTokens(run.tokens.cacheRead)}` : ""),
 		run.cost ? `$${run.cost.toFixed(4)}` : "",

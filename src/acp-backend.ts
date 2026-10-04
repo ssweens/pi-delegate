@@ -64,7 +64,7 @@ import {
 import { type ObserveCursor, observationText, observeAmpThread } from "./amp-observe.js";
 import { AMP_LABEL, AMP_THREAD_ID, ampThreadLabel, ampThreadUsage, parseAmpCost, type AmpRun } from "./acp/runtime/amp-cli.js";
 import type { AmpThreadUsage } from "./backend.js";
-import { acpUsage, elapsed } from "./render.js";
+import { acpUsage, currentAcpTaskDurationMs, elapsed } from "./render.js";
 import { ownedElsewhere, processOwner, readRecord, type RunOwner, writeRecord } from "./storage.js";
 import type { ChildActivity } from "./transcript.js";
 
@@ -1021,7 +1021,7 @@ export function acpModelsText(models: AcpModelsView): string {
 const modelsText = acpModelsText;
 
 export function acpSummary(v: AcpRunView): string {
-	const dur = elapsed((v.endedAt ?? Date.now()) - v.startedAt);
+	const dur = elapsed(currentAcpTaskDurationMs(v));
 	const { tokens: { input: tokensIn, output: tokensOut }, cost } = acpUsage(v);
 	// An Amp run's cost is its thread's, as last read; never read or unreadable is unknown, not zero.
 	const costText = v.session.agent === "amp"
@@ -1034,7 +1034,7 @@ export function acpSummary(v: AcpRunView): string {
 		v.role ? `role ${v.role}` : "",
 		v.model ? `model ${v.model}` : "",
 		v.mode ? `mode ${v.mode}` : "",
-		`${v.turns.length} turn${v.turns.length === 1 ? "" : "s"} in ${dur}`,
+		`${v.turns.length} turn${v.turns.length === 1 ? "" : "s"} · ${dur} current task`,
 		tokensIn || tokensOut ? `tokens in ${tokensIn}, out ${tokensOut}` : "",
 		costText,
 	].filter(Boolean).join(" · ");

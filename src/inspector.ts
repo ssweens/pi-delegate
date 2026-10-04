@@ -125,7 +125,7 @@ export class AgentsPanel implements Component, Focusable {
 		const body = shown.map((v) => {
 			const selected = this.focused && v.id === this.selectedId;
 			const prefix = `${selected ? this.theme.fg("accent", "›") : " "} ${icon(v, this.theme)} `;
-			const time = elapsed(v.status === "running" ? v.segmentDurationMs : v.durationMs);
+			const time = elapsed(v.durationMs);
 			const title = this.theme.fg(selected ? "accent" : "text", runTitle(v));
 			if (inner < 65) return pad(`${prefix}${title}`, Math.max(1, inner - time.length - 1)) + ` ${time}`;
 			// Reserve the column on every row once it is shown, so a session with no model
