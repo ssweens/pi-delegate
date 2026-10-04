@@ -7,6 +7,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { existsSync, readdirSync } from "node:fs";
 import {
 	LEGACY_TODO_CUSTOM_TYPE,
+	LEGACY_TODO_WIDGET_KEY,
 	TODO_CUSTOM_TYPE,
 	TODO_WIDGET_KEY,
 	installTodo,
@@ -114,6 +115,7 @@ test("tool drives the widget, restores it on session navigation, and clears when
 	h.fire("session_start", { type: "session_start" }, ctx);
 	h.fire("session_tree", { type: "session_tree" }, ctx);
 	assert.equal(h.widgets.filter((w) => w.content !== undefined).length, 3);
+	assert.deepEqual(h.widgets.filter((w) => w.key === LEGACY_TODO_WIDGET_KEY && w.content === undefined).length, 3);
 
 	// Branch navigation to a sibling branch that still carries legacy pi-omp state.
 	const legacy = [{ type: "custom", customType: LEGACY_TODO_CUSTOM_TYPE, data: { phases: [{ name: "Sibling", tasks: [{ content: "Use sibling task", status: "pending" }] }] } }];
@@ -122,6 +124,7 @@ test("tool drives the widget, restores it on session navigation, and clears when
 
 	await tool.execute("todo-2", { op: "done", content: "Keep the current task visible" }, undefined, undefined, ctx);
 	assert.deepEqual(h.widgets.at(-1), { key: TODO_WIDGET_KEY, content: undefined, options: undefined });
+	assert.equal(h.widgets.filter((w) => w.key === LEGACY_TODO_WIDGET_KEY && w.content === undefined).length, 5);
 	const completion = tool.renderResult(
 		await tool.execute("todo-3", { op: "view" }, undefined, undefined, ctx),
 		{ expanded: false },

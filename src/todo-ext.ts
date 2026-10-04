@@ -42,6 +42,8 @@ export const TODO_CUSTOM_TYPE = "pi_delegate.todo";
 /** Legacy namespace written by pi-omp; read-only migration source. */
 export const LEGACY_TODO_CUSTOM_TYPE = "pi_omp.todo";
 export const TODO_WIDGET_KEY = "pi-delegate.todo";
+/** Widget key used by the former pi-omp owner; clear it when taking ownership. */
+export const LEGACY_TODO_WIDGET_KEY = "pi-omp.todo";
 /** Default phase for `/todo add`. */
 export const TODO_DEFAULT_PHASE = "Tasks";
 /** Default Markdown path for `/todo export|import`. */
@@ -131,6 +133,10 @@ function applyOp(state: TodoState, p: TodoParams): TodoState {
 }
 
 export function syncTodoWidget(ui: Pick<ExtensionCommandContext["ui"], "setWidget">, state: TodoState): void {
+	// A running Pi process can retain the old pi-omp widget across an extension
+	// reload. Remove that key before installing the delegate-owned widget so a
+	// stale unframed panel cannot remain beside (or instead of) the new one.
+	ui.setWidget(LEGACY_TODO_WIDGET_KEY, undefined);
 	if (countOpen(state) === 0) {
 		ui.setWidget(TODO_WIDGET_KEY, undefined);
 		return;
