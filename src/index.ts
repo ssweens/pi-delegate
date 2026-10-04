@@ -117,6 +117,9 @@ interface Run {
 	droppedTools: string[];
 	output: string;
 	failedAttempts: number;
+	/** Failed attempts in the current segment, for causal timeout reporting. */
+	segmentFailedAttempts: number;
+	segmentFailedAttemptsBase: number;
 	lastAttemptError?: string;
 	providerRetryMs: number;
 	providerRetry?: { attempt: number; maxAttempts: number; delayMs: number; errorMessage: string; startedAt: number };
@@ -133,6 +136,9 @@ interface Run {
 	/** Resource preparation is part of the background launch, not the parent tool call. */
 	preparing?: Promise<void>;
 	startIdx: number;
+	/** Transcript index at which the current segment began; lifetime counters still use startIdx. */
+	segmentStartIdx: number;
+	/** Start of the current execution segment; unlike startedAt, this resets on every resume. */
 	segmentStartedAt: number;
 	forkedMessages?: number;
 	writer: boolean;
@@ -231,6 +237,12 @@ function restoreRun(path: string, owner: Owner): Run {
 	// Parent message_end hooks run before Pi appends the message. Only its transcript
 	// can establish durable delivery after a crash; never trust a saved in-memory acknowledgement.
 	const run: Run = { ...record, recordPath: path, acknowledged: false, completion: new RunCompletion(), activeTools: new Map() };
+	// Older records used the lifetime start as the implicit segment start. Keep them readable;
+	// a subsequent resume below always establishes a fresh segment start.
+	run.segmentStartedAt ??= run.startedAt;
+	run.segmentStartIdx ??= run.startIdx;
+	run.segmentFailedAttempts ??= 0;
+	run.segmentFailedAttemptsBase ??= Math.max(0, run.failedAttempts - run.segmentFailedAttempts);
 	run.providerRetryMs ??= 0;
 	if (ownedElsewhere(record)) {
 		// Its live owner is still running or delivering it: show a snapshot, never write or re-deliver it.
@@ -383,10 +395,13 @@ function harvest(run: Run) {
 				if (typeof p === "string") changed.add(p);
 			}
 		}
-		if (text.trim()) output = text;
+		// A resumed segment may fail before producing text. Do not re-report the last
+		// completed segment as if it were the current attempt's report.
+		if (i >= run.segmentStartIdx && text.trim()) output = text;
 	}
 	run.turns = turns;
 	run.failedAttempts = failedAttempts;
+	run.segmentFailedAttempts = Math.max(run.segmentFailedAttempts, Math.max(0, failedAttempts - run.segmentFailedAttemptsBase));
 	run.lastAttemptError = lastAttemptError;
 	run.tokens = tokens;
 	run.cost = cost;
@@ -767,6 +782,7 @@ function view(run: Run): RunView {
 		tokens: run.tokens,
 		cost: run.cost,
 		durationMs: (run.endedAt ?? Date.now()) - run.startedAt,
+		segmentDurationMs: (run.status === "running" ? Date.now() : (run.endedAt ?? Date.now())) - run.segmentStartedAt,
 		changedFiles: run.changedFiles,
 		droppedTools: run.droppedTools,
 		failedAttempts: run.failedAttempts,
@@ -796,7 +812,8 @@ function summary(run: Run): string {
 		`role ${run.role}`,
 		`model ${run.model}${run.thinking ? `:${run.thinking}` : ""}`,
 		run.context === "fork" ? `context forked from ${run.forkedMessages ?? 0} parent messages` : "context fresh",
-		`${run.turns} turn${run.turns === 1 ? "" : "s"} in ${dur.toFixed(0)}s`,
+		`${run.turns} turn${run.turns === 1 ? "" : "s"} in ${dur.toFixed(0)}s lifetime`,
+		run.status === "running" ? `current segment ${Math.max(0, (Date.now() - run.segmentStartedAt) / 1000).toFixed(0)}s` : "",
 		`tokens in ${fmtTokens(run.tokens.input)}, out ${fmtTokens(run.tokens.output)}` +
 			(run.tokens.cacheRead ? `, cached ${fmtTokens(run.tokens.cacheRead)}` : ""),
 		run.cost ? `$${run.cost.toFixed(4)}` : "",
@@ -817,7 +834,8 @@ function summary(run: Run): string {
 
 /** The child's words are quoted, never blended into this tool's own reporting. */
 function resultText(run: Run): string {
-	return `${summary(run)}\n\n----- ${run.id} reported, verbatim -----\n${run.output || "(the child ended without a final message)"}\n----- end of report -----`;
+	const report = run.output || `(no final report was produced in segment ${run.segment}; an earlier segment's report is not repeated)`;
+	return `${summary(run)}\n\n----- ${run.id} reported for segment ${run.segment}, verbatim -----\n${report}\n----- end of report -----`;
 }
 
 function log(run: Run) {
@@ -860,8 +878,8 @@ function finish(run: Run, status: Status, error?: string) {
 	catch (e) { run.status = "error"; run.error = `Cannot read child transcript: ${String(e)}`; }
 	if (run.status === "timeout" && !run.error) {
 		run.error = `Stopped after its ${Math.round(run.timeoutMs / 60000)} min budget (timeoutMs, default ${DEFAULT_TIMEOUT_MS / 60000} min). Its work up to that point stands and is not rolled back.`
-			+ (run.failedAttempts
-				? ` Most of that budget went to ${run.failedAttempts} failed provider attempt${run.failedAttempts === 1 ? "" : "s"} and retries (last: ${run.lastAttemptError}), not to the work \u2014 investigate that provider or choose another offering before granting more time.`
+			+ (run.segmentFailedAttempts
+				? ` Most of this segment's budget went to ${run.segmentFailedAttempts} failed provider attempt${run.segmentFailedAttempts === 1 ? "" : "s"} and retries (last: ${run.lastAttemptError}), not to the work \u2014 investigate that provider or choose another offering before granting more time.`
 				: ` Give it a larger timeoutMs only if the work genuinely needs longer.`);
 	}
 	run.activeTools.clear();
@@ -953,7 +971,14 @@ function beginResume(run: Run, restart: boolean, replacement?: { model?: string;
 	// sends the next segment to the old provider, so a new offering reopens from the transcript.
 	const rebind = Boolean(replacement) && ((replacement!.model ?? run.model) !== run.model || (replacement!.thinking ?? run.thinking) !== run.thinking);
 	const next: Run = { ...run, ...replacement, segment: run.segment + 1, stopped: false, acknowledged: false,
+		// A new segment must not publish the prior segment's report while it is still running.
+		output: "",
 		status: "running", endedAt: undefined, error: undefined, revision: run.revision + 1,
+		// A resume starts a fresh budget and report scope; persist both with the segment.
+		segmentStartIdx: messagesOf(run).length,
+		segmentFailedAttemptsBase: run.failedAttempts,
+		segmentFailedAttempts: 0,
+		segmentStartedAt: Date.now(),
 		session: rebind ? undefined : run.session,
 		completion: new RunCompletion<RunResult>() };
 	saveRun(next);
@@ -1169,6 +1194,9 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (ev.type === "message_end") run.streamingMessage = undefined;
 			if (ev.type === "auto_retry_start") {
+				// Retry events can arrive before the failed assistant message is persisted;
+				// retain the current-segment attribution for an ensuing timeout.
+				run.segmentFailedAttempts++;
 				const now = Date.now();
 				const retryWall = run.providerRetryMs + (run.providerRetry ? Math.max(0, now - run.providerRetry.startedAt) : 0);
 				if (run.providerRetry) {
@@ -1501,9 +1529,12 @@ export default function (pi: ExtensionAPI) {
 				droppedTools: wantedTools.filter((t) => !BUILTIN_TOOLS.includes(t)),
 				output: "",
 				startIdx: inherited.length,
+				segmentStartIdx: inherited.length,
 				forkedMessages: context === "fork" ? inherited.length : undefined,
 				writer: isWriter,
 				providerRetryMs: 0,
+				segmentFailedAttempts: 0,
+				segmentFailedAttemptsBase: 0,
 				toolCalls: [],
 				activeTools: new Map(),
 				revision: 0,
@@ -1822,7 +1853,7 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 					return await waitForChild(run, ctx, signal);
 				case "status":
 					if (run.session && run.status === "running") harvest(run);
-					return { content: [{ type: "text", text: `${summary(run)}${run.status === "running" ? `\nnow: ${run.providerRetry ? `provider retry ${run.providerRetry.attempt}/${run.providerRetry.maxAttempts}` : run.activeTools.values().next().value?.name ?? (run.lastTool ? `thinking after ${run.lastTool}` : "thinking")} \u00b7 ${run.toolCalls.length} tool call${run.toolCalls.length === 1 ? "" : "s"} so far \u00b7 ${Math.round((run.timeoutMs - (Date.now() - run.startedAt)) / 60000)} min of its budget left` : ""}` }], details: recordedView(run) };
+					return { content: [{ type: "text", text: `${summary(run)}${run.status === "running" ? `\nnow: ${run.providerRetry ? `provider retry ${run.providerRetry.attempt}/${run.providerRetry.maxAttempts}` : run.activeTools.values().next().value?.name ?? (run.lastTool ? `thinking after ${run.lastTool}` : "thinking")} \u00b7 ${run.toolCalls.length} tool call${run.toolCalls.length === 1 ? "" : "s"} so far \u00b7 ${Math.max(0, Math.round((run.timeoutMs - (Date.now() - run.segmentStartedAt)) / 60000))} min of current segment budget left` : ""}` }], details: recordedView(run) };
 				case "result":
 					return run.completion.settled ? finalResult(run) : { content: [{ type: "text", text: resultText(run) }], details: recordedView(run) };
 				case "cancel":

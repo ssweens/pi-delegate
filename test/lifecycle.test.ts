@@ -193,15 +193,15 @@ test("real SDK delegation lifecycle (loopback provider, no credentials)", { time
 			api.script("Quoted report", { text: "CHILD-WORDS" });
 			const result = await h.waitLaunch("Quoted report");
 			assert.equal(result.details.joinedWaiters, 0);
-			const [summary, report] = result.content[0].text.split(/^----- \S+ reported, verbatim -----$/m);
-			assert.match(summary, /^complete \u00b7 scout-[\w-]+ \u00b7 role scout \u00b7 model fixture\/fixture:off \u00b7 context fresh \u00b7 1 turn in \d+s \u00b7 tokens in \d/);
+			const [summary, report] = result.content[0].text.split(/^----- \S+ reported for segment \d+, verbatim -----$/m);
+			assert.match(summary, /^complete \u00b7 scout-[\w-]+ \u00b7 role scout \u00b7 model fixture\/fixture:off \u00b7 context fresh \u00b7 1 turn in \d+s lifetime \u00b7 tokens in \d/);
 			// Progress is a read the parent can take at any time, not something it must wait for.
 			const gate = deferred(), arrived = api.script("Progress read", { text: "WORKING", gate });
 			const { details: { id } } = await h.launch("Progress read", { timeoutMs: 600000 });
 			await arrived;
 			const status = await h.ctl("status", id);
 			assert.match(status.content[0].text, /^running \u00b7 /);
-			assert.match(status.content[0].text, /\nnow: thinking \u00b7 0 tool calls so far \u00b7 10 min of its budget left$/);
+			assert.match(status.content[0].text, /\nnow: thinking \u00b7 0 tool calls so far \u00b7 10 min of current segment budget left$/);
 			// A blocked parent turn is visible while it lasts, so a queued prompt is explicable.
 			assert.equal(state().runs.get(id).completion.waiting, 0);
 			const wait = h.ctl("wait", id);
@@ -304,6 +304,24 @@ test("real SDK delegation lifecycle (loopback provider, no credentials)", { time
 			assert.equal((await wait).details.status, "cancelled");
 			assert.equal(api.requests.length, count);
 		});
+		await t.test("a completed run resumes with a fresh segment clock and budget", async () => {
+			api.script("Initial segment", { text: "INITIAL" });
+			const first = await h.waitLaunch("Initial segment", { timeoutMs: 60000 });
+			const run = state().runs.get(first.details.id);
+			// Simulate a long-lived saved run whose previous segment budget was spent.
+			run.startedAt = Date.now() - 10 * 60 * 1000;
+			run.segmentStartedAt = run.startedAt;
+			api.script("Resumed segment", { text: "RESUMED" });
+			const steer = await h.ctl("steer", run.id, { message: "Resumed segment", timeoutMs: 60000 });
+			assert.match(steer.content[0].text, /resumed in the background/);
+			assert.equal(steer.details.output, "", "an immediate resumed snapshot must not repeat the prior segment report");
+			const status = await h.ctl("status", run.id);
+			assert.match(status.content[0].text, /current segment budget left/);
+			assert.ok(status.details.segmentDurationMs < 60000, `segment duration was ${status.details.segmentDurationMs}`);
+			assert.ok(status.details.durationMs >= 10 * 60 * 1000, "lifetime duration remains historical");
+			const done = await h.ctl("wait", run.id);
+			assert.equal(done.details.output, "RESUMED");
+		});
 		await t.test("a running child's time budget can be extended, and a spent one is refused", async () => {
 			const gate = deferred(), arrived = api.script("Budget work", { text: "WORKING", gate });
 			api.script("Keep going", { text: "FINISHED-WITH-MORE-TIME" });
@@ -359,8 +377,8 @@ test("real SDK delegation lifecycle (loopback provider, no credentials)", { time
 			const timedOut = await h.ctl("wait", hung.details.id);
 			api.onUnscripted();
 			assert.equal(timedOut.details.status, "timeout");
-			assert.match(timedOut.details.error, /Most of that budget went to 1 failed provider attempt and retries \(last: [^)]*Fixture provider failure[^)]*\), not to the work/);
-			assert.doesNotMatch(timedOut.details.error, /Give it a larger timeoutMs only/);
+			assert.doesNotMatch(timedOut.details.error, /Most of this segment's budget went to/);
+			assert.match(timedOut.details.error, /Give it a larger timeoutMs only/);
 		});
 		await t.test("missing transcript and failed snapshot leave the previous segment intact", async () => {
 			api.script("Transactional seed", { text: "SAVED" });

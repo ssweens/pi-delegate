@@ -24,7 +24,10 @@ export interface RunView {
 	turns: number;
 	tokens: { input: number; output: number; cacheRead: number; cacheWrite: number };
 	cost: number;
+	/** Lifetime wall time from the first segment. */
 	durationMs: number;
+	/** Wall time in the current segment; resets when a completed run is resumed. */
+	segmentDurationMs: number;
 	changedFiles: string[];
 	droppedTools: string[];
 	failedAttempts?: number;
@@ -74,7 +77,7 @@ export function acpRowView(v: AcpRunView): RunView {
 		id: v.id, segment: v.turns.length, stopped: false, settled: v.status !== "running",
 		role: `acp ${v.session.agent}`, model: v.model ?? "", cwd: v.cwd, thinking: "", context: "fresh",
 		status: v.status, task: v.task ?? "", output: v.output, turns: v.turns.length, tokens, cost,
-		durationMs: (v.endedAt ?? Date.now()) - v.startedAt, changedFiles: [], droppedTools: [], toolCalls: [],
+		durationMs: (v.endedAt ?? Date.now()) - v.startedAt, segmentDurationMs: (v.endedAt ?? Date.now()) - (v.turns.at(-1)?.startedAt ? Date.parse(v.turns.at(-1)!.startedAt) : v.startedAt), changedFiles: [], droppedTools: [], toolCalls: [],
 		revision: v.turns.length * 1_000_003 + v.output.length * 2 + (v.status === "running" ? 0 : 1),
 		...(v.error ? { error: v.error } : {}),
 		backend: "acp", agent: v.session.agent, origin: v.session.origin,
