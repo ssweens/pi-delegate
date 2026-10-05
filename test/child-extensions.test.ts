@@ -108,7 +108,7 @@ test("a child loads its parent's extensions; its role's tools line is a plain al
 			assert.match(result.content[0].text, /tools the child could not have .*: no_such_tool, todo, web_\*/);
 		});
 
-		await t.test("an extension that throws on load, or in a handler, does not stop the child; the run reports it", async () => {
+		await t.test("an extension that throws on load does not stop the child and is reported; extensions' session_start never runs in a child", async () => {
 			const boom = join(box.agentDir, "extensions", "boom.js");
 			const badStart = join(box.agentDir, "extensions", "bad-start.js");
 			writeFileSync(boom, `throw new Error("BOOM-ON-LOAD");\n`);
@@ -121,7 +121,7 @@ test("a child loads its parent's extensions; its role's tools line is a plain al
 				assert.match(lastTool(requestsFor("Survives")[1]), /^fixture_tool: s$/, "the other extensions still work");
 				const errors = run(result.details.id).extensionErrors.join("\n");
 				assert.match(errors, /boom\.js: .*BOOM-ON-LOAD/);
-				assert.match(errors, /bad-start\.js: session_start: BOOM-ON-START/);
+				assert.doesNotMatch(errors, /BOOM-ON-START/, "a child does not run extensions' session_start handlers");
 				assert.match(result.content[0].text, /extensions that failed in the child \(it ran without them\):\n  .*boom\.js/);
 			} finally { rmSync(boom, { force: true }); rmSync(badStart, { force: true }); }
 		});

@@ -355,6 +355,9 @@ function gateExtensions(run: Run, base: LoadExtensionsResult): LoadExtensionsRes
 		const gated = new GatedTools(allows, offered);
 		for (const [name, tool] of extension.tools) gated.set(name, tool);
 		extension.tools = gated;
+		// A child shares the parent's process; startup work (browsers, daemons, credential switching)
+		// already ran for the parent. Only the nested pi-delegate needs session_start, to attach its children.
+		if (extension.path !== NESTED_PATH) extension.handlers.delete("session_start");
 	}
 	// Pi reports a copy's tools as conflicting with the nested instance's; with the copy left out, they do not.
 	const errors = base.errors.filter((error) => !copies.has(error.path) && ![...copies].some((path) => error.error.includes(path)));
