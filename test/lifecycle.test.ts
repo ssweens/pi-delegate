@@ -1,3 +1,4 @@
+import "./setup.ts"; // First: isolates this file from the real home even when run on its own.
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { existsSync, rmSync, readFileSync, renameSync } from "node:fs";
@@ -400,6 +401,7 @@ test("real SDK delegation lifecycle (loopback provider, no credentials)", { time
 			api.script("Stalled provider", { error: 503 });
 			const failed = await h.waitLaunch("Stalled provider");
 			const id = failed.details.id;
+			assert.equal(h.state().runs.get(id).session.settingsManager.getRetryEnabled(), false, "the child reads this sandbox's settings: retry off, so one 503 is one attempt");
 			assert.equal(failed.details.status, "error");
 			assert.equal(failed.details.failedAttempts, 1);
 			assert.equal(failed.details.turns, 0, "a failed request is not a turn");
@@ -491,7 +493,7 @@ test("real SDK delegation lifecycle (loopback provider, no credentials)", { time
 		await t.test("a second process on the same parent delegates; the live parent's runs stay read-only there", async () => {
 			api.script("Shared child", { text: "SHARED-OK" });
 			api.onUnscripted(() => ({ text: "SHARED-ACK" }));
-			const child = spawn(process.execPath, ["--import", "tsx", "test/reopen.ts", box.root, h.parent, "shared"], { env: box.env, stdio: ["ignore", "pipe", "pipe"] });
+			const child = spawn(process.execPath, ["--import", "tsx", "test/reopen.ts", box.root, h.parent, "shared", box.agentDir], { env: box.env, stdio: ["ignore", "pipe", "pipe"] });
 			let output = ""; child.stdout.on("data", (s) => output += s); child.stderr.on("data", (s) => output += s);
 			const [code] = await once(child, "exit"); assert.equal(code, 0, output); assert.match(output, /SHARED-PARENT-OK/);
 			api.onUnscripted();
@@ -500,7 +502,7 @@ test("real SDK delegation lifecycle (loopback provider, no credentials)", { time
 			const parent = h.parent;
 			await h.runtime.dispose();
 			const count = api.requests.length;
-			const child = spawn(process.execPath, ["--import", "tsx", "test/reopen.ts", box.root, parent, "cold"], { env: box.env, stdio: ["ignore", "pipe", "pipe"] });
+			const child = spawn(process.execPath, ["--import", "tsx", "test/reopen.ts", box.root, parent, "cold", box.agentDir], { env: box.env, stdio: ["ignore", "pipe", "pipe"] });
 			let output = ""; child.stdout.on("data", (s) => output += s); child.stderr.on("data", (s) => output += s);
 			const [code] = await once(child, "exit"); assert.equal(code, 0, output); assert.match(output, /COLD-READ-ONLY/);
 			assert.equal(api.requests.length, count);
@@ -529,6 +531,10 @@ test("a long pi fork launch returns before copying parent history", { timeout: 6
 		await arrived;
 		assert.equal(h.state().runs.get(id).status, "running");
 		assert.ok(h.state().runs.get(id).forkedMessages >= 2_000);
+		// Not the first sandbox in this process: its child still reads this sandbox's settings, not Pi's defaults.
+		const settings = h.state().runs.get(id).session.settingsManager;
+		assert.equal(settings.getCompactionEnabled(), false, "the child reads this sandbox's settings: compaction off");
+		assert.equal(settings.getRetryEnabled(), false, "the child reads this sandbox's settings: retry off");
 		gate.resolve();
 		const done = await h.ctl("wait", id);
 		assert.equal(done.details.output, "LONG-FORK-DONE");
@@ -550,6 +556,8 @@ test("provider retry status is live and bounded separately from task work", { ti
 		const run = h.state().runs.get(id);
 		assert.ok(run?.ready, "child session setup is observable before its prompt begins");
 		await run.ready;
+		assert.equal(run.session.settingsManager.getRetryEnabled(), true, "the child reads this sandbox's settings: retry enabled");
+		assert.equal(run.session.settingsManager.getRetrySettings().baseDelayMs, 250);
 		const retryStarted = deferred<any>();
 		const unsubscribe = run.session.subscribe((event: any) => {
 			if (event.type === "auto_retry_start") retryStarted.resolve(event);

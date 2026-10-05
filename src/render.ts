@@ -41,6 +41,10 @@ export interface RunView {
 	lastTool?: string;
 	error?: string;
 	sessionFile?: string;
+	/** Pi runs: 1 for a child of the root parent, one more per delegating child above it. */
+	depth?: number;
+	/** Pi runs started by a delegating child: that child's run ID. */
+	parentRunId?: string;
 	/** Display facts of an ACP run (acpRowView). Absent on pi runs, which are the default. */
 	backend?: "pi" | "acp";
 	agent?: string;
@@ -589,8 +593,10 @@ export function resultView(
 				+ theme.fg("text", pad(r.name, nameWidth)) + "  "
 				+ theme.fg("muted", pad(r.mode, modeWidth)) + "  "
 				+ theme.fg(r.approved === true ? "dim" : "warning", pad(r.model, modelWidth)) + "  "
-				+ theme.fg(r.writes === true ? "warning" : "success", r.writes === true ? "writes" : "read-only")
+				// A delegating role's own tools may be read-only; the children it starts may write.
+				+ theme.fg(r.writes === true || r.delegates === true ? "warning" : "success", r.writes === true ? (r.delegates === true ? "writes; delegates" : "writes") : r.delegates === true ? "delegates; can write via children" : "read-only")
 				+ theme.fg("dim", ` · ${r.tools.length} tools`)
+				+ (r.mcp ? theme.fg("dim", ` · mcp${Array.isArray(r.mcp) ? ` ${r.mcp.join(",")}` : ""}`) : "")
 				+ (r.timeoutMs ? theme.fg("dim", ` · ${Math.round(r.timeoutMs / 60000)}m`) : "")
 				+ ((r.dropped?.length ?? 0) ? theme.fg("warning", ` · ${r.dropped.length} unavailable`) : ""),
 				inner, "\u2026")),

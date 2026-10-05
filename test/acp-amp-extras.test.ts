@@ -1,3 +1,4 @@
+import "./setup.ts"; // First: isolates this file from the real home even when run on its own.
 /**
  * Amp extras through `delegate`/`delegate_ctl` (todo 058), with the real extension and Pi SDK
  * parent and the fake Amp CLI (test/acp/fixtures/fake-amp.mjs), which records every invocation and

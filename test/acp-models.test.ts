@@ -1,3 +1,4 @@
+import "./setup.ts"; // First: isolates this file from the real home even when run on its own.
 /**
  * An ACP run's own model IDs in delegate_ctl status/result for one run: one bounded Coordinator
  * status per call, never on render or in the list. Through the real extension and Pi SDK parent;

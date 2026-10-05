@@ -1,3 +1,4 @@
+import "./setup.ts"; // First: isolates this file from the real home even when run on its own.
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { spawn } from "node:child_process";
@@ -7,7 +8,7 @@ import { join } from "node:path";
 import { provider, sandbox, type Sandbox } from "./fixture.ts";
 
 async function run(box: Sandbox, mode: string) {
-	const child = spawn(process.execPath, ["--import", "tsx", "test/recovery-worker.ts", box.root, mode], { env: box.env, stdio: ["ignore", "pipe", "pipe"], timeout: 30000, killSignal: "SIGKILL" });
+	const child = spawn(process.execPath, ["--import", "tsx", "test/recovery-worker.ts", box.root, mode, box.agentDir], { env: box.env, stdio: ["ignore", "pipe", "pipe"], timeout: 30000, killSignal: "SIGKILL" });
 	let output = ""; child.stdout.on("data", (s) => output += s); child.stderr.on("data", (s) => output += s);
 	const [code, signal] = await once(child, "exit");
 	return { code, signal, output };
@@ -15,7 +16,7 @@ async function run(box: Sandbox, mode: string) {
 test("SIGKILL before delivery and before receipt persistence recovers once without child execution", { timeout: 45000 }, async () => {
 	const api = await provider(), box = sandbox(api.url);
 	try {
-		const scenarios = ["crash-before-delivery", "crash-receipt"].map((mode) => ({ mode, box: sandbox(api.url, join(box.root, mode)) }));
+		const scenarios = ["crash-before-delivery", "crash-receipt"].map((mode) => ({ mode, box: sandbox(api.url, join(box.root, mode), { ownAgentDir: true }) }));
 		api.script("Crash child", { text: "CRASH-RESULT" }, { text: "CRASH-RESULT" });
 		const crashes = await Promise.all(scenarios.map(({ box, mode }) => run(box, mode)));
 		for (const crash of crashes) assert.equal(crash.signal, "SIGKILL", crash.output);

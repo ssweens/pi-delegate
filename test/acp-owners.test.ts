@@ -1,3 +1,4 @@
+import "./setup.ts"; // First: isolates this file from the real home even when run on its own.
 /**
  * The Coordinator is process-wide; parents are not. Two SDK parents in one process (as an
  * embedder runs them) share it, and a mixed pi/acp wait keeps its own Coordinator waits in check.

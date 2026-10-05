@@ -1,3 +1,4 @@
+import "./setup.ts"; // First: isolates this file from the real home even when run on its own.
 /**
  * `delegate`/`delegate_ctl` dispatch to the acp backend (todo 042), through the real extension
  * and Pi SDK parent. ACP agents are the existing fixtures: the fake ACP agent

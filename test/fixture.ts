@@ -1,8 +1,9 @@
 /** Real Pi transport, sessions, tools, and extension. Only the remote model is scripted. */
+import { REAL_HOME, TEST_AGENT_DIR, underRealPi } from "./setup.ts";
 import assert from "node:assert/strict";
 import { createServer, type ServerResponse } from "node:http";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { once } from "node:events";
 
@@ -60,8 +61,15 @@ export async function provider() {
 		async close() { for (const res of sockets) res.destroy(); server.close(); await once(server, "close"); },
 	};
 }
-export function sandbox(url: string, root = mkdtempSync(join(tmpdir(), "pi-delegate-qc-")), options: { retry?: Record<string, unknown> } = {}) {
-	const cwd = join(root, "project"), agentDir = join(root, "agent");
+/**
+ * A fresh project, home and agent configuration for one test. src/index.ts resolves its agent
+ * directory once per process, and its children read settings from there, so every sandbox in this
+ * process uses that one directory (the preload's), emptied and rewritten here. A sandbox for another
+ * process (`ownAgentDir`, which that process passes to harness) keeps its own under its root.
+ */
+export function sandbox(url: string, root = mkdtempSync(join(tmpdir(), "pi-delegate-qc-")), options: { retry?: Record<string, unknown>; ownAgentDir?: boolean } = {}) {
+	const cwd = join(root, "project"), agentDir = options.ownAgentDir ? join(root, "agent") : TEST_AGENT_DIR;
+	if (!options.ownAgentDir) rmSync(agentDir, { recursive: true, force: true });
 	mkdirSync(cwd, { recursive: true }); mkdirSync(agentDir, { recursive: true });
 	// Pi 0.99 sends strict tool schemas only to endpoints that advertise support; the loopback accepts them, as real strict-capable providers do.
 	writeFileSync(join(agentDir, "models.json"), JSON.stringify({ providers: { fixture: { api: "openai-completions", baseUrl: url, apiKey: "loopback-only", models: [{ id: "fixture", name: "Deterministic fixture", reasoning: false, input: ["text"], contextWindow: 32768, maxTokens: 4096, compat: { supportsStrictMode: true }, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }] } } }));
@@ -70,7 +78,29 @@ export function sandbox(url: string, root = mkdtempSync(join(tmpdir(), "pi-deleg
 }
 export type Sandbox = ReturnType<typeof sandbox>;
 
-export async function harness(box: Sandbox, parent?: string, hooks: { beforeNotice?: (message: any) => void; register?: (pi: any) => void; tools?: string[] } = {}) {
+/**
+ * Fails the test, and then the whole test process: the test that called harness has a provider
+ * listening that it never reaches its cleanup to close, which would keep the process alive forever.
+ */
+function refuse(message: string): never {
+	console.error(`${message} Refusing to run.`);
+	setTimeout(() => process.exit(1), 2000).unref();
+	throw new Error(`${message} Refusing to run.`);
+}
+
+/** A dialog-capable UI for the parent, as Pi's TUI and RPC modes bind one. Only what a test passes does anything. */
+function uiContext(ui: { select?: (title: string, options: string[], opts?: { signal?: AbortSignal }) => Promise<string | undefined> }) {
+	const nothing = () => undefined;
+	return {
+		select: ui.select ?? (async () => undefined), confirm: async () => false, input: async () => undefined, editor: async () => undefined, custom: async () => undefined,
+		notify: nothing, onTerminalInput: () => nothing, setStatus: nothing, setWorkingMessage: nothing, setWorkingVisible: nothing, setWorkingIndicator: nothing,
+		setHiddenThinkingLabel: nothing, setWidget: nothing, setFooter: nothing, setHeader: nothing, setTitle: nothing, pasteToEditor: nothing, setEditorText: nothing,
+		getEditorText: () => "", addAutocompleteProvider: nothing, setEditorComponent: nothing, getEditorComponent: nothing, theme: undefined,
+		getAllThemes: () => [], getTheme: nothing, setTheme: () => ({ success: false, error: "UI not available" }), getToolsExpanded: () => false, setToolsExpanded: nothing,
+	};
+}
+
+export async function harness(box: Sandbox, parent?: string, hooks: { beforeNotice?: (message: any) => void; register?: (pi: any) => void; tools?: string[]; projectTrusted?: boolean; ui?: { select?: (title: string, options: string[], opts?: { signal?: AbortSignal }) => Promise<string | undefined> } } = {}) {
 	// Import after isolation: Pi and the extension resolve configuration paths on first load.
 	process.env.HOME = box.root;
 	process.env.PI_CODING_AGENT_DIR = box.agentDir;
@@ -78,7 +108,11 @@ export async function harness(box: Sandbox, parent?: string, hooks: { beforeNoti
 	process.env.DO_NOT_TRACK = "1";
 	process.env.PI_TELEMETRY = "0";
 	const sdk = await import("@earendil-works/pi-coding-agent");
-	const { default: extension } = await import("../src/index.ts");
+	const { default: extension, AGENT_DIR } = await import("../src/index.ts");
+	// Before anything launches: src/index.ts resolved its agent directory once, when first loaded. A
+	// test file that loaded it before test/setup.ts would point it at the real home.
+	if (homedir() === REAL_HOME || underRealPi(AGENT_DIR)) refuse(`harness: pi-delegate's agent directory ${AGENT_DIR} is the real home's ~/.pi; import "./setup.ts" first in the test file. Refusing to run.`);
+	if (AGENT_DIR !== box.agentDir) refuse(`harness: pi-delegate's agent directory is ${AGENT_DIR}, not this sandbox's ${box.agentDir}; its children would read another sandbox's settings.`);
 	const tools = new Map<string, any>();
 	const commands = new Map<string, any>();
 	let ctx: any;
@@ -105,14 +139,16 @@ export async function harness(box: Sandbox, parent?: string, hooks: { beforeNoti
 	const modelRuntime = await sdk.ModelRuntime.create({ authPath: join(box.agentDir, "auth.json"), modelsPath: join(box.agentDir, "models.json"), allowModelNetwork: false, refreshOnCreate: false });
 	const model = modelRuntime.getModel("fixture", "fixture"); assert(model);
 	const runtime = await sdk.createAgentSessionRuntime(async (options) => {
-		const services = await sdk.createAgentSessionServices({ cwd: options.cwd, agentDir: box.agentDir, modelRuntime, resourceLoaderOptions: {
+		// The parent's own trust decision, as Pi's startup makes it; children inherit it for its cwd.
+		const settingsManager = hooks.projectTrusted === undefined ? undefined : sdk.SettingsManager.create(options.cwd, box.agentDir, { projectTrusted: hooks.projectTrusted });
+		const services = await sdk.createAgentSessionServices({ cwd: options.cwd, agentDir: box.agentDir, modelRuntime, ...(settingsManager ? { settingsManager } : {}), resourceLoaderOptions: {
 			noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
 			systemPrompt: "Deterministic verification parent.", extensionFactories: [factory],
 		} });
 		const result = await sdk.createAgentSessionFromServices({ services, sessionManager: options.sessionManager, sessionStartEvent: options.sessionStartEvent, model, thinkingLevel: "off", tools: hooks.tools ?? ["delegate", "delegate_ctl"] });
 		return { ...result, services, diagnostics: services.diagnostics };
 	}, { cwd: box.cwd, agentDir: box.agentDir, sessionManager: manager });
-	await runtime.session.bindExtensions({ onError: (error) => errors.push(error) });
+	await runtime.session.bindExtensions({ onError: (error) => errors.push(error), ...(hooks.ui ? { uiContext: uiContext(hooks.ui) as any, mode: "rpc" as const } : {}) });
 	const raw = async (name: string, args: any, signal?: AbortSignal) => {
 		const result = await tools.get(name).execute("fixture", args, signal, undefined, ctx);
 		// Direct test calls bypass the parent's agent loop. Seed its durable receipt at
@@ -121,7 +157,7 @@ export async function harness(box: Sandbox, parent?: string, hooks: { beforeNoti
 		return result;
 	};
 	const ctl = (action: string, runId?: string, extra: any = {}, signal?: AbortSignal) => raw("delegate_ctl", { action, runId, ...extra }, signal);
-	const launch = (task: string, extra: any = {}) => raw("delegate", { role: "scout", context: "fresh", task, cwd: box.cwd, model: "fixture/fixture:off", ...extra });
+	const launch = (task: string, extra: any = {}, signal?: AbortSignal) => raw("delegate", { role: "scout", context: "fresh", task, cwd: box.cwd, model: "fixture/fixture:off", ...extra }, signal);
 	const waitReady = async (id: string) => {
 		for (;;) {
 			const current = await ctl("status", id);

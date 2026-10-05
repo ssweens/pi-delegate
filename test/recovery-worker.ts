@@ -1,9 +1,11 @@
+import "./setup.ts"; // First: isolates this file from the real home even when run on its own.
 import assert from "node:assert/strict";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { harness, deferred, type Sandbox } from "./fixture.ts";
-const [root, mode] = process.argv.slice(2);
-const box = { root, cwd: join(root, "project"), agentDir: join(root, "agent"), env: process.env } as Sandbox;
+// The agent directory is the spawning test's sandbox's (its own, per scenario).
+const [root, mode, agentDir] = process.argv.slice(2);
+const box = { root, cwd: join(root, "project"), agentDir, env: process.env } as Sandbox;
 const manifestPath = join(root, "manifest.json");
 if (mode.startsWith("crash")) {
 	let h: Awaited<ReturnType<typeof harness>>;

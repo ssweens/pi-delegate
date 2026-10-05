@@ -1,3 +1,4 @@
+import "./setup.ts"; // First: isolates this file from the real home even when run on its own.
 /**
  * The delegate contract (src/backend.ts, ADR 0001) as one table, through the real extension and Pi
  * SDK parent (todo 046):

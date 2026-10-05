@@ -1,3 +1,4 @@
+import "./setup.ts"; // First: isolates this file from the real home even when run on its own.
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { rmSync } from "node:fs";

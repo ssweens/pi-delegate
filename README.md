@@ -2,7 +2,7 @@
 
 Install: `pi install npm:@ssweens/pi-delegate`, `pi install git:<repo>`, or `pi install ./pi-delegate`. The delegation tools, phased todo tool, `delegation` skill, and default roles all ship in the package — nothing is copied to `~/.agents`.
 
-Requires Pi 0.99.1 or newer, below 0.100.0. Minimal delegation for pi: durable child runs, role files, fork context, steer, honest run log, and a stock-Pi phased todo list. Replaces pi-subagents (125 schema params, 14.8k lines, 11 tools in context) and pi-strings.
+Requires Pi 0.99.1 or newer, below 2.0.0. Minimal delegation for pi: durable child runs, role files, fork context, steer, honest run log, and a stock-Pi phased todo list. Replaces pi-subagents (125 schema params, 14.8k lines, 11 tools in context) and pi-strings.
 
 One tool pair, two backends:
 
@@ -14,9 +14,9 @@ One tool pair, two backends:
 ## Tools
 
 **`delegate({ backend?, role?, task?, model?, reason?, context?, cwd?, timeoutMs?, agent?, sessionId?, executionEnvironment?, mode? })`**
-On the pi backend, `role` and `task` are required, and it runs `role` on `task` in its own in-process session (`createAgentSession`, no extensions/skills loaded — built-in tools only). Returns final report, changed files, turns, tokens, cost, run id, and the child's session file path. Refuses a second writing child in a `cwd` that already has one running. `agent`, `sessionId`, `executionEnvironment` and `mode` are ACP-only; see [Backends](#backends).
+On the pi backend, `role` and `task` are required, and it runs `role` on `task` in its own in-process session (`createAgentSession`, no extensions/skills loaded — built-in tools only, unless the role opts into [nested delegation](#nested-delegation) or [MCP servers](#mcp-servers)). Returns final report, changed files, turns, tokens, cost, run id, and the child's session file path. Refuses a second writing child in a `cwd` that already has one running. `agent`, `sessionId`, `executionEnvironment` and `mode` are ACP-only; see [Backends](#backends).
 
-- `context: "fork"` (default) — child starts with the parent's conversation so far (`buildSessionContext` of the active branch, trailing unresolved tool call trimmed). No re-acquisition. Delegation records are left out of that inheritance — `delegate`/`delegate_ctl` calls, their results, and completion notices — so a child inherits the work rather than a pattern of handing it off; children have no delegation tools, and copies of those calls only produced confident re-delegation attempts and false "extension not loaded" diagnoses. A forked child is also told, in its own instructions, that the inherited conversation belongs to the agent that delegated to it: stripping the calls stops the mimicry, but the surrounding prose still reads as supervising a worker, and a child that adopts that voice inspects the job instead of doing it. When the parent's recent conversation is mostly orchestration, `fresh` with a complete brief remains the safer choice.
+- `context: "fork"` (default) — child starts with the parent's conversation so far (`buildSessionContext` of the active branch, trailing unresolved tool call trimmed). No re-acquisition. Delegation records are left out of that inheritance — `delegate`/`delegate_ctl` calls, their results, and completion notices — so a child inherits the work rather than a pattern of handing it off; children have no delegation tools unless their role opts in, and copies of those calls only produced confident re-delegation attempts and false "extension not loaded" diagnoses. The records are left out for opted-in roles too. A forked child is also told, in its own instructions, that the inherited conversation belongs to the agent that delegated to it: stripping the calls stops the mimicry, but the surrounding prose still reads as supervising a worker, and a child that adopts that voice inspects the job instead of doing it. When the parent's recent conversation is mostly orchestration, `fresh` with a complete brief remains the safer choice.
 - `context: "fresh"` — adversarial/independent review.
 - `model: "provider/id[:thinking]"` — tier switch at call time; no new role needed.
 - Background handoff — records the run and returns its id before child resource preparation or model work. Do independent work; unjoined completion wakes the parent via `sendMessage(followUp, triggerTurn)`. Use `delegate_ctl wait` only when dependent work needs the result.
@@ -42,6 +42,66 @@ In the sheet: **1–4** or **Tab/Shift+Tab** changes tabs; **↑↓**, **PgUp/Pg
 Value compares a stated basket of 1M prompt + 250k completion tokens using **listed model prices, not discounted endpoint prices**; frontier means the top 15% of today's AA-Intelligence-scored, tool-capable text models with at least 128k context, and light means the top half below that frontier with at least 32k context. These are relative score bands, not a guarantee of task performance. Free, `:batch`, and per-request-priced models are excluded from the value ranking; promotional offers with missing AA scores remain visible. Non-healthy endpoints are omitted. The scan checks every eligible model's endpoints in batches of eight, caches successful responses for ten minutes unless refreshed, and reports lookup failures rather than claiming a complete promotion scan. Entries absent from Pi's available OpenRouter registry are labeled **not configured**. This action never switches or approves a model.
 
 `rate` stores ratings the agent researched, keyed by exact `provider/id` (`[{model, score, source, note?}]`), in `~/.pi/agent/delegate-ratings.json`; reported stale after 14 days. Ratings appear on `models` lines.
+
+## Roles
+
+A role is a Markdown file with frontmatter. These directories are read in order, and a later file overrides an earlier one with the same `name`: the package's `roles/`, `~/.pi/agent/agents/`, `~/.agents/agents/`, and the project's `.pi/agents/` when the project is trusted. `delegate_ctl roles` lists what is loaded. It shows a role that lists `delegate` as `delegates; can write via children`, even when its own tools are read-only, because the children it starts can be writers.
+
+```markdown
+---
+name: scout
+description: Read-only recon of code the parent has not seen.
+tools: read, grep, find, ls, bash
+context: fresh
+thinking: low
+---
+
+Instructions for the child.
+```
+
+`tools` lists the child's tools. A child gets Pi's built-ins only: `read`, `bash`, `edit`, `write`, `grep`, `find` and `ls`. Without `tools` it gets all seven. Two opt-ins add more: `delegate` ([nested delegation](#nested-delegation)) and `mcp` or `mcp:<server>` ([MCP servers](#mcp-servers)). Any other name is dropped, and the run reports it. A role with `edit` or `write` is a writer. `context` is `fork` (the default) or `fresh`. `model`, `thinking` and `timeoutMs` set the role's defaults.
+
+### Nested delegation
+
+A child has no delegation tools by default. A role opts in by listing `delegate` in `tools`:
+
+```markdown
+tools: read, grep, find, ls, bash, delegate
+```
+
+That child also gets `delegate` and `delegate_ctl` in its own session, so it can start children of its own. Use it for roles that coordinate, such as a PR owner that starts its own verifiers. A role without `delegate` gets exactly what it got before.
+
+- **Depth cap.** The root parent is depth 0 and its children are depth 1. No child runs deeper than 3, the constant `MAX_DELEGATION_DEPTH` in `src/index.ts`. A child at depth 3 gets neither `delegate` nor `delegate_ctl`, even when its role lists `delegate`: its tools are its role's other tools, its instructions say it runs at the depth limit, and the delegation tools are not reported as dropped. A delegating child below the cap is told its depth and the cap. A `delegate` call that would still start a child deeper than 3 fails with `DEPTH_EXCEEDED`, and the error names the cap.
+- **Same machinery.** A nested child is an ordinary pi run: the run log, ownership leases, revival, steer, and one writer per `cwd` across the whole tree. Its model resolves as `model:` → the role's approved default → the role file → the delegating child's model. Its catalog is mirrored from the delegating child's runtime, which is mirrored from the parent's.
+- **Forks.** Delegation records stay out of forked context at every depth. A child forked from a coordinator inherits its work, not its `delegate` calls, their results, its completion notices, or the prompt that revived it. A `codemode` call whose script calls `delegate` or `delegate_ctl` (`tools.delegate(…)`, `tools["delegate_ctl"]`) is left out too. A script that only mentions the word, such as `searchTools("delegate")`, stays, and so does one that builds the tool name at run time. Where the removed turns sat between two assistant messages, a one-word user turn, `Continue.`, takes their place, so user and assistant turns still alternate, as some providers (Bedrock's Converse API among them) require. Where removing an assistant turn that only delegated leaves two user turns in a row, they are merged into one user turn, in order. No assistant turn is invented, so the model is never shown words it did not say.
+- **Project trust.** Every Pi child, nested or not, gets its trust for its `cwd` when it is started, and keeps it across revivals. Where its parent works, it is the parent's own decision. In another folder:
+  1. Pi's saved decision for that folder (the nearest ancestor with an entry in Pi's `trust.json`) wins.
+  2. Otherwise, when the parent is the root interactive session, pi-delegate asks you with Pi's own choices for that folder: **Trust**, **Trust parent folder**, **Trust (this session only)**, **Do not trust**, **Do not trust (this session only)**. The answer is saved exactly as Pi saves it and used. Agents often work in copy-on-write repo copies such as `~/.agents/projects/<slug>/copies/<name>/`: choose **Trust parent folder** once on the `copies` folder and later copies are trusted without a question. Dismissing the question counts as **Do not trust (this session only)**: the child is untrusted, nothing is saved, and the delegating session does not ask about that folder again. Aborting the `delegate` call while its question is open closes the question the same way and starts no child (the call fails `ABORTED`), and lets the next queued question be asked.
+  3. Otherwise (a nested child, or a parent in print mode or another mode without a dialog UI), the child gets the delegating parent's own decision. That decision covers the folder's `.pi/agents` roles too: a trusted parent without a UI hands its trust to a child in an unrecorded folder, and a delegating child there loads that folder's roles. Record a decision for the folder in Pi's `trust.json` to avoid this.
+
+  As in Pi, a folder with nothing trust-gated in it is never asked about; it gets the parent's decision. Trust-gated means what Pi gates (`.pi` settings, `mcp.json`, extensions, skills, prompts, themes, `SYSTEM.md`, `APPEND_SYSTEM.md`, and project `.agents/skills`) plus pi-delegate's own `.pi/agents` roles, which Pi does not know about. A folder whose only project resource is `.pi/agents` is asked about, so a repository cannot redefine a role such as `scout` with write tools, `delegate` or `mcp` under a trusted parent's trust. `defaultProjectTrust: "always"` or `"never"` in your global settings answers instead of you, as it does for Pi. An untrusted child reads nothing from `<cwd>/.pi`: not its settings, not its `mcp.json`, and, for a delegating child, not its `agents/`.
+
+  A run's status, result and completion say its trust and why, as `project trusted (trust source: <source>)`, and its record keeps `projectTrustSource`. The sources: `parent` (it works where its parent does), `saved` (Pi's `trust.json`), `ungated` (nothing trust-gated in the folder), `setting` (`defaultProjectTrust`), `prompted` (your answer), `session` (an earlier session-only answer or dismissal), `dismissed`, `inherited` (no one could be asked), and `unknown` (a record from before 0.2.0).
+- **Completion.** A delegating child should join each child it starts with `delegate_ctl wait` before its final report. A child that settles after that report revives the delegating child, with the child's report in its context, the way an unjoined completion wakes the root parent. The revival is a new segment, so the root parent is woken again when it ends. A delegating child that was cancelled or stopped, or whose last segment timed out, is not revived this way, and neither is one whose revival is refused (another writer holds its `cwd`, say): its owner gets a `delegate late report` notice instead, naming the run, the reason, and the report.
+- **Lifetime.** A delegating child's children are bound to its session. Parent exit interrupts the whole tree. Cancelling a delegating child, or its timeout, cancels its unsettled children, theirs too, and closes its session; a restart reopens it. Reopening restores each level when its session opens again. A delegating child keeps its session while any of its children runs or has a report not yet delivered, and while its children run it refuses a `steer` with a different `model`. Once they are idle its session is retired like any other finished child's, and a revival restores its children from their records.
+- **Visibility.** The root parent's `status` and Agents frame list only its own children. A nested child's runs are in the run log, with `depth` and `parentRunId`, and in the delegating child's transcript.
+- **Limits.** A nested child cannot `delegate_ctl approve` a model default, because only the root parent talks to the user. It does not get the `todo` tool.
+
+### MCP servers
+
+A child has no MCP servers by default, even when the parent has them. A role opts in through `tools`. `mcp` gives it every server in `mcp.json`; `mcp:<server>`, repeated as needed, gives it only those servers:
+
+```markdown
+tools: read, grep, mcp
+tools: read, mcp:github, mcp:docs
+```
+
+The child's session then loads Pi's own MCP extension, with `codemode` and `tool_search`, and connects the servers when it starts. `mcp` and `mcp:<server>` read `mcp.json` the same way, as Pi 1.0.2 does: the agent directory's file, plus the project's `.pi/mcp.json` when the child's project is trusted. A project entry replaces the global one of the same name, or overrides only its `enabled`, `exposure` and `toolExposure`, and cannot set `auth`. Each entry is validated with Pi 1.0.2's rules (on Pi 0.99.1 too, so a project override and the `codemode-deferred` alias behave as in 1.0.2), and an entry Pi would refuse is never started: the run lists it and why. `mcp:<server>` keeps only the named servers. Listing `mcp` as well as named servers gives every server. A named server that neither file defines, or defines invalidly, is reported as a dropped tool, `mcp:<server>`. `delegate_ctl roles` shows the opt-in on each role.
+
+- **Exposure.** Each server's `exposure` in `mcp.json` applies in the child as it does in Pi. With `direct`, the child sees `mcp__<server>__<tool>` tools. With the default, `codemode`, it sees one `codemode` tool and calls the MCP tools from scripts. With `deferred`, `tool_search` loads them.
+- **Built-ins stay withheld.** The role's built-ins are still the only built-ins the child has. A built-in the role does not list is not registered in the child's session at all, so a codemode script cannot call it either. A child with `read, mcp` cannot reach the built-in `write` or `bash` through any route. A server's own tools are another matter: a server that edits files or runs commands gives the child that power, and pi-delegate does not count it as a writer for the one-writer-per-`cwd` rule. Opt a read-only role into such a server only on purpose.
+- **No sign-in.** A child has no UI, so it cannot sign in to a server. A server that needs a sign-in stays unconnected in the child, and the child gets none of its tools. Sign in from the parent with `/mcp` (or `pi mcp login`) first; the credentials are shared, and the child's next connection uses them.
+- **Lifetime.** The servers run only while the child runs. They close when its run settles, and they connect again when a `steer`, or a late report from one of its own children, revives it. When the parent exits, or a finished child's session is retired, nothing is left running. A delegating child with MCP keeps its session for its children as before, but its servers still close at each settle.
 
 ## Backends
 
@@ -233,6 +293,8 @@ One filesystem lease owns each parent's children. Opening the same parent in ano
 
 Recovery metadata is recorded for children launched by this version. Older transcript files remain readable but have no saved parent/runtime contract to revive.
 
+A run record from before 0.2.0 has no saved trust decision. It is revived untrusted, whatever its folder's trust is now, and its status, result, completion and `steer` reply say `project trust unknown for this record; treated as untrusted`. This is a change: before 0.2.0, pi-delegate gave every child Pi's default, a trusted project. To give it trust, start a new child in that folder.
+
 ## Which offerings a child can use
 
 A child runs on the parent's catalog, including providers that extensions register at runtime — account switchers, gateways, subscription pools. Those registrations are mirrored into the child runtime each time a child session opens, so launch order does not decide what a child can run, and a provider registered after the first child still works. A provider the parent drops stops serving children that have to reopen their session; a session already in memory keeps the model it was built with. Nothing about those providers is copied into a child's saved record beyond the `provider/id` it ran on, so credentials stay with the parent's runtime.
@@ -285,7 +347,7 @@ Async launches have no duplicate status card or dispatch frame in the conversati
 
 ## Run log
 
-`~/.pi/agent/delegate-runs.jsonl` — one line per run: id, role, model, thinking, context, cwd, **task text**, status, tokens, cost, duration, changed files, dropped tools, error, first 2 KB of output. Child transcripts persist in the working directory the child ran in: `<cwd>/.agents/pi/subsessions/` — `tail -f` one to watch a child live. The full path is in every run-log row (`sessionFile`) and in the expanded outcome record. Each child also has an atomic JSON snapshot of its identity, runtime inputs, stop state, and result. Parent indexes and ownership leases live in the parent's working directory under `.agents/pi/subsessions/owners/`. ACP run records (identity, native session, turns with request IDs, delivery and output) are saved next to them under `owners/<parent>/acp/`. The directory gets a self-ignoring `.gitignore` (`*`) on creation, so transcripts never reach `git status` or a child's `git add -A`; it is scoped to that directory, so a repo can still track `.agents/` for agent definitions.
+`~/.pi/agent/delegate-runs.jsonl` — one line per run: id, role, model, thinking, context, cwd, **task text**, status, tokens, cost, duration, changed files, dropped tools, error, first 2 KB of output. A run also records its `depth`, and a run that a delegating child started records that child's run ID as `parentRunId`. Child transcripts persist in the working directory the child ran in: `<cwd>/.agents/pi/subsessions/` — `tail -f` one to watch a child live. The full path is in every run-log row (`sessionFile`) and in the expanded outcome record. Each child also has an atomic JSON snapshot of its identity, runtime inputs, stop state, and result. Parent indexes and ownership leases live in the parent's working directory under `.agents/pi/subsessions/owners/`. ACP run records (identity, native session, turns with request IDs, delivery and output) are saved next to them under `owners/<parent>/acp/`. The directory gets a self-ignoring `.gitignore` (`*`) on creation, so transcripts never reach `git status` or a child's `git add -A`; it is scoped to that directory, so a repo can still track `.agents/` for agent definitions.
 
 ## In-process milestone events
 

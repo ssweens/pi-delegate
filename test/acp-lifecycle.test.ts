@@ -1,3 +1,4 @@
+import "./setup.ts"; // First: isolates this file from the real home even when run on its own.
 /**
  * delegate_ctl lifecycle on the acp backend (todo 043), through the real extension and Pi SDK
  * parent: timeout, provider failure, ambiguous delivery, cancellation and output bounds; wait

@@ -52,9 +52,11 @@ test("a current roles record renders as a table, with the prose behind the expan
 		details: { kind: "roles", rows: [
 			{ name: "scout", mode: "fresh:low", model: "needs approval", approved: false, writes: false, tools: ["read", "grep", "find", "ls", "bash"], dropped: [], timeoutMs: undefined, description: "Read-only recon of code the parent has not seen.", source: "~/roles/scout.md" },
 			{ name: "worker", mode: "fork:medium", model: "needs approval", approved: false, writes: true, tools: ["read", "bash", "edit", "write", "grep", "find", "ls"], dropped: ["playwright"], timeoutMs: 1800000, description: "Implements a bounded change.", source: "~/roles/worker.md" },
+			{ name: "lead", mode: "fresh", model: "needs approval", approved: false, writes: false, delegates: true, tools: ["read", "grep", "delegate", "delegate_ctl"], dropped: [], timeoutMs: undefined, description: "Starts its own children.", source: "~/roles/lead.md" },
 		] },
 	};
 	const collapsed = render(current);
+	assert.match(collapsed, /lead\s+fresh\s+needs approval\s+delegates; can write via children/, "a delegating role with read-only tools of its own is not shown as read-only");
 	assert.match(collapsed, /scout\s+fresh:low\s+needs approval\s+read-only · 5 tools/);
 	assert.match(collapsed, /worker\s+fork:medium\s+needs approval\s+writes · 7 tools · 30m · 1 unavailable/);
 	assert.doesNotMatch(collapsed, /Read-only recon of code/, "no row ends mid-sentence");
