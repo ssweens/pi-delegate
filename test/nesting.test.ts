@@ -4,15 +4,14 @@ import { test } from "node:test";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { deferred, provider, sandbox, harness, type Reply } from "./fixture.ts";
-import { BUILTIN_TOOLS, DELEGATION_TOOLS, roleTools, toolList } from "../src/roles.ts";
+import { DELEGATION_TOOLS, EVERY_TOOL, toolAllowlist, toolList } from "../src/roles.ts";
 
-test("roleTools: listing delegate opts into the delegation pair; nothing else outside the built-ins", () => {
-	assert.deepEqual(roleTools(undefined), { tools: BUILTIN_TOOLS, dropped: [], delegates: false, mcp: false });
-	assert.deepEqual(roleTools(toolList("read, grep, find, ls, bash")), { tools: ["read", "grep", "find", "ls", "bash"], dropped: [], delegates: false, mcp: false });
-	assert.deepEqual(roleTools(toolList("read, bash, delegate")), { tools: ["read", "bash", ...DELEGATION_TOOLS], dropped: [], delegates: true, mcp: false });
-	assert.deepEqual(roleTools(toolList("[read, subagent]")), { tools: ["read"], dropped: ["subagent"], delegates: false, mcp: false });
-	assert.deepEqual(roleTools(["delegate"]), { tools: ["read", ...DELEGATION_TOOLS], dropped: [], delegates: true, mcp: false });
-	assert.deepEqual(roleTools(toolList("read, bash, delegate"), false), { tools: ["read", "bash"], dropped: [], delegates: false, mcp: false }, "at the depth cap the pair is withheld, not reported as dropped");
+test("delegate and delegate_ctl are ordinary tool names, allowed by a list that names them or by no list, and withheld at the cap", () => {
+	assert(toolAllowlist(EVERY_TOOL).allows("delegate") && toolAllowlist(EVERY_TOOL).allows("delegate_ctl"), "no tools line: every tool, delegation included");
+	assert(toolAllowlist(toolList("read, bash, delegate, delegate_ctl")!).allows("delegate"));
+	assert(!toolAllowlist(toolList("read, grep, find, ls, bash")!).allows("delegate"), "a list without it cannot delegate");
+	assert(!toolAllowlist(toolList("read, delegate")!).allows("delegate_ctl"), "listing delegate does not bring delegate_ctl");
+	assert(!toolAllowlist(toolList("read, delegate, delegate_ctl")!, DELEGATION_TOOLS).allows("delegate"), "at the depth cap the pair is withheld");
 });
 
 const text = (content: any) => typeof content === "string" ? content : (content ?? []).filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n");
@@ -22,11 +21,11 @@ const toolNames = (request: any): string[] => (request.tools ?? []).map((t: any)
 const system = (request: any) => text(request.messages.find((m: any) => m.role === "system" || m.role === "developer")?.content);
 const delegateCall = (role: string, task: string, context: "fork" | "fresh" = "fresh"): Reply => ({ tool: { name: "delegate", arguments: { role, context, task, model: "fixture/fixture:off" } } });
 
-test("nested delegation is opt-in per role and capped in depth (real SDK, loopback provider)", { timeout: 60000 }, async (t) => {
+test("nested delegation follows the role's tools and is capped in depth (real SDK, loopback provider)", { timeout: 60000 }, async (t) => {
 	const api = await provider();
 	const box = sandbox(api.url);
 	mkdirSync(join(box.cwd, ".pi", "agents"), { recursive: true });
-	writeFileSync(join(box.cwd, ".pi", "agents", "coordinator.md"), "---\nname: coordinator\ndescription: Test coordinator that starts its own children.\ntools: read, grep, delegate\ncontext: fresh\n---\n\nYou coordinate a piece of work.\n");
+	writeFileSync(join(box.cwd, ".pi", "agents", "coordinator.md"), "---\nname: coordinator\ndescription: Test coordinator that starts its own children.\ntools: read, grep, delegate, delegate_ctl\ncontext: fresh\n---\n\nYou coordinate a piece of work.\n");
 	const h = await harness(box);
 	// A coordinator that started a child joins it; replies queued here follow that child's report.
 	const after = new Map<string, Reply[]>();
@@ -38,7 +37,7 @@ test("nested delegation is opt-in per role and capped in depth (real SDK, loopba
 	const requestFor = (task: string) => api.requests.find((r) => lastUser(r) === task);
 	const logRows = () => readFileSync(join(box.agentDir, "delegate-runs.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
 	try {
-		await t.test("a role without delegate gets exactly its built-ins (regression)", async () => {
+		await t.test("a role whose tools line lacks delegate gets exactly its listed tools and cannot delegate", async () => {
 			api.script("Plain scout work", { text: "PLAIN-OK" });
 			const result = await h.waitLaunch("Plain scout work");
 			assert.equal(result.details.status, "complete", result.content[0].text);
@@ -52,7 +51,7 @@ test("nested delegation is opt-in per role and capped in depth (real SDK, loopba
 			assert(![...h.state().owners.values()].some((owner: any) => owner.parentRun === run), "a plain child has no delegation runtime of its own");
 		});
 
-		await t.test("an opted-in role gets delegate and delegate_ctl; its child is logged with its parent", async () => {
+		await t.test("a role that lists delegate and delegate_ctl gets them; its child is logged with its parent", async () => {
 			api.script("Coordinate review", delegateCall("scout", "Nested scout"));
 			api.script("Nested scout", { text: "NESTED-SCOUT-REPORT" });
 			const result = await h.waitLaunch("Coordinate review", { role: "coordinator" });
@@ -105,7 +104,7 @@ test("nested delegation is opt-in per role and capped in depth (real SDK, loopba
 			assert.equal(rows.find((row) => row.task === "Chain 3").parentRunId, id("Chain 2"));
 			assert.equal(rows.find((row) => row.task === "Side scout").parentRunId, id("Chain 1"));
 			assert(!rows.some((row) => row.task === "Chain 4"));
-			assert.deepEqual(rows.find((row) => row.task === "Chain 3").tools.sort(), ["grep", "read"]);
+			assert.deepEqual(rows.find((row) => row.task === "Chain 3").withheld, DELEGATION_TOOLS, "the pair is withheld at the cap whatever the role lists");
 			assert.deepEqual(rows.find((row) => row.task === "Chain 3").droppedTools, []);
 			// Chain 2 forked Chain 1's conversation: the brief is inherited, the delegation records are not.
 			const forked = requestFor("Chain 2");

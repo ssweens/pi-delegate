@@ -22,16 +22,23 @@ test("a child of an untrusted project reads nothing from its .pi: no project MCP
 	const marking = (name: string) => ({ command: process.execPath, args: ["-e", `require("fs").writeFileSync(${JSON.stringify(marker(name))}, "started")`], exposure: "direct" });
 	mkdirSync(join(box.cwd, ".pi", "agents"), { recursive: true });
 	writeFileSync(join(box.cwd, ".pi", "mcp.json"), JSON.stringify({ mcpServers: { evil: marking("evil"), fake: marking("fake-replaced") } }));
+	// A project extension, which an untrusted child must not load.
+	mkdirSync(join(box.cwd, ".pi", "extensions"), { recursive: true });
+	writeFileSync(join(box.cwd, ".pi", "extensions", "project-ext.js"), `import { writeFileSync } from "node:fs";\nexport default function (pi) { writeFileSync(${JSON.stringify(marker("project-ext"))}, "loaded"); pi.registerTool({ name: "project_tool", label: "p", description: "p", parameters: { type: "object", properties: {} }, async execute() { return { content: [{ type: "text", text: "p" }] }; } }); }\n`);
 	writeFileSync(join(box.cwd, ".pi", "agents", "scout.md"), "---\nname: scout\ndescription: PROJECT-SCOUT redefined by the repository.\ntools: read, write, edit, bash\ncontext: fresh\n---\n\nPROJECT-SCOUT instructions.\n");
 	// Roles the user defined: the agent directory's, which do not depend on the project's trust.
 	const userRoles = join(box.root, ".pi", "agent", "agents");
 	mkdirSync(userRoles, { recursive: true });
-	writeFileSync(join(userRoles, "coordinator.md"), "---\nname: coordinator\ndescription: Starts its own children.\ntools: read, delegate, mcp\ncontext: fresh\n---\n\nCoordinate.\n");
-	writeFileSync(join(userRoles, "fake-user.md"), "---\nname: fake-user\ndescription: Uses the global fake server.\ntools: read, mcp:fake\ncontext: fresh\n---\n\nUse fake.\n");
-	const h = await harness(box, undefined, { projectTrusted: false });
-	const { AGENT_DIR } = await import("../src/index.ts");
+	writeFileSync(join(userRoles, "coordinator.md"), "---\nname: coordinator\ndescription: Starts its own children.\ntools: read, delegate, delegate_ctl, mcp__*\ncontext: fresh\n---\n\nCoordinate.\n");
+	writeFileSync(join(userRoles, "fake-user.md"), "---\nname: fake-user\ndescription: Uses the global fake server.\ntools: read, mcp__fake__*\ncontext: fresh\n---\n\nUse fake.\n");
+	// The parent's global server; the child reaches it through proxies and starts none of its own.
 	const fakePid = join(box.root, "fake.pid");
-	writeFileSync(join(AGENT_DIR, "mcp.json"), JSON.stringify({ mcpServers: { fake: { command: process.execPath, args: [FIXTURE, fakePid], exposure: "direct" } } }));
+	writeFileSync(join(box.agentDir, "mcp.json"), JSON.stringify({ mcpServers: { fake: { command: process.execPath, args: [FIXTURE, fakePid], exposure: "direct" } } }));
+	const h = await harness(box, undefined, { projectTrusted: false, mcp: true, tools: ["delegate", "delegate_ctl", "mcp__fake__echo"] });
+	for (const end = Date.now() + 8000; !h.runtime.session.getAllTools().some((tool: any) => tool.name === "mcp__fake__echo");) {
+		if (Date.now() > end) assert.fail("the parent's MCP server never connected");
+		await new Promise((resolve) => setTimeout(resolve, 25));
+	}
 	api.onUnscripted((request) => {
 		const started = /^(scout-[0-9a-f-]{36}) running/.exec(lastTool(request));
 		return started ? { tool: { name: "delegate_ctl", arguments: { action: "wait", runId: started[1] } } } : { text: `DONE ${lastUser(request)}` };
@@ -48,6 +55,8 @@ test("a child of an untrusted project reads nothing from its .pi: no project MCP
 		const run = h.state().runs.get(result.details.id);
 		assert.equal(run.projectTrusted, false, "the run keeps the parent's decision");
 		assert.equal(run.session.settingsManager.isProjectTrusted(), false, "the child's own session is untrusted");
+		assert.equal(run.offered.has("project_tool"), false, "the child never loaded the project's extension");
+		assert.equal(existsSync(marker("project-ext")), false);
 
 		const [first, afterRoles] = requestsFor("Untrusted coordinator");
 		assert.deepEqual(toolNames(first), ["delegate", "delegate_ctl", "mcp__fake__echo", "read"], "the global server only; the project's evil server is not loaded");
@@ -66,7 +75,7 @@ test("a child of an untrusted project reads nothing from its .pi: no project MCP
 		const named = await h.waitLaunch("Named server", { role: "fake-user" });
 		assert.equal(named.details.status, "complete", named.content[0].text);
 		assert.deepEqual(toolNames(requestsFor("Named server")[0]), ["mcp__fake__echo", "read"]);
-		assert.equal(existsSync(marker("fake-replaced")), false, "mcp:fake read the global entry; the untrusted project entry was ignored");
+		assert.equal(existsSync(marker("fake-replaced")), false, "mcp__fake__* read the global entry; the untrusted project entry was ignored");
 		assert.deepEqual(named.details.droppedTools, []);
 		await h.runtime.session.agent.waitForIdle();
 	} finally {
@@ -106,7 +115,7 @@ async function trustBox(options: { projectTrusted: boolean; select?: Select }) {
 }
 const never = async (title: string): Promise<string | undefined> => assert.fail(`no prompt expected: ${title}`);
 const recorded = (run: any) => JSON.parse(readFileSync(run.recordPath, "utf8"));
-const PROJECT_SCOUT = "---\nname: scout\ndescription: PROJECT-SCOUT redefined by the repository.\ntools: read, write, edit, bash, delegate, mcp\ncontext: fresh\n---\n\nPROJECT-SCOUT instructions.\n";
+const PROJECT_SCOUT = "---\nname: scout\ndescription: PROJECT-SCOUT redefined by the repository.\ntools: read, write, edit, bash, delegate, delegate_ctl, mcp__*\ncontext: fresh\n---\n\nPROJECT-SCOUT instructions.\n";
 /** A folder whose only project resource is pi-delegate's own: a `.pi/agents` role, which Pi does not gate. */
 function rolesOnlyFolder(path: string) {
 	mkdirSync(join(path, ".pi", "agents"), { recursive: true });
@@ -271,7 +280,7 @@ test("a nested child never prompts, even under a root with a UI: an unrecorded f
 	try {
 		const roles = join(t.box.root, ".pi", "agent", "agents");
 		mkdirSync(roles, { recursive: true });
-		writeFileSync(join(roles, "coordinator.md"), "---\nname: coordinator\ndescription: Starts its own children.\ntools: read, delegate\ncontext: fresh\n---\n\nCoordinate.\n");
+		writeFileSync(join(roles, "coordinator.md"), "---\nname: coordinator\ndescription: Starts its own children.\ntools: read, delegate, delegate_ctl\ncontext: fresh\n---\n\nCoordinate.\n");
 		const folder = gatedFolder(join(t.box.root, "nested-target"));
 		t.api.onUnscripted((request) => {
 			const started = /^(scout-[0-9a-f-]{36}) running/.exec(lastTool(request));

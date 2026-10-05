@@ -100,7 +100,7 @@ function uiContext(ui: { select?: (title: string, options: string[], opts?: { si
 	};
 }
 
-export async function harness(box: Sandbox, parent?: string, hooks: { beforeNotice?: (message: any) => void; register?: (pi: any) => void; tools?: string[]; projectTrusted?: boolean; ui?: { select?: (title: string, options: string[], opts?: { signal?: AbortSignal }) => Promise<string | undefined> } } = {}) {
+export async function harness(box: Sandbox, parent?: string, hooks: { beforeNotice?: (message: any) => void; register?: (pi: any) => void; tools?: string[]; projectTrusted?: boolean; extensions?: boolean; mcp?: boolean; ui?: { select?: (title: string, options: string[], opts?: { signal?: AbortSignal }) => Promise<string | undefined> } } = {}) {
 	// Import after isolation: Pi and the extension resolve configuration paths on first load.
 	process.env.HOME = box.root;
 	process.env.PI_CODING_AGENT_DIR = box.agentDir;
@@ -142,15 +142,18 @@ export async function harness(box: Sandbox, parent?: string, hooks: { beforeNoti
 		// The parent's own trust decision, as Pi's startup makes it; children inherit it for its cwd.
 		const settingsManager = hooks.projectTrusted === undefined ? undefined : sdk.SettingsManager.create(options.cwd, box.agentDir, { projectTrusted: hooks.projectTrusted });
 		const services = await sdk.createAgentSessionServices({ cwd: options.cwd, agentDir: box.agentDir, modelRuntime, ...(settingsManager ? { settingsManager } : {}), resourceLoaderOptions: {
-			noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
-			systemPrompt: "Deterministic verification parent.", extensionFactories: [factory],
+			// `extensions`: the parent also loads the extensions Pi finds in the sandbox's agent directory, as a child does.
+			noExtensions: !hooks.extensions, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+			systemPrompt: "Deterministic verification parent.", extensionFactories: [factory, ...(hooks.mcp ? [sdk.createMcpExtension()] : [])],
 		} });
 		const result = await sdk.createAgentSessionFromServices({ services, sessionManager: options.sessionManager, sessionStartEvent: options.sessionStartEvent, model, thinkingLevel: "off", tools: hooks.tools ?? ["delegate", "delegate_ctl"] });
 		return { ...result, services, diagnostics: services.diagnostics };
 	}, { cwd: box.cwd, agentDir: box.agentDir, sessionManager: manager });
 	await runtime.session.bindExtensions({ onError: (error) => errors.push(error), ...(hooks.ui ? { uiContext: uiContext(hooks.ui) as any, mode: "rpc" as const } : {}) });
 	const raw = async (name: string, args: any, signal?: AbortSignal) => {
-		const result = await tools.get(name).execute("fixture", args, signal, undefined, ctx);
+		// A tool's context, as Pi's agent loop passes it: the extension context plus the session's live `tools`.
+		const toolCtx = hooks.mcp ? runtime.session.extensionRunner?.createToolContext?.("fixture", signal) ?? ctx : ctx;
+		const result = await tools.get(name).execute("fixture", args, signal, undefined, toolCtx);
 		// Direct test calls bypass the parent's agent loop. Seed its durable receipt at
 		// the return boundary; async sendMessage delivery itself remains unmodified.
 		if (result.details?.completionReceipt) runtime.session.sessionManager.appendCustomMessageEntry("delegate", result.content[0].text, true, result.details);

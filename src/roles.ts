@@ -17,30 +17,28 @@ export interface Role {
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
-/** Tools a pi child can have from its own session. Anything else a role lists is dropped. */
-export const BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
-/** The pair a role opts into by listing `delegate`. Without it a child cannot start another agent. */
+/** A role without a `tools` line: every tool the child's session can load. */
+export const EVERY_TOOL = ["*"];
+/** The delegation pair. A child at the depth cap is never given either. */
 export const DELEGATION_TOOLS = ["delegate", "delegate_ctl"];
+/** Tools whose contract is to mutate files. bash is not one: read-only roles use it for grep, git diff and tests. */
+export const WRITE_TOOLS = ["edit", "write"];
 
-/** A role entry naming one MCP server, `mcp:<server>`. The name follows mcp.json's server-name rule. */
-const MCP_SERVER_ENTRY = /^mcp:([A-Za-z0-9_-]+)$/;
-const isMcpEntry = (t: string) => t === "mcp" || MCP_SERVER_ENTRY.test(t);
-
+/** A `tools` entry is a tool name, or a prefix followed by `*`. */
+const matches = (entry: string, name: string) => entry.endsWith("*") ? name.startsWith(entry.slice(0, -1)) : name === entry;
 /**
- * What a child running this role actually gets. Listing `delegate` (or `delegate_ctl`) opts into
- * both delegation tools, unless `canDelegate` is false: a child at the depth cap gets neither. Listing `mcp` opts into every configured MCP server, and `mcp:<server>`
- * into that server only; `mcp` wins over named servers. Nothing else outside the built-ins is
- * available, and is reported as dropped.
+ * What a role's `tools` line lets a child have, decided by name over every tool the child's session offers
+ * (built-ins, extension tools, the parent's MCP tools, delegate and delegate_ctl): a listed name or `*`
+ * pattern, and never a `withheld` name (the delegation pair at the depth cap).
  */
-export function roleTools(wanted: readonly string[] | undefined, canDelegate = true): { tools: string[]; dropped: string[]; delegates: boolean; mcp: boolean | string[] } {
-	const list = wanted ?? BUILTIN_TOOLS;
-	const tools = list.filter((t) => BUILTIN_TOOLS.includes(t));
-	if (!tools.length) tools.push("read");
-	const delegates = canDelegate && list.some((t) => DELEGATION_TOOLS.includes(t));
-	if (delegates) tools.push(...DELEGATION_TOOLS);
-	const servers = [...new Set(list.flatMap((t) => MCP_SERVER_ENTRY.exec(t)?.[1] ?? []))];
-	const mcp = list.includes("mcp") ? true : servers.length ? servers : false;
-	return { tools, dropped: list.filter((t) => !BUILTIN_TOOLS.includes(t) && !DELEGATION_TOOLS.includes(t) && !isMcpEntry(t)), delegates, mcp };
+export function toolAllowlist(entries: readonly string[], withheld: readonly string[] = []) {
+	return { allows: (name: string) => !withheld.includes(name) && entries.some((entry) => matches(entry, name)) };
+}
+
+/** Entries that matched none of the tools a child was offered. A withheld name is not reported. */
+export function droppedTools(entries: readonly string[], offered: Iterable<string>, withheld: readonly string[] = []): string[] {
+	const names = [...offered];
+	return entries.filter((entry) => !withheld.includes(entry) && !names.some((name) => matches(entry, name)));
 }
 
 /**

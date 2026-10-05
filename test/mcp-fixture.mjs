@@ -1,10 +1,12 @@
 // A stdio MCP server for tests: newline-delimited JSON-RPC with initialize, tools/list (one `echo`
 // tool) and tools/call. It writes its pid to argv[2] on start and removes the file when stdin ends,
 // which is how a client closes a stdio server, or on SIGTERM.
-import { rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, rmSync, writeFileSync } from "node:fs";
 
 const pidFile = process.argv[2];
 writeFileSync(pidFile, String(process.pid));
+// Every start, so a test can count the server processes ever started.
+appendFileSync(`${pidFile}.starts`, `${process.pid}\n`);
 const exit = () => { rmSync(pidFile, { force: true }); process.exit(0); };
 process.on("SIGTERM", exit);
 process.stdin.on("end", exit);

@@ -2,24 +2,21 @@ import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
 	type ExtensionAPI,
 	type ExtensionContext,
 	type ExtensionFactory,
 	type InlineExtension,
-	type LoadedMcpConfig,
-	type McpServerConfig,
-	type McpServerEntry,
+	type LoadExtensionsResult,
+	type RegisteredTool,
 	buildSessionContext,
 	convertToLlm,
 	createAgentSession,
-	createCodemodeExtension,
-	createMcpExtension,
-	createToolSearchExtension,
 	DefaultResourceLoader,
 	getAgentDir,
+	loadProjectContextFiles,
 	ModelRuntime,
 	SessionManager,
 	SettingsManager,
@@ -34,12 +31,11 @@ import { type AAIndices, acpRowView, asRunView, elapsed, empty, framed, type Liv
 import { type AcpRunView, type LifecycleAction, type PiStartInput, type WaitOutcome, PI_CAPABILITIES, requireAction, validateStartInput, validateSteer } from "./backend.js";
 import { AcpBackend, acpModelsText, acpResultText, acpStatusText, acpSummary, DelegateError, sessionLabel, unwrap } from "./acp-backend.js";
 import { shutdownAcpCoordinator } from "./acp/instance.js";
-import { BUILTIN_TOOLS, loadRoles, roleTools } from "./roles.js";
+import { DELEGATION_TOOLS, droppedTools, EVERY_TOOL, loadRoles, toolAllowlist, WRITE_TOOLS } from "./roles.js";
 import { installTodo } from "./todo-ext.js";
 import { dealEligible, formatPercent, selectDeals, type DealsDetails } from "./deals.js";
 import { DealSheet } from "./deals-sheet.js";
 import { RunCompletion } from "./completion.js";
-import { loadChildMcpConfig } from "./mcp-config.js";
 import { resolveChildTrust, type ChildTrust, type TrustSource } from "./project-trust.js";
 import { ownedElsewhere, processOwner, readRecord, storageDir, writeRecord } from "./storage.js";
 
@@ -53,9 +49,6 @@ const RATINGS_STALE_DAYS = 14;
 const OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models";
 const OPENROUTER_TTL_MS = 10 * 60 * 1000;
 const OPENROUTER_TIMEOUT_MS = 8000;
-// Only tools whose contract is to mutate files. bash is not one: read-only roles use it for grep/git diff/tests,
-// and treating it as a writer made two scouts in one cwd collide. Keeping bash out is a decision, not a guess.
-const WRITE_TOOLS = new Set(["edit", "write"]);
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 /** The root parent is depth 0 and its children depth 1. A child may not start a child deeper than this. */
 export const MAX_DELEGATION_DEPTH = 3;
@@ -92,7 +85,7 @@ CHANGES: <files changed, from the actual diff; or none>
 VERIFIED: <commands or flows run and their concrete results>
 GAPS: <unfinished work or blockers, or none>`;
 
-/** Only for a role that lists `delegate`. Nesting is the role's purpose, so the limits are stated, not implied. */
+/** Only for a child whose tools allow `delegate`. Its limits are stated, not implied. */
 const childrenFooter = (depth: number) => `
 
 ## Your own children
@@ -118,7 +111,10 @@ interface Run {
 	systemPrompt: string;
 	contextFiles: { path: string; content: string }[];
 	appendSystemPrompt: string[];
+	/** The role's `tools` line, names and `*` patterns; EVERY_TOOL when it has none. */
 	tools: string[];
+	/** Names it may not have whatever its list says: the delegation pair at the depth cap. */
+	withheld?: string[];
 	timeoutMs: number;
 	sessionId: string;
 	completion: RunCompletion<RunResult>;
@@ -173,14 +169,12 @@ interface Run {
 	foreign?: boolean;
 	/** 1 for a child of the root parent; one more for each delegating child above it. */
 	depth: number;
-	/** Set when a delegating child (a role that lists `delegate`) started this run. */
+	/** Set when a delegating child started this run. */
 	parentRunId?: string;
-	/** A role that lists `mcp` (true: every configured server) or `mcp:<server>` (those servers). */
-	mcp?: true | string[];
-	/** The MCP extension of the child's current session, which connects and closes its servers. */
-	mcpLink?: McpLink;
-	/** mcp.json entries this child's role asked for that were refused, as Pi would refuse them. */
-	mcpProblems?: string[];
+	/** Every tool name the child's current session was offered, allowed or not; droppedTools is read from it. */
+	offered?: Set<string>;
+	/** Extensions that failed to load, or failed in a handler, in the child's current session. It ran without them. */
+	extensionErrors?: string[];
 	/**
 	 * Whether the child's project is trusted, decided by its parent at delegate time (childTrust). It
 	 * governs everything the child reads from `<cwd>/.pi`: settings, mcp.json, and a delegating child's roles.
@@ -320,50 +314,51 @@ async function closeSession(session: any) {
 	try { session.dispose(); } catch { /* ignore */ }
 }
 
-// --- MCP in a child. A role that lists `mcp` or `mcp:<server>` gets Pi's MCP extension in its own
-// session, with codemode and tool_search, which reach the MCP tools that are not declared to the model.
+// --- A child's extensions. A child loads what Pi loads for a session in its folder, with its own trust
+// deciding the project's part, so it has the extensions its parent has, Pi's built-ins included. Its role's
+// `tools` line then decides which of their tools it gets.
 
-/** Pi's built-in tools. A child with MCP is denied each one its role lacks, so a codemode script cannot call it either. */
-const PI_BUILTIN_TOOLS = [...BUILTIN_TOOLS, "powershell"];
+/** Pi's built-in tools. Each one a child may not have is left out of its session before any tool registers. */
+const PI_BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls", "powershell"];
+/** The child's own pi-delegate, as Pi names an inline extension. */
+const NESTED_PATH = "<inline:pi-delegate>";
+
+const allowlist = (run: Run) => toolAllowlist(run.tools, run.withheld);
 
 /**
- * Connects and closes the MCP servers of one child session. Pi's MCP extension connects them on
- * session_start and closes them on session_shutdown. A settled child keeps its session for steering,
- * and a delegating child's own children report into it, so the session is not shut down at settle:
- * the link runs the MCP extension's own two handlers instead, closing the servers when the run
- * settles and connecting them again when it is revived.
+ * An extension's tool table that keeps only the tools a child may have. Pi registers a tool by setting it
+ * here, when the extension loads and whenever it registers one later, as Pi's MCP extension does when a
+ * server connects. A tool the child may not have is never in its registry, so neither the model nor a
+ * codemode script can call it. Every name is recorded as offered.
  */
-interface McpLink { start(): Promise<void>; stop(): Promise<void> }
-function mcpLink(factory: ExtensionFactory): { link: McpLink; factory: ExtensionFactory } {
-	type Handler = (event: any, ctx: ExtensionContext) => unknown;
-	let starts: Handler[] = [], stops: Handler[] = [];
-	let ctx: ExtensionContext | undefined;
-	let live = false;
-	let queue: Promise<void> = Promise.resolve();
-	const serial = (step: () => Promise<void>) => { const next = queue.then(step); queue = next.catch(() => {}); return next; };
-	const wrapped: ExtensionFactory = (pi) => {
-		starts = []; stops = []; ctx = undefined; live = false;
-		const on = (event: string, handler: Handler) => {
-			if (event === "session_start") { starts.push(handler); return (pi.on as any)(event, (e: any, c: ExtensionContext) => { ctx = c; live = true; return handler(e, c); }); }
-			if (event === "session_shutdown") { stops.push(handler); return (pi.on as any)(event, (e: any, c: ExtensionContext) => { live = false; return handler(e, c); }); }
-			return (pi.on as any)(event, handler);
-		};
-		return factory(new Proxy(pi, { get: (target, key) => key === "on" ? on : (target as any)[key] }));
-	};
-	const link: McpLink = {
-		// Only a session that already started (bound) has a context to reconnect with.
-		start: () => serial(async () => {
-			if (live || !ctx) return;
-			live = true;
-			for (const handler of starts) await handler({ type: "session_start", reason: "resume" }, ctx);
-		}),
-		stop: () => serial(async () => {
-			if (!live) return;
-			live = false;
-			for (const handler of stops) await handler({ type: "session_shutdown", reason: "quit" }, ctx!);
-		}),
-	};
-	return { link, factory: wrapped };
+class GatedTools extends Map<string, RegisteredTool> {
+	constructor(private readonly allows: (name: string) => boolean, private readonly offered: Set<string>) { super(); }
+	override set(name: string, tool: RegisteredTool): this {
+		this.offered.add(name);
+		return this.allows(name) ? super.set(name, tool) : this;
+	}
+}
+
+/**
+ * The extensions a child's session runs. An installed pi-delegate would add the root parent's
+ * `delegate`, `delegate_ctl` and `todo`, so it is left out: the child's own nested instance is its only
+ * one. Every other extension keeps only the tools the child may have.
+ */
+function gateExtensions(run: Run, base: LoadExtensionsResult): LoadExtensionsResult {
+	const { allows } = allowlist(run);
+	const offered = run.offered = new Set(PI_BUILTIN_TOOLS);
+	const copies = new Set(base.extensions
+		.filter((extension) => extension.path !== NESTED_PATH && [...extension.tools.keys()].some((name) => DELEGATION_TOOLS.includes(name)))
+		.map((extension) => extension.path));
+	const extensions = base.extensions.filter((extension) => !copies.has(extension.path));
+	for (const extension of extensions) {
+		const gated = new GatedTools(allows, offered);
+		for (const [name, tool] of extension.tools) gated.set(name, tool);
+		extension.tools = gated;
+	}
+	// Pi reports a copy's tools as conflicting with the nested instance's; with the copy left out, they do not.
+	const errors = base.errors.filter((error) => !copies.has(error.path) && ![...copies].some((path) => error.error.includes(path)));
+	return { ...base, extensions, errors };
 }
 
 /**
@@ -449,10 +444,10 @@ function lateReport(run: Run, message: Notice, why: string) {
 	send();
 }
 
-type RunRecord = Omit<Run, "completion" | "session" | "timer" | "streamingMessage" | "activeTools" | "activityCache" | "dirtyBefore" | "ready" | "preparing" | "acknowledged" | "foreign" | "mcpLink" | "closeOnSettle"> & { version: 1; savedAt: number };
+type RunRecord = Omit<Run, "completion" | "session" | "timer" | "streamingMessage" | "activeTools" | "activityCache" | "dirtyBefore" | "ready" | "preparing" | "acknowledged" | "foreign" | "offered" | "closeOnSettle"> & { version: 1; savedAt: number };
 function saveRun(run: Run): void {
 	if (run.foreign) throw foreignError(run);
-	const { completion, session, timer, streamingMessage, activeTools, activityCache, dirtyBefore, ready, preparing, acknowledged, foreign, mcpLink, closeOnSettle, ...record } = run;
+	const { completion, session, timer, streamingMessage, activeTools, activityCache, dirtyBefore, ready, preparing, acknowledged, foreign, offered, closeOnSettle, ...record } = run;
 	writeRecord(run.recordPath, { ...record, version: 1, savedAt: Date.now() });
 }
 function messagesOf(run: Run): any[] {
@@ -490,6 +485,12 @@ function restoreRun(path: string, owner: Owner): Run {
 	run.segmentFailedAttemptsBase ??= Math.max(0, run.failedAttempts - run.segmentFailedAttempts);
 	run.providerRetryMs ??= 0;
 	run.depth ??= 1; // Records from before nesting are children of a root parent.
+	// 0.2.0 kept a role's MCP opt-in apart from its tools: as tool patterns, every server's tools or the named servers'.
+	const legacyMcp = (record as { mcp?: true | string[] }).mcp;
+	if (legacyMcp) {
+		run.tools = [...run.tools, ...(legacyMcp === true ? ["mcp__*"] : legacyMcp.flatMap((server) => [...new Set([`mcp__${server}__*`, `mcp__${server.replace(/-/g, "_")}__*`])]))];
+		delete (run as { mcp?: unknown }).mcp;
+	}
 	// Records from before trust was recorded: nothing of the project is read, and the run says why.
 	if (typeof run.projectTrusted !== "boolean") { run.projectTrusted = false; run.projectTrustUnknown = true; }
 	run.projectTrustSource ??= "unknown";
@@ -1121,9 +1122,8 @@ function summary(run: Run): string {
 	s += `\nproject ${run.projectTrusted ? "trusted" : "untrusted"} (trust source: ${run.projectTrustSource})`;
 	if (run.projectTrustUnknown) s += `\n${TRUST_UNKNOWN}`;
 	if (run.parentRunId) s += `\nstarted by ${run.parentRunId} · depth ${run.depth} of ${MAX_DELEGATION_DEPTH}`;
-	if (run.mcp) s += `\nmcp: ${run.mcp === true ? "every configured server" : run.mcp.join(", ")}; connected while the child runs, closed when it settles`;
-	if (run.mcpProblems?.length) s += `\nmcp.json entries refused, as Pi refuses them (not started):\n  ${run.mcpProblems.join("\n  ")}`;
-	if (run.droppedTools.length) s += `\ntools the child could not have (children get built-ins, plus delegate and delegate_ctl when the role lists delegate and the child runs below depth ${MAX_DELEGATION_DEPTH}, and MCP servers when it lists mcp or mcp:<server>): ${run.droppedTools.join(", ")}`;
+	if (run.extensionErrors?.length) s += `\nextensions that failed in the child (it ran without them):\n  ${run.extensionErrors.join("\n  ")}`;
+	if (run.droppedTools.length) s += `\ntools the child could not have (a child gets the tools its parent's extensions and MCP tools provide, limited to its role's tools; no delegate or delegate_ctl at depth ${MAX_DELEGATION_DEPTH}; no todo): ${run.droppedTools.join(", ")}`;
 	if (run.changedFiles.length) s += `\nchanged: ${run.changedFiles.join(", ")}`;
 	if (run.error) s += `\nerror: ${run.error}`;
 	return s;
@@ -1138,7 +1138,7 @@ function resultText(run: Run): string {
 function log(run: Run) {
 	try {
 		mkdirSync(dirname(LOG_FILE), { recursive: true });
-		const { session: _s, timer: _t, activityCache: _a, streamingMessage: _m, activeTools: _tools, completion: _completion, ready: _ready, systemPrompt: _prompt, contextFiles: _context, appendSystemPrompt: _append, mcpLink: _mcp, closeOnSettle: _close, ...rest } = run;
+		const { session: _s, timer: _t, activityCache: _a, streamingMessage: _m, activeTools: _tools, completion: _completion, ready: _ready, systemPrompt: _prompt, contextFiles: _context, appendSystemPrompt: _append, offered: _offered, closeOnSettle: _close, ...rest } = run;
 		appendFileSync(LOG_FILE, `${JSON.stringify({ ...rest, output: run.output.slice(0, 2000), ts: Date.now() })}\n`);
 	} catch {
 		/* logging must never fail the run */
@@ -1179,12 +1179,12 @@ function finish(run: Run, status: Status, error?: string) {
 	}
 	run.activeTools.clear();
 	run.streamingMessage = undefined;
+	// What the role listed that its session never offered. MCP tools register as their servers connect, so this waits for the settle.
+	if (run.offered) run.droppedTools = droppedTools(run.tools, run.offered, run.withheld);
 	run.revision++;
 	try { saveRun(run); }
 	catch (e) { run.status = "error"; run.error = `Could not persist completion: ${String(e)}`; }
 	log(run);
-	// Nothing of a settled child keeps running: its MCP servers close now and reconnect if it is revived.
-	void run.mcpLink?.stop();
 	retire(run);
 	if (run.closeOnSettle) { run.closeOnSettle = false; dropSession(run); }
 	run.completion.settle(finalResult(run));
@@ -1257,29 +1257,83 @@ function armTimeout(run: Run) {
 	run.timer = setTimeout(() => { run.status = "timeout"; void stopTree(run); void run.session?.abort(); }, run.timeoutMs - spent);
 }
 
-/** A role that lists `delegate` saved the delegation pair in its tools; revival reads it from there. */
-const delegating = (run: Run) => run.tools.includes("delegate");
+/** A child whose tools allow either delegation tool runs its own pi-delegate. Revival reads that from the run. */
+const delegating = (run: Run) => DELEGATION_TOOLS.some(allowlist(run).allows);
 /** The delegation tools inside a delegating child's own session, as an inline extension of that session. */
 const nestedExtension = (run: Run) => ({ name: "pi-delegate", factory: (pi: ExtensionAPI) => installDelegate(pi, run) });
 /**
- * The inline extensions of a child's session: delegation when its role lists `delegate`, and MCP when
- * it lists `mcp` or `mcp:<server>`. Each call builds a new session's set, so the run's MCP link
- * becomes that session's.
+ * What a child's session takes from the session that started it. Pi caches each extension module's factory
+ * for the folder it last loaded extensions for (the root session's), so a child whose loader loads from that
+ * folder re-binds the factories the root already imported instead of importing them again. MCP tools are
+ * the parent's: the child gets proxies that call the parent's live tool by name at call time.
  */
-function childExtensions(run: Run): InlineExtension[] {
-	const extensions: InlineExtension[] = delegating(run) ? [nestedExtension(run)] : [];
-	const named = run.mcp;
-	if (!named) return extensions;
-	// One loader for `mcp` and `mcp:<server>`, validated as Pi validates, with the trust the parent decided.
-	const mcp = mcpLink(createMcpExtension({ loadConfig: () => loadChildMcpConfig(AGENT_DIR, run.cwd, run.projectTrusted, Array.isArray(named) ? named : undefined) }));
-	run.mcpLink = mcp.link;
-	return [...extensions,
-		{ name: "codemode", factory: createCodemodeExtension() },
-		{ name: "tool-search", factory: createToolSearchExtension() },
-		{ name: "mcp", factory: mcp.factory }];
+interface ParentLink {
+	/** The folder the root session loaded its extensions for. */
+	extensionCwd: string;
+	/** The parent's MCP tools when the child's session is built. */
+	mcpTools: () => ReturnType<ExtensionAPI["getAllTools"]>;
+	/** The tools the parent's session can call now (its tool context's live `tools`). */
+	callable: () => readonly any[] | undefined;
 }
-/** A child's session binds its extensions only when it has some: delegation or MCP. */
-const bindsExtensions = (run: Run) => delegating(run) || Boolean(run.mcp);
+const parentLinks = new WeakMap<Run, ParentLink>();
+/** A parent tool a child reaches through a proxy: an MCP server's tool, as Pi's MCP extension names it. */
+const isMcpTool = (tool: { name: string; exposure?: string }) => tool.name.startsWith("mcp__") && tool.exposure !== "hidden";
+
+/**
+ * The parent's MCP tools in a child: each forwards to the parent's tool of the same name, looked up when
+ * called, so a server that reconnected in the parent is reached through its new connection. The child
+ * starts no MCP server. Proxies are direct tools, so the child needs no codemode or tool search for them.
+ */
+function mcpProxyExtension(run: Run): InlineExtension {
+	return { name: "mcp-proxy", factory: (pi: ExtensionAPI) => {
+		const link = parentLinks.get(run);
+		if (!link) return;
+		for (const info of link.mcpTools()) {
+			pi.registerTool({
+				name: info.name, label: info.name, description: info.description, parameters: info.parameters as any,
+				...(info.promptGuidelines ? { promptGuidelines: info.promptGuidelines } : {}),
+				...(info.annotations ? { annotations: info.annotations } : {}),
+				async execute(toolCallId: string, params: any, signal: AbortSignal | undefined, onUpdate: any) {
+					let tools: readonly any[] | undefined;
+					try { tools = link.callable(); } catch { tools = undefined; }
+					const tool = tools?.find((candidate) => candidate.name === info.name);
+					if (!tool) throw new Error(`${info.name}: the parent session no longer offers this MCP tool.`);
+					return tool.execute(toolCallId, params, signal, onUpdate);
+				},
+			} as any);
+		}
+	} };
+}
+
+/** The inline extensions of a child's session: its own pi-delegate when it delegates, and its parent's MCP tools. */
+function childExtensions(run: Run): InlineExtension[] {
+	return [...(delegating(run) ? [nestedExtension(run)] : []), mcpProxyExtension(run)];
+}
+/**
+ * The resource loader of a child's session. It loads from the folder the root session loaded its extensions
+ * for, so Pi's factory cache hands it the factories the root already imported, each bound to the child's own
+ * extension API; the child's trust in `settingsManager` still decides the project's part. Context files are
+ * the child's folder's. Skills, prompt templates and themes stay out. A reopened session gets the context
+ * files saved on the run.
+ */
+function childLoader(run: Run, settingsManager: SettingsManager, reopen: boolean): DefaultResourceLoader {
+	const cwd = parentLinks.get(run)?.extensionCwd ?? run.cwd;
+	return new DefaultResourceLoader({
+		cwd, agentDir: AGENT_DIR, settingsManager, systemPrompt: run.systemPrompt,
+		noSkills: true, noPromptTemplates: true, noThemes: true,
+		extensionFactories: childExtensions(run),
+		extensionsOverride: (base) => gateExtensions(run, base),
+		...(reopen
+			? { noContextFiles: true, agentsFilesOverride: () => ({ agentsFiles: run.contextFiles }), appendSystemPromptOverride: () => run.appendSystemPrompt }
+			: { agentsFilesOverride: () => ({ agentsFiles: loadProjectContextFiles({ cwd: run.cwd, agentDir: AGENT_DIR }) }) }),
+	});
+}
+const MAX_EXTENSION_ERRORS = 20;
+/** An extension failure in a child, kept on the run once. The child runs on without that extension. */
+function extensionError(run: Run, message: string) {
+	const errors = run.extensionErrors ??= [];
+	if (!errors.includes(message) && errors.length < MAX_EXTENSION_ERRORS) errors.push(message);
+}
 
 type Replacement = { model?: string; thinking?: string; contextWindow?: number; timeoutMs?: number };
 const rebinds = (run: Run, replacement?: Replacement) =>
@@ -1330,7 +1384,7 @@ export default function (pi: ExtensionAPI) { installDelegate(pi); }
 
 /**
  * The delegation tools for one session. At the root, that is the parent's session. With `nesting`,
- * it is a delegating child's own session (a role that lists `delegate`): the same machinery, one
+ * it is a delegating child's own session (its tools allow `delegate`): the same machinery, one
  * level down, with its children's completions delivered to that child.
  */
 function installDelegate(pi: ExtensionAPI, nesting?: Run) {
@@ -1346,6 +1400,23 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 	// second child bound for the same folder waits for the first answer instead of asking again. An
 	// aborted delegate call closes its question, which releases the queue.
 	const sessionTrust = new Map<string, boolean>();
+	// The latest tool context of this session (a delegate or delegate_ctl call's): its live `tools` is what a
+	// child's MCP proxies call. Its folder is where the root session loaded its extensions.
+	let toolContext: any;
+	let sessionCwd: string | undefined;
+	const remember = (ctx: any) => {
+		if (!ctx) return;
+		if ("tools" in ctx) toolContext = ctx;
+		if (typeof ctx.cwd === "string") sessionCwd ??= resolve(ctx.cwd);
+	};
+	const linkParent = (run: Run, ctx?: any) => {
+		remember(ctx);
+		parentLinks.set(run, {
+			extensionCwd: nesting ? (parentLinks.get(nesting)?.extensionCwd ?? nesting.cwd) : (sessionCwd ?? run.cwd),
+			mcpTools: () => pi.getAllTools().filter(isMcpTool),
+			callable: () => toolContext?.tools,
+		});
+	};
 	let trustQueue: Promise<unknown> = Promise.resolve();
 	const decideTrust = (cwd: string, ctx: ExtensionContext, signal?: AbortSignal) => {
 		const decided = trustQueue.then(() => childTrust(cwd, ctx, depth, sessionTrust, signal));
@@ -1520,40 +1591,31 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		if (!model) throw new Error(`Saved model is unavailable: ${run.model}. No fallback was selected \u2014 choose a replacement: delegate_ctl steer runId=${run.id} model=<provider/id[:thinking]>.`);
 		// Without its own settings manager Pi trusts every project (SettingsManager.create defaults to trusted).
 		const settingsManager = SettingsManager.create(run.cwd, AGENT_DIR, { projectTrusted: run.projectTrusted });
-		const loader = preparedLoader ?? new DefaultResourceLoader({
-			cwd: run.cwd, agentDir: AGENT_DIR, settingsManager,
-			noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
-			extensionFactories: childExtensions(run),
-			systemPrompt: run.systemPrompt,
-			agentsFilesOverride: () => ({ agentsFiles: run.contextFiles }),
-			appendSystemPromptOverride: () => run.appendSystemPrompt,
-		});
+		if (!parentLinks.has(run)) linkParent(run);
+		const loader = preparedLoader ?? childLoader(run, settingsManager, true);
 		if (!preparedLoader) await loader.reload();
+		// An extension that failed to load is left out by Pi; the child runs without it, and its run says so.
+		run.extensionErrors = [];
+		for (const error of loader.getExtensions().errors) extensionError(run, `${error.path}: ${error.error}`);
 		const manager = openTranscript(run);
 		// A crash may have happened before the first prompt was appended. Preserve the original
 		// brief before the explicit revival message rather than silently discarding the task.
 		if (run.segment > 1 && !messagesOf(run).some((message, index) => index >= run.startIdx && message.role === "user")) {
 			manager.appendMessage({ role: "user", content: [{ type: "text", text: run.task }], timestamp: run.startedAt });
 		}
-		// `tools` is an allowlist of exact names, and MCP tool names are known only once a server
-		// connects. An MCP child is instead denied each built-in its role lacks, before any tool is
-		// registered, so neither the model nor a codemode script can reach one.
-		const toolOptions = run.mcp
-			? { noTools: "builtin" as const, excludeTools: PI_BUILTIN_TOOLS.filter((name) => !run.tools.includes(name)) }
-			: { tools: run.tools };
+		// Extension tools the child may not have never register (gateExtensions). Pi's built-in tools are
+		// not an extension's, so each one it may not have is excluded here, before any tool registers.
+		const { allows } = allowlist(run);
 		const { session } = await createAgentSession({
 			cwd: run.cwd, agentDir: AGENT_DIR, settingsManager, model, thinkingLevel: run.thinking as any,
-			...toolOptions, resourceLoader: loader,
+			excludeTools: PI_BUILTIN_TOOLS.filter((name) => !allows(name)), resourceLoader: loader,
 			sessionManager: manager, modelRuntime: runtime,
 		} as any);
-		if (run.mcp) {
-			session.setActiveToolsByName(run.tools);
-			// A built-in this Pi has and the list above does not know is refused, never handed over.
-			const extra = session.getAllTools().filter((tool: any) => tool.sourceInfo?.source === "builtin" && !run.tools.includes(tool.name));
-			if (extra.length) {
-				await closeSession(session);
-				throw new Error(`This Pi has built-in tools pi-delegate cannot withhold from an MCP child: ${extra.map((tool: any) => tool.name).join(", ")}.`);
-			}
+		// A tool that reached the registry anyway, such as a built-in this Pi has and the list above does not know, is refused, never handed over.
+		const leaked = session.getAllTools().filter((tool: any) => !allows(tool.name));
+		if (leaked.length) {
+			await closeSession(session);
+			throw new Error(`This Pi gives a child tools pi-delegate cannot withhold: ${leaked.map((tool: any) => tool.name).join(", ")}.`);
 		}
 		run.session = session;
 		saveRun(run);
@@ -1613,9 +1675,13 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			}
 			changed();
 		});
-		// Binding starts the nested instance (session_start), which attaches this child as its children's
-		// parent. It needs run.session set first: restored children may report into it at once.
-		if (bindsExtensions(run)) await session.bindExtensions({});
+		// Binding starts the child's extensions (session_start), its nested pi-delegate among them, which
+		// attaches this child as its children's parent. It needs run.session set first: restored children may
+		// report into it at once. With no UI bound, extensions get Pi's headless UI, as in print mode.
+		await session.bindExtensions({ onError: (error: any) => extensionError(run, `${error.extensionPath}: ${error.event}: ${error.error}`) });
+		// Pi declares its default tools and the extension tools that ask to be; a tool the role names is declared too, as `pi --tools` does.
+		const named = session.getAllTools().filter((tool: any) => run.tools.includes(tool.name)).map((tool: any) => tool.name);
+		session.setActiveToolsByName([...new Set([...session.getActiveToolNames(), ...named])]);
 	}
 
 	async function launch(run: Run, task: string, onUpdate?: (u: any) => void, preparedLoader?: DefaultResourceLoader) {
@@ -1623,9 +1689,6 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			await run.preparing;
 			run.preparing = undefined;
 			await openSession(run, onUpdate, preparedLoader);
-			// A retained session closed its MCP servers when its last segment settled. A new session
-			// connected them when it bound, so this does nothing there.
-			await run.mcpLink?.start();
 		})();
 		run.ready = sessionReady;
 		try {
@@ -1810,7 +1873,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			"Delegate only for context isolation, parallelism, or a model-tier switch — if the brief would be longer than the expected diff, do the work yourself. " +
 			"Start the brief with a short task title on its own line, then objective, ownership, interfaces/constraints, verification, return shape. " +
 			'context "fork" (default) hands the child your conversation so far; "fresh" is for adversarial review. ' +
-			"Runs in the background by default \u2014 the call returns a run id at once and you are woken once, when the child finishes. There are no progress pings by design; waiting is not your work. Do other work, or use delegate_ctl wait with that runId to block without polling when nothing else can proceed, or delegate_ctl status for a single progress read when someone asks. A launch never joins the child; use delegate_ctl wait only when dependent work needs its result. Children have built-in tools only, unless their role lists delegate: then they also get delegate and delegate_ctl, except at depth " + MAX_DELEGATION_DEPTH + ", the cap, where they get neither. A role that lists mcp (every configured server) or mcp:<server> also reaches those MCP servers while the child runs. Model: run delegate_ctl models first; a role's approved default is used when model: is omitted. Proposing a model that is not the approved default is a conversation with the user, not a tool step: state the offering, price, rating and tradeoff, get their answer, then call delegate; if they want it kept, delegate_ctl action=approve. Use delegate_ctl to list roles, wait, check status, steer, or cancel. " +
+			"Runs in the background by default \u2014 the call returns a run id at once and you are woken once, when the child finishes. There are no progress pings by design; waiting is not your work. Do other work, or use delegate_ctl wait with that runId to block without polling when nothing else can proceed, or delegate_ctl status for a single progress read when someone asks. A launch never joins the child; use delegate_ctl wait only when dependent work needs its result. A child re-binds the extensions your session loaded and calls your session's MCP tools, and gets their tools (built-ins, extension tools, mcp__<server>__<tool>, delegate and delegate_ctl), limited to its role's tools list; at depth " + MAX_DELEGATION_DEPTH + ", the cap, it gets no delegate or delegate_ctl. Model: run delegate_ctl models first; a role's approved default is used when model: is omitted. Proposing a model that is not the approved default is a conversation with the user, not a tool step: state the offering, price, rating and tradeoff, get their answer, then call delegate; if they want it kept, delegate_ctl action=approve. Use delegate_ctl to list roles, wait, check status, steer, or cancel. " +
 			'backend "acp" runs an external ACP agent session instead (agent required, e.g. "pi", "amp", "codex", "claude"): it creates a session and sends task as its first turn, or with sessionId opens that exact native session (an Amp T-ID, say) without owning it and sends task only when given. ' +
 			"An ACP child never receives your conversation (no context), and an opened session keeps its native role and model. Its report carries the agent's native session ID and each turn's request ID and delivery. Close an ACP run with delegate_ctl close when done.",
 		parameters: Type.Object({
@@ -1828,6 +1891,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			mode: Type.Optional(Type.String({ description: 'acp + amp only, created threads: Amp\'s agent mode (low, medium, high, ultra or a plugin mode), used for every turn. Not with model or sessionId' })),
 		}),
 		async execute(_id, params, signal, onUpdate, ctx) {
+			remember(ctx);
 			const start = validateStartInput(params as Record<string, unknown>);
 			if (!start.ok) return failed(new DelegateError(start.error.code, start.error.message, start.error.field));
 			// A session at the cap is launched without delegation tools. This check is the backstop for any
@@ -1870,18 +1934,13 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			const timeoutMs = p.timeoutMs ?? role.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 			// A child at the cap could only fail its delegate calls, so it gets no delegation tools at all.
 			const atDepthCap = depth + 1 >= MAX_DELEGATION_DEPTH;
-			const { tools, dropped, delegates, mcp } = roleTools(role.tools, !atDepthCap);
-			// A named server that no mcp.json defines, or defines as Pi would refuse, is reported like any
-			// tool the child cannot have; why it was refused is reported with it.
-			const mcpConfig = mcp ? loadChildMcpConfig(AGENT_DIR, cwd, projectTrusted, Array.isArray(mcp) ? mcp : undefined) : undefined;
-			if (Array.isArray(mcp)) {
-				const defined = new Set(mcpConfig!.servers.map((server) => server.name));
-				dropped.push(...mcp.filter((name) => !defined.has(name)).map((name) => `mcp:${name}`));
-			}
-			const mcpProblems = mcpConfig?.errors ?? [];
-			const isWriter = tools.some((t) => WRITE_TOOLS.has(t));
+			const tools = [...(role.tools ?? EVERY_TOOL)];
+			const withheld = atDepthCap ? [...DELEGATION_TOOLS] : undefined;
+			const { allows } = toolAllowlist(tools, withheld);
+			const delegates = allows("delegate");
+			const isWriter = WRITE_TOOLS.some(allows);
 			const context = p.context ?? role.context ?? "fork";
-			const systemPrompt = role.systemPrompt + (role.systemPrompt.includes("STATUS:") ? "" : contractFooter(delegates, atDepthCap && roleTools(role.tools).delegates))
+			const systemPrompt = role.systemPrompt + (role.systemPrompt.includes("STATUS:") ? "" : contractFooter(delegates, atDepthCap && toolAllowlist(tools).allows("delegate")))
 				+ (delegates ? childrenFooter(depth + 1) : "") + (context === "fork" ? FORK_FOOTER : "");
 			if (isWriter) {
 				const clash = [...runs.values()].find((r) => !r.completion.settled && r.writer && r.cwd === cwd);
@@ -1915,7 +1974,8 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 				tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 				cost: 0,
 				changedFiles: [],
-				droppedTools: dropped,
+				// Read from what the child's session offered, once it settles.
+				droppedTools: [],
 				output: "",
 				// Fork context is materialized by the background preparation below. Until then the
 				// durable child contains only its header and has no child messages to harvest.
@@ -1933,15 +1993,12 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 				...processOwner(),
 				depth: depth + 1,
 				...(nesting ? { parentRunId: nesting.id } : {}),
-				...(mcp ? { mcp } : {}),
-				...(mcpProblems.length ? { mcpProblems } : {}),
+				...(withheld ? { withheld } : {}),
 				projectTrusted,
 				projectTrustSource,
 			};
-			const loader = new DefaultResourceLoader({ cwd, agentDir: AGENT_DIR, systemPrompt,
-				settingsManager: SettingsManager.create(cwd, AGENT_DIR, { projectTrusted }),
-				noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true,
-				extensionFactories: childExtensions(run) });
+			linkParent(run, ctx);
+			const loader = childLoader(run, SettingsManager.create(cwd, AGENT_DIR, { projectTrusted }), false);
 			saveRun(run);
 			writeRecord(join(owner.dir, `${encodeURIComponent(run.id)}.json`), { version: 1, recordPath: run.recordPath });
 			runs.set(run.id, run);
@@ -2064,6 +2121,7 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 			),
 		}),
 		async execute(_id, p, signal, onUpdate, ctx) {
+			remember(ctx);
 			if (p.action === "approve") {
 				// Approval records the user's yes from the conversation. A delegating child never has that conversation.
 				if (nesting) return { content: [{ type: "text", text: "approve records a default the user agreed to; only the root parent talks to the user. Report the proposal in your final report instead." }], isError: true, details: undefined };
@@ -2187,25 +2245,29 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 			if (p.action === "roles") {
 				const roles = [...loadRoles(ctx.cwd, ctx.isProjectTrusted()).values()].sort((a, b) => a.name.localeCompare(b.name));
 				const approved = loadDefaults().approved;
+				// The tools a child started from here would be offered: this session's, or, in a delegating child,
+				// what its own session was offered. The todo tool stays with the root parent.
+				const offered = (nesting ? [...(nesting.offered ?? [])] : pi.getAllTools().map((tool) => tool.name)).filter((name) => name !== "todo");
+				const withheld = depth + 1 >= MAX_DELEGATION_DEPTH ? DELEGATION_TOOLS : [];
 				const rows = roles.map((r) => {
-					const { tools, dropped, mcp, delegates } = roleTools(r.tools, depth + 1 < MAX_DELEGATION_DEPTH);
+					const tools = r.tools ?? EVERY_TOOL;
+					const { allows } = toolAllowlist(tools, withheld);
 					return {
 						name: r.name,
 						mode: `${r.context ?? "fork"}${r.thinking ? `:${r.thinking}` : ""}`,
 						model: approved[r.name]?.spec ?? r.model ?? "needs approval",
 						approved: Boolean(approved[r.name]),
-						writes: tools.some((t) => WRITE_TOOLS.has(t)),
+						writes: WRITE_TOOLS.some(allows),
 						// Its own tools may be read-only, but the children it starts may be writers.
-						delegates,
+						delegates: allows("delegate"),
 						tools,
-						dropped,
-						mcp,
+						dropped: droppedTools(tools, offered, withheld),
 						timeoutMs: r.timeoutMs,
 						description: r.description,
 						source: r.source,
 					};
 				});
-				const lines = rows.map((r, i) => `${r.name}  [${r.mode}]  ${approved[roles[i].name] ? "default" : "no default"}: ${r.model}${r.delegates ? `  [delegates; can write via children]` : ""}  ${r.description}  (${r.source})`);
+				const lines = rows.map((r, i) => `${r.name}  [${r.mode}]  ${approved[roles[i].name] ? "default" : "no default"}: ${r.model}${r.delegates ? (r.writes ? "  [writes; delegates]" : "  [delegates; can write via children]") : ""}  ${r.description}  (${r.source})`);
 				return { content: [{ type: "text", text: lines.join("\n") || "no roles found" }], details: { kind: "roles", rows } };
 			}
 			const owner = requireOwner();

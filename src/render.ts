@@ -595,8 +595,7 @@ export function resultView(
 				+ theme.fg(r.approved === true ? "dim" : "warning", pad(r.model, modelWidth)) + "  "
 				// A delegating role's own tools may be read-only; the children it starts may write.
 				+ theme.fg(r.writes === true || r.delegates === true ? "warning" : "success", r.writes === true ? (r.delegates === true ? "writes; delegates" : "writes") : r.delegates === true ? "delegates; can write via children" : "read-only")
-				+ theme.fg("dim", ` · ${r.tools.length} tools`)
-				+ (r.mcp ? theme.fg("dim", ` · mcp${Array.isArray(r.mcp) ? ` ${r.mcp.join(",")}` : ""}`) : "")
+				+ theme.fg("dim", r.tools.length === 1 && r.tools[0] === "*" ? " · every tool" : ` · ${r.tools.length} tools`)
 				+ (r.timeoutMs ? theme.fg("dim", ` · ${Math.round(r.timeoutMs / 60000)}m`) : "")
 				+ ((r.dropped?.length ?? 0) ? theme.fg("warning", ` · ${r.dropped.length} unavailable`) : ""),
 				inner, "\u2026")),

@@ -1,6 +1,6 @@
 {
   "name": "@ssweens/pi-delegate",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Delegation and phased todos for pi: durable child runs, steer, honest run log, and a stock-Pi todo tool.",
   "type": "module",
   "main": "src/index.ts",

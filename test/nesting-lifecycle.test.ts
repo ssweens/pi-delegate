@@ -104,8 +104,8 @@ test("a delegating child's subtree ends with it, and a late report is never drop
 	const box = sandbox(api.url);
 	const agents = join(box.cwd, ".pi", "agents");
 	mkdirSync(agents, { recursive: true });
-	writeFileSync(join(agents, "coordinator.md"), "---\nname: coordinator\ndescription: Starts its own children.\ntools: read, grep, delegate\ncontext: fresh\n---\n\nCoordinate.\n");
-	writeFileSync(join(agents, "writer-coordinator.md"), "---\nname: writer-coordinator\ndescription: Writes and starts its own children.\ntools: read, write, delegate\ncontext: fresh\n---\n\nCoordinate and write.\n");
+	writeFileSync(join(agents, "coordinator.md"), "---\nname: coordinator\ndescription: Starts its own children.\ntools: read, grep, delegate, delegate_ctl\ncontext: fresh\n---\n\nCoordinate.\n");
+	writeFileSync(join(agents, "writer-coordinator.md"), "---\nname: writer-coordinator\ndescription: Writes and starts its own children.\ntools: read, write, delegate, delegate_ctl\ncontext: fresh\n---\n\nCoordinate and write.\n");
 	const h = await harness(box);
 	api.onUnscripted((request) => {
 		const started = /^(scout-[0-9a-f-]{36}) running/.exec(lastTool(request));
