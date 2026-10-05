@@ -31,7 +31,7 @@ export const ACP_ONLY_FIELDS = ["agent", "sessionId", "executionEnvironment", "m
 /** Accepted only with backend "acp" and agent "amp". On any other agent each one is an error. */
 export const AMP_ONLY_FIELDS = ["mode"] as const;
 /** Accepted only with backend "pi". An ACP child cannot receive the parent conversation. */
-export const PI_ONLY_FIELDS = ["context"] as const;
+export const PI_ONLY_FIELDS = ["context", "runtime"] as const;
 /** Opening an existing native session keeps its settings: these are creation-only (Coordinator rule). */
 export const OPEN_FORBIDDEN_FIELDS = ["role", "model", "mode"] as const;
 
@@ -51,6 +51,8 @@ export interface PiStartInput extends CommonStartInput {
 	/** provider/id[:thinking] */
 	model?: string;
 	context?: "fork" | "fresh";
+	/** Overrides the role's runtime: an in-process Pi child, or an oven slice. */
+	runtime?: "in-process" | "oven";
 }
 
 /** `delegate` on acp without `sessionId`: create a Coordinator worker and send `task` as its first turn. */
@@ -449,6 +451,10 @@ export function validateStartInput(raw: Record<string, unknown>): Validated<Star
 		if (!isNonEmptyString(raw.role)) return fail("INPUT_INVALID", "role is required: a pi-delegate role name", "role");
 		if (!isNonEmptyString(raw.task)) return fail("INPUT_INVALID", "task is required", "task");
 		const value: PiStartInput = { backend: "pi", role: raw.role, task: raw.task, ...common.value };
+		if (raw.runtime !== undefined) {
+			if (raw.runtime !== "in-process" && raw.runtime !== "oven") return fail("INPUT_INVALID", 'runtime is "in-process" or "oven"', "runtime");
+			value.runtime = raw.runtime;
+		}
 		if (raw.model !== undefined) {
 			if (!isNonEmptyString(raw.model)) return fail("INPUT_INVALID", "model must be a non-empty string", "model");
 			value.model = raw.model;

@@ -1,9 +1,16 @@
 import "./setup.ts"; // First: isolates this file from the real home even when run on its own.
 import assert from "node:assert/strict";
-import { rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import { test } from "node:test";
 import { deferred, provider, sandbox, harness } from "./fixture.ts";
+
+// Mom runs in oven: this file reaches pi-tether's test stand-in for it on a private socket, never a real oven.
+const ovenDir = mkdtempSync(join("/tmp", "pd-oven-"));
+Object.assign(process.env, { OVEN_CLI: fileURLToPath(new URL("../../pi-tether/test/oven-stub.sh", import.meta.url)), OVEN_SOCKET: join(ovenDir, "oven.sock"), OVEN_STUB_DATA: join(ovenDir, "data"), OVEN_STUB_WATCH_PID: String(process.pid) });
+// The stand-in watches this process (OVEN_STUB_WATCH_PID) and closes its owners and exits when it is gone.
+process.once("exit", () => rmSync(ovenDir, { recursive: true, force: true }));
 
 // Real parent/child tool protocol, sessions, reload and event bus. Only HTTP model replies are scripted.
 test("Mom batches settled worker evidence until lead cadence is due, without extra delegate work", { timeout: 30000 }, async () => {
@@ -37,7 +44,7 @@ test("Mom batches settled worker evidence until lead cadence is due, without ext
 			motherRequests.push(input);
 			const ref = /\[src:([^\]]+)\]/.exec(input.newEvents)?.[1] ?? input.original.ref;
 			return { tool: { name: "commit_graph", arguments: { revision: input.graph.revision, purpose: "main", focus: "main", note: null,
-				upsertNodes: [{ id: "main", kind: "try", parent: null, state: "active", label: "Main purpose", intent: input.original.text, observed: "Scout progress received.", actor: "lead", sources: [ref], purposeSource: ref }],
+				upsertNodes: [{ id: "main", kind: "try", parent: null, state: "active", label: "Main purpose", intent: input.original.text, observed: "Scout progress received.", actor: "lead", sources: [ref] }],
 				unfinished: [], upsertEdges: [], removeEdges: [], merges: [], folds: [], removeNodes: [], supersessions: [] } } };
 		});
 		await h.runtime.session.prompt(prompt);

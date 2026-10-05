@@ -12,6 +12,10 @@ export interface Role {
 	tools?: string[];
 	context?: "fork" | "fresh";
 	timeoutMs?: number;
+	/** Where its children run by default: in this Pi process, or as an oven slice. A delegate call can override it. */
+	runtime?: "in-process" | "oven";
+	/** oven only: the Pi-package and Durable extensions the slice selects (oven's are off by default). */
+	extensions?: string[];
 	source: string;
 }
 
@@ -128,6 +132,8 @@ export function loadRoles(cwd: string, projectTrusted: boolean): Map<string, Rol
 				tools: toolList(fm.tools),
 				context: ctx === "fresh" || ctx === "fork" ? ctx : undefined,
 				timeoutMs: fm.timeoutMs ? Number(fm.timeoutMs) || undefined : undefined,
+				runtime: fm.runtime === "oven" || fm.runtime === "in-process" ? fm.runtime : undefined,
+				extensions: toolList(fm.extensions),
 				source: file.replace(homedir(), "~"),
 			});
 		}

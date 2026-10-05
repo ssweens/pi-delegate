@@ -29,6 +29,7 @@ import { AgentHistory, AgentsPanel, ChildView, type LiveSource } from "./inspect
 import type { ActiveTool, ChildActivity } from "./transcript.js";
 import { type AAIndices, acpRowView, asRunView, elapsed, empty, framed, type LiveFacts, type ModelRow, type ModelsDetails, resultLines, resultView, type RunView } from "./render.js";
 import { type AcpRunView, type LifecycleAction, type PiStartInput, type WaitOutcome, PI_CAPABILITIES, requireAction, validateStartInput, validateSteer } from "./backend.js";
+import { ovenRequest, type SliceView } from "./oven.js";
 import { AcpBackend, acpModelsText, acpResultText, acpStatusText, acpSummary, DelegateError, sessionLabel, unwrap } from "./acp-backend.js";
 import { shutdownAcpCoordinator } from "./acp/instance.js";
 import { DELEGATION_TOOLS, droppedTools, EVERY_TOOL, loadRoles, toolAllowlist, WRITE_TOOLS } from "./roles.js";
@@ -169,6 +170,12 @@ interface Run {
 	foreign?: boolean;
 	/** 1 for a child of the root parent; one more for each delegating child above it. */
 	depth: number;
+	/** Set when the child runs as an oven slice instead of in this process (role `runtime: oven`, or the call's `runtime`). */
+	runtime?: "oven";
+	/** oven: the extensions the slice selects, from the role. */
+	extensions?: string[];
+	/** oven: the slice this run drives; set once oven created it. */
+	sliceId?: string;
 	/** Set when a delegating child started this run. */
 	parentRunId?: string;
 	/** Every tool name the child's current session was offered, allowed or not; droppedTools is read from it. */
@@ -508,7 +515,9 @@ function restoreRun(path: string, owner: Owner): Run {
 	if (run.status === "running") {
 		run.status = "interrupted";
 		run.endedAt = record.savedAt;
-		run.error = "The previous process ended before this execution settled. Inspect its saved work; send a message to continue.";
+		run.error = run.runtime === "oven"
+			? `The previous process ended before this execution settled. Its oven slice ${run.sliceId ?? "(not created yet)"} keeps running in oven; steer to rejoin it.`
+			: "The previous process ended before this execution settled. Inspect its saved work; send a message to continue.";
 	}
 	try { harvest(run); }
 	catch (error) { run.status = "error"; run.error = String(error); }
@@ -655,6 +664,8 @@ function trimDangling(messages: any[]): any[] {
 }
 
 function harvest(run: Run) {
+	// An oven run has no transcript here: its output and turns come from oven (launchOven).
+	if (run.runtime === "oven") return;
 	const msgs = messagesOf(run);
 	let turns = 0;
 	const tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
@@ -1201,7 +1212,41 @@ async function cancelRun(run: Run) {
 	if (run.status === "running") run.status = "cancelled";
 	try { saveRun(run); }
 	// The subtree is marked stopped before the abort can settle this run, so nothing below revives it.
-	finally { changed(); await Promise.all([stopTree(run), run.session?.abort()]); }
+	finally { changed(); await Promise.all([stopTree(run), run.session?.abort(), haltSlice(run)]); }
+}
+
+/** Stop an oven run's slice; its conversation and copy stay in oven. */
+async function haltSlice(run: Run) {
+	if (run.runtime === "oven" && run.sliceId) await ovenRequest({ op: "stop", slice: run.sliceId }).catch(() => {});
+}
+
+/**
+ * One segment of an oven run: the first creates the slice from the run's role configuration in a copy of its
+ * cwd, a later one sends the message to it. Then it waits for oven to settle the slice, in short joins so a
+ * cancel or the timeout (armTimeout) ends the wait, and settles the run like an in-process child's.
+ */
+async function launchOven(run: Run, task: string) {
+	try {
+		milestone(run, { kind: "started", task: task.slice(0, 600) });
+		run.segmentStartedAt = Date.now();
+		armTimeout(run);
+		if (!run.sliceId) {
+			const config = { name: run.role, instructions: run.systemPrompt, model: run.model, ...(run.thinking ? { thinking: run.thinking } : {}),
+				...(run.extensions?.length ? { extensions: run.extensions } : {}), ...(run.tools.includes("*") ? {} : { tools: run.tools }) };
+			const created = await ovenRequest<SliceView>({ op: "create", config, task, cwd: run.cwd }, 120_000);
+			run.sliceId = created.id;
+			saveRun(run);
+		} else await ovenRequest({ op: "send", slice: run.sliceId, text: task });
+		let slice: SliceView;
+		do slice = await ovenRequest<SliceView & { cwd: string }>({ op: "wait", slice: run.sliceId, timeoutMs: 15_000 }, 30_000);
+		while (slice.state === "running" && run.status === "running");
+		if (run.status !== "running") { await haltSlice(run); finish(run, run.status); return; }
+		run.turns = slice.turns;
+		run.output = `${slice.output ?? ""}\n\n(oven slice ${run.sliceId}; its changes are in its copy, ${(slice as any).cwd})`;
+		finish(run, slice.state === "idle" ? "complete" : "error", slice.state === "idle" ? undefined : slice.detail ?? `oven slice ${slice.state}`);
+	} catch (e: any) {
+		finish(run, run.status === "running" ? "error" : run.status, run.error ?? String(e?.message ?? e));
+	}
 }
 
 function publish(completion: RunCompletion<RunResult>) {
@@ -1531,6 +1576,8 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 	async function steer(run: Run, message: string, restart = false, replacement?: { model?: string; thinking?: string; contextWindow?: number; timeoutMs?: number }) {
 		requireOwner();
 		if (run.foreign) throw foreignError(run);
+		// A running oven slice takes the message into its running work, as a live session's steer does.
+		if (run.runtime === "oven" && run.status === "running" && run.sliceId) { await ovenRequest({ op: "send", slice: run.sliceId, text: message, steer: true }); return; }
 		if (run.status === "running") {
 			await run.preparing;
 			await run.ready;
@@ -1688,6 +1735,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 	}
 
 	async function launch(run: Run, task: string, onUpdate?: (u: any) => void, preparedLoader?: DefaultResourceLoader) {
+		if (run.runtime === "oven") return launchOven(run, task);
 		const sessionReady = (async () => {
 			await run.preparing;
 			run.preparing = undefined;
@@ -1885,6 +1933,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			task: Type.Optional(Type.String({ description: "the brief. Required, except acp with sessionId, where it is the first native turn when given" })),
 			model: Type.Optional(Type.String({ description: "override. pi: provider/id[:thinking]. acp: the agent's own model ID, created sessions only" })),
 			context: Type.Optional(StringEnum(["fork", "fresh"] as const)),
+			runtime: Type.Optional(StringEnum(["in-process", "oven"] as const, { description: 'pi only: where the child runs. Default: the role\'s runtime line, else "in-process". "oven" runs it as an oven slice in a copy of cwd that outlives this session; it never receives your conversation' })),
 			cwd: Type.Optional(Type.String()),
 			timeoutMs: Type.Optional(Type.Number({ description: `abort the child after this many ms; default ${DEFAULT_TIMEOUT_MS / 60000} min. Size it to the work: a build, suite, or training run that takes hours needs hours here, or it is killed mid-flight` })),
 			reason: Type.Optional(Type.String({ description: "one line: why this model for this role; recorded in the run log" })),
@@ -1942,10 +1991,14 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			const { allows } = toolAllowlist(tools, withheld);
 			const delegates = allows("delegate");
 			const isWriter = WRITE_TOOLS.some(allows);
-			const context = p.context ?? role.context ?? "fork";
+			// Like the model: the role's line is a default the call can override.
+			const runtime = (start.value as PiStartInput).runtime ?? role.runtime ?? "in-process";
+			// An oven slice runs outside this process and never receives the conversation, as an ACP child.
+			const context = runtime === "oven" ? "fresh" : p.context ?? role.context ?? "fork";
 			const systemPrompt = role.systemPrompt + (role.systemPrompt.includes("STATUS:") ? "" : contractFooter(delegates, atDepthCap && toolAllowlist(tools).allows("delegate")))
 				+ (delegates ? childrenFooter(depth + 1) : "") + (context === "fork" ? FORK_FOOTER : "");
-			if (isWriter) {
+			// An oven slice writes in its own copy, never in this tree.
+			if (isWriter && runtime !== "oven") {
 				const clash = [...runs.values()].find((r) => !r.completion.settled && r.writer && r.cwd === cwd);
 				if (clash) return { content: [{ type: "text", text: `refused: ${clash.id} (${clash.role}) is already writing in ${cwd}. One writer per tree — wait, cancel it, or give this child its own cwd/worktree.` }], isError: true, details: undefined };
 			}
@@ -1985,7 +2038,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 				startIdx: 0,
 				segmentStartIdx: 0,
 				forkedMessages: context === "fork" ? 0 : undefined,
-				writer: isWriter,
+				writer: isWriter && runtime !== "oven",
 				providerRetryMs: 0,
 				segmentFailedAttempts: 0,
 				segmentFailedAttemptsBase: 0,
@@ -1997,11 +2050,12 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 				depth: depth + 1,
 				...(nesting ? { parentRunId: nesting.id } : {}),
 				...(withheld ? { withheld } : {}),
+				...(runtime === "oven" ? { runtime: "oven" as const, extensions: role.extensions ?? [] } : {}),
 				projectTrusted,
 				projectTrustSource,
 			};
 			linkParent(run, ctx);
-			const loader = childLoader(run, SettingsManager.create(cwd, AGENT_DIR, { projectTrusted }), false);
+			const loader = run.runtime === "oven" ? undefined : childLoader(run, SettingsManager.create(cwd, AGENT_DIR, { projectTrusted }), false);
 			saveRun(run);
 			writeRecord(join(owner.dir, `${encodeURIComponent(run.id)}.json`), { version: 1, recordPath: run.recordPath });
 			runs.set(run.id, run);
@@ -2011,7 +2065,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			// forked parent transcript must not turn an asynchronous delegate call into a blocked
 			// parent turn. Yield once before the sync transcript copy so queued Intercom/follow-up
 			// messages can be delivered before large history is materialized.
-			run.preparing = (async () => {
+			if (loader) run.preparing = (async () => {
 				await new Promise<void>((resolve) => setImmediate(resolve));
 				requireOwner();
 				const inherited = context === "fork"
@@ -2032,7 +2086,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 				changed();
 			})();
 			void launch(run, p.task, onUpdate, loader).then(() => publish(completion));
-			return { content: [{ type: "text", text: `${run.id} running (${run.context}, ${run.model}). Completion will wake you; use delegate_ctl wait with this runId when dependent work needs the result.` }], details: recordedView(run) };
+			return { content: [{ type: "text", text: `${run.id} running (${run.runtime === "oven" ? "oven slice" : run.context}, ${run.model}). Completion will wake you; use delegate_ctl wait with this runId when dependent work needs the result.` }], details: recordedView(run) };
 		},
 	});
 
