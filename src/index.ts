@@ -29,7 +29,7 @@ import { AgentHistory, AgentsPanel, ChildView, type LiveSource } from "./inspect
 import type { ActiveTool, ChildActivity } from "./transcript.js";
 import { type AAIndices, acpRowView, asRunView, elapsed, empty, framed, type LiveFacts, type ModelRow, type ModelsDetails, resultLines, resultView, type RunView } from "./render.js";
 import { type AcpRunView, type LifecycleAction, type PiStartInput, type WaitOutcome, PI_CAPABILITIES, requireAction, validateStartInput, validateSteer } from "./backend.js";
-import { ovenRequest, type SliceView } from "./oven.js";
+import { ovenRequest, ovenWatch, type SliceView } from "./oven.js";
 import { AcpBackend, acpModelsText, acpResultText, acpStatusText, acpSummary, DelegateError, sessionLabel, unwrap } from "./acp-backend.js";
 import { shutdownAcpCoordinator } from "./acp/instance.js";
 import { DELEGATION_TOOLS, droppedTools, EVERY_TOOL, loadRoles, toolAllowlist, WRITE_TOOLS } from "./roles.js";
@@ -1217,7 +1217,37 @@ async function cancelRun(run: Run) {
 
 /** Stop an oven run's slice; its conversation and copy stay in oven. */
 async function haltSlice(run: Run) {
-	if (run.runtime === "oven" && run.sliceId) await ovenRequest({ op: "stop", slice: run.sliceId }).catch(() => {});
+	ovenWatches.get(run.id)?.abort();
+	if (run.runtime === "oven" && run.sliceId) await ovenRequest("stop", { slice: run.sliceId }).catch(() => {});
+}
+
+/** The watch stream each oven run is following, so a cancel ends it. */
+const ovenWatches = new Map<string, AbortController>();
+
+/**
+ * Follow an oven run's slice until it settles: oven's watch stream, which answers the moment the slice is
+ * done. If the stream breaks (oven restarted), it is opened again up to 3 times; after that, long-poll
+ * `wait` in 15 s joins, bounded like the stream by the run's own status (cancel, timeout).
+ */
+async function settleOven(run: Run): Promise<SliceView & { cwd?: string }> {
+	const slice = run.sliceId!;
+	for (let attempt = 0; attempt < 3 && run.status === "running"; attempt++) {
+		const abort = new AbortController();
+		ovenWatches.set(run.id, abort);
+		try {
+			for await (const event of ovenWatch(slice, abort.signal)) {
+				if (event.type === "settled") { const settled = event as Extract<typeof event, { type: "settled" }>; return { ...settled.slice, output: settled.output }; }
+			}
+		} catch (error) {
+			if (run.status !== "running") break;
+			if (attempt === 2) break;
+			await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
+		} finally { ovenWatches.delete(run.id); }
+	}
+	let view: SliceView & { cwd?: string };
+	do view = await ovenRequest<SliceView & { cwd: string }>("wait", { slice, timeoutMs: 15_000 }, 30_000);
+	while (view.state === "running" && run.status === "running");
+	return view;
 }
 
 /**
@@ -1233,16 +1263,14 @@ async function launchOven(run: Run, task: string) {
 		if (!run.sliceId) {
 			const config = { name: run.role, instructions: run.systemPrompt, model: run.model, ...(run.thinking ? { thinking: run.thinking } : {}),
 				...(run.extensions?.length ? { extensions: run.extensions } : {}), ...(run.tools.includes("*") ? {} : { tools: run.tools }) };
-			const created = await ovenRequest<SliceView>({ op: "create", config, task, cwd: run.cwd }, 120_000);
+			const created = await ovenRequest<SliceView>("create", { config, task, cwd: run.cwd }, 120_000);
 			run.sliceId = created.id;
 			saveRun(run);
-		} else await ovenRequest({ op: "send", slice: run.sliceId, text: task });
-		let slice: SliceView;
-		do slice = await ovenRequest<SliceView & { cwd: string }>({ op: "wait", slice: run.sliceId, timeoutMs: 15_000 }, 30_000);
-		while (slice.state === "running" && run.status === "running");
+		} else await ovenRequest("send", { slice: run.sliceId, text: task });
+		const slice = await settleOven(run);
 		if (run.status !== "running") { await haltSlice(run); finish(run, run.status); return; }
 		run.turns = slice.turns;
-		run.output = `${slice.output ?? ""}\n\n(oven slice ${run.sliceId}; its changes are in its copy, ${(slice as any).cwd})`;
+		run.output = `${slice.output ?? ""}\n\n(oven slice ${run.sliceId}; its changes are in its copy, ${slice.cwd})`;
 		finish(run, slice.state === "idle" ? "complete" : "error", slice.state === "idle" ? undefined : slice.detail ?? `oven slice ${slice.state}`);
 	} catch (e: any) {
 		finish(run, run.status === "running" ? "error" : run.status, run.error ?? String(e?.message ?? e));
@@ -1577,7 +1605,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		requireOwner();
 		if (run.foreign) throw foreignError(run);
 		// A running oven slice takes the message into its running work, as a live session's steer does.
-		if (run.runtime === "oven" && run.status === "running" && run.sliceId) { await ovenRequest({ op: "send", slice: run.sliceId, text: message, steer: true }); return; }
+		if (run.runtime === "oven" && run.status === "running" && run.sliceId) { await ovenRequest("send", { slice: run.sliceId, text: message, steer: true }); return; }
 		if (run.status === "running") {
 			await run.preparing;
 			await run.ready;
