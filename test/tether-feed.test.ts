@@ -1,22 +1,17 @@
 import "./setup.ts"; // First: isolates this file from the real home even when run on its own.
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { createServer } from "node:net";
-import { fileURLToPath } from "node:url";
+import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { deferred, provider, sandbox, harness } from "./fixture.ts";
 
-// Mom runs in oven: this file reaches pi-tether's test stand-in for it on a private port, never a real oven.
-const ovenDir = mkdtempSync(join("/tmp", "pd-oven-"));
-const ovenPort = await new Promise<number>((resolve) => { const s = createServer().listen(0, "127.0.0.1", () => { const { port } = s.address() as { port: number }; s.close(() => resolve(port)); }); });
-Object.assign(process.env, { OVEN_CLI: fileURLToPath(new URL("../../pi-tether/test/oven-stub.sh", import.meta.url)), OVEN_URL: `http://127.0.0.1:${ovenPort}`, OVEN_TOKEN: "stub", OVEN_STUB_DATA: join(ovenDir, "data"), OVEN_STUB_WATCH_PID: String(process.pid) });
-// The stand-in watches this process (OVEN_STUB_WATCH_PID) and closes its owners and exits when it is gone.
-process.once("exit", () => rmSync(ovenDir, { recursive: true, force: true }));
+// Mom runs in oven: this file starts a real oven in this process, on its own port and folders under the sandbox (pi-tether's test helper).
+const { startOven } = await import("../../pi-tether/test/fixture.ts");
 
 // Real parent/child tool protocol, sessions, reload and event bus. Only HTTP model replies are scripted.
 test("Mom batches settled worker evidence until lead cadence is due, without extra delegate work", { timeout: 30000 }, async () => {
 	const api = await provider(), box = sandbox(api.url);
+	const oven = await startOven(box.root, box.agentDir);
 	const { default: tether } = await import("../../pi-tether/src/index.ts");
 	const { SidecarStore } = await import("../../pi-tether/src/sidecar.ts");
 	const { LiveFeed } = await import("../../pi-tether/src/feed.ts");
@@ -83,5 +78,5 @@ test("Mom batches settled worker evidence until lead cadence is due, without ext
 		assert.equal(checkpoint.data.snapshot.cut.workers[0].runId, id);
 		assert(!manager.getEntries().some((e: any) => typeof e.customType === "string" && e.customType.startsWith("pi-tether.mom.")), "no Mom checkpoint in the session file");
 		assert.deepEqual(h.errors, []); assert.deepEqual(api.errors, []);
-	} finally { firstGate.resolve(); gate.resolve(); await h.runtime.dispose(); await api.close(); rmSync(box.root, { recursive: true, force: true }); }
+	} finally { firstGate.resolve(); gate.resolve(); await h.runtime.dispose(); await oven.stop(); await api.close(); rmSync(box.root, { recursive: true, force: true }); }
 });
