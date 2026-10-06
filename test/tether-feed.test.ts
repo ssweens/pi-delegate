@@ -1,14 +1,16 @@
 import "./setup.ts"; // First: isolates this file from the real home even when run on its own.
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:net";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import { test } from "node:test";
 import { deferred, provider, sandbox, harness } from "./fixture.ts";
 
-// Mom runs in oven: this file reaches pi-tether's test stand-in for it on a private socket, never a real oven.
+// Mom runs in oven: this file reaches pi-tether's test stand-in for it on a private port, never a real oven.
 const ovenDir = mkdtempSync(join("/tmp", "pd-oven-"));
-Object.assign(process.env, { OVEN_CLI: fileURLToPath(new URL("../../pi-tether/test/oven-stub.sh", import.meta.url)), OVEN_SOCKET: join(ovenDir, "oven.sock"), OVEN_STUB_DATA: join(ovenDir, "data"), OVEN_STUB_WATCH_PID: String(process.pid) });
+const ovenPort = await new Promise<number>((resolve) => { const s = createServer().listen(0, "127.0.0.1", () => { const { port } = s.address() as { port: number }; s.close(() => resolve(port)); }); });
+Object.assign(process.env, { OVEN_CLI: fileURLToPath(new URL("../../pi-tether/test/oven-stub.sh", import.meta.url)), OVEN_URL: `http://127.0.0.1:${ovenPort}`, OVEN_TOKEN: "stub", OVEN_STUB_DATA: join(ovenDir, "data"), OVEN_STUB_WATCH_PID: String(process.pid) });
 // The stand-in watches this process (OVEN_STUB_WATCH_PID) and closes its owners and exits when it is gone.
 process.once("exit", () => rmSync(ovenDir, { recursive: true, force: true }));
 
