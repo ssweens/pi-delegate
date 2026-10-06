@@ -1,33 +1,44 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { connect } from "node:net";
-import { existsSync } from "node:fs";
-import { createRequire } from "node:module";
-import { dirname, join } from "node:path";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { promisify } from "node:util";
 
 const execute = promisify(execFile);
 
 /**
- * The oven CLI, as a command: OVEN_CLI, else the `oven` dependency this package installs (run with this
- * node), else `oven` on PATH. Nothing has to be linked or configured. oven owns its paths, so its socket
- * is read from it, never guessed.
+ * The oven CLI, as a command: OVEN_CLI, else `oven` on PATH. pi-delegate does not depend on oven; only a
+ * `runtime: "oven"` child needs it, and pi-tether, which does depend on it, usually has it running already.
  */
 export function ovenCli(): { command: string; args: string[] } {
-	if (process.env.OVEN_CLI) return { command: process.env.OVEN_CLI, args: [] };
-	try {
-		const bin = join(dirname(createRequire(import.meta.url).resolve("oven/package.json")), "bin", "oven.mjs");
-		if (existsSync(bin)) return { command: process.execPath, args: [bin] };
-	} catch { /* not installed */ }
-	return { command: "oven", args: [] };
+	return process.env.OVEN_CLI ? { command: process.env.OVEN_CLI, args: [] } : { command: "oven", args: [] };
 }
 const run = (args: string[], options: { timeout: number }) => { const cli = ovenCli(); return execute(cli.command, [...cli.args, ...args], options); };
+const missingCli = (error: unknown) => (error as NodeJS.ErrnoException)?.code === "ENOENT";
 let socket: string | undefined;
 
+/** Where oven listens by its own convention (oven's src/paths.ts): $XDG_RUNTIME_DIR/oven, else its XDG state dir. */
+export function defaultOvenSocket(): string {
+	const runtime = process.env.XDG_RUNTIME_DIR
+		? join(process.env.XDG_RUNTIME_DIR, "oven")
+		: join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "oven");
+	const path = join(runtime, "oven.sock");
+	if (Buffer.byteLength(path) <= 100) return path;
+	return join("/tmp", `oven-${process.getuid?.() ?? "u"}-${createHash("sha256").update(path).digest("hex").slice(0, 12)}.sock`);
+}
+
+/** oven's socket: OVEN_SOCKET, else what the CLI reports, else oven's default location (no CLI installed). */
 async function socketPath(): Promise<string> {
 	if (process.env.OVEN_SOCKET) return process.env.OVEN_SOCKET;
 	if (socket) return socket;
-	const { stdout } = await run(["paths", "--json"], { timeout: 30_000 });
-	return socket = JSON.parse(stdout).socket;
+	try {
+		const { stdout } = await run(["paths", "--json"], { timeout: 30_000 });
+		return socket = JSON.parse(stdout).socket;
+	} catch (error) {
+		if (!missingCli(error)) throw error;
+		return defaultOvenSocket();
+	}
 }
 
 class NotRunning extends Error {}
@@ -60,7 +71,11 @@ export async function ovenRequest<T = any>(req: Record<string, unknown>, timeout
 	try { return await send<T>(path, req, timeoutMs); }
 	catch (error) {
 		if (!(error instanceof NotRunning)) throw error;
-		await run(["start"], { timeout: 90_000 });
+		try { await run(["start"], { timeout: 90_000 }); }
+		catch (startError) {
+			if (!missingCli(startError)) throw startError;
+			throw new Error('runtime "oven" needs oven: it is not running and its CLI is not installed. pi-tether starts it; or install oven (github.com/ssweens/oven) and set OVEN_CLI or put `oven` on PATH. The default runtime "in-process" needs nothing.');
+		}
 		return send<T>(path, req, timeoutMs);
 	}
 }
