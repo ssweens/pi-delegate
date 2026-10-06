@@ -136,6 +136,16 @@ Ask in plain words. The agent turns the request into a `delegate` or `delegate_c
 
 `backend` is omitted, so this runs on pi. `role` is a role name from `delegate_ctl roles`.
 
+### A Pi child in oven
+
+> "Have the scout check the README, in the background, outside this session."
+
+```json
+{"role":"scout","task":"Check the README\nOBJECTIVE …","runtime":"oven"}
+```
+
+`runtime: "oven"` runs the child as an [oven](https://github.com/ssweens/oven) slice instead of in this process; a role's `runtime: oven` line makes it that role's default, and the call's `runtime` overrides it, as `model` does. The slice gets the role's instructions, model, `extensions` and `tools` and a copy-on-write copy of `cwd`, keeps running after this session closes, and never receives the conversation. The run keeps this tool's surface: run ID, `status`, `result`, `wait`, `steer` (sent into the slice) and `cancel` (halts it), the run log and the completion notice. Nothing to set up: oven is a dependency of this package, started with `node` when it is not running (`OVEN_CLI`, else the `oven` dependency, else `oven` on PATH), and it brings Pi's credentials in by itself.
+
 ### An ACP worker
 
 > "Ask Codex for a read-only review of src/backend.ts."
