@@ -6,7 +6,8 @@ import { test } from "node:test";
 import { deferred, provider, sandbox, harness } from "./fixture.ts";
 
 // Mom runs in oven: this file starts a real oven in this process, on its own port and folders under the sandbox (pi-tether's test helper).
-const { startOven } = await import("../../pi-tether/test/fixture.ts");
+// By URL: typechecking that fixture would follow its own sibling imports, which resolve only at run time.
+const { startOven } = await import(new URL("../../pi-tether/test/fixture.ts", import.meta.url).href);
 
 // Real parent/child tool protocol, sessions, reload and event bus. Only HTTP model replies are scripted.
 test("Mom batches settled worker evidence until lead cadence is due, without extra delegate work", { timeout: 30000 }, async () => {
