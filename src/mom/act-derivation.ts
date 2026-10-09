@@ -117,7 +117,10 @@ const RESULT_FINDING = /\b(?:\d+\s*\/\s*\d+|tests?|checks?|verified|passed|faile
 const NUMERIC_RESULT = /\b\d+\s*\/\s*\d+\b/;
 const OBSOLETE_PARKED = /\b(?:abandoned|obsolete|superseded|deferred|resume only if|parked after)\b/i;
 
-const NEGATED = /\b(not|never|didn['’]?t|haven['’]?t|hasn['’]?t|isn['’]?t|wasn['’]?t|weren['’]?t|doesn['’]?t|don['’]?t|didnt|skipped|omitted|left out|pending|unverified|untested|failed|cannot|can['’]?t|without running)\b/i;
+/** A caveat is an explicit statement that a step did NOT happen. The bare word "not" is not one:
+ *  "…is the allowlist, not what the model sees" is description, and treating it as a caveat turned
+ *  every report sentence into a recorded observation. */
+const CAVEAT = /\b(?:not (?:yet |ever )?(?:verified|tested|run|done|complete|completed|finished|fixed|implemented|removed|committed|checked|confirmed|landed|shipped|attempted)|(?:has|have|had)n['’]?t (?:yet )?(?:been )?(?:run|tested|verified|done|completed|finished|fixed|implemented|removed|committed|checked|landed)|(?:was|were)n['’]?t (?:yet )?(?:been )?(?:run|tested|verified|done|completed|finished|fixed|implemented|removed|committed|checked|landed)|didn['’]?t (?:yet )?(?:run|test|verify|finish|complete|fix|implement|remove|commit|check|land)|(?:ran|run|executed) no tests?|no tests? (?:were|was|have been) (?:run|executed)|still (?:pending|unverified|untested|outstanding|open|uncommitted)|remains? (?:unverified|untested|pending|open|outstanding|uncommitted)|without (?:running|testing|verifying|committing))\b/i;
 const COMPLETION_LEXIS = /\b(done|completed?|finished|passed|passes|verified|fixed|deleted|removed|implemented|reworked|is gone|gone|shipped|cleared)\b/i;
 
 /**
@@ -402,7 +405,7 @@ export function deriveActs(
 		}
 
 		if (act === "report-of-completion") {
-			const negated = NEGATED.test(candidate.quote);
+			const negated = CAVEAT.test(candidate.quote);
 			// One report, one work: fragments from the same source as an already-resolved completion
 			// belong to THAT completion's work — detail sentences never re-resolve a subject of their
 			// own, or a stray word would bind them to unrelated work.
@@ -410,10 +413,10 @@ export function deriveActs(
 			const subject = bound ? nodes.get(bound) : subjectOf(candidate, true);
 			const work = subject ? toEndeavor(subject.id) : undefined;
 			if (negated || !COMPLETION_LEXIS.test(candidate.quote)) {
-				// A negative or lexis-less "completion" is a caveat, never a state change — and only if
-				// it actually concerns the work it would attach to. At most one caveat per work per turn.
-				if (work && caveated.size < 2 && !caveated.has(work.id) && score(work, new Set(tokens(candidate.quote)))) { caveated.add(work.id); attach(work.id, "observation", candidate.quote, candidate.source); processedNotes.add(candidate.id); log.push(`caveat ${candidate.id} on ${work.id}`); }
-				else log.push(`caveat ${candidate.id}: does not concern ${work?.id ?? "any work"}, dropped`);
+				// Only an explicit "this did not happen" is a caveat. A completion label carrying no
+					// completion lexis is narration the model mislabeled, and records nothing at all.
+				if (negated && work && caveated.size < 2 && !caveated.has(work.id) && score(work, new Set(tokens(candidate.quote)))) { caveated.add(work.id); attach(work.id, "observation", candidate.quote, candidate.source); processedNotes.add(candidate.id); log.push(`caveat ${candidate.id} on ${work.id}`); }
+				else log.push(`completion ${candidate.id}: ${negated ? "explicit non-completion" : "no completion lexis"}, dropped`);
 				continue;
 			}
 			if (!work) { log.push(`completion ${candidate.id}: no named work, dropped`); continue; }
@@ -427,7 +430,7 @@ export function deriveActs(
 				if (sibling.source !== candidate.source || processedNotes.has(sibling.id)) continue;
 				const siblingAct = acts.get(sibling.id) ?? "other";
 				if (siblingAct !== "other" && siblingAct !== "answer") continue;
-				if (NEGATED.test(sibling.quote)) {
+				if (CAVEAT.test(sibling.quote)) {
 					if (!score(work, new Set(tokens(sibling.quote)))) { log.push(`caveat ${sibling.id}: does not concern ${work.id}, dropped`); continue; }
 					attach(work.id, "observation", sibling.quote, sibling.source);
 					processedNotes.add(sibling.id);
