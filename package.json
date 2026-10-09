@@ -1,6 +1,7 @@
 {
   "name": "@ssweens/pi-delegate",
   "version": "0.3.0",
+  "private": true,
   "description": "Delegation and phased todos for pi: durable child runs, steer, honest run log, and a stock-Pi todo tool.",
   "type": "module",
   "main": "src/index.ts",
@@ -36,6 +37,12 @@
       "./skills"
     ]
   },
+  "oven": {
+    "extensions": {
+      "mom": "./src/mom/mom-tools.ts",
+      "mom-ask": "./src/mom/mom-ask.ts"
+    }
+  },
   "peerDependencies": {
     "@earendil-works/pi-ai": ">=0.99.1 <2.0.0",
     "@earendil-works/pi-coding-agent": ">=0.99.1 <2.0.0",
@@ -47,6 +54,7 @@
   ],
   "dependencies": {
     "@agentclientprotocol/sdk": "1.3.0",
+    "@earendil-works/pi-durable": "1.0.2",
     "proper-lockfile": "4.1.2",
     "write-file-atomic": "7.0.1",
     "zod": "4.4.3"

@@ -1,0 +1,672 @@
+/**
+ * Mom's operations in oven. Every message her slice gets (a delivery of new lead entries from oven's
+ * follow, or a request from the lead's client) is one operation: her turn calls `mom_begin`, which settles
+ * the previous operation, applies requests, prepares the evidence, and hands her the review; her finalizers
+ * accept the map. Only this code writes her `.mom` file. Her status for clients lives in Durable documents
+ * of her slice, which oven serves through `oven_state` and `oven_watch`.
+ */
+import { createHash, randomUUID } from "node:crypto";
+import { appendFileSync, statSync } from "node:fs";
+import type * as Durable from "@earendil-works/pi-durable";
+import { ANCHOR, collectSideEffects, renderAnchor } from "./anchor.ts";
+import { SystemOneAdvisor } from "./advisor.ts";
+import { Decider } from "./decider.ts";
+import { DEFAULT_BOOTSTRAP_POLICY, type BootstrapPolicy } from "./bootstrap.ts";
+import { emptyUsage, graphChange, isCheckpoint, loadState, noticeKey, sumUsage, type Checkpoint, type Usage, type WindowLive } from "./checkpoint.ts";
+import { reviewFromSession, type CompactionReview } from "./compaction.ts";
+import { extractEvents, isUserDirection, renderEvents, type FeedEvent, type SessionReader } from "./feed.ts";
+import { Mom, readStep, type StepRequest, type StepRunner } from "./mother.ts";
+import { isEndeavor, isObsoleteParkedWork } from "./graph.ts";
+import { ACT_LABELS_MODE, COMMIT_GRAPH_MODE, modeFor } from "./modes.ts";
+import { repairWorkProvenance } from "./act-derivation.ts";
+import { enumerateCandidates } from "./enumerate.ts";
+import { decodeStart, encodeOperation, OPERATION_FAILED, type MomRequest, type OperationHeader, type OperationStart } from "./operation.ts";
+import { feedbackApplies, recordEngagement } from "./process-health.ts";
+import { currentSession, leadRunning } from "./session-file.ts";
+import { SidecarStore } from "./sidecar.ts";
+import { formatElapsed, isStatusPing } from "./status.ts";
+import { collectTurnSignals, lastDirectionOf, MAX_WINDOW_CHECKS, MAX_WINDOW_TURNS, offeredRefs, parseWindowVerdict, renderCorrection, stageOne, windowMessages, windowPurpose } from "./window.ts";
+
+/** The operation in her slice's current context. */
+export interface OperationState {
+	/** The entry that started it (a delivery or a request). */
+	startEntry?: number;
+	job?: string;
+	header?: OperationHeader;
+	start?: OperationStart;
+	status: "none" | "open" | "accepted" | "answered" | "rejected" | "done";
+	rejection?: string;
+	/** Set when the operation failed in a way oven should retry: her turn ends as a failed turn. */
+	fault?: string;
+	/** Usage of the operation's child steps (audit sections, continuity checks). */
+	childUsage?: Usage;
+	/** Her usage before the operation, from her `.mom` file. */
+	baseUsage?: Usage;
+	/** Shadow: the decider's guess per open item, made before her model saw the batch; compared once she saves. */
+	shadow?: { guesses: { id: string; label: string; state: string; guess: string; p: number }[]; latencyMs: number };
+}
+
+/** What clients show of her: what she is doing, and what the `.mom` file cannot say. */
+export interface MomStatus {
+	op?: { job: string; mode: string; startedAt: number; thinkingAt?: number; activity: string; target?: string | null; recovering?: boolean; question?: string; section?: { section: number; of: number } };
+	waitingForWorkers?: boolean;
+	deferredUntil?: number;
+	more?: boolean;
+	rejectedStreak: number;
+	lastRejection?: string;
+	/** Her saved notes could not be opened: she needs the user. */
+	openingError?: string;
+	lastError?: string;
+	operationTiming?: { startupMs: number; requestMs: number; totalMs: number; oldestEvidenceAgeMs: number };
+	/** Evidence she could not read (a missing worker transcript), and tool calls whose outcome is unknown: for the workspace's Status tab. */
+	unavailable?: string[];
+	uncertainEffects?: { ref: string; name?: string }[];
+	/** Messages for the user, newest last. */
+	notices: { at: number; text: string; level: "info" | "warning" | "error" }[];
+	/** The last eight answered questions: follow-ups see them. */
+	conversation?: { question: string; answer: string }[];
+	/** Answers to questions, by request ID. */
+	answers: Record<string, { answer?: string; error?: string; at: number }>;
+	/** Failed compaction audits, by trigger; two retire the audit. */
+	auditAttempts: Record<string, number>;
+	model?: string;
+}
+export const STATUS_DOC = "pi-tether.mom-status";
+export const OPERATION_DOC = "pi-tether.mom-operation";
+/** More unreviewed compactions than this are a backlog, not live activity. */
+const MAX_QUEUED_REVIEWS = 3;
+/** The prompt that sends her back to mom_begin when she ended again without a finalizer: that call fails the operation. */
+export const GIVE_UP = "You ended without finishing, twice. Call mom_begin.";
+const emptyStatus = (): MomStatus => ({ rejectedStreak: 0, notices: [], answers: {}, auditAttempts: {} });
+
+/** Settings the lead passes in her instructions (the `--mom-*` flags). */
+export interface MomSettings { mapMode?: string; bootstrap?: false | BootstrapPolicy; advisor?: { url: string; model: string; threshold: number; timeoutMs: number }; decider?: { url: string; clear: number } }
+const SETTINGS = /<!-- mom-settings (\{.*\}) -->/;
+export const settingsLine = (settings: MomSettings) => `<!-- mom-settings ${JSON.stringify(settings)} -->`;
+export function readSettings(instructions: string | undefined): MomSettings {
+	try { return JSON.parse(SETTINGS.exec(instructions ?? "")?.[1] ?? "{}"); } catch { return {}; }
+}
+
+interface Docs { operation: Durable.ConversationDocToken<OperationState & Durable.JsonObject>; status: Durable.ConversationDocToken<MomStatus & Durable.JsonObject> }
+const cache = new WeakMap<object, Docs>();
+/** Her documents, defined once per Durable instance. */
+export function docsFor(durable: typeof Durable): Docs {
+	let docs = cache.get(durable);
+	if (!docs) {
+		docs = {
+			operation: durable.defineDoc<OperationState & Durable.JsonObject>({ kind: OPERATION_DOC, version: 1, scope: "conversation", history: "latest", fork: "initial", initial: () => ({ status: "none" }) as any }),
+			status: durable.defineDoc<MomStatus & Durable.JsonObject>({ kind: STATUS_DOC, version: 1, scope: "conversation", history: "latest", fork: "initial", initial: () => emptyStatus() as any }),
+		};
+		cache.set(durable, docs);
+	}
+	return docs;
+}
+
+const textOf = (message: any) => typeof message?.content === "string" ? message.content
+	: (message?.content ?? []).filter((part: any) => part.type === "text").map((part: any) => part.text).join("");
+
+/** Entries of a conversation from `min` on (oldest first), with their model messages. */
+async function entriesFrom(api: Durable.ToolExecutionApi, ctx: any, conversationId: number, min?: number, max?: number) {
+	return api.commit(async tx => {
+		const out: { id: number; model: any[] }[] = [];
+		let cursor: any;
+		do {
+			const page = await tx.scanEntries({ conversationId: conversationId as any, ...(min !== undefined ? { minEntryId: min as any } : {}), ...(max !== undefined ? { maxEntryId: max as any } : {}) }, 200, cursor);
+			for (const entry of page.items) out.push({ id: Number(entry.id), model: [...(entry.model ?? [])] as any[] });
+			cursor = page.next;
+		} while (cursor);
+		return out.reverse();
+	}, ctx);
+}
+
+/** The newest entry of her slice that started an operation, and how. */
+export async function latestStart(api: Durable.ToolExecutionApi, ctx: any): Promise<{ entry: number; start: OperationStart } | undefined> {
+	return api.commit(async tx => {
+		let cursor: any;
+		do {
+			const page = await tx.scanEntries({ conversationId: api.conversationId }, 50, cursor);
+			for (const entry of page.items) for (const message of entry.model ?? []) {
+				if (message.role !== "user") continue;
+				const start = decodeStart(textOf(message));
+				if (start) return { entry: Number(entry.id), start };
+			}
+			cursor = page.next;
+		} while (cursor);
+		return undefined;
+	}, ctx);
+}
+
+export interface Engine {
+	durable: typeof Durable;
+	docs: Docs;
+}
+
+export const readOperation = async (engine: Engine, api: Pick<Durable.ToolExecutionApi, "snapshot" | "conversationId">, ctx: any): Promise<OperationState> =>
+	(await api.snapshot(engine.docs.operation, api.conversationId, ctx) as OperationState | undefined) ?? { status: "none" };
+export const readStatus = async (engine: Engine, api: Pick<Durable.ToolExecutionApi, "snapshot" | "conversationId">, ctx: any): Promise<MomStatus> =>
+	({ ...emptyStatus(), ...(await api.snapshot(engine.docs.status, api.conversationId, ctx) as MomStatus | undefined) });
+export const writeOperation = (engine: Engine, api: Durable.ToolExecutionApi, ctx: any, change: (op: OperationState) => void) =>
+	api.commit(async tx => { change(await tx.doc(engine.docs.operation, api.conversationId) as any); }, ctx);
+export const writeStatus = (engine: Engine, api: Durable.ToolExecutionApi, ctx: any, change: (status: MomStatus) => void) =>
+	api.commit(async tx => {
+		const status = await tx.doc(engine.docs.status, api.conversationId) as any as MomStatus;
+		status.notices ??= []; status.answers ??= {}; status.auditAttempts ??= {}; status.rejectedStreak ??= 0;
+		change(status);
+		if (status.notices.length > 10) status.notices.splice(0, status.notices.length - 10);
+		const answers = Object.entries(status.answers).sort(([, a], [, b]) => a.at - b.at);
+		for (const [id] of answers.slice(0, Math.max(0, answers.length - 8))) delete status.answers[id];
+	}, ctx);
+
+/** A step in a child conversation of her slice: its own fresh context, instructions and tools. */
+function stepRunner(engine: Engine, api: Durable.ToolExecutionApi, ctx: any, usage: { total: Usage }): StepRunner {
+	return async (request: StepRequest) => {
+		const key = `${request.header.job}:${request.header.step}`;
+		let id = await api.memo<number>(`step:${key}`, ctx);
+		if (id === undefined) {
+			const agent = await api.agent(ctx);
+			const created = await api.commit(async tx => {
+				const child = await tx.createConversation({ ownership: { kind: "task", taskId: api.taskId } });
+				await engine.durable.configure(tx, child.id, { instructions: request.instructions, thinkingLevel: request.thinking as any,
+					tools: agent.tools.filter(tool => request.tools.includes(tool.name)) });
+				return Number(child.id);
+			}, ctx);
+			id = await api.memo<number>(`step:${key}`, created, ctx);
+		}
+		const child = await api.conversation(id as any, ctx);
+		if (!child) throw new Error(`Mom's step ${key} lost its context.`);
+		const texts = [encodeOperation(request.header, request.body), ...(request.more ?? [])];
+		for (const [index, text] of texts.entries()) {
+			const submission = await child.submit({ type: "input", content: text, requestId: index ? `${key}:${index}` : key }, ctx);
+			await submission.wait(ctx);
+		}
+		const messages = (await entriesFrom(api, ctx, id)).flatMap(entry => entry.model);
+		usage.total = sumUsage(usage.total, readStep(messages).usage);
+		return { messages };
+	};
+}
+
+/** The lead's session as Mom reads it in oven, with her notices collected for clients. */
+function leadContext(file: string, notices: MomStatus["notices"]) {
+	let reader = currentSession(file);
+	const modifiedAt = () => { try { return statSync(file).mtimeMs; } catch { return 0; } };
+	let modified = modifiedAt();
+	// The session file keeps growing while she waits: `refresh` reads it again.
+	const sessionManager: SessionReader = { getSessionId: () => reader.getSessionId(), getSessionFile: () => reader.getSessionFile(), getCwd: () => reader.getCwd(),
+		getLeafId: () => reader.getLeafId(), getEntry: id => reader.getEntry(id), getBranch: () => reader.getBranch() };
+	return { cwd: reader.getCwd(), isIdle: () => !leadRunning(reader, modified), sessionManager,
+		refresh() { reader = currentSession(file); modified = modifiedAt(); },
+		ui: { notify: (text: string, level?: "info" | "warning" | "error") => { notices.push({ at: Date.now(), text, level: level ?? "info" }); } } };
+}
+
+const sleep = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve, reject) => {
+	const timer = setTimeout(resolve, ms);
+	signal?.addEventListener("abort", () => { clearTimeout(timer); reject(signal.reason ?? new Error("aborted")); }, { once: true });
+});
+
+/** The messages of an earlier operation of her slice: its entries from its start to just before `before`. */
+async function operationMessages(api: Durable.ToolExecutionApi, ctx: any, start: number, before: number) {
+	return (await entriesFrom(api, ctx, api.conversationId as any, start, before === Number.MAX_SAFE_INTEGER ? undefined : before - 1)).flatMap(entry => entry.model);
+}
+
+/**
+ * Record what the previous operation left, unless its finalizer already did: usage, and for a rejected or
+ * unfinished update a retry record or a skipped range.
+ */
+async function settlePrevious(engine: Engine, api: Durable.ToolExecutionApi, ctx: any, previous: OperationState, before: number, mom: Mom, status: MomStatus) {
+	if (!previous.header || !previous.startEntry || !["open", "rejected"].includes(previous.status)) return false;
+	const messages = await operationMessages(api, ctx, previous.startEntry, before);
+	const outcome = readStep(messages);
+	if (previous.rejection && !outcome.rejection) outcome.rejection = previous.rejection;
+	const usage = sumUsage(sumUsage(previous.baseUsage ?? mom.usage, previous.childUsage ?? emptyUsage()), outcome.usage);
+	const settled = await mom.settle(previous.header, outcome, usage);
+	if (settled.retiredRejection) { status.rejectedStreak++; status.lastRejection = settled.retiredRejection; }
+	if (settled.error) status.lastError = settled.error;
+	const question = previous.start?.kind === "request" && previous.start.request.kind === "question" ? previous.start.request : undefined;
+	if (question && !status.answers[question.id]) {
+		status.answers[question.id] = { error: outcome.answer ? undefined : settled.error ?? "Mom returned no answer.", answer: outcome.answer, at: Date.now() };
+		if (outcome.answer) status.conversation = [...(status.conversation ?? []), { question: question.question, answer: outcome.answer }].slice(-8);
+	}
+	return true;
+}
+
+/** `mom_begin`: start the operation her context holds. Returns her tool result. */
+export async function begin(engine: Engine, api: Durable.ToolExecutionApi, ctx: any): Promise<Durable.ToolExecutionResult> {
+	const text = (value: string) => [{ type: "text" as const, text: value }];
+	const done = (value: string): Durable.ToolExecutionResult => ({ content: text(value), control: { terminate: true } });
+	const latest = await latestStart(api, ctx);
+	if (!latest || latest.start.kind === "step") return done("There is no delivery or request to work on.");
+	const previous = await readOperation(engine, api, ctx);
+	if (previous.startEntry === latest.entry && previous.status !== "none") {
+		// She was told to finish and called mom_begin again instead: the operation gave no finalizer. It fails as a rejected one does.
+		if (previous.status === "open" && previous.header && previous.startEntry !== undefined) {
+			const messages = (await entriesFrom(api, ctx, api.conversationId as any, previous.startEntry)).flatMap(entry => entry.model);
+			if (messages.some((message: any) => message.role === "user" && (typeof message.content === "string" ? message.content : message.content.map((part: any) => part.text ?? "").join("")).startsWith(GIVE_UP))) {
+				const message = previous.header.mode === "ask" ? "Mom finished without an answer." : "Mom finished without an accepted background graph transaction.";
+				await rejected(engine, api, ctx, previous.header, message);
+				const failedOp = await readOperation(engine, api, ctx);
+				return failedOp.fault ? { content: text(`${OPERATION_FAILED}${message}`), isError: true, control: { terminate: true } } : { content: text(`${OPERATION_FAILED}${message}`), control: { terminate: true } };
+			}
+		}
+		return { content: text("This operation has already begun: continue it from the evidence above, and finish with one finalizer."), isError: true };
+	}
+	const start = latest.start;
+	const agent = await api.agent(ctx);
+	const model = agent.model ? `${agent.model.provider}/${agent.model.modelId}` : "";
+	const settings = readSettings(agent.instructions);
+	const status = await readStatus(engine, api, ctx);
+	const notices: MomStatus["notices"] = [];
+	const job = randomUUID();
+	const usage = { total: emptyUsage() };
+	let lead: ReturnType<typeof leadContext> | undefined;
+	let current: Mom | undefined;
+	const progress = () => { const section = current?.auditProgress; if (section) void writeStatus(engine, api, ctx, status => { if (status.op) status.op.section = section; }).catch(() => {}); };
+	const host = (file: string) => ({ ctx: leadContext(file, notices), model, mapMode: settings.mapMode, store: new SidecarStore(() => file, currentSession(file).getSessionId()), steps: stepRunner(engine, api, ctx, usage),
+		bootstrapPolicy: settings.bootstrap === false ? undefined : settings.bootstrap ?? DEFAULT_BOOTSTRAP_POLICY,
+		advisor: settings.advisor?.url ? new SystemOneAdvisor(settings.advisor) : undefined,
+		changed: progress });
+	const question = start.kind === "request" && start.request.kind === "question" ? start.request : undefined;
+	const relabel = start.kind === "request" && start.request.kind === "relabel";
+	let decider: { client: Decider; clear: number } | undefined;
+	try { if (settings.decider?.url) decider = { client: new Decider(settings.decider.url), clear: settings.decider.clear }; } catch { /* a bad URL disables it */ }
+	// A question's finalizers are mom-ask's (an answer); maintenance offers none. The change applies from her next request.
+	const selected = agent.extensions.map(extension => extension.name);
+	if (selected.includes("mom-ask") !== Boolean(question)) {
+		const wanted = ["mom", ...(question ? ["mom-ask"] : [])].map(name => api.registry.extension(name)).filter((e): e is Durable.Extension => Boolean(e));
+		await api.commit(tx => engine.durable.configure(tx, api.conversationId, { extensions: wanted }), ctx);
+	}
+	const save = async (op: Partial<OperationState>, change?: (status: MomStatus) => void) => {
+		await writeOperation(engine, api, ctx, current => { for (const key of Object.keys(current)) delete (current as any)[key]; Object.assign(current, { status: "none", startEntry: latest.entry, start, ...op }); });
+		await writeStatus(engine, api, ctx, current => {
+			Object.assign(current, { ...status, notices: [...current.notices, ...notices], answers: { ...current.answers, ...status.answers }, model });
+			delete current.op;
+			change?.(current);
+		});
+	};
+	// A settings change: saved, and answered to the client waiting for it (also when her notes cannot be opened).
+	const controls = async () => {
+		const request = start.kind === "request" && start.request.kind === "controls" ? start.request : undefined;
+		if (!request) return undefined;
+		let error: string | undefined;
+		try { await new SidecarStore(() => start.session, currentSession(start.session).getSessionId()).append("control", request.change); }
+		catch (cause) { error = cause instanceof Error ? cause.message : String(cause); }
+		await save({ status: "done" }, current => { current.answers[request.id] = error ? { error, at: Date.now() } : { answer: "Saved.", at: Date.now() }; });
+		return done(error ? `Not saved: ${error}` : "Saved.");
+	};
+	let mom: Mom;
+	const open = async () => { const opened = host(start.session); lead = opened.ctx; const made = new Mom(opened); await made.open(); current = made; return made; };
+	try { mom = await open(); }
+	catch (error) {
+		const saved = await controls();
+		if (saved) return saved;
+		status.openingError = String(error);
+		notices.push({ at: Date.now(), text: `Mom needs you: she couldn't open her saved notes. ${String(error)}`, level: "warning" });
+		if (question) status.answers[question.id] = { error: `Mom couldn't open her saved notes: ${String(error)}`, at: Date.now() };
+		await save({ status: "done" });
+		return done(`Mom couldn't open her saved notes: ${String(error)}`);
+	}
+	status.openingError = undefined;
+	mom.conversation = [...(status.conversation ?? [])];
+	try {
+		if (await settlePrevious(engine, api, ctx, previous, latest.entry, mom, status)) mom = await open();
+	} catch (error) { status.lastError = `Mom could not record her last operation: ${String(error)}`; }
+	const reader = currentSession(start.session);
+	const store = new SidecarStore(() => start.session, reader.getSessionId());
+	const leaf = reader.getLeafId();
+	// Requests that change settings or record feedback take no review.
+	if (start.kind === "request") {
+		const request: MomRequest = start.request;
+		if (request.kind === "controls") return (await controls())!;
+		if (request.kind === "finding") {
+			const note = mom.checkpoint?.note;
+			if (!note || note.text !== request.finding) { notices.push({ at: Date.now(), text: "This finding has changed; reopen Mom.", level: "info" }); await save({ status: "done" }); return done("That finding has changed."); }
+			await store.append("notice", { key: noticeKey(note), action: request.action, note, parent: leaf });
+			await save({ status: "done" });
+			return done("Recorded.");
+		}
+		if (request.kind === "resume" && !mom.enabled) { await store.append("control", { enabled: true }); mom = await open(); }
+	}
+	if (!mom.enabled) {
+		if (question) status.answers[question.id] = { error: "Mom is paused.", at: Date.now() };
+		await save({ status: "done" });
+		return done("Mom is paused; nothing to do.");
+	}
+	if (relabel && mom.checkpoint) {
+		const repaired = repairWorkProvenance(mom.graph, mom.feed.byRef);
+		if (repaired.removed.length) {
+			const checkpoint: Checkpoint = { ...mom.checkpoint, graph: repaired.graph, change: graphChange(mom.graph, repaired.graph),
+				unfinished: (mom.checkpoint.unfinished ?? []).filter(item => !repaired.removed.includes(item.node)), at: Date.now(), model };
+			await store.append("map", { snapshot: checkpoint, failure: null }, `${job}:provenance`);
+			mom = await open();
+		}
+	}
+	if (question) await store.append("notice", { key: "conversation", action: "asked", parent: leaf });
+	let review: CompactionReview | undefined;
+	try {
+		const reviewing = await continuity(mom, start, host(start.session), store, decider);
+		if (reviewing) mom = await open();
+		review = !relabel && (start.kind === "delivery" || (start.kind === "request" && start.request.kind !== "question")) ? compactionToReview(mom, reader, status) : undefined;
+		await writeStatus(engine, api, ctx, current => { current.op = { job, mode: question ? "ask" : review ? "audit" : "update", startedAt: Date.now(), activity: "reading history", ...(question ? { question: question.question } : {}) }; });
+		let prepared = await mom.prepare({ question: question?.question, refresh: start.kind === "request" && start.request.kind !== "update" && !relabel, review, force: relabel && Boolean(mom.checkpoint), relabel, job, signal: ctx?.abortSignal });
+		while (prepared.kind === "defer") {
+			await writeStatus(engine, api, ctx, current => { current.waitingForWorkers = mom.waitingForWorkers; current.deferredUntil = prepared.kind === "defer" ? prepared.until : undefined; });
+			await sleep(Math.max(250, Math.min(2000, prepared.until - Date.now())), ctx?.abortSignal);
+			lead?.refresh();
+			prepared = await mom.prepare({ question: question?.question, refresh: start.kind === "request" && start.request.kind !== "update" && !relabel, review, force: relabel && Boolean(mom.checkpoint), relabel, job, signal: ctx?.abortSignal });
+		}
+		status.waitingForWorkers = false; status.deferredUntil = undefined;
+		status.unavailable = [...mom.feed.gaps.values()]; status.uncertainEffects = mom.feed.uncertainEffects();
+		if (prepared.kind === "idle") {
+			const mode = modeFor(settings.mapMode ?? mom.mode);
+			if (start.kind === "request" && start.request.kind === "refresh" && mode.name === "act_labels" && mom.checkpoint && mom.checkpointId) {
+				const known = new Map(mom.feed.byRef);
+				const manager = lead?.sessionManager;
+				if (manager) {
+					const session = manager.getSessionId();
+					for (const ref of mom.graph.nodes.flatMap(node => node.sources)) {
+						const parts = ref.split(":");
+						if (parts[0] !== session || !parts[1]) continue;
+						const entry = manager.getEntry(parts[1]);
+						if (!entry) continue;
+						for (const event of extractEvents({ key: session, actor: "lead" }, entry)) known.set(event.ref, event);
+					}
+				}
+
+				const derived = ACT_LABELS_MODE.apply!({ prior: mom.graph, candidates: [], committed: { acts: [] }, known, events: [...known.values()] });
+				if (derived.declined.length) throw new Error(derived.declined.join("; "));
+				const live = new Map(derived.graph.nodes.map(node => [node.id, node]));
+				const unfinished = (mom.checkpoint.unfinished ?? []).filter(item => {
+					const node = live.get(item.node);
+					return item.disposition !== "resolved" && ["active", "parked"].includes(node?.state ?? "") && Boolean(node && !isObsoleteParkedWork(node));
+				});
+				const cut = mom.target ?? mom.checkpoint.cut;
+				const material = JSON.stringify(derived.graph) !== JSON.stringify(mom.graph) || JSON.stringify(unfinished) !== JSON.stringify(mom.checkpoint.unfinished);
+				if (material) {
+					const checkpoint: Checkpoint = { sessionId: reader.getSessionId(), graph: derived.graph, change: graphChange(mom.graph, derived.graph), note: mom.checkpoint.note,
+						unfinished, cut, at: Date.now(), model };
+					if (!isCheckpoint(checkpoint)) throw new Error("Host-derived refresh checkpoint is invalid; last checkpoint unchanged.");
+					await store.append("map", { snapshot: checkpoint, failure: null }, `${job}:refresh`);
+				} else await store.append("map", { base: mom.checkpointId, cut, failure: null }, `${job}:refresh`);
+				await save({ status: "done" }, current => { delete current.op; });
+				return done(material ? "Map refreshed." : "Map unchanged; evidence coverage saved. Nothing to refresh.");
+			}
+			if (question) status.answers[question.id] = { error: "Mom has nothing to answer from yet.", at: Date.now() };
+			status.more = false;
+			await save({ status: "done" }, current => { delete current.op; });
+			return done(prepared.reason);
+		}
+		const mode = modeFor(settings.mapMode ?? mom.mode);
+		// Historical catch-up is a chapter-chain thread-map operation. It deliberately uses the
+		// transaction finalizer for this operation, then returns to the saved frontier mode.
+		const operationMode = prepared.batch.digest || relabel ? COMMIT_GRAPH_MODE : mode;
+		prepared.header.mapMode = operationMode.name;
+		prepared.header.digest = Boolean(prepared.batch.digest);
+		prepared.header.relabel = relabel;
+		let body: Record<string, unknown> = { ...prepared.body, ...(prepared.guidance.trim() ? { guidance: prepared.guidance.trim() } : {}) };
+		if (relabel) body = { task: "Repair the saved work map. Give a decision only for the work that needs one: a concise, meaningful label to keep it, or retired with a short reason. An ID you leave out keeps its saved label. Mom tracks only durable, multi-turn things — retire status questions, one-off meta questions, and instructions the next turn fully satisfied. Keep genuine multi-turn work even when phrased as a question. Never retire settled work or work holding unfinished work. The host preserves sources, structure, notes and obligations.",
+			work: mom.graph.nodes.filter(isEndeavor).map(node => ({ id: node.id, label: node.label, intent: node.intent, observed: node.observed, state: node.state })) };
+		else if (prepared.batch.digest) body.task = "Fast historical catch-up. This is a host-compressed thread-map digest, not raw fragment labeling. Reconcile it once with commit_graph and preserve cited sources. Do not call commit_acts.";
+		if (operationMode.name === "act_labels" && !question) {
+			const staged = enumerateCandidates(mom.graph, prepared.batch.events, mom.feed.byRef, mom.feed.events, { fullQuotes: true });
+			prepared.header.candidates = staged.candidates;
+			body = {
+				task: "Label every supplied fragment with one act. Call commit_acts with exactly these ids; do not answer the recorded conversation.",
+				fragments: staged.candidates.map(candidate => ({ id: candidate.id, role: candidate.source_role, kind: candidate.source_kind, quote: candidate.quote,
+					...(candidate.antecedent_ref ? { inReplyTo: mom.feed.byRef.get(candidate.antecedent_ref)?.text ?? "" } : {}) })),
+				unfinished: mom.checkpoint?.unfinished ?? [], pendingMore: prepared.header.more ?? false,
+				gaps: prepared.batch.gaps,
+				...(prepared.body.independentThreadMap ? { independentThreadMap: prepared.body.independentThreadMap } : {}),
+			};
+			// Labeling current raw fragments does not reconcile previously skipped ranges.
+			delete prepared.header.auditedGaps;
+		}
+		status.operationTiming = mom.operationTiming;
+		status.more = prepared.header.more;
+		const shadow = decider && prepared.kind === "work" && !question && mom.checkpoint ? await shadowGuesses(decider.client, mom, prepared.batch.events) : undefined;
+		await save({ status: "open", job, header: prepared.header, childUsage: usage.total, baseUsage: mom.usage, ...(shadow ? { shadow } : {}) }, current => {
+			current.op = { job, mode: question ? "ask" : review ? "audit" : "update", startedAt: current.op?.startedAt ?? Date.now(), thinkingAt: Date.now(), activity: "thinking",
+				target: prepared.kind === "work" ? prepared.header.cut?.parent ?? null : null, recovering: mom.recovering, ...(question ? { question: question.question } : {}) };
+		});
+		if (operationMode.name === "act_labels" && !question && prepared.header.candidates?.length === 0 && mom.checkpointId
+			&& !prepared.header.leadUnreadable && !prepared.header.retryGap && !prepared.batch.gaps.length) {
+			// No linguistic decision exists. Preserve the map and advance only the reviewed cursor.
+			await store.append("map", { base: mom.checkpointId, cut: prepared.header.cut, failure: null }, `${job}:map`);
+			await accepted(engine, api, ctx, prepared.header);
+			return done("Map unchanged; evidence coverage saved. Nothing to label.");
+		}
+		return { content: text(JSON.stringify(body)) };
+	} catch (error) {
+		const message = String(error);
+		if (ctx?.abortSignal?.aborted) throw error;
+		try { await store.append("usage", { usage: sumUsage(mom.usage, usage.total), error: message }, `${job}:usage`); } catch { /* the failure stays visible */ }
+		status.lastError = message;
+		// A review that failed still watches the lead after the compaction, from her last accepted map.
+		if (review && mom.inject && mom.checkpoint) try { await openWindow(store, reader, mom.window, review.triggerRef); } catch { /* the failure stays visible */ }
+		if (question) { status.answers[question.id] = { error: message, at: Date.now() }; await save({ status: "done" }, current => { delete current.op; }); return done(`${OPERATION_FAILED}${message}`); }
+		await save({ status: "done", fault: message }, current => { delete current.op; });
+		return { content: text(`${OPERATION_FAILED}${message}`), isError: true, control: { terminate: true } };
+	}
+}
+
+/**
+ * The newest compaction after her coverage that has not been reviewed twice without success: its review
+ * (a thread-map audit before the map update). Its anchor is prepared first, as the live lead did.
+ */
+function compactionToReview(mom: Mom, reader: ReturnType<typeof currentSession>, status: MomStatus): CompactionReview | undefined {
+	// A backlog (read cold, or still being caught up) has compactions that are history, read by the catch-up itself:
+	// only a few compactions since her last save, on a saved map, are worth an audit.
+	const queued = mom.unreviewedCompactions();
+	const trigger = mom.checkpoint && !status.more && queued.length <= MAX_QUEUED_REVIEWS ? queued.at(-1) : undefined;
+	if (!trigger) return undefined;
+	if ((status.auditAttempts[trigger.ref] ?? 0) >= 2) return undefined;
+	status.auditAttempts[trigger.ref] = (status.auditAttempts[trigger.ref] ?? 0) + 1;
+	const id = trigger.ref.slice(trigger.ref.indexOf(":") + 1);
+	try { return reviewFromSession(reader.getBranch(), reader.getSessionId(), id); } catch { return undefined; }
+}
+
+/**
+ * Post-compaction continuity, before the review: the anchor for a new compaction, the receipt of one the
+ * lead delivered, and the check of a settled lead turn while a continuity window is open.
+ */
+async function continuity(mom: Mom, start: OperationStart, host: ConstructorParameters<typeof Mom>[0], store: SidecarStore, decider?: { client: Decider; clear: number }): Promise<boolean> {
+	let changed = false;
+	const reader = host.ctx.sessionManager, branch = reader.getBranch(), leaf = reader.getLeafId();
+	// The lead delivered the anchor she prepared: record it.
+	const reserved = mom.reservedAnchor;
+	if (reserved && branch.some(entry => entry.type === "custom_message" && entry.customType === ANCHOR && entry.details?.key === reserved.key)) {
+		await store.append("injection", { kind: "anchor", action: "delivered", key: reserved.key, compaction: reserved.key, content: reserved.content, parent: leaf }, `${reserved.key}:delivered`);
+		changed = true;
+	}
+	// A new compaction: queue and prepare its anchor from the saved map, before the audit changes it.
+	const trigger = mom.unreviewedCompactions().at(-1);
+	const known = (await store.load()).some(record => record.type === "injection" && record.data.kind === "anchor" && record.data.key === trigger?.ref);
+	if (trigger && mom.inject && !known) {
+		await store.append("injection", { kind: "anchor", action: "pending", key: trigger.ref, compaction: trigger.ref, parent: leaf }, `${trigger.ref}:pending`);
+		if (!mom.checkpoint) await store.append("injection", { kind: "anchor", action: "skipped", key: trigger.ref, compaction: trigger.ref, reason: "Mom had no saved map to anchor from", parent: leaf }, `${trigger.ref}:skipped`);
+		else {
+			const content = renderAnchor(mom.checkpoint, await collectSideEffects(mom.feed), formatElapsed(Date.now() - mom.checkpoint.at));
+			await store.append("injection", { kind: "anchor", action: "reserved", key: trigger.ref, compaction: trigger.ref, content, parent: leaf }, `${trigger.ref}:reserved`);
+		}
+		changed = true;
+	}
+	// The finding the user saw stays unanswered across two of their messages: ignored.
+	const active = mom.engagement.active, note = mom.checkpoint?.note;
+	if (active && note && active.key === noticeKey(note) && !feedbackApplies(mom.findingFeedback.get(active.key), note)) {
+		const since = active.parent === null ? -1 : branch.findIndex(entry => entry.id === active.parent);
+		const messages = branch.slice(since + 1).filter(entry => entry.type === "message" && entry.message.role === "user" && !isStatusPing(textOf(entry.message)));
+		if (since >= -1 && messages.length >= 2) { await store.append("notice", { key: active.key, action: "ignored", note, parent: leaf }); changed = true; }
+	}
+	const win = mom.window;
+	if (start.kind !== "delivery" || !win || !mom.inject || !mom.checkpoint || !host.ctx.isIdle()) return changed;
+	// The turn since the last check, as one settled lead turn.
+	const records = (await store.load()).filter(record => record.type === "injection" && record.data.kind === "window" && record.data.key === win.key);
+	const boundary = records.at(-1)?.data.parent ?? null;
+	const check = new Mom(host); await check.open();
+	await check.feed.capture(24000, true);
+	const events = check.feed.events, from = boundary === null ? 0 : events.findIndex(event => event.ref.split(":")[1] === boundary) + 1;
+	const turn = events.slice(Math.max(0, from)).filter(event => event.actor === "lead");
+	if (!turn.length) return changed;
+	const compactAt = events.findIndex(event => event.ref === win.compaction);
+	const close = (reason: string, held: boolean, turns: number) => store.append("injection", { kind: "window", action: "closed", key: win.key, compaction: win.compaction, reason, held, turns, parent: leaf });
+	if (events.slice(Math.max(compactAt + 1, from)).some(event => isUserDirection(event) && !isStatusPing(event.text ?? ""))) { await close("user-message", win.turns > 0, win.turns); return true; }
+	let error: string | undefined;
+	const signals = await collectTurnSignals(check.feed, turn);
+	let flags: Awaited<ReturnType<typeof stageOne>> = [];
+	try { flags = await stageOne(check.feed, mom.checkpoint, signals); } catch (cause) { error = String(cause); }
+	const direction = lastDirectionOf(check.feed), purpose = windowPurpose(mom.checkpoint);
+	const canCheck = flags.length > 0 && win.checks < MAX_WINDOW_CHECKS;
+	let verdict: ReturnType<typeof parseWindowVerdict>;
+	// The local decider can only clear: a confident "continues" skips the model check; anything else falls through.
+	let cleared: { p: number; latencyMs: number } | undefined;
+	if (canCheck && decider) try {
+		const state = [purpose, direction ? `Last user direction: ${direction.text}` : "", "Flagged records this turn touched:",
+			...flags.map(flag => `- ${flag.class}: ${flag.label}${flag.intent ? ` — ${flag.intent}` : ""}`), "", "This turn:", renderEvents(turn)].filter(Boolean).join("\n").slice(-24000);
+		const { answers, latencyMs } = await decider.client.ask(state, { continues: { type: "noul", instructions: "Does this turn stay on the current line of work, or the user's last direction?",
+			criteria: { false: "The turn departs from the recorded line: it resumes parked or finished work, breaks a standing rule, or pursues a different goal without the user asking.",
+				true: "The turn continues the recorded line of work or follows the user's last direction; touching a flagged record is incidental." } } });
+		const p = answers.continues.type === "noul" ? answers.continues.noul : 0;
+		if (p >= decider.clear) cleared = { p, latencyMs };
+	} catch { /* the decider is optional: the model check runs */ }
+	if (canCheck && !cleared) try {
+		const texts = windowMessages({ flags, turnEvents: turn, purpose, lastUserDirection: direction }).map(message => textOf(message));
+		const checkJob = `window-${createHash("sha256").update(JSON.stringify(texts)).digest("hex").slice(0, 32)}`;
+		const session = { file: reader.getSessionFile()!, id: reader.getSessionId(), cwd: host.ctx.cwd, leaf };
+		const result = await host.steps({ header: { job: checkJob, step: "check", mode: "check", refs: [], session }, body: texts[0], more: texts.slice(1),
+			instructions: "Check post-compaction continuity using the supplied evidence.", tools: [], thinking: "low" });
+		const reply = [...result.messages].reverse().find((message: any) => message.role === "assistant");
+		if (!reply || reply.stopReason === "error") throw new Error(reply?.errorMessage ?? "Mom's check returned no answer.");
+		verdict = parseWindowVerdict(textOf(reply), offeredRefs({ flags, turnEvents: turn, lastUserDirection: direction }));
+		if (!verdict) error = "The check reply was not a cited verdict; no correction.";
+	} catch (cause) { error = String(cause); }
+	const turns = win.turns + 1, checks = canCheck ? win.checks + 1 : win.checks;
+	await store.append("injection", { kind: "window", action: "checked", key: win.key, compaction: win.compaction, turns, checks, ...(flags.length ? { flagged: flags } : {}), ...(error ? { error } : {}),
+		...(cleared ? { decider: { continues: cleared.p, latencyMs: cleared.latencyMs } } : {}), parent: leaf });
+	if (verdict && !verdict.continues) {
+		const content = renderCorrection({ signals, flags, purpose, lastUserDirection: direction });
+		await store.append("injection", { kind: "window", action: "corrected", key: win.key, compaction: win.compaction, content, parent: leaf });
+		await close("correction", false, turns);
+	} else if (turns >= MAX_WINDOW_TURNS) await close("turns", true, turns);
+	return true;
+}
+
+const STATE_CHOICES = {
+	unchanged: "Still in progress, or not touched by this activity.",
+	finished: "This activity finished, shipped, or verified it.",
+	blocked: "This activity left it blocked, waiting on the user or something else.",
+	abandoned: "This activity dropped it, rejected it, or replaced it with another approach.",
+};
+/** Shadow only: for each open item on her map, the decider's guess of what this batch did to it. Failures are silent. */
+async function shadowGuesses(client: Decider, mom: Mom, events: readonly FeedEvent[]): Promise<OperationState["shadow"]> {
+	const open = (mom.checkpoint?.graph.nodes ?? []).filter(node => ["active", "proposed", "parked"].includes(node.state) && ["feature", "theory", "postulate", "try"].includes(node.kind)).slice(0, 12);
+	if (!open.length || !events.length) return undefined;
+	const activity = renderEvents(events).slice(-20000);
+	const guesses: NonNullable<OperationState["shadow"]>["guesses"] = [];
+	let latencyMs = 0;
+	try {
+		for (const node of open) {
+			const state = `WORK ITEM: [${node.state}] ${node.label}${node.intent ? ` — ${node.intent.slice(0, 300)}` : ""}\n\nWHAT HAPPENED SINCE THE LAST UPDATE:\n${activity}`;
+			const { answers, latencyMs: ms } = await client.ask(state, { fate: { type: "choice", instructions: "What did this activity do to the work item?", criteria: STATE_CHOICES } });
+			latencyMs += ms;
+			const a = answers.fate;
+			if (a.type === "choice") guesses.push({ id: node.id, label: node.label, state: node.state, guess: a.choice, p: Math.round((a.probabilities[a.choice] ?? 0) * 1000) / 1000 });
+		}
+	} catch { return guesses.length ? { guesses, latencyMs } : undefined; }
+	return { guesses, latencyMs };
+}
+
+/** A compaction's continuity window opens (a window still open for an earlier one closes as superseded). */
+async function openWindow(store: SidecarStore, reader: ReturnType<typeof currentSession>, open: WindowLive | undefined, trigger: string) {
+	if (open?.key === trigger) return; // a retry of the same review
+	if (open) await store.append("injection", { kind: "window", action: "closed", key: open.key, compaction: open.compaction, reason: "superseded", held: open.turns > 0, turns: open.turns, parent: reader.getLeafId() });
+	await store.append("injection", { kind: "window", action: "opened", key: trigger, compaction: trigger, parent: reader.getLeafId() }, `${trigger}:window`);
+}
+
+/**
+ * After her finalizer saved the map (or an answer): usage, her finding for the user, and for a compaction
+ * review the continuity window. Runs in the finalizer's tool call.
+ */
+export async function accepted(engine: Engine, api: Durable.ToolExecutionApi, ctx: any, header: OperationHeader, answer?: string) {
+	const op = await readOperation(engine, api, ctx);
+	if (op.job !== header.job || op.status !== "open") return;
+	const file = header.session.file;
+	const store = new SidecarStore(() => file, header.session.id);
+	const messages = op.startEntry ? (await entriesFrom(api, ctx, api.conversationId as any, op.startEntry)).flatMap(entry => entry.model) : [];
+	// Her turn's wall time (the model's replies and her tool calls), from the end of the preparation to now.
+	const before = await readStatus(engine, api, ctx), turnMs = before.op?.thinkingAt ? Math.max(0, Date.now() - before.op.thinkingAt) : 0;
+	const turn = readStep(messages).usage;
+	const usage = sumUsage(sumUsage(op.baseUsage ?? emptyUsage(), op.childUsage ?? emptyUsage()), { ...turn, elapsedMs: turn.elapsedMs + turnMs });
+	await store.append("usage", { usage, error: null }, `${header.job}:usage`);
+	const reader = currentSession(file);
+	const state = await loadState(store, reader);
+	const question = op.start?.kind === "request" && op.start.request.kind === "question" ? op.start.request : undefined;
+	if (op.shadow?.guesses.length) {
+		const after = new Map((state.checkpoint?.graph.nodes ?? []).map(node => [node.id, node.state]));
+		const actual = (before: string, now: string | undefined) => now === undefined ? "removed" : now === before ? "unchanged"
+			: now === "settled" ? "finished" : now === "parked" ? "blocked" : `now ${now}`;
+		// Its own log beside her .mom file: evaluation data, not her state (older readers reject unknown record types).
+		try {
+			appendFileSync(file.replace(/\.jsonl$/, "") + ".mom-decider", JSON.stringify({ at: Date.now(), kind: "state-shadow", job: header.job, latencyMs: op.shadow.latencyMs,
+				items: op.shadow.guesses.map(g => ({ ...g, actual: actual(g.state, after.get(g.id)) })) }) + "\n");
+		} catch { /* shadow data is best-effort */ }
+	}
+	const notices: MomStatus["notices"] = [];
+	if (!question) {
+		// Her finding reaches the user when her account is complete and the user wants that kind of finding.
+		const note = state.checkpoint?.note, key = note ? noticeKey(note) : undefined;
+		const offered = note && state.engagement.last?.key === key && note.riskRefs.every(ref => state.engagement.last!.riskRefs.includes(ref));
+		if (note && key && state.enabled && !header.more && !state.gaps.length && !state.failure && state.nudgedClasses.includes(note.riskClass) && !offered && !feedbackApplies(state.feedback[key], note)) {
+			const action = state.engagement.remaining ? "backoff" : "delivered";
+			await store.append("notice", { key, action, note, parent: reader.getLeafId(), presented: action === "delivered" });
+			recordEngagement(state.engagement, action, key, note, reader.getLeafId(), action === "delivered");
+		}
+		// A reviewed compaction opens its continuity window.
+		// A compaction queued behind this one opens its own window instead.
+		const branch = reader.getBranch(), at = branch.findIndex(entry => `${header.session.id}:${entry.id}` === header.trigger?.ref);
+		const superseded = at >= 0 && branch.slice(at + 1).some(entry => entry.type === "compaction");
+		if (header.trigger && state.inject && state.checkpoint && !superseded) await openWindow(store, reader, state.window, header.trigger.ref);
+	}
+	await writeOperation(engine, api, ctx, current => { current.status = question ? "answered" : "accepted"; });
+	await writeStatus(engine, api, ctx, status => {
+		delete status.op;
+		if (status.operationTiming) status.operationTiming = { ...status.operationTiming, requestMs: turnMs, totalMs: status.operationTiming.startupMs + turnMs };
+		status.notices.push(...notices);
+		if (!question) { status.rejectedStreak = 0; delete status.lastRejection; delete status.lastError; status.more = Boolean(header.more) || state.gaps.length > 0; if (header.trigger) delete status.auditAttempts[header.trigger.ref]; }
+		if (question) { status.answers[question.id] = { answer: answer ?? "", at: Date.now() }; status.conversation = [...(status.conversation ?? []), { question: question.question, answer: answer ?? "" }].slice(-8); }
+	});
+}
+
+/**
+ * A finalizer gave up after its repair: the operation is rejected, and what it leaves is recorded now (a
+ * retry record, a skipped range, or a retired range). An update's turn then fails, so oven retries it.
+ */
+export async function rejected(engine: Engine, api: Durable.ToolExecutionApi, ctx: any, header: OperationHeader, rejection: string) {
+	const op = await readOperation(engine, api, ctx);
+	if (op.job !== header.job || op.status !== "open") return;
+	const question = op.start?.kind === "request" && op.start.request.kind === "question" ? op.start.request : undefined;
+	const fault = !question && header.mode === "update" && !header.retryGap ? rejection : undefined;
+	const status = await readStatus(engine, api, ctx);
+	let settled = false;
+	try {
+		const file = header.session.file, notices: MomStatus["notices"] = [];
+		const mom = new Mom({ ctx: leadContext(file, notices), model: "", store: new SidecarStore(() => file, header.session.id), steps: async () => { throw new Error("no steps while settling"); }, changed: () => {} });
+		await mom.open();
+		const messages = op.startEntry ? await operationMessages(api, ctx, op.startEntry, Number.MAX_SAFE_INTEGER) : [];
+		const outcome = { ...readStep(messages), rejection };
+		const result = await mom.settle(header, outcome, sumUsage(sumUsage(op.baseUsage ?? mom.usage, op.childUsage ?? emptyUsage()), outcome.usage));
+		if (result.retiredRejection) { status.rejectedStreak++; status.lastRejection = result.retiredRejection; }
+		settled = true;
+	} catch (error) { status.lastError = `Mom could not record her rejected notes: ${String(error)}`; }
+	await writeOperation(engine, api, ctx, current => { current.status = settled ? "done" : "rejected"; current.rejection = rejection; if (fault) current.fault = fault; });
+	await writeStatus(engine, api, ctx, current => {
+		delete current.op; current.lastError = rejection; current.rejectedStreak = status.rejectedStreak; current.lastRejection = status.lastRejection;
+		if (question) current.answers[question.id] = { error: rejection, at: Date.now() };
+	});
+}
+
+/** Her own tooling failed mid-operation: the operation ends; an update's turn fails so oven retries it. */
+export async function failed(engine: Engine, api: Durable.ToolExecutionApi, ctx: any, error: string) {
+	const op = await readOperation(engine, api, ctx);
+	if (op.status !== "open") return;
+	const question = op.start?.kind === "request" && op.start.request.kind === "question" ? op.start.request : undefined;
+	await writeOperation(engine, api, ctx, current => { if (!question) current.fault = error; });
+	await writeStatus(engine, api, ctx, status => { delete status.op; status.lastError = error; if (question) status.answers[question.id] = { error, at: Date.now() }; });
+}

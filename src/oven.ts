@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { callOven, OvenTransportError } from "./oven-client.js";
 
 /**
  * A small MCP client for oven, only for `runtime: "oven"` children. pi-delegate does not depend on oven:
@@ -19,7 +20,7 @@ export function ovenUrl(): string {
 	return `http://127.0.0.1:${port}`;
 }
 
-function ovenToken(): string | undefined {
+export function ovenToken(): string | undefined {
 	if (process.env.OVEN_TOKEN) return process.env.OVEN_TOKEN;
 	try { return readFileSync(join(ovenConfigDir(), "token"), "utf8").trim() || undefined; } catch { return undefined; }
 }
@@ -34,48 +35,21 @@ export class OvenUnreachable extends Error {
 export interface SliceView { id: string; state: "running" | "idle" | "failed" | "stopped"; stage?: string; reason?: string; turns: number; detail?: string; output?: string; cwd?: string }
 export interface Settled { type: "settled"; slice: SliceView; output: string }
 
-let id = 0;
-/**
- * Call `oven_<tool>`. A streaming tool answers Server-Sent Events: progress notifications (each event as
- * JSON in their message, `ping`s skipped) go to `onEvent`, and the JSON-RPC result ends the call.
- */
+/** Call `oven_<tool>` with delegate-specific configuration and error wording. */
 export async function ovenCall<T = any>(tool: string, args: Record<string, unknown>, options: { signal?: AbortSignal; onEvent?: (event: any) => void } = {}): Promise<T> {
-	const url = ovenUrl(), token = ovenToken(), call = ++id;
-	let res: Response;
+	const url = ovenUrl();
 	try {
-		res = await fetch(`${url}/mcp`, {
-			method: "POST", signal: options.signal,
-			headers: { "content-type": "application/json", accept: "application/json, text/event-stream", ...(token ? { authorization: `Bearer ${token}` } : {}) },
-			body: JSON.stringify({ jsonrpc: "2.0", id: call, method: "tools/call", params: { name: `oven_${tool}`, arguments: args, _meta: { progressToken: call } } }),
-		});
+		return await callOven<T>({ url, token: ovenToken(), tool, args, ...options });
 	} catch (error) {
-		if (options.signal?.aborted) throw error;
-		throw new OvenUnreachable(url);
-	}
-	if (res.status === 401) throw new Error(`oven at ${url} refused the token: pi-delegate reads ${join(ovenConfigDir(), "token")} (or OVEN_TOKEN).`);
-	if (!res.ok) throw new Error(`oven at ${url} answered ${res.status}: ${(await res.text()).slice(0, 300)}`);
-	let reply: any;
-	if (res.headers.get("content-type")?.includes("text/event-stream")) {
-		const decoder = new TextDecoder();
-		let buffer = "";
-		for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
-			buffer += decoder.decode(chunk, { stream: true });
-			let end: number;
-			while ((end = buffer.indexOf("\n\n")) >= 0) {
-				const data = buffer.slice(0, end).split("\n").filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("");
-				buffer = buffer.slice(end + 2);
-				if (!data) continue;
-				const message = JSON.parse(data);
-				if (message.method === "notifications/progress") {
-					const event = JSON.parse(message.params.message);
-					if (event.type !== "ping") options.onEvent?.(event);
-				} else if (message.id === call) reply = message;
-			}
+		if (!(error instanceof OvenTransportError)) throw error;
+		switch (error.kind) {
+			case "unreachable": throw new OvenUnreachable(url);
+			case "unauthorized": throw new Error(`oven at ${url} refused the token: pi-delegate reads ${join(ovenConfigDir(), "token")} (or OVEN_TOKEN).`);
+			case "http": throw new Error(`oven at ${url} answered ${error.status}: ${error.message}`);
+			case "closed": throw new Error(`oven closed oven_${tool} before it answered`);
+			case "rpc":
+			case "tool":
+			case "protocol": throw new Error(`oven: ${error.message}`);
 		}
-		if (!reply) throw new Error(`oven closed oven_${tool} before it answered`);
-	} else reply = await res.json();
-	if (reply.error) throw new Error(`oven: ${reply.error.message}`);
-	const text = (reply.result?.content ?? []).map((c: any) => c.text).join("");
-	if (reply.result?.isError) throw new Error(`oven: ${text}`);
-	try { return JSON.parse(text) as T; } catch { return text as T; }
+	}
 }

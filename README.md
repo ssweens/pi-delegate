@@ -1,8 +1,8 @@
 # pi-delegate
 
-Install: `pi install npm:@ssweens/pi-delegate`, `pi install git:<repo>`, or `pi install ./pi-delegate`. The delegation tools, phased todo tool, `delegation` skill, and default roles all ship in the package — nothing is copied to `~/.agents`.
+Install from a local checkout with `pi install ./pi-delegate`. This private package is not published to npm. During the tether compatibility window, use this package instead of `pi-tether`; do not list both packages in Pi or Oven settings because both declare Mom. The delegation tools, phased todo tool, `delegation` skill, and default roles all ship in the package. Nothing is copied to `~/.agents`.
 
-Requires Pi 0.99.1 or newer, below 2.0.0. Minimal delegation for pi: durable child runs, role files, fork context, steer, honest run log, and a stock-Pi phased todo list. Replaces pi-subagents (125 schema params, 14.8k lines, 11 tools in context) and pi-strings.
+Requires Pi 0.99.1 or newer, below 2.0.0. Minimal delegation for pi: durable child runs, role files, fork context, steer, honest run log, a stock-Pi phased todo list, and Mom's unified activity view. Mom map modes are documented in [`docs/map-modes.md`](docs/map-modes.md). Replaces pi-subagents (125 schema params, 14.8k lines, 11 tools in context) and pi-strings.
 
 One tool pair, two backends:
 
@@ -402,7 +402,7 @@ Run the additional check when its boundary changes:
 | Completion, cancellation, delivery, persistence—or their assertions | Scoped mutation of the affected production behavior, after its baseline passes |
 | Docs only | Check examples/resource paths; no terminal or model run required |
 
-`check:install` packs the candidate, installs dependencies in an isolated extracted directory, runs the real `pi install`, and checks all tools, packaged roles, and the delegation skill. Pi links local directories without installing dependencies: run `npm install` in a local checkout first. npm/Git installs manage dependencies themselves. To check a published npm or Git source explicitly: `npm run check:install -- npm:@ssweens/pi-delegate@<version>` or `npm run check:install -- git:<repo>@<ref>`; that checks the named source, not uncommitted local changes.
+`check:install` packs the local candidate, installs its dependencies in an isolated extracted directory, runs the real `pi install`, and checks all tools, packaged roles, and the delegation skill. Pi links local directories without installing dependencies. Run `npm install` in the local checkout first. This repository does not publish packages to npm.
 
 `smoke:tui` runs actual Pi and actual built-in tools with the loopback provider in a private tmux server. It checks native tool disclosure, streaming/follow vs paused scrolling, narrow resize, separate drafts, history, same-ID revival, and finished-frame removal. It prints the temporary evidence directory containing text/ANSI terminal captures, traces, and sessions; it stops only its own tmux server. Parent model wake-up is disabled in this UI fixture and verified separately by lifecycle tests.
 

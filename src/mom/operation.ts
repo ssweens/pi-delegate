@@ -1,0 +1,91 @@
+import type { AdvisorScreenRecord } from "./advisor.ts";
+import type { Candidate } from "./candidate.ts";
+import type { Cut, FeedEvent } from "./feed.ts";
+
+/**
+ * One Mom step as her tools in oven see it: the header her tools read (from the first
+ * message of the operation's fresh context) and the lead reads back after a reload. Everything else her
+ * tools need is in the session file and her `.mom` file. The model never sees the header.
+ */
+export type OperationMode = "update" | "ask" | "audit" | "check";
+
+export interface OperationHeader {
+	job: string;
+	/** One fresh context per step: `map`, `audit-<n>`, or `check-<hash>`. */
+	step: string;
+	mode: OperationMode;
+	/** Pinned at preparation, independent of later settings changes. */
+	mapMode?: string;
+	/** This is a host-compressed historical catch-up, not a frontier update. */
+	digest?: boolean;
+	/** This request repairs existing model labels without changing graph structure or evidence. */
+	relabel?: boolean;
+	/** Exactly the fragments supplied to the model, not re-enumerated after inspections. */
+	candidates?: Candidate[];
+	session: { file: string; id: string; cwd: string; leaf: string | null };
+	/** Evidence boundary: the feed her tools rebuild, and the coverage an accepted map records. */
+	cut?: Cut;
+	from?: Cut;
+	/** The batch's evidence refs, in order: what she must review. */
+	refs: string[];
+	more?: boolean;
+	gaps?: number;
+	retryGap?: { id: string; remaining: string[] };
+	question?: string;
+	/** A compaction review: its trigger is known evidence beyond the session's own entries. */
+	trigger?: FeedEvent;
+	auditedGaps?: string[];
+	screen?: AdvisorScreenRecord;
+	/** The lead's own evidence could not be read; an empty commit cannot certify the batch. */
+	leadUnreadable?: boolean;
+	/** Audit steps: the chapters this section must state. */
+	section?: { actor: string; chapterIds: string[]; sources?: Record<string, string>; needsInspection?: boolean };
+}
+
+const KEY = "mom", TEXT = "$text";
+
+/** The first message of a step: the header, then the body (an object, or text the model sees as is). */
+export const encodeOperation = (header: OperationHeader, body: Record<string, unknown> | string) =>
+	JSON.stringify({ [KEY]: header, ...(typeof body === "string" ? { [TEXT]: body } : body) });
+
+/** The header of an operation message, and the message as the model sees it (without the header). */
+export function decodeOperation(text: string): { header?: OperationHeader; text: string } {
+	if (!text.startsWith(`{"${KEY}":`)) return { text };
+	try {
+		const { [KEY]: header, ...body } = JSON.parse(text);
+		return { header, text: typeof body[TEXT] === "string" ? body[TEXT] : JSON.stringify(body) };
+	} catch { return { text }; }
+}
+
+/** A tool result that ends the operation because Mom's own tooling failed, not because her notes were rejected. */
+export const OPERATION_FAILED = "Mom operation failed: ";
+
+/** What the lead's client asks of Mom's slice; the session names the lead's session file. */
+export type MomRequest =
+	| { kind: "update" }
+	| { kind: "refresh" }
+	| { kind: "relabel" }
+	| { kind: "resume" }
+	| { kind: "question"; id: string; question: string }
+	| { kind: "controls"; id: string; change: { inject: boolean } | { nudgedClasses: string[] } | { enabled: boolean } | { mode: string } | { model: string } }
+	| { kind: "finding"; action: "understood" | "dismiss" | "incorrect" | "discuss" | "explained"; finding: string };
+const REQUEST = "mom.request";
+export const encodeRequest = (session: string, request: MomRequest) => JSON.stringify({ [REQUEST]: { session, ...request } });
+
+/** The prefix of oven's delivery of new entries of a followed Pi session. */
+const DELIVERY = /^New entries in the followed Pi session (.+?) \(\d+: /;
+
+/** How a message starts an operation: a delivery of new lead entries, a request, or a step's header. */
+export type OperationStart =
+	| { kind: "delivery"; session: string }
+	| { kind: "request"; session: string; request: MomRequest }
+	| { kind: "step"; header: OperationHeader };
+export function decodeStart(text: string): OperationStart | undefined {
+	const delivery = DELIVERY.exec(text);
+	if (delivery) return { kind: "delivery", session: delivery[1] };
+	if (text.startsWith(`{"${REQUEST}":`)) {
+		try { const { session, ...request } = JSON.parse(text)[REQUEST]; return typeof session === "string" ? { kind: "request", session, request } : undefined; } catch { return undefined; }
+	}
+	const header = decodeOperation(text).header;
+	return header ? { kind: "step", header } : undefined;
+}

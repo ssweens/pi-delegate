@@ -28,7 +28,7 @@ function pad(text: string, width: number): string {
 /** Replace the frame's bottom border with its navigation legend. */
 function withLegend(lines: string[], legend: string, theme: Theme, width: number): string[] {
 	if (width < 8) return lines;
-	const label = truncateToWidth(` ${legend} `, width - 4, "…");
+	const label = truncateToWidth(` ${legend} `, width - 3, "…");
 	lines[lines.length - 1] = theme.fg("borderMuted", "╰─") + theme.fg("dim", label) + theme.fg("borderMuted", "─".repeat(Math.max(0, width - 3 - visibleWidth(label))) + "╯");
 	return lines;
 }
@@ -44,7 +44,7 @@ export class AgentsPanel implements Component, Focusable {
 	private removeInputListener: () => void;
 	private opening = false;
 
-	constructor(private src: LiveSource, private theme: Theme, private tui: TUI, private openChild: (id: string) => Promise<void>) {
+	constructor(private src: LiveSource, private theme: Theme, private tui: TUI, private openChild: (id: string) => Promise<void>, private focusTarget?: Component & Focusable) {
 		this.unsubscribe = src.subscribe(() => this.update());
 		// Fullscreen transcript navigation runs before focused-component input. Consume list
 		// navigation here so Home/PageDown cannot move the parent transcript behind the list.
@@ -66,11 +66,12 @@ export class AgentsPanel implements Component, Focusable {
 		if (!this.rows().length) return;
 		// Both Pi renderers expose this public TuiBase method; the TUI interface omits it.
 		this.previousFocus = (this.tui as TUI & { getFocusedComponent(): Component | null }).getFocusedComponent();
-		this.tui.setFocus(this);
+		this.tui.setFocus(this.focusTarget ?? this);
 		this.tui.requestRender();
 	}
 
 	private release() {
+		this.focused = false;
 		this.tui.setFocus(this.previousFocus);
 		this.tui.requestRender();
 	}
@@ -106,9 +107,9 @@ export class AgentsPanel implements Component, Focusable {
 		this.tui.requestRender();
 	}
 
-	render(width: number): string[] {
+	private section(width: number): { header: string; body: string[]; hint: string } | undefined {
 		const rows = this.rows();
-		if (!rows.length) return [];
+		if (!rows.length) return undefined;
 		const index = Math.max(0, rows.findIndex((r) => r.id === this.selectedId));
 		this.selectedId = rows[index].id;
 		const count = Math.min(LIST_ROWS, Math.max(1, this.tui.terminal.rows - 10), rows.length);
@@ -145,8 +146,18 @@ export class AgentsPanel implements Component, Focusable {
 		const joined = rows.some((v) => v.joinedWaiters);
 		const header = this.theme.bold("Agents") + this.theme.fg("muted", ` · ${rows.length} active${range}`)
 			+ (joined ? this.theme.fg("warning", " · parent blocked in wait") : "");
-		const hint = this.focused ? "↑↓ select · Enter open · Esc editor" : "Ctrl+J focus agents · /agents history";
-		return withLegend(frame(header, body.map((l) => truncateToWidth(l, inner, "…")), this.focused ? "borderAccent" : "borderMuted", this.theme, width), hint, this.theme, width);
+		return { header, body: body.map((l) => truncateToWidth(l, inner, "…")), hint: this.focused ? "↑↓ select · Enter open · Esc editor" : "Ctrl+J focus agents · /agents history" };
+	}
+
+	renderSection(width: number): string[] {
+		const section = this.section(width);
+		return section ? [section.header, ...section.body] : [];
+	}
+
+	render(width: number): string[] {
+		const section = this.section(width);
+		if (!section) return [];
+		return withLegend(frame(section.header, section.body, this.focused ? "borderAccent" : "borderMuted", this.theme, width), section.hint, this.theme, width);
 	}
 
 	invalidate() {}

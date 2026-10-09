@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { Type, type Static } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ActivityCoordinator } from "./ui/activity.js";
 import {
 	type TodoState,
 	addTask,
@@ -132,11 +133,15 @@ function applyOp(state: TodoState, p: TodoParams): TodoState {
 	}
 }
 
-export function syncTodoWidget(ui: Pick<ExtensionCommandContext["ui"], "setWidget">, state: TodoState): void {
+export function syncTodoWidget(ui: Pick<ExtensionCommandContext["ui"], "setWidget">, state: TodoState, activity?: ActivityCoordinator): void {
 	// A running Pi process can retain the old pi-omp widget across an extension
-	// reload. Remove that key before installing the delegate-owned widget so a
-	// stale unframed panel cannot remain beside (or instead of) the new one.
+	// reload. Remove both legacy keys before the coordinator owns the single surface.
 	ui.setWidget(LEGACY_TODO_WIDGET_KEY, undefined);
+	if (activity) {
+		ui.setWidget(TODO_WIDGET_KEY, undefined);
+		activity.setTodos(state);
+		return;
+	}
 	if (countOpen(state) === 0) {
 		ui.setWidget(TODO_WIDGET_KEY, undefined);
 		return;
@@ -168,6 +173,8 @@ export interface TodoInstallOptions {
 	hasActiveJobs?: () => boolean;
 	/** Reminder cap per session. Defaults to {@link TODO_MAX_REMINDERS}. */
 	maxReminders?: number;
+	/** Shared persistent activity surface. */
+	activity?: ActivityCoordinator;
 }
 
 export function installTodo(pi: ExtensionAPI, options: TodoInstallOptions = {}): void {
@@ -189,7 +196,7 @@ export function installTodo(pi: ExtensionAPI, options: TodoInstallOptions = {}):
 		execute: async (_toolCallId, params: TodoParams, _signal, _onUpdate, ctx) => {
 			const state = applyOp(loadState(ctx.sessionManager), params);
 			pi.appendEntry(TODO_CUSTOM_TYPE, state);
-			syncTodoWidget(ctx.ui, state);
+			syncTodoWidget(ctx.ui, state, options.activity);
 			const text = params.op === "init" ? "Todos cleared." : viewTasks(state);
 			return {
 				content: [{ type: "text", text }],
@@ -214,7 +221,7 @@ export function installTodo(pi: ExtensionAPI, options: TodoInstallOptions = {}):
 	});
 
 	const syncFromBranch = (ctx: { ui: Pick<ExtensionCommandContext["ui"], "setWidget">; sessionManager: TodoBranchSource }) =>
-		syncTodoWidget(ctx.ui, loadState(ctx.sessionManager));
+		syncTodoWidget(ctx.ui, loadState(ctx.sessionManager), options.activity);
 
 	pi.on("session_start", (_event, ctx) => syncFromBranch(ctx));
 	pi.on("session_tree", (_event, ctx) => syncFromBranch(ctx));
@@ -227,7 +234,7 @@ export function installTodo(pi: ExtensionAPI, options: TodoInstallOptions = {}):
 			const state = loadState(ctx.sessionManager);
 			const persist = (next: TodoState) => {
 				pi.appendEntry(TODO_CUSTOM_TYPE, next);
-				syncTodoWidget(ctx.ui, next);
+				syncTodoWidget(ctx.ui, next, options.activity);
 				return next;
 			};
 			switch (sub) {

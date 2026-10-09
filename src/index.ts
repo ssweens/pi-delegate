@@ -25,7 +25,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { keyHint } from "@earendil-works/pi-coding-agent";
-import { AgentHistory, AgentsPanel, ChildView, type LiveSource } from "./inspector.js";
+import { AgentHistory, ChildView, type LiveSource } from "./inspector.js";
 import type { ActiveTool, ChildActivity } from "./transcript.js";
 import { type AAIndices, acpRowView, asRunView, elapsed, empty, framed, type LiveFacts, type ModelRow, type ModelsDetails, resultLines, resultView, type RunView } from "./render.js";
 import { type AcpRunView, type LifecycleAction, type PiStartInput, type WaitOutcome, PI_CAPABILITIES, requireAction, validateStartInput, validateSteer } from "./backend.js";
@@ -39,6 +39,8 @@ import { DealSheet } from "./deals-sheet.js";
 import { RunCompletion } from "./completion.js";
 import { resolveChildTrust, type ChildTrust, type TrustSource } from "./project-trust.js";
 import { ownedElsewhere, processOwner, readRecord, storageDir, writeRecord } from "./storage.js";
+import { installMom } from "./mom/index.js";
+import { activityFor } from "./ui/activity.js";
 
 /** Resolved once, at load, by Pi's own rule (PI_CODING_AGENT_DIR with `~` expanded, else ~/.pi/agent), so this file and Pi read the same mcp.json and settings. */
 export const AGENT_DIR = getAgentDir();
@@ -1453,7 +1455,7 @@ function activityOf(run: Run): ChildActivity {
 	return items;
 }
 
-export default function (pi: ExtensionAPI) { installDelegate(pi); }
+export default function (pi: ExtensionAPI) { installDelegate(pi); installMom(pi); }
 
 /**
  * The delegation tools for one session. At the root, that is the parent's session. With `nesting`,
@@ -1461,6 +1463,7 @@ export default function (pi: ExtensionAPI) { installDelegate(pi); }
  * level down, with its children's completions delivered to that child.
  */
 function installDelegate(pi: ExtensionAPI, nesting?: Run) {
+	const activity = nesting ? undefined : activityFor(pi);
 	// The session this instance serves runs at this depth; the children it starts run one deeper.
 	const depth = nesting?.depth ?? 0;
 	// ACP Pi workers (pi-acp) are full Pi processes that load installed extensions. They must not
@@ -1540,7 +1543,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 	// so an incomplete-todo nag at agent_end would be premature.
 	const busy = (target: Owner) => ownedRuns(target).some((run) => !run.completion.settled) || acp.owned(target.key).some((run) => run.status === "running");
 	// A delegating child gets the delegation pair only; the todo tool stays the root parent's.
-	if (!nesting) installTodo(pi, { hasActiveJobs: () => Boolean(owner && !owner.closed && busy(owner)) });
+	if (!nesting) installTodo(pi, { hasActiveJobs: () => Boolean(owner && !owner.closed && busy(owner)), activity });
 	function requireOwner(): Owner {
 		if (!owner || owner.closed || owner.binding?.pi !== pi) throw new Error(attachError ?? "Delegate runtime is not attached to this parent.");
 		return owner;
@@ -2453,7 +2456,6 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 		return framed((width) => resultLines(shown, expanded, theme, width));
 	});
 
-	let panel: AgentsPanel | undefined;
 	let navigationOpen = false;
 	const childDrafts = new Map<string, string>();
 	async function openChild(ctx: ExtensionContext, id: string) {
@@ -2486,10 +2488,7 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 		try { await attach(ctx); }
 		catch (error) { attachError = String(error); ctx.ui.notify(attachError, "error"); return; }
 		if (ctx.mode !== "tui") return;
-		ctx.ui.setWidget("delegate-agents", (tui, theme) => {
-			panel = new AgentsPanel(liveSource, theme, tui, (id) => openChild(ctx, id));
-			return panel;
-		});
+		activity?.install(ctx, liveSource, (id) => openChild(ctx, id));
 	});
 	// A delegating child has no UI: its commands and shortcut stay the root parent's.
 	if (!nesting) {
@@ -2521,15 +2520,14 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 			description: "Focus active delegates, or open finished history when idle",
 			handler: async (ctx) => {
 				if (navigationOpen) return;
-				if (liveSource.all().some((r) => !r.settled)) panel?.focus();
+				if (liveSource.all().some((r) => !r.settled)) activity?.focusAgents();
 				else await openHistory(ctx);
 			},
 		});
 	}
 
 	async function shutdown(reason: string) {
-		panel?.dispose();
-		panel = undefined;
+		activity?.dispose();
 		const previous = owner;
 		owner = undefined;
 		if (!previous || previous.binding?.pi !== pi) return;

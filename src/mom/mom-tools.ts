@@ -1,0 +1,552 @@
+/**
+ * Mom's tools, as Durable extensions oven installs by name: `mom` (her operation, evidence and
+ * finalizers) and `mom-ask` (the question variants of her finalizers). Each message her slice gets starts
+ * an operation: `mom_begin` (engine.ts) prepares it and keeps its header in a Durable document; her
+ * other tools rebuild the evidence from the lead's session file and her `.mom` file, and keep
+ * per-operation progress (pages read, rejections) in a Durable document. Acceptance writes the map record
+ * `${job}:map` to the `.mom` file, once. Child steps (audits, checks) carry their header in their first
+ * message instead. Only these tools write the `.mom` file.
+ *
+ * oven calls the default export with its own `@earendil-works/pi-durable`.
+ */
+import { existsSync } from "node:fs";
+import type * as Durable from "@earendil-works/pi-durable";
+import { Type, type Static } from "typebox";
+import { Check } from "typebox/value";
+import { validateToolArguments } from "@earendil-works/pi-ai/utils/validation";
+import { graphChange, isCheckpoint, loadState, noticeKey, type Checkpoint } from "./checkpoint.ts";
+import { acceptGraph, momTools, validateSearchQuery } from "./contract.ts";
+import { ACT_LABELS_MODE, modeFor } from "./modes.ts";
+import { actLabelsTool } from "./act-derivation.ts";
+import { LiveFeed, type FeedEvent } from "./feed.ts";
+import { editGraph, emptyGraph, isEndeavor, isObsoleteParkedWork, sourceSuggestion, Unfinished, type GraphNode } from "./graph.ts";
+import { decodeOperation, decodeStart, OPERATION_FAILED, type OperationHeader } from "./operation.ts";
+import { accepted, begin, docsFor, failed, GIVE_UP, readOperation, readSettings, rejected, type Engine } from "./engine.ts";
+import { sessionFromFile } from "./session-file.ts";
+import { SidecarStore } from "./sidecar.ts";
+
+const FINALIZERS = new Set(["commit_graph", "commit_acts", "commit_labels", "record_thread_map", "answer_question"]);
+const BEGIN = "mom_begin";
+const SOLE = "Mom finalization requires a sole direct tool call, never a batch or nested call.";
+
+const item = Type.Object({ text: Type.String({ minLength: 1 }), sources: Type.Array(Type.String(), { minItems: 1 }) }, { additionalProperties: false });
+const items = Type.Array(item);
+const chapterState = Type.Object({ chapter: Type.String(), goal: items, decisions: items, artifacts: items, deadEnds: items, openQuestions: items }, { additionalProperties: false });
+const threadMap = Type.Object({ states: Type.Array(chapterState, { minItems: 1 }) }, { additionalProperties: false });
+const ITEM_FIELDS = ["goal", "decisions", "artifacts", "deadEnds", "openQuestions"] as const;
+
+type World = { store: SidecarStore; state: Awaited<ReturnType<typeof loadState>>; feed: LiveFeed; known: Map<string, FeedEvent>; newRefs: Set<string>;
+	/** Worker transcripts in the cut that are gone: their sources read as missing files. */
+	missing: Map<string, string> };
+/** Rebuilt evidence per operation; a cache, not authority: a restart rebuilds it from the files. */
+const worlds = new Map<string, Promise<World>>();
+
+async function rebuild(op: OperationHeader): Promise<World> {
+	const reader = sessionFromFile(op.session.file, op.session.leaf);
+	const store = new SidecarStore(() => op.session.file, op.session.id);
+	const state = await loadState(store, reader);
+	let feed = new LiveFeed(reader);
+	const cut = op.cut ?? state.coverageCut ?? state.checkpoint?.cut;
+	// A worker transcript that disappeared stays unreviewed; readable evidence is still reconciled.
+	const missing = new Map<string, string>();
+	try { await feed.restore(cut); }
+	catch (error) {
+		if (!cut?.workers.length) throw error;
+		for (const worker of cut.workers) if (!existsSync(worker.file)) missing.set(worker.sessionId, worker.file);
+		feed = new LiveFeed(reader);
+		await feed.restore({ ...cut, workers: cut.workers.filter(worker => !missing.has(worker.sessionId)) });
+	}
+	for (const observation of state.observations) feed.observe(observation);
+	const known = new Map(feed.byRef), newRefs = new Set(op.refs);
+	if (op.trigger) { known.set(op.trigger.ref, op.trigger); newRefs.add(op.trigger.ref); }
+	for (const ref of feed.byRef.keys()) if (ref.startsWith(`mom-${op.job}:`)) newRefs.add(ref);
+	return { store, state, feed, known, newRefs, missing };
+}
+function world(op: OperationHeader): Promise<World> {
+	const key = `${op.job}:${op.step}`;
+	let found = worlds.get(key);
+	if (!found) {
+		found = rebuild(op);
+		worlds.set(key, found);
+		found.catch(() => worlds.delete(key));
+		while (worlds.size > 8) worlds.delete(worlds.keys().next().value!);
+	}
+	return found;
+}
+
+/** Her results are evidence she must read whole: Durable's 50 KB default would cut a digest (a JSON document) mid-string. */
+const WHOLE = { maxBytes: 16 * 1024 * 1024, maxLines: 1_000_000 };
+const text = (value: string) => [{ type: "text" as const, text: value }];
+
+export function momExtension(durable: typeof Durable, answering: boolean): Durable.Extension {
+	type Progress = { inspected: string[]; auditReads: string[]; rejections: number; repaired: boolean };
+	const Progress = durable.defineDocFamily<Progress, null>({
+		kind: "pi-tether.mom-operation", version: 1, family: true, scope: "conversation", history: "latest", fork: "initial",
+		initial: () => ({ inspected: [], auditReads: [], rejections: 0, repaired: false }) });
+
+	const engine: Engine = { durable, docs: docsFor(durable) };
+	/**
+	 * The operation this call belongs to and its tool calls: her slice's open operation (from its document,
+	 * calls since it started), or a child step's (the header of its context's first message).
+	 */
+	type Call = { id: string; name: string; arguments: unknown; round: string };
+	async function operationContext(api: Durable.ToolExecutionApi, ctx: any): Promise<{ header: OperationHeader; calls: Call[]; slice: boolean }> {
+		const op = await readOperation(engine, api, ctx);
+		const own = op.status === "open" && op.header && op.startEntry !== undefined ? op : undefined;
+		const found = await api.commit(async tx => {
+			const marker = own ? undefined : await tx.latestHeadMarker(api.conversationId);
+			const min = own ? own.startEntry : marker?.head;
+			let oldest: string | undefined, cursor: any;
+			const calls: Call[] = [];
+			do {
+				const page = await tx.scanEntries({ conversationId: api.conversationId, ...(min !== undefined ? { minEntryId: min as any } : {}) }, 200, cursor);
+				for (const entry of page.items) for (const message of entry.model ?? []) {
+					if (message.role === "user") oldest = typeof message.content === "string" ? message.content : message.content.filter((part: any) => part.type === "text").map((part: any) => part.text).join("");
+					if (message.role === "assistant") for (const block of [...message.content].reverse()) if (block.type === "toolCall") calls.unshift({ id: block.id, name: block.name, arguments: block.arguments, round: String(entry.id) });
+				}
+				cursor = page.next;
+			} while (cursor);
+			return { oldest, calls };
+		}, ctx);
+		const header = own?.header ?? (found.oldest ? decodeOperation(found.oldest).header : undefined);
+		if (!header) throw new Error("No Mom operation is open: call mom_begin first.");
+		return { header, calls: found.calls, slice: Boolean(own) };
+	}
+	const operation = async (api: Durable.ToolExecutionApi, ctx: any) => (await operationContext(api, ctx)).header;
+	/** A finalizer must be a sole direct call: batched with others, every call of that round refuses and the operation ends. */
+	const batched = (calls: Call[], callId: string) => {
+		const round = calls.find(call => call.id === callId)?.round;
+		const together = calls.filter(call => call.round === round);
+		return together.length > 1 && together.some(call => FINALIZERS.has(call.name));
+	};
+	const progress = (api: Durable.ToolExecutionApi, ctx: any, job: string) => api.snapshot(Progress, api.conversationId, job, ctx).then(doc => doc ?? { inspected: [], auditReads: [], rejections: 0, repaired: false });
+	const update = (api: Durable.ToolExecutionApi, ctx: any, job: string, change: (doc: Progress) => void) =>
+		api.commit(async tx => { change(await tx.doc(Progress, api.conversationId, job, null)); }, ctx);
+
+	/** A private tool: errors of Mom's own tooling end the operation with a marked result the lead reads. */
+	const tool = (definition: { name: string; description: string; parameters: any; constrainedSampling?: any },
+		run: (args: any, op: OperationHeader, api: Durable.ToolExecutionApi, ctx: any) => Promise<Durable.ToolExecutionResult>) => durable.defineTool({
+		...definition, replay: "safe", executionMode: "sequential", outputLimits: WHOLE,
+		async execute(args: any, api: Durable.ToolExecutionApi, ctx: any) {
+			try {
+				if (FINALIZERS.has(definition.name) && api.callId.includes(":")) throw new Error(SOLE);
+				const { header, calls } = await operationContext(api, ctx);
+				if (batched(calls, api.callId)) throw new Error(SOLE);
+				return await run(args, header, api, ctx);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				await failed(engine, api, ctx, message).catch(() => {});
+				return { content: text(`${OPERATION_FAILED}${message}`), isError: true, control: { terminate: true } };
+			}
+		},
+	});
+
+	const read = async (feed: LiveFeed, ref: string, offset: number, limit: number, strict: boolean) => {
+		try { return await feed.lookup(ref, offset, limit); }
+		catch (error) {
+			if (strict && !(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+			return { ref, error: String(error), instruction: "Continue with available evidence; this read did not verify the source." };
+		}
+	};
+
+	const definitions = momTools(answering);
+	const definition = (name: string) => { const found = definitions.find(d => d.name === name)!; return { name, description: found.description, parameters: found.parameters, constrainedSampling: found.constrainedSampling }; };
+
+	/**
+	 * Finalizers check their own arguments, so a malformed call counts as an attempt: Durable would answer it
+	 * without running the tool. After one repair (a second failed finalization) the operation ends.
+	 */
+const clip = (text: string, max: number): string => text.length <= max ? text : text.slice(0, max);
+/** Newest evidence a node cites, so focus lands on the work the user asked for most recently. */
+const sourceAt = (node: GraphNode, known: ReadonlyMap<string, FeedEvent>): number => Math.max(...node.sources.map(ref => {
+	const at = known.get(ref)?.at;
+	return at ? Date.parse(at) : Number.NEGATIVE_INFINITY;
+}));
+const STOP = new Set(["that", "this", "with", "from", "into", "over", "under", "about", "them", "they", "their", "there", "here", "what", "when", "where", "which", "while", "would", "could", "should", "have", "been", "being", "does", "done", "also", "than", "then", "some", "more", "most", "very", "just", "only", "also"]);
+const words = (text: string): Set<string> => new Set(text.toLowerCase().match(/[a-z][a-z0-9_-]{3,}/g)?.filter(w => !STOP.has(w)) ?? []);
+/** A label that describes the conversation rather than the work: a question, or a wrapper verb
+ *  around an object. Those are the ones older rules fabricated, so only those may be rewritten. */
+const CONVERSATION_LABEL = /^\s*(?:request|ask|asking|clarify|explain|determine|confirm|check|show|tell|report|give me|walk me)\b|\?\s*$/i;
+	const labelsDefinition = { name: "commit_labels", description: "Repair saved work labels and retire work that is not durable, multi-turn tracking. Supply every saved work ID: a label to keep it, or retired with a reason to drop it. The host preserves sources and evidence.",
+		constrainedSampling: { type: "json_schema", strict: "prefer" },
+		parameters: Type.Object({ labels: Type.Array(Type.Object({ id: Type.String({ minLength: 1 }), label: Type.String({ minLength: 1, maxLength: 160 }),
+			state: Type.Optional(Type.Union([Type.Literal("active"), Type.Literal("parked")])) }, { additionalProperties: false }), { maxItems: 64 }),
+			retired: Type.Optional(Type.Array(Type.Object({ id: Type.String({ minLength: 1 }), reason: Type.String({ minLength: 1, maxLength: 240 }) }, { additionalProperties: false }), { maxItems: 64 })) }, { additionalProperties: false }) };
+	/** Arguments as Durable checks and coerces them (pi-ai's validation); throws its "Validation failed" error. */
+	const check = (name: string, args: unknown) => validateToolArguments(name === "commit_labels" ? labelsDefinition as any : { ...definition(name) } as any,
+		{ type: "toolCall", id: "check", name, arguments: JSON.parse(JSON.stringify(args ?? {})) });
+	// Transaction commits a model-authored graph; acts derives work from model-written labels;
+	// relabels apply model-written display labels. All three use the same single-writer commit tail.
+	const finalize = (form: "transaction" | "acts" | "labels" = "transaction") => ({ ...tool(form === "acts" ? actLabelsTool() : form === "labels" ? labelsDefinition : definition("commit_graph"), async (_args, op, api, ctx) => {
+		const { calls } = await operationContext(api, ctx);
+		const call = calls.find(each => each.id === api.callId);
+		const attempts = calls.filter(each => FINALIZERS.has(each.name)).length;
+		const reject = async (reason: string) => {
+			if (attempts >= 2) await rejected(engine, api, ctx, op, `Mom could not finalize after one repair. ${reason}`);
+			return { content: text(attempts >= 2 ? `Mom could not finalize after one repair. ${reason} No map was accepted.` : `${reason} Correct all reported defects and resubmit once.`),
+				isError: true, ...(attempts >= 2 ? { control: { terminate: true as const } } : {}) };
+		};
+		let answer: string | undefined;
+		const { store, state, known, newRefs, feed } = await world(op);
+		// A mode is in force or loudly refused (docs/map-modes.md, M2). Both finalizers are always
+		// registered because the extension is built statically, so each one must refuse work the
+		// active mode did not ask it to do — otherwise a small model can reach for commit_graph in
+		// act_labels mode and author writes the host is supposed to derive.
+		const active = modeFor(op.mapMode ?? state.mode);
+		if (op.relabel ? form !== "labels" : active.finalizer !== (form === "acts" ? "commit_acts" : "commit_graph"))
+			return await reject(`This operation requires ${op.relabel ? "commit_labels" : active.finalizer}.`);
+		const records = await new SidecarStore(() => op.session.file, op.session.id).load();
+		if (records.some(record => record.id === `${op.job}:map`)) return { content: text("Map saved."), control: { terminate: true } };
+		const done = await progress(api, ctx, op.job);
+		const inspected = new Set([...done.inspected, ...[...feed.byRef.keys()].filter(ref => ref.startsWith(`mom-${op.job}:`))]);
+		const graph = state.checkpoint?.graph ?? emptyGraph();
+		const unresolved = new Set(state.unresolvedNotices);
+		if (state.checkpoint?.note) unresolved.add(noticeKey(state.checkpoint.note));
+		let next;
+		try {
+			if (form === "labels") {
+				const payload = check("commit_labels", call?.arguments ?? _args) as { labels: { id: string; label: string; state?: "active" | "parked" }[]; retired?: { id: string; reason: string }[] };
+				const work = graph.nodes.filter(isEndeavor), byId = new Map(payload.labels.map(item => [item.id, { label: item.label.trim(), state: item.state }]));
+				const retired = new Map((payload.retired ?? []).map(item => [item.id, item.reason.trim()]));
+				const decided = new Set([...byId.keys(), ...retired.keys()]);
+				const unknown = [...decided].filter(id => !work.some(node => node.id === id));
+				if (unknown.length || decided.size !== byId.size + retired.size)
+					throw new Error(`Unknown or repeated work ID: ${unknown.join(", ") || [...decided].join(", ")}. Supply each work ID at most once, either with a label or as retired.`);
+				const dropped = new Set(retired.keys());
+				// A repair fixes labels that describe the conversation, never labels that describe the work:
+				// a model rewriting good history is how "Review pi-delegate and pi-tether…" became "Check
+				// compilation". And a label must name its own work — one sharing no content word with the
+				// intent is invented, not written.
+				const settled = work.filter(node => dropped.has(node.id) && node.state === "settled").map(node => node.id);
+				if (settled.length) throw new Error(`Finished records are not retirable: ${settled.join(", ")}. Give each a label instead.`);
+				for (const node of work) {
+					const wanted = byId.get(node.id);
+					if (!wanted || wanted.label === node.label) continue;
+					if (!CONVERSATION_LABEL.test(node.label)) throw new Error(`${node.id} keeps its saved label ${JSON.stringify(node.label)}: it describes the work, not the conversation.`);
+					const intent = words(node.intent);
+					if (intent.size && ![...words(wanted.label)].some(word => intent.has(word)))
+						throw new Error(`${node.id}: label ${JSON.stringify(wanted.label)} names nothing in this work's intent. Write a label that describes it.`);
+				}
+				// Retiring is structural too: never a node whose unfinished work would be orphaned, and the
+					// retired node's own quote survives as evidence on its surviving parent.
+				for (const node of work) if (dropped.has(node.id)) {
+					const orphan = graph.nodes.find(child => child.parent === node.id && isEndeavor(child) && child.state !== "settled" && !dropped.has(child.id));
+					if (orphan) throw new Error(`${node.id} still holds unfinished work ${orphan.id}; finish or reparent it first.`);
+				}
+				const landing = new Map<string, string | null>();
+				for (const node of work) if (dropped.has(node.id)) landing.set(node.id, node.parent);
+				const nodes: GraphNode[] = [];
+				for (const node of graph.nodes) {
+					if (dropped.has(node.id)) {
+						const quote = clip(node.intent || node.label, 1200);
+						if (quote) nodes.push({ ...node, parent: landing.get(node.id) ?? null, kind: "observation", state: "active",
+							label: clip(quote, 160), observed: clip(quote, 2400) });
+						continue;
+					}
+					const parent = node.parent && dropped.has(node.parent) ? landing.get(node.parent) ?? null : node.parent;
+					const wanted = byId.get(node.id);
+					nodes.push({ ...node, parent, ...(isEndeavor(node) && wanted ? { label: wanted.label } : {}),
+						...(isEndeavor(node) && wanted?.state && wanted.state !== node.state ? { state: wanted.state } : {}) });
+				}
+				// A retired node must not leave focus on nothing: hand it to the latest-sourced unfinished
+					// work, which is the work the user actually asked for, and unpark it — a junk node that
+					// stole focus had parked the real one. No other node's state changes: the retired node
+					// displaced nothing, so parking a sibling would be a fresh error.
+				let focus = graph.focus;
+				if (focus && dropped.has(focus)) {
+					const latest = [...nodes].filter(node => isEndeavor(node) && ["active", "parked"].includes(node.state))
+						.sort((a, b) => sourceAt(b, known) - sourceAt(a, known) || a.id.localeCompare(b.id))[0];
+					focus = latest?.id ?? landing.get(focus) ?? graph.purpose ?? null;
+					const target = focus ? nodes.find(node => node.id === focus) : undefined;
+					if (target && isEndeavor(target) && target.state === "parked") nodes[nodes.indexOf(target)] = { ...target, state: "active" };
+				}
+				// You cannot be working on a child of deferred work: whatever holds the current focus is in
+					// progress. Structure, not a model judgment — a parked umbrella above active work is a map error.
+				for (let ancestor = focus ? nodes.find(node => node.id === focus)?.parent ?? null : null; ancestor;) {
+					const node = nodes.find(each => each.id === ancestor);
+					if (!node) break;
+					if (isEndeavor(node) && node.state === "parked") nodes[nodes.indexOf(node)] = { ...node, state: "active" };
+					ancestor = node.parent;
+				}
+				const updated = editGraph(graph, graph.revision, nodes.map(node => ({ op: "put_node" as const, node })),
+					graph.purpose, focus, new Set(known.keys()), state.checkpointId);
+				const labels = new Map(updated.nodes.map(node => [node.id, node.label]));
+				next = { graph: updated, note: null, resolutions: [], repairs: [], unfinished: (state.checkpoint?.unfinished ?? [])
+					.filter(item => !dropped.has(item.node)).map(item => ({ ...item, label: labels.get(item.node) ?? item.label })) };
+			} else if (form === "acts") {
+				// Mode-owned apply (docs/map-modes.md, M5): the model labeled fragments, host code
+				// derives every write. The host then validates its own result like any other commit.
+				const payload = (call?.arguments ?? _args) as { answer?: unknown } | undefined;
+				const events = feed.events.filter(event => newRefs.has(event.ref));
+				if (!op.candidates) throw new Error("This operation has no staged fragments; prepare a new act_labels operation.");
+				const derived = ACT_LABELS_MODE.apply!({ prior: graph, candidates: op.candidates, committed: payload, known, events });
+				if (derived.declined.length) throw new Error(derived.declined.join("; "));
+				if (typeof payload?.answer === "string") answer = payload.answer;
+				const before = new Map(graph.nodes.map(node => [node.id, node]));
+				const upsertNodes = derived.graph.nodes.filter(node => JSON.stringify(before.get(node.id)) !== JSON.stringify(node));
+				next = acceptGraph({ upsertNodes, focus: derived.graph.focus }, graph, state.checkpointId, known, newRefs, inspected, op.question, Boolean(op.trigger), unresolved);
+				const live = new Map(next.graph.nodes.map(node => [node.id, node]));
+				const unfinished = new Map((state.checkpoint?.unfinished ?? [])
+					.filter(item => {
+						const node = live.get(item.node);
+						return item.disposition !== "resolved" && ["active", "parked"].includes(node?.state ?? "") && Boolean(node && !isObsoleteParkedWork(node));
+					})
+					.map(item => [item.node, { ...item, label: live.get(item.node)!.label }]));
+				for (const item of next.unfinished) unfinished.set(item.node, item);
+				next.unfinished = [...unfinished.values()];
+				if (!Check(Unfinished, next.unfinished)) throw new Error("Unfinished obligations exceed the checkpoint contract; no obligations were discarded.");
+			} else {
+				const args = check("commit_graph", call?.arguments ?? _args);
+				if (typeof args?.answer === "string") answer = args.answer;
+				// acceptGraph rejects an empty commit on a cold graph or with an unanswered question.
+				next = acceptGraph(args, graph, state.checkpointId, known, newRefs, inspected, op.question, Boolean(op.trigger), unresolved);
+			}
+			// A graph-identical commit closes nothing: it keeps the saved unfinished declarations rather than clearing them.
+			if (state.checkpoint && JSON.stringify(next.graph) === JSON.stringify(graph)) {
+				next = { ...next, unfinished: state.checkpoint.unfinished ?? [] };
+				if (op.leadUnreadable && !next.note && !next.resolutions.length) throw new Error("A commit that changes nothing cannot certify unreadable lead evidence.");
+			}
+		} catch (error) {
+			await update(api, ctx, op.job, doc => { doc.rejections++; });
+			return await reject(`Graph transaction rejected; last checkpoint unchanged. ${String(error)}`);
+		}
+		// A graph-identical acceptance still advances durable evidence coverage: a cursor record over the latest full checkpoint.
+		const resolutionKeys = new Set(next.resolutions.map(item => `${item.riskClass}:${item.target}`));
+		const pendingNotice = state.checkpoint?.note && !resolutionKeys.has(noticeKey(state.checkpoint.note)) ? state.checkpoint.note : null;
+		// Advice stays on Mom's surface. Delivery never adds it to lead context.
+		const effectiveNote = next.note ? { ...next.note, nextRequest: true } : pendingNotice;
+		const material = !state.checkpoint || JSON.stringify(next.graph) !== JSON.stringify(graph)
+			|| JSON.stringify(effectiveNote) !== JSON.stringify(state.checkpoint.note ?? null)
+			|| JSON.stringify(next.unfinished) !== JSON.stringify(state.checkpoint.unfinished ?? []);
+		const retried = op.retryGap ? state.gaps.find(gap => gap.id === op.retryGap!.id) : undefined;
+		const range = (refs: string[]) => {
+			const events = refs.map(ref => feed.byRef.get(ref));
+			if (!events.length || events.some(event => !event)) throw new Error("Mom cannot retry a skipped range because its recorded sources are unreadable.");
+			return { firstRef: events[0]!.ref, lastRef: events.at(-1)!.ref, count: events.length };
+		};
+		const gapUpdate = !op.retryGap ? {} : op.retryGap.remaining.length && retried
+			? { gap: { action: "open", ...retried, ...range(op.retryGap.remaining) } } : { gap: { action: "resolved", id: op.retryGap.id } };
+		const resolutionUpdate = { ...(resolutionKeys.size ? { resolvedNotices: [...resolutionKeys] } : {}), ...(op.auditedGaps?.length ? { resolvedGaps: op.auditedGaps } : {}) };
+		const cut = op.cut!, at = Date.now(), agent = await api.agent(ctx);
+		const write = async (data: Record<string, unknown>, failure: string) => {
+			try { await store.append("map", data, `${op.job}:map`); } catch (error) { throw new Error(`${failure}: ${String(error)}`); }
+		};
+		{
+			if (material) {
+				const checkpoint: Checkpoint = { sessionId: op.session.id, graph: next.graph, change: graphChange(state.checkpoint?.graph ?? emptyGraph(), next.graph),
+					note: effectiveNote, unfinished: next.unfinished, cut, at, model: agent.model ? `${agent.model.provider}/${agent.model.modelId}` : "" };
+				if (!isCheckpoint(checkpoint)) return await reject("Host-derived checkpoint is invalid; last checkpoint unchanged.");
+				await write({ snapshot: checkpoint, failure: null, ...gapUpdate, ...resolutionUpdate, ...(op.screen ? { screen: op.screen } : {}) }, "Mom could not write her state beside the session");
+			} else {
+				if (!state.checkpointId) throw new Error("Mom cannot advance evidence coverage without a saved sidecar checkpoint.");
+				await write({ base: state.checkpointId, cut, failure: null, ...gapUpdate, ...resolutionUpdate, ...(op.screen ? { screen: op.screen } : {}) }, "Mom could not advance her state beside the session");
+			}
+		}
+		worlds.delete(`${op.job}:${op.step}`);
+		await accepted(engine, api, ctx, op, answer);
+		return { content: text("Map saved."), control: { terminate: true } };
+	}), prepareArguments: (args: unknown) => { try { return validateToolArguments(form === "acts" ? actLabelsTool() as any : form === "labels" ? labelsDefinition as any : { ...definition("commit_graph") } as any,
+		{ type: "toolCall", id: "check", name: form === "acts" ? "commit_acts" : form === "labels" ? "commit_labels" : "commit_graph", arguments: JSON.parse(JSON.stringify(args ?? {})) }) as any; } catch { return {} as any; } } });
+
+	const answer = () => tool(definition("answer_question"), async (args, op, api, ctx) => {
+		if (!op.question || typeof args.answer !== "string" || !args.answer.trim()) throw new Error("An explicit question and nonempty answer are required.");
+		await accepted(engine, api, ctx, op, args.answer);
+		return { content: text("Answer recorded. Pending evidence has not been marked reviewed."), control: { terminate: true } };
+	});
+
+	const inspect = tool({ ...definition("inspect_evidence") }, async (args, op, api, ctx) => {
+		const { feed, known, missing, state } = await world(op);
+		if (typeof args.ref !== "string" || !Number.isSafeInteger(args.offset) || args.offset < 0 || !Number.isSafeInteger(args.limit) || args.limit < 1 || args.limit > 24000) throw new Error("Invalid evidence request.");
+		if (args.ref.startsWith("node:") && op.mode !== "audit") {
+			const node = state.checkpoint?.graph.nodes.find(node => node.id === args.ref.slice(5));
+			if (!node) throw new Error(`Unknown saved node: ${args.ref}`);
+			const value = JSON.stringify(node);
+			return { content: text(JSON.stringify({ ref: args.ref, authority: "Saved interpretation, not original evidence. Cite its sources, not this node reference.",
+				offset: args.offset, totalChars: value.length, nextOffset: args.offset + args.limit < value.length ? args.offset + args.limit : null,
+				text: value.slice(args.offset, args.offset + args.limit) })) };
+		}
+		if (op.section?.sources?.[args.ref]) args = { ...args, ref: op.section.sources[args.ref] };
+		const gone = typeof args.ref === "string" && !known.has(args.ref) ? missing.get(args.ref.slice(0, args.ref.indexOf(":"))) : undefined;
+		if (gone) return { content: text(JSON.stringify({ ref: args.ref, error: `Error: ENOENT: no such file or directory, open '${gone}'`,
+			instruction: "The original file is unavailable. Continue with supplied evidence; do not infer unseen contents or repeat this read." })), isError: op.mode === "audit" };
+		const done = await progress(api, ctx, op.job);
+		if (op.mode === "audit") {
+			const ref = known.has(args.ref) ? args.ref : sourceSuggestion(args.ref, known.keys()) ?? args.ref;
+			if (!known.has(ref)) {
+				const error = `Unknown source: ${args.ref}. Copy an exact source pointer from the supplied evidence (session-id:entry-id, with any block suffix). A session ID alone is not a source. Do not invent an entry ID.`;
+				if (done.repaired) throw new Error(error);
+				await update(api, ctx, op.job, doc => { doc.repaired = true; });
+				return { content: text(error), isError: true };
+			}
+			const key = JSON.stringify([ref, args.offset, args.limit]);
+			if (done.auditReads.includes(key)) throw new Error("Thread-map audit repeated an evidence page.");
+			await update(api, ctx, op.job, doc => { doc.auditReads.push(key); });
+			try { return { content: text(JSON.stringify({ ...await feed.lookup(ref, args.offset, args.limit), pairedRef: feed.pairedSource(ref) })) }; }
+			catch (error) {
+				if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+				return { content: text(JSON.stringify({ ref, error: String(error), instruction: "The original file is unavailable. Continue with supplied evidence; do not infer unseen contents or repeat this read." })), isError: true };
+			}
+		}
+		const strict = Boolean(op.trigger);
+		let ref = args.ref;
+		if (strict) {
+			ref = feed.byRef.has(ref) ? ref : sourceSuggestion(ref, feed.byRef.keys()) ?? ref;
+			const key = JSON.stringify([ref, args.offset, args.limit]);
+			if (done.auditReads.includes(key)) throw new Error("Thread-map reconciliation repeated an evidence page.");
+			await update(api, ctx, op.job, doc => { doc.auditReads.push(key); });
+		}
+		const paired = feed.pairedSource(ref);
+		// Either entry point supplies the pair within one page's character budget.
+		const companion = paired && !done.inspected.includes(paired) && args.limit > 1 ? await read(feed, paired, 0, Math.floor(args.limit / 2), strict) : undefined;
+		const available = args.limit - (companion && "text" in companion ? companion.text.length : 0);
+		const results = [await read(feed, ref, args.offset, available, strict)];
+		if (companion) results.push(companion);
+		const read_ = results.filter(result => !("error" in result)).map(result => result.ref);
+		await update(api, ctx, op.job, doc => { for (const r of read_) if (!doc.inspected.includes(r)) doc.inspected.push(r); });
+		return { content: text(JSON.stringify({ results })) };
+	});
+
+	const search = tool(definition("search_history"), async (args, op, _api, ctx) => {
+		const { feed } = await world(op);
+		const query = validateSearchQuery(args.query);
+		return { content: text(JSON.stringify({ ...await feed.search(query, AbortSignal.any([AbortSignal.timeout(120000), ...(ctx?.abortSignal ? [ctx.abortSignal] : [])]), op.question ?? query), limit: 5 })) };
+	});
+
+	const recordDefinition = { name: "record_thread_map", description: "Return exactly one source-backed chapter state for this section of the independent thread map.",
+		constrainedSampling: { type: "json_schema", strict: "prefer" }, parameters: Type.Object({ states: Type.Array(chapterState) }, { additionalProperties: false }) };
+	const placeholder = { states: [{ chapter: "", goal: [], decisions: [], artifacts: [], deadEnds: [], openQuestions: [] }] };
+	const record = { ...tool(recordDefinition, async (_args, op, api, ctx) => {
+		if (op.mode !== "audit" || !op.section) throw new Error("record_thread_map belongs to a thread-map audit step.");
+		const { calls } = await operationContext(api, ctx);
+		let args: any;
+		try { args = validateToolArguments(recordDefinition as any, { type: "toolCall", id: "check", name: "record_thread_map", arguments: JSON.parse(JSON.stringify(calls.find(call => call.id === api.callId)?.arguments ?? _args)) }); }
+		catch (error) {
+			if (calls.filter(call => FINALIZERS.has(call.name)).length >= 2) throw new Error(`Mom could not finalize after one repair. ${error instanceof Error ? error.message : String(error)}`);
+			return { content: text(`${error instanceof Error ? error.message : String(error)} Correct all reported defects and resubmit once.`), isError: true };
+		}
+		const { known, feed } = await world(op);
+		const canonical = (ref: string) => {
+			ref = op.section?.sources?.[ref] ?? ref;
+			const observed = feed.byRef.get(ref);
+			if (observed?.actor === "mom") known.set(ref, observed);
+			return known.has(ref) ? ref : sourceSuggestion(ref, known.keys()) ?? ref;
+		};
+		const map = args as Static<typeof threadMap>;
+		const sourceMetadata: Record<string, Pick<FeedEvent, "at" | "actor" | "kind">> = {};
+		const errors: string[] = [];
+		if (!Check(threadMap, map)) errors.push("Invalid thread-map chapter state.");
+		else {
+			const ids = op.section.chapterIds;
+			if (map.states.length !== ids.length || ids.some(id => !map.states.some(s => s.chapter === id))) errors.push("Thread-map audit omitted or duplicated a chapter.");
+			for (const state of map.states) for (const field of ITEM_FIELDS) for (const entry of state[field]) {
+				entry.sources = entry.sources.map(canonical);
+				for (const ref of entry.sources) {
+					const event = known.get(ref);
+					if (!event) errors.push(`Unknown source: ${ref}.`);
+					else sourceMetadata[ref] = { at: event.at, actor: event.actor, kind: event.kind };
+				}
+				if (entry.sources.length && entry.sources.every(ref => known.get(ref)?.kind === "compaction")) errors.push(`Summary-only claim on ${entry.sources.join(", ")}: ${entry.text}`);
+			}
+		}
+		const done = await progress(api, ctx, op.job);
+		if (errors.length && !done.repaired) {
+			await update(api, ctx, op.job, doc => { doc.repaired = true; });
+			return { content: text(`${errors.join("\n")} Inspect original evidence if needed, then resubmit once. Copy source IDs exactly. Every item needs a non-summary source; omit unsupported assertions rather than treating summary claims as facts.`), isError: true };
+		}
+		if (errors.length) {
+			if (errors.some(error => /^(Invalid thread-map|Thread-map audit omitted)/.test(error))) throw new Error(`Thread-map audit rejected; saved map retained. ${errors.join("\n")}`);
+			for (const state of map.states) for (const field of ITEM_FIELDS) state[field] = state[field]
+				.map(entry => ({ ...entry, sources: entry.sources.filter(ref => known.has(ref)) }))
+				.filter(entry => entry.sources.some(ref => known.get(ref)?.kind !== "compaction"));
+		}
+		return { content: text(`Chapter state recorded.\n${JSON.stringify({ actor: op.section.actor, sourceMetadata, ...map })}`), control: { terminate: true } };
+	}), prepareArguments: (args: unknown) => { try { validateToolArguments(recordDefinition as any, { type: "toolCall", id: "check", name: "record_thread_map", arguments: JSON.parse(JSON.stringify(args ?? {})) }); return args as any; } catch { return placeholder as any; } } };
+
+	/** `mom_begin`: every operation starts here, as a sole call. */
+	const beginTool = durable.defineTool({ name: BEGIN, replay: "safe", executionMode: "sequential", outputLimits: WHOLE,
+		description: "Start the operation this message asks for: it reads the new lead activity or the request, settles your previous operation, and returns the evidence to review (or says there is nothing to do). Call it first, alone, once per message.",
+		parameters: Type.Object({}, { additionalProperties: false }) as any,
+		execute: (_args: unknown, api: Durable.ToolExecutionApi, ctx: any) => begin(engine, api, ctx) });
+
+	/**
+	 * The model sees only the current operation: messages from its start (her slice keeps earlier ones in
+	 * storage), with a delivery or request shown as a short prompt and a step's header removed.
+	 */
+	const prompt = (text: string) => {
+		const start = decodeStart(text);
+		if (start?.kind === "delivery") return "The lead's session recorded new activity. Call mom_begin.";
+		if (start?.kind === "request") return start.request.kind === "question" ? `The user asks: ${start.request.question}\nCall mom_begin.`
+			: start.request.kind === "relabel" ? "The user requested a repair of saved work labels. Call mom_begin." : "The user's session sent a request. Call mom_begin.";
+		return decodeOperation(text).text;
+	};
+	const textOf = (message: any) => typeof message.content === "string" ? message.content : message.content.filter((part: any) => part.type === "text").map((part: any) => part.text).join("");
+	const REPAIR_PREFIX = "No finalizer was executed.";
+	const repair = (header: OperationHeader) => `${REPAIR_PREFIX} Review the supplied evidence and finish with ${header.question ? "answer_question" : header.relabel ? "commit_labels" : modeFor(header.mapMode).finalizer} as a sole direct call. Your previous text did not save any changes.`;
+/** Mom's own tool surface. A stale or foreign slice configuration must never hand her native
+ *  filesystem, shell or editor tools: a small model given those leaves the operation and wanders.
+ *  The extension enforces its own boundary rather than trusting the allowlist it was given. */
+const MOM_TOOL_NAMES = new Set([BEGIN, "commit_graph", "commit_acts", "commit_labels", "answer_question", "record_thread_map", "inspect_evidence", "search_history"]);
+	const RELABEL_PROMPT = "You are Mom repairing her saved work map, not processing new activity or answering conversation questions. First call mom_begin alone. Then read its work list and call commit_labels once. Give a decision only for the work that needs one: a concise, meaningful label to keep it, or retired with a short reason. An ID you leave out keeps its saved label.\n\n\n\nMom tracks only durable, multi-turn things. Retire work that is not: a status or progress question (\"where are we?\", \"is it in place now?\", \"were those labels from act mode or commit mode\"), a one-off meta question, or an instruction the next turn fully satisfied. Keep genuine multi-turn work even when it is phrased as a question (\"What else is fucking idiotic in this stack?\" is a real audit request). Never retire settled work, or work that still holds unfinished work — give those a label instead.\n\n\n\nA kept work item may also carry state: active when it is being worked on now, parked when it is deliberately deferred. Set active for work in progress, including an umbrella initiative whose child is current. Never mark work settled here — a completion needs its own evidence. Base every label on that work's intent and observed outcome; do not copy terminal markup or invent new work. Never call other tools, and never alter IDs, sources, or notes.";
+
+	const hooks = [durable.hook(durable.GenerationTask, {
+		async beforeRequest(request, api, ctx) {
+			const startAt = request.messages.findLastIndex(message => message.role === "user" && decodeStart(textOf(message)) !== undefined);
+			// System entries (the prompt and the tool list) are positional: keep every one, drop earlier operations.
+			const messages = request.messages.filter((message, index) => index >= startAt || !["user", "assistant", "toolResult"].includes(message.role));
+			// Whether this operation already had its repair prompt: onYield, in this same generation, reads it.
+			await api.memo("mom-repaired", messages.some(message => message.role === "user" && textOf(message).startsWith(REPAIR_PREFIX)), ctx);
+			await api.memo("mom-gave-up", messages.some(message => message.role === "user" && textOf(message).startsWith(GIVE_UP)), ctx);
+			const start = startAt >= 0 ? decodeStart(textOf(request.messages[startAt]!)) : undefined;
+			const operation = await readOperation(engine, api as any, ctx);
+			const begun = messages.some(message => message.role === "toolResult" && message.toolName === BEGIN && !message.isError);
+			const header = start?.kind === "step" ? start.header : begun && operation.status === "open" ? operation.header : undefined;
+			const settings = readSettings(messages.filter(message => message.role === "system").map(textOf).join("\n"));
+			const operationMode = modeFor(header?.mapMode ?? settings.mapMode);
+			const givingUp = messages.some(message => message.role === "user" && textOf(message).startsWith(GIVE_UP));
+			const allowed = new Set(!header || givingUp ? [BEGIN] : header.mode === "audit" ? ["record_thread_map", ...(header.section?.needsInspection ? ["inspect_evidence"] : [])]
+				: header.question ? ["answer_question", "inspect_evidence", "search_history"]
+				: header.relabel ? ["commit_labels"]
+				: header.digest ? ["commit_graph"]
+				: operationMode.name === "act_labels" ? ["commit_acts"] : ["commit_graph", "inspect_evidence", "search_history"]);
+			return { messages: messages.map(message => {
+				if (message.role === "system") return { ...message,
+					...(header?.relabel && message.sections?.instructions ? { sections: { ...message.sections, instructions: RELABEL_PROMPT } } : {}),
+					// Mom's tools only. A stale slice configuration that carried native read/bash/codemode
+					// is corrected here, at the one place every request passes through.
+					...(message.toolsAdded ? { toolsAdded: message.toolsAdded.filter(tool => allowed.has(tool.name) && MOM_TOOL_NAMES.has(tool.name)) } : {}) };
+				if (message.role !== "user") return message;
+				if (typeof message.content === "string") return { ...message, content: prompt(message.content) };
+				return { ...message, content: message.content.map((part: any) => part.type === "text" ? { ...part, text: prompt(part.text) } : part) };
+			}) };
+		},
+		/**
+		 * An operation that ends without a finalizer gets one repair prompt; an update that ends again without
+		 * one is a failed turn, which oven retries.
+		 */
+		async onYield(_answer, api, ctx) {
+			const op = await readOperation(engine, api as any, ctx);
+			if (op.status !== "open" || !op.header || !["update", "ask"].includes(op.header.mode)) return undefined;
+			if (!await api.memo<boolean>("mom-repaired", ctx)) return { continue: repair(op.header) };
+			// Ended again without a finalizer: a hook cannot fail the turn, a tool result can. mom_begin fails the operation.
+			return await api.memo<boolean>("mom-gave-up", ctx) ? undefined : { continue: GIVE_UP };
+		},
+		/** An operation her tools ended as failed (a rejection after repair, or her own tooling) fails the turn. */
+		async afterTools(_assistant, _results, api, ctx) {
+			const op = await readOperation(engine, api as any, ctx);
+			if (op.fault) throw new Error(op.fault);
+		},
+	})];
+
+	// Her operations each start a fresh context (the hook above): summarizing the stored history would only spend model calls.
+	hooks.push(durable.hook(durable.CompactionTask, { beforeCompact: () => ({ decline: true as const }) }));
+
+	// `mom-ask` only replaces her finalizers with their question variants; `mom` carries everything else.
+	if (answering) return durable.defineExtension({ name: "mom-ask", tools: [finalize(), finalize("acts"), answer()] });
+	return durable.defineExtension({
+		name: "mom",
+		tools: [beginTool, finalize(), finalize("acts"), finalize("labels"), inspect, search, record],
+		hooks,
+	});
+}
+
+export default function mom(durable: typeof Durable): Durable.Extension { return momExtension(durable, false); }

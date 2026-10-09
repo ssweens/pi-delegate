@@ -11,12 +11,15 @@ const root = mkdtempSync(join(tmpdir(), "pi-delegate-install-"));
 const cli = join(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "bundle/cli.js");
 const env = { ...process.env, HOME: root, PI_CODING_AGENT_DIR: join(root, "agent"), PI_OFFLINE: "1", PI_TELEMETRY: "0" };
 const manifest = JSON.parse(readFileSync(join(repo, "package.json"), "utf8"));
+assert.equal(manifest.private, true, "local-only package must not be publishable");
+assert.deepEqual(manifest.oven?.extensions, { mom: "./src/mom/mom-tools.ts", "mom-ask": "./src/mom/mom-ask.ts" });
 const peerRange: string = manifest.peerDependencies["@earendil-works/pi-coding-agent"];
 const runtimeBinaries = ["dist/pi-acp.js", "dist/amp-acp.js"];
 const runtimeModule = "dist/acpx-runtime/runtime.js";
 const required = [
 	"package.json", "README.md", "LICENSE", "NOTICE.md", "vendor/acpx/LICENSE", "vendor/pi-acp/LICENSE",
 	"src/index.ts", "src/inspector.ts", "src/transcript.ts", "src/todo-ext.ts", "src/todo-render.ts", "src/todo.ts",
+	"src/mom/index.ts", "src/mom/mom-tools.ts", "src/mom/mom-ask.ts", "src/mom/modes.ts", "src/mom/candidate.ts", "src/mom/act-derivation.ts", "src/mom/model-picker.ts", "src/ui/activity.ts", "src/ui/panel.ts", "src/work/projection.ts",
 	"src/acp-backend.ts", "src/acp/runtime/acpx-runtime.ts", "src/acp/domain/types.ts",
 	...runtimeBinaries, runtimeModule,
 	"skills/delegation/SKILL.md", "roles/scout.md", "roles/worker.md", "roles/reviewer.md", "docs/ARCHITECTURE.md",
@@ -61,6 +64,7 @@ try {
 	assert.equal(tools.filter((name) => name === "delegate").length, 1);
 	assert.equal(tools.filter((name) => name === "delegate_ctl").length, 1);
 	assert.equal(tools.filter((name) => name === "todo").length, 1);
+	assert.equal(tools.filter((name) => name === "mom").length, 1);
 	const skill = loader.getSkills().skills.find((skill) => skill.name === "delegation"); assert(skill);
 	assert.match(readFileSync(skill.filePath, "utf8"), /Model per role/);
 	const definition = result.extensions.flatMap((extension) => [...extension.tools.values()]).find((tool) => tool.definition.name === "delegate");

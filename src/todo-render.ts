@@ -470,20 +470,22 @@ function renderFramedBlock(
  * border — and the nested tree of phases — the active phase's open tasks as
  * inner `├─`/`└─` continuation lines — as the framed body.
  */
-export function renderTodoWidgetLines(state: TodoState, theme: TodoStyler, width: number): string[] {
+export function renderTodoSectionLines(state: TodoState, theme: TodoStyler, width: number): string[] {
 	const phases = state.phases.filter((phase) => phase.tasks.length > 0);
 	const allTasks = phases.flatMap((phase) => phase.tasks);
 	const open = countOpen(allTasks);
 	if (open === 0) return [];
 
-	// Agents-panel header shape: bold-accent "Todos" + muted " · done/total",
-	// always in the top border (`Agents · N active` always carries its count).
+	// Agents-panel header shape: bold-accent "Todos" + muted " · done/total".
 	const done = allTasks.filter((task) => task.status === "completed").length;
 	const header = theme.bold(theme.fg("accent", "Todos")) + theme.fg("muted", ` · ${done}/${allTasks.length}`);
-
-	// The frame's rows give the tree its budget: `│ ` + line + ` │`.
 	const tree = renderNestedTree(state, theme, Math.max(0, width - 4), false, true);
-	return renderFramedBlock(header, tree, theme, width);
+	return [header, ...tree];
+}
+
+export function renderTodoWidgetLines(state: TodoState, theme: TodoStyler, width: number): string[] {
+	const section = renderTodoSectionLines(state, theme, width);
+	return section.length ? renderFramedBlock(section[0]!, section.slice(1), theme, width) : [];
 }
 
 // --- Tool result (framed block, scrollback) ---

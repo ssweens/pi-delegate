@@ -2,9 +2,11 @@
 import { REAL_HOME, TEST_AGENT_DIR, underRealPi } from "./setup.ts";
 import assert from "node:assert/strict";
 import { createServer, type ServerResponse } from "node:http";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { createServer as createNetServer } from "node:net";
+import { existsSync, mkdtempSync, mkdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { once } from "node:events";
 
 export function deferred<T = void>() {
@@ -78,6 +80,39 @@ export function sandbox(url: string, root = mkdtempSync(join(tmpdir(), "pi-deleg
 }
 export type Sandbox = ReturnType<typeof sandbox>;
 
+const OVEN_DIR = process.env.OVEN_DIR ?? fileURLToPath(new URL("../../../oven/", import.meta.url));
+export const OVEN_AVAILABLE = existsSync(join(OVEN_DIR, "src", "daemon.ts"));
+const freePort = () => new Promise<number>((resolve) => {
+	const server = createNetServer().listen(0, "127.0.0.1", () => {
+		const { port } = server.address() as { port: number };
+		server.close(() => resolve(port));
+	});
+});
+
+export async function startOven(root: string, agentDir: string) {
+	const port = await freePort();
+	Object.assign(process.env, {
+		XDG_CONFIG_HOME: join(root, "xdg", "config"), XDG_DATA_HOME: join(root, "xdg", "data"), XDG_STATE_HOME: join(root, "xdg", "state"),
+		XDG_CACHE_HOME: join(root, "xdg", "cache"), OVEN_URL: `http://127.0.0.1:${port}`, OVEN_PI_AGENT_DIR: agentDir,
+		OVEN_ROLES_DIR: join(root, "roles"), OVEN_LAUNCH_AGENTS_DIR: join(root, "LaunchAgents"), OVEN_SERVICE: "off", OVEN_TAILSCALE: "off", OVEN_SETUP: "off",
+	});
+	const config = join(root, "xdg", "config", "oven");
+	mkdirSync(config, { recursive: true });
+	writeFileSync(join(config, "settings.json"), JSON.stringify({ packages: [fileURLToPath(new URL("..", import.meta.url)).replace(/\/$/, "")] }));
+	const later = new Date(Date.now() + 3600_000);
+	utimesSync(join(config, "settings.json"), later, later);
+	const { startDaemon } = await import(join(OVEN_DIR, "src", "daemon.ts"));
+	const host = { tools: [], dropped: [], errors: [], async promptFor() { return ""; }, close() {} };
+	const start = () => startDaemon({ toolHost: host });
+	let daemon: any = await start(), stopped = false;
+	return {
+		get oven() { return daemon.oven; },
+		async restart() { await daemon.stop(); daemon = await start(); stopped = false; },
+		async stop() { if (!stopped) { stopped = true; await daemon.stop(); } },
+		async start() { if (stopped) { daemon = await start(); stopped = false; } },
+	};
+}
+
 /**
  * Fails the test, and then the whole test process: the test that called harness has a provider
  * listening that it never reaches its cleanup to close, which would keep the process alive forever.
@@ -100,7 +135,7 @@ function uiContext(ui: { select?: (title: string, options: string[], opts?: { si
 	};
 }
 
-export async function harness(box: Sandbox, parent?: string, hooks: { beforeNotice?: (message: any) => void; register?: (pi: any) => void; tools?: string[]; projectTrusted?: boolean; extensions?: boolean; mcp?: boolean; ui?: { select?: (title: string, options: string[], opts?: { signal?: AbortSignal }) => Promise<string | undefined> } } = {}) {
+export async function harness(box: Sandbox, parent?: string, hooks: { beforeNotice?: (message: any) => void; register?: (pi: any) => void; flags?: Record<string, string>; tools?: string[]; projectTrusted?: boolean; extensions?: boolean; mcp?: boolean; ui?: { select?: (title: string, options: string[], opts?: { signal?: AbortSignal }) => Promise<string | undefined> } } = {}) {
 	// Import after isolation: Pi and the extension resolve configuration paths on first load.
 	process.env.HOME = box.root;
 	process.env.PI_CODING_AGENT_DIR = box.agentDir;
@@ -122,6 +157,7 @@ export async function harness(box: Sandbox, parent?: string, hooks: { beforeNoti
 	const factory = (pi: any) => {
 		extensionApi = pi;
 		extension(new Proxy(pi, { get(target, key) {
+			if (key === "getFlag") return (name: string) => Object.prototype.hasOwnProperty.call(hooks.flags ?? {}, name) ? hooks.flags![name] : target.getFlag(name);
 			if (key === "registerTool") return (tool: any) => { tools.set(tool.name, tool); target.registerTool(tool); };
 			if (key === "registerCommand") return (name: string, options: any) => { commands.set(name, options); target.registerCommand(name, options); };
 			if (key === "sendMessage") return (message: any, options: any) => { hooks.beforeNotice?.(message); notices.push(message); notice.resolve(message); return target.sendMessage(message, options); };

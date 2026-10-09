@@ -3,24 +3,16 @@ import assert from "node:assert/strict";
 import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
-import { deferred, provider, sandbox, harness } from "./fixture.ts";
-
-// Mom runs in oven: this file starts a real oven in this process, on its own port and folders under the sandbox (pi-tether's test helper).
-// By URL: typechecking that fixture would follow its own sibling imports, which resolve only at run time.
-const { startOven } = await import(new URL("../../pi-tether/test/fixture.ts", import.meta.url).href);
+import { deferred, provider, sandbox, harness, OVEN_AVAILABLE, startOven } from "./fixture.ts";
 
 // Real parent/child tool protocol, sessions, reload and event bus. Only HTTP model replies are scripted.
-test("Mom batches settled worker evidence until lead cadence is due, without extra delegate work", { timeout: 30000 }, async () => {
+test("Mom batches settled worker evidence until lead cadence is due, without extra delegate work", { timeout: 30000, skip: OVEN_AVAILABLE ? false : "Oven checkout unavailable; set OVEN_DIR for this integration lane." }, async () => {
 	const api = await provider(), box = sandbox(api.url);
 	const oven = await startOven(box.root, box.agentDir);
-	const { default: tether } = await import("../../pi-tether/src/index.ts");
-	const { SidecarStore } = await import("../../pi-tether/src/sidecar.ts");
-	const { LiveFeed } = await import("../../pi-tether/src/feed.ts");
-	const h = await harness(box, undefined, { register: (pi: any) => {
-		tether(new Proxy(pi, { get(target, key) {
-			if (key === "getFlag") return (name: string) => name === "mom-model" ? "fixture/fixture" : name === "mom-interval-ms" ? "0" : target.getFlag(name);
-			return target[key];
-		} }));
+	const { SidecarStore } = await import("../src/mom/sidecar.ts");
+	const { LiveFeed } = await import("../src/mom/feed.ts");
+	const h = await harness(box, undefined, { flags: {
+		"mom-model": "fixture/fixture", "mom-interval-ms": "0", "mom-quiet-ms": "0", "mom-max-wait-ms": "0", "mom-retry-ms": "100,100,100",
 	} });
 	const gate = deferred<void>(), firstGate = deferred<void>();
 	writeFileSync(join(box.cwd, "seed.txt"), "seed");
@@ -36,9 +28,15 @@ test("Mom batches settled worker evidence until lead cadence is due, without ext
 			{ text: "Scout launched. I am continuing the main purpose." });
 		const arrived = api.script("Trace route", { text: "Exploring the boundary before changing code.", tool: { name: "read", arguments: { path: "seed.txt" } }, gate: firstGate }, { text: "Worker result: the route is understood.", gate });
 		api.onUnscripted((request) => {
+			const latest = request.messages.at(-1);
+			const latestText = typeof latest?.content === "string" ? latest.content : latest?.content?.map((block: any) => block.text).join("\n");
+			if (latest?.role === "user" && request.tools?.some((t: any) => t.function?.name === "mom_begin") && /Call mom_begin\.$/.test(latestText ?? "")) return { tool: { name: "mom_begin", arguments: {} } };
 			if (!request.tools?.some((t: any) => t.function?.name === "commit_graph")) return { text: "Lead received the worker's completion." };
-			const user = request.messages.findLast((m: any) => m.role === "user");
-			const input = JSON.parse(typeof user.content === "string" ? user.content : user.content.map((b: any) => b.text).join("\n"));
+			const textOf = (message: any) => typeof message?.content === "string" ? message.content : message?.content?.map((block: any) => block.text).join("\n");
+			const begin = request.messages.flatMap((message: any) => message.role === "assistant" ? message.tool_calls ?? [] : []).findLast((call: any) => call.function?.name === "mom_begin");
+			const begun = begin && request.messages.find((message: any) => message.role === "tool" && message.tool_call_id === begin.id);
+			const user = request.messages.findLast((message: any) => message.role === "user");
+			const input = JSON.parse(textOf(begun ?? user));
 			motherRequests.push(input);
 			const ref = /\[src:([^\]]+)\]/.exec(input.newEvents)?.[1] ?? input.original.ref;
 			return { tool: { name: "commit_graph", arguments: { revision: input.graph.revision, purpose: "main", focus: "main", note: null,
