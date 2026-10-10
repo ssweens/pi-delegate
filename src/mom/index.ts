@@ -271,7 +271,10 @@ export function installMom(pi: ExtensionAPI) {
 				if (command === "relabel") { await request({ kind: "relabel" }); return; }
 				throw new Error("Use /mom, overview, status, map, graph, detail, correct, source, log, refresh, relabel, pause, or resume.");
 			} catch (error) {
-				if (commandEpoch === epoch) { failure(error); context.ui.notify("Mom couldn't complete that request. Your last saved view is unchanged. Use /mom detail for the reason and /mom for your place in the work.", "error"); }
+				if (commandEpoch === epoch) {
+					failure(error);
+					context.ui.notify(`Mom request failed: ${updateErrorSummary(String(error))}. The saved map is unchanged; /mom detail has full diagnostics.`, "error");
+				}
 			}
 		},
 	});

@@ -8,9 +8,10 @@ import { settingsFile } from "../src/settings-file.ts";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MOM_TOOLS, OPERATION_PROMPT, deciderFor, momConfiguration, type SessionIdentity } from "../src/mom/slice.ts";
+import { MOM_TOOLS, OPERATION_PROMPT, assertSliceSupportsMode, deciderFor, momConfiguration, type SessionIdentity } from "../src/mom/slice.ts";
 import { COMMIT_GRAPH_MODE, DEFAULT_MODE, MODES, V2_MODE, assertRunnable, modeFor, modeInstructions, modeNames, type MapMode } from "../src/mom/modes.ts";
 import { commitV2Tool } from "../src/mom/v2.ts";
+import { updateErrorSummary } from "../src/mom/status.ts";
 
 const settings: MomSettings = { bootstrap: false, decider: { url: "http://127.0.0.1:8711/v1/systemone", clear: 0.9 } };
 const identity: SessionIdentity = { cwd: "/tmp/mom-modes", sessionFile: "/tmp/mom-modes/session.jsonl", sessionId: "session" };
@@ -35,6 +36,24 @@ test("M1: choosing no mode, an empty mode, or the current mode changes nothing t
 	assert.equal(modeFor(undefined), COMMIT_GRAPH_MODE);
 	// And the mode contributes exactly MOM_PROMPT, so the model's map-maintenance rules are unchanged.
 	assert.ok(none.startsWith(MOM_PROMPT.trim() + "\n\n"));
+});
+
+test("command errors retain their concise cause", () => {
+	assert.equal(updateErrorSummary('Error: Unknown Mom mode "act_labels"; --mom-mode accepts commit_graph, v2.'), 'Unknown Mom mode "act_labels"; --mom-mode accepts commit_graph, v2.');
+});
+
+test("retired mode history is replayed without rejecting the current saved mode", async () => {
+	const { loadState } = await import("../src/mom/checkpoint.ts");
+	const read = async (...modes: string[]) => loadState({ load: async () => modes.map((mode, index) => ({ id: `mode-${index}`, sessionId: "session", type: "map", at: index + 1, data: { mode } })) } as never,
+		{ getBranch: () => [] } as never);
+	assert.equal((await read("act_labels", "commit_graph")).mode, "commit_graph", "superseded mode history is not validated as current state");
+	assert.equal((await read("act_labels")).mode, DEFAULT_MODE, "a removed last-selected mode migrates to the safe default");
+	await assert.rejects(read("unknown_mode"), /Unknown Mom mode "unknown_mode"/);
+});
+
+test("a stale Oven extension fails clearly when it lacks the selected mode's finalizer", () => {
+	assert.doesNotThrow(() => assertSliceSupportsMode("commit_graph", ["commit_v2"]));
+	assert.throws(() => assertSliceSupportsMode("v2", ["commit_v2"]), /mode v2 requires missing tool commit_v2.*Restart Oven/);
 });
 
 test("M2: an unknown mode is refused loudly and never falls back to the default", () => {

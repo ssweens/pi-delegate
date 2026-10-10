@@ -229,9 +229,9 @@ export async function loadState(store: MomStore, manager: SessionReader): Promis
 			state.inject = item.data.inject;
 		}
 		if (item.data.mode !== undefined) {
-			// A mode is in force or loudly refused: an undeclared name never silently falls back.
+			// Sidecar records are history: validate the effective mode after replay, not a superseded value.
 			if (typeof item.data.mode !== "string") throw new Error("Invalid Mom mode in her sidecar.");
-			state.mode = modeFor(item.data.mode).name;
+			state.mode = item.data.mode;
 		}
 		if (item.data.model !== undefined) {
 			// Empty means "the configured default"; anything else must be a non-empty provider/id.
@@ -298,12 +298,14 @@ export async function loadState(store: MomStore, manager: SessionReader): Promis
 	// sides read this — the lead's client and her slice in oven — so a setting saved once holds
 	// everywhere, and a value that is not valid is simply absent.
 	const globals = readMomGlobals();
+	const sessionMode = state.mode === "act_labels" ? DEFAULT_MODE : state.mode;
 	const saved = mergeGlobals(globals, { enabled: state.enabled, inject: state.inject, nudgedClasses: state.nudgedClasses,
-		mode: state.mode, model: state.model, ...(state.decider === undefined ? {} : { decider: state.decider }) });
+		mode: sessionMode, model: state.model, ...(state.decider === undefined ? {} : { decider: state.decider }) });
 	state.enabled = saved.enabled as boolean;
 	state.inject = saved.inject as boolean;
 	state.nudgedClasses = saved.nudgedClasses as ProcessRiskClass[];
-	state.mode = String(saved.mode ?? "");
+	const selectedMode = String(saved.mode ?? "");
+	state.mode = selectedMode ? modeFor(selectedMode).name : "";
 	state.model = String(saved.model ?? "");
 	state.decider = saved.decider === undefined ? undefined : String(saved.decider);
 	return state;

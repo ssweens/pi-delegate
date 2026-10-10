@@ -16,7 +16,7 @@ import type { PanelDiagnostics, PanelView } from "../ui/panel.ts";
 import { feedbackApplies, type FindingAction, type ProcessRiskClass } from "./process-health.ts";
 import { coverageProgress, presentGraph, summaryText, type WorkView } from "../ui/presentation.ts";
 import { SidecarStore } from "./sidecar.ts";
-import { deciderFor, identityOf, momConfiguration, ownerKey, type SessionIdentity } from "./slice.ts";
+import { assertSliceSupportsMode, deciderFor, identityOf, momConfiguration, ownerKey, type SessionIdentity } from "./slice.ts";
 import { readMomGlobals, writeMomGlobals, type MomGlobals } from "./globals.ts";
 import { formatElapsed, updateErrorSummary } from "./status.ts";
 import { ANCHOR } from "./anchor.ts";
@@ -116,6 +116,7 @@ export class MomClient {
 		}
 		const slice = await oven("create", { key: this.key, cwd: this.identity.cwd, copy: "none", config: momConfiguration(this.identity, flags, this.context.modelRegistry) });
 		if (slice.state === "failed" && !slice.conversation) throw new Error(`Mom's slice in oven failed (${slice.reason}): ${slice.detail}`);
+		assertSliceSupportsMode(String(flags["mom-mode"] ?? ""), slice.missingTools ?? []);
 		this.slice = slice;
 		// Notes paused before her slice followed this session stay paused.
 		if (this.state && !this.state.enabled && !slice.stopped) this.slice = await oven("stop", { slice: slice.id });

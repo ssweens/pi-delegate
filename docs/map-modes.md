@@ -187,7 +187,7 @@ replays** against `omlx/Qwen3.5-4B-MLX-4bit`: focus, current findings, abandoned
 stale-state complaint retention failed even though every operation was accepted and nine
 `commit_acts` calls landed. Accepted writes and fresh timestamps did not make the map semantically
 current — the host inferred targets and actions from prose with token matching, and that inference
-was wrong. `v2` removes the inference: the model writes the map, and the host checks structure plus any available per-node spec.
+was wrong. `v2` removes the inference: the model writes the map, and the host checks structure plus any available per-node spec. Old `.mom` sidecars remain append-only: replay ignores superseded mode values and maps a final retired `act_labels` value to the safe `commit_graph` default.
 
 `test/mom-v2.test.ts` covers map invariants, change-spec enforcement, source accumulation, and
 save/reload round trips. `test/mom-v2-live.test.ts` exercises the finalizer and decision-model

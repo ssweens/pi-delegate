@@ -58,6 +58,11 @@ export function deciderFor(flags: Record<string, string | boolean | undefined>, 
 	return { ref, ...(ref ? { classifier: resolveClassifier(registry, ref) } : {}) };
 }
 
+export function assertSliceSupportsMode(modeName: string | undefined, missingTools: readonly string[] = []): void {
+	const mode = modeFor(modeName);
+	if (missingTools.includes(mode.finalizer)) throw new Error(`Mom's Oven extension is stale: mode ${mode.name} requires missing tool ${mode.finalizer}. Restart Oven to load the current Mom tools.`);
+}
+
 export function momConfiguration(identity: SessionIdentity, flags: Record<string, string | boolean | undefined>, registry?: ClassifierRegistry) {
 	const model = String(flags["mom-model"] || DEFAULT_MODEL);
 	// The mode is resolved here, at configuration time, so a bad --mom-mode fails loudly at start
