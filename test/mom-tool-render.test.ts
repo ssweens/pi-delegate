@@ -23,10 +23,12 @@ test("collapsed Mom tool results use the activity preview instead of dumping the
 	assert.doesNotMatch(screen, /last-saved snapshot|Rules in force|\[src:/);
 });
 
-test("expanded Mom tool results retain the complete saved map", () => {
+test("expanded Mom tool results never print the saved map or source details", () => {
 	const output = "Mother thread: Review pi-delegate [review] — finished\nRules in force (2):\n    Why: Keep the map readable [src:session:rule]";
 	const rendered = momTool().renderResult({ content: [{ type: "text", text: output }], details: { overview: "Mom · up to date", preview: "Mom · up to date", expandable: true } }, { expanded: true }, theme);
-	assert.equal(rendered.render(120, 10).map((line: string) => line.trimEnd()).join("\n"), output);
+	const screen = rendered.render(120, 10).map((line: string) => line.trimEnd()).join("\n");
+	assert.equal(screen, "Mom · up to date\nSelected records and sources are available to the model, not displayed here.");
+	assert.doesNotMatch(screen, /Mother thread|Rules in force|\[src:/);
 });
 
 /** Mom's view: what she saved, with no way to ask her a question from it. */

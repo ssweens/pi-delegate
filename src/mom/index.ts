@@ -181,13 +181,13 @@ export function installMom(pi: ExtensionAPI) {
 			}, { additionalProperties: false })),
 			source: Type.Optional(Type.Object({ ref: Type.String({ minLength: 1 }), offset: Type.Optional(Type.Integer({ minimum: 0 })) }, { additionalProperties: false })) }, { additionalProperties: false }),
 		renderCall(args, theme) { return new Text(theme.fg("toolTitle", theme.bold("Mom")) + theme.fg("muted", ` · ${args.source ? "reading original evidence" : "finding our place"}`), 0, 0); },
-		renderResult(result, { expanded }, theme) {
+		renderResult(result, _options, theme) {
 			const text = result.content.filter(part => part.type === "text").map(part => part.text).join("\n");
 			const details = result.details;
 			const overview = details && typeof details === "object" && "overview" in details && typeof details.overview === "string" ? details.overview : text;
 			const preview = details && typeof details === "object" && "preview" in details && typeof details.preview === "string" ? details.preview : overview;
 			const expandable = details && typeof details === "object" && "expandable" in details && details.expandable === true;
-			return new Text(expanded ? text : `${preview}${expandable ? `\n${theme.fg("dim", "Expand for the selected records and sources.")}` : ""}`, 0, 0);
+			return new Text(`${preview}${expandable ? `\n${theme.fg("dim", "Selected records and sources are available to the model, not displayed here.")}` : ""}`, 0, 0);
 		},
 		async execute(_id, args, signal) {
 			if (args.graph && args.source) throw new Error("Choose one of graph or source.");
