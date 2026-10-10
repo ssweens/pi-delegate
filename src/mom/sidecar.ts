@@ -3,11 +3,10 @@ import { randomUUID } from "node:crypto";
 
 /** The only durable Mom record families. Map records also own cursor/failure/control state. */
 export type SidecarType = "map" | "notice" | "usage" | "injection";
-/** `control` is an input command translated to a map patch; it is never persisted as a record type. */
-export type SidecarWriteType = SidecarType | "control";
+export type SidecarWriteType = SidecarType;
 /** Every durable delivery setting. A control record names exactly one, so the sidecar can reject a
  * malformed request before it is written and a reader can apply it without guessing. */
-export const CONTROL_KEYS = ["enabled", "inject", "nudgedClasses", "mode", "model"] as const;
+export const CONTROL_KEYS = ["enabled", "inject", "nudgedClasses", "mode", "model", "decider"] as const;
 export type ControlKey = typeof CONTROL_KEYS[number];
 export interface SidecarRecord { id: string; sessionId: string; type: SidecarType; at: number; data: Record<string, any> }
 
@@ -107,13 +106,7 @@ export class SidecarStore implements MomStore {
 				if (again) return again;
 				if (this.torn) { await this.io.truncate(this.torn.file, this.torn.bytes); this.torn = undefined; }
 			}
-			if (type === "control") {
-				const keys = Object.keys(data);
-				if (keys.length !== 1 || !(CONTROL_KEYS as readonly string[]).includes(keys[0]!))
-					throw new Error(`A Mom control record needs exactly one setting: ${CONTROL_KEYS.join(", ")}.`);
-			}
-			const record: SidecarRecord = { id, sessionId: this.sessionId,
-				type: type === "control" ? "map" : type, at: Date.now(), data };
+			const record: SidecarRecord = { id, sessionId: this.sessionId, type, at: Date.now(), data };
 			await this.io.append(file, JSON.stringify(record) + "\n");
 			if (!this.seen || this.seen.file !== file) { const identity = await this.io.identity(file); if (identity) this.seen = { file, identity }; }
 			this.records!.push(record);

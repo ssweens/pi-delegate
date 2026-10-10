@@ -87,10 +87,6 @@ export function graphForModel(graph: WorkGraph) {
 
 /** Annotations are attached records, never independent work centers. */
 export const isEndeavor = (node: { kind: string }): boolean => ["feature", "theory", "postulate", "try"].includes(node.kind);
-const OBSOLETE_PARKED = /\b(?:abandoned|obsolete|superseded|deferred|resume only if|parked after)\b/i;
-/** A parked return condition remains unfinished unless its own prose explicitly retires it. */
-export const isObsoleteParkedWork = (node: Pick<GraphNode, "state" | "label" | "intent" | "observed">): boolean =>
-	node.state === "parked" && OBSOLETE_PARKED.test(`${node.label} ${node.intent} ${node.observed}`);
 
 function checkForest(nodes: ReadonlyMap<string, GraphNode>) {
 	for (const node of nodes.values()) {

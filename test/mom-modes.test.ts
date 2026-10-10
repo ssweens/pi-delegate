@@ -1,10 +1,16 @@
+import "./setup.ts";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { MOM_PROMPT, momTools } from "../src/mom/contract.ts";
-import { settingsLine, type MomSettings } from "../src/mom/engine.ts";
-import { MOM_TOOLS, OPERATION_PROMPT, momConfiguration, type SessionIdentity } from "../src/mom/slice.ts";
-import { COMMIT_GRAPH_MODE, DEFAULT_MODE, MODES, ACT_LABELS_MODE, assertRunnable, modeFor, modeInstructions, modeNames, type MapMode } from "../src/mom/modes.ts";
-import { actLabelsTool } from "../src/mom/act-derivation.ts";
+import { readSettings, settingsLine, type MomSettings } from "../src/mom/engine.ts";
+import { readMomGlobals, writeMomGlobals } from "../src/mom/globals.ts";
+import { settingsFile } from "../src/settings-file.ts";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { MOM_TOOLS, OPERATION_PROMPT, deciderFor, momConfiguration, type SessionIdentity } from "../src/mom/slice.ts";
+import { COMMIT_GRAPH_MODE, DEFAULT_MODE, MODES, V2_MODE, assertRunnable, modeFor, modeInstructions, modeNames, type MapMode } from "../src/mom/modes.ts";
+import { commitV2Tool } from "../src/mom/v2.ts";
 
 const settings: MomSettings = { bootstrap: false, decider: { url: "http://127.0.0.1:8711/v1/systemone", clear: 0.9 } };
 const identity: SessionIdentity = { cwd: "/tmp/mom-modes", sessionFile: "/tmp/mom-modes/session.jsonl", sessionId: "session" };
@@ -34,7 +40,7 @@ test("M1: choosing no mode, an empty mode, or the current mode changes nothing t
 test("M2: an unknown mode is refused loudly and never falls back to the default", () => {
 	assert.throws(() => modeFor("freeform"), /Unknown Mom mode "freeform"/);
 	// The message names the flag and the declared names so a typo is fixable from the error alone.
-	assert.throws(() => modeFor("nonsense"), /--mom-mode accepts commit_graph, act_labels/);
+	assert.throws(() => modeFor("nonsense"), /--mom-mode accepts commit_graph, v2/);
 	assert.throws(() => momConfiguration(identity, { ...flags, "mom-mode": "nonsense" }), /Unknown Mom mode/);
 });
 
@@ -48,7 +54,7 @@ test("M2: the registry is well formed — unique lowercase_underscore names, eac
 		assert.match(mode.finalizer, /^[a-z][a-z0-9_]*$/, `${mode.name} finalizer is not lowercase_underscore`);
 		assert.equal(typeof mode.turns, "number");
 	}
-	assert.deepEqual(modeNames(), ["commit_graph", "act_labels"]);
+	assert.deepEqual(modeNames(), ["commit_graph", "v2"]);
 });
 
 test("M3: a mode needing more than one model turn cannot be selected", () => {
@@ -66,34 +72,22 @@ test("M4: the current mode's finalizer is a tool the registry actually provides"
 	for (const mode of MODES) assert.ok(mode.turns >= 1, `${mode.name} must declare at least one turn`);
 });
 
-test("M5: act_labels is selectable, declares its own apply, and its finalizer is registered", () => {
-	const mode = modeFor("act_labels");
-	assert.equal(mode, ACT_LABELS_MODE);
-	assert.equal(mode.finalizer, "commit_acts");
-	assert.equal(typeof mode.apply, "function", "a mode whose model emits acts must supply apply");
+test("M5: v2 is selectable, declares its own apply, and its finalizer is registered", () => {
+	const mode = modeFor("v2");
+	assert.equal(mode, V2_MODE);
+	assert.equal(mode.finalizer, "commit_v2");
+	assert.equal(typeof mode.apply, "function", "a mode whose model emits its own edits must supply apply");
 	// A mode owns its payload: momTools() keeps its small shared contract and does not grow it.
-	assert.equal(actLabelsTool().name, "commit_acts");
-	assert.ok(!momTools().some(tool => tool.name === "commit_acts"), "mode-owned tools stay out of the shared surface");
+	assert.equal(commitV2Tool().name, "commit_v2");
+	assert.ok(!momTools().some(tool => tool.name === "commit_v2"), "mode-owned tools stay out of the shared surface");
 });
 
 test("M5: the transaction mode needs no apply; a non-transaction mode does", () => {
 	assert.equal(COMMIT_GRAPH_MODE.apply, undefined, "a transaction mode uses the default acceptGraph path");
 	for (const mode of MODES) {
 		if (mode.finalizer === "commit_graph") continue;
-		assert.equal(typeof mode.apply, "function", `${mode.name} emits ${mode.finalizer} and must derive the graph in host code`);
+		assert.equal(typeof mode.apply, "function", `${mode.name} emits ${mode.finalizer} and must apply its own payload`);
 	}
-});
-
-test("M5: act_labels derives the graph from acts alone — the model names no node", () => {
-	const graph = {
-		revision: 1, motherThread: "root", purpose: "root", focus: "root", edges: [],
-		nodes: [{ id: "root", kind: "feature", parent: null, label: "Ship it", state: "active", intent: "Ship it", observed: "", actor: "user", sources: ["u1"] }],
-	} as never;
-	const candidate = { id: "c01", kind: "new_work" as const, source: "u1", source_role: "user" as const, quote: "Add a second pane", prior_ref: null, proposed: null };
-	const known = new Map([["u1", { ref: "u1", at: "t", actor: "lead", kind: "user", text: "Add a second pane" }]]);
-	const result = ACT_LABELS_MODE.apply!({ prior: graph, candidates: [candidate], committed: { acts: [{ id: "c01", act: "request", label: "Add a second pane" }] }, known, events: [...known.values()] as never });
-	assert.deepEqual(result.declined, []);
-	assert.ok(result.graph.nodes.some(n => /second pane/.test(n.label) && n.kind === "feature"), "the host created the work");
 });
 
 test("the current mode's prompt is exactly MOM_PROMPT, with no mode-specific drift", () => {
@@ -108,36 +102,68 @@ test("mode is a durable setting: listed, cycled to a declared name, and carried 
 	const { CONTROL_KEYS } = await import("../src/mom/sidecar.ts");
 	initTheme("dark");
 	const saved: unknown[] = [];
-	const component = momSettings({ enabled: true, inject: false, hush: false, nudgedClasses: [], mode: "", model: "" },
+	const component = momSettings({ enabled: true, inject: false, hush: false, nudgedClasses: [], mode: "", model: "", decider: "" },
 		async change => { saved.push(change); }, () => {}, () => {});
 	const rendered = component.render(120).join("\n").replace(/\x1b\[[0-9;]*m/g, "");
 	assert.match(rendered, /Map mode/);
+	assert.match(rendered, /Decision model/);
 	assert.match(rendered, /commit_graph/);
-	// The sidecar accepts a mode control record alongside the existing ones.
-	assert.deepEqual([...CONTROL_KEYS], ["enabled", "inject", "nudgedClasses", "mode", "model"]);
-	assert.equal(modeFor("act_labels").name, "act_labels");
+	// The sidecar accepts mode and decision-model control records alongside the existing ones.
+	assert.deepEqual([...CONTROL_KEYS], ["enabled", "inject", "nudgedClasses", "mode", "model", "decider"]);
+	assert.equal(modeFor("v2").name, "v2");
 });
 
 test("Mom's model receives only bounded domain tools, never native filesystem or shell tools", () => {
 	const configured = momConfiguration(identity, flags);
 	assert.deepEqual(configured.tools, [...MOM_TOOLS]);
 	assert.ok(!configured.tools?.some(tool => ["read", "write", "edit", "bash", "codemode"].includes(tool)), "native tools let Mom leave the bounded operation");
-	assert.deepEqual(momConfiguration(identity, { ...flags, "mom-mode": "act_labels" }).tools, [...MOM_TOOLS]);
+	assert.deepEqual(momConfiguration(identity, { ...flags, "mom-mode": "v2" }).tools, [...MOM_TOOLS]);
 });
 
 test("momConfiguration honors a persisted mode: the prompt is that mode's, not the flag's", () => {
-	const configured = momConfiguration(identity, { ...flags, "mom-mode": "act_labels" });
-	const act = configured.instructions;
-	assert.ok(act.startsWith(ACT_LABELS_MODE.prompt), "the persisted mode must drive the standing instructions");
-	assert.ok(act.includes("historical catch-up") && act.includes("commit_graph"), "act_labels must define the fast thread-map catch-up path");
-	assert.ok(configured.tools?.includes("commit_graph"), "act_labels slices need the transaction finalizer for historical catch-up");
-	assert.ok(act !== momConfiguration(identity, flags).instructions, "switching mode must change what the model sees");
+	const configured = momConfiguration(identity, { ...flags, "mom-mode": "v2" });
+	const v2 = configured.instructions;
+	assert.ok(v2.startsWith(V2_MODE.prompt), "the persisted mode must drive the standing instructions");
+	assert.ok(v2.includes("commit_v2"), "v2 must state its own finalizer");
+	assert.ok(configured.tools?.includes("commit_v2"));
+	assert.ok(v2 !== momConfiguration(identity, flags).instructions, "switching mode must change what the model sees");
 	// M1 still holds: the default path is unchanged (asserted byte-for-byte above, against itself).
+});
+
+test("a global setting applies when each session loads it, not only in the transcript that saved it", async () => {
+	const { loadState } = await import("../src/mom/checkpoint.ts");
+	const { SidecarStore } = await import("../src/mom/sidecar.ts");
+	const dir = await mkdtemp(join(tmpdir(), "pi-delegate-mom-global-sessions-"));
+	const file = settingsFile();
+	const saved = await readMomGlobals(file);
+	const session = async (name: string, legacy: Record<string, unknown>) => {
+		const path = join(dir, `${name}.jsonl`);
+		await writeFile(path, "{}\n");
+		const store = new SidecarStore(() => path, name);
+		if (Object.keys(legacy).length) await store.append("map", { ...legacy });
+		return loadState(store, { getBranch: () => [] } as never);
+	};
+	try {
+		// Two sessions that each saved something different, the old way.
+		assert.equal((await session("one", { mode: "commit_graph" })).mode, "commit_graph");
+		assert.equal((await session("two", { decider: "" })).decider, "");
+		// Each session reads the global save after it changes.
+		await writeMomGlobals({ mode: "v2", decider: "local-llm/beverly-4B" }, file);
+		for (const name of ["one", "two"]) {
+			const state = await session(name, {});
+			assert.equal(state.mode, "v2", `${name} reads the global mode`);
+			assert.equal(state.decider, "local-llm/beverly-4B", `${name} reads the global decision model`);
+		}
+	} finally {
+		await rm(file, { force: true });
+		if (Object.keys(saved).length) await writeMomGlobals(saved, file);
+		await rm(dir, { recursive: true, force: true });
+	}
 });
 
 test("the model control is durable and scoped to Mom, never to Pi", async () => {
 	const { CONTROL_KEYS } = await import("../src/mom/sidecar.ts");
-	assert.deepEqual([...CONTROL_KEYS], ["enabled", "inject", "nudgedClasses", "mode", "model"]);
+	assert.deepEqual([...CONTROL_KEYS], ["enabled", "inject", "nudgedClasses", "mode", "model", "decider"]);
 	// A persisted model overrides the flag when the slice is configured.
 	const withModel = momConfiguration(identity, { ...flags, "mom-model": "fixture/fixture" });
 	assert.match(withModel.instructions, /[\s\S]*/, "instructions still build with a model set");
@@ -147,4 +173,65 @@ test("the model control is durable and scoped to Mom, never to Pi", async () => 
 	assert.equal(typeof picker.pickMomModel, "function");
 	assert.equal(typeof picker.configuredMomModel, "function");
 	assert.equal(typeof picker.getModelRuntime, "function");
+});
+
+test("the decision model resolves through Pi's classifier registry; an empty or unavailable pick runs Mom without it", () => {
+	const registry = { findOfType: (_type: "classifier", provider: string, id: string) =>
+		provider === "local-llm" && id === "beverly-4B" ? { id, api: "typesafe-system-one", baseUrl: "http://127.0.0.1:8000/v1/" } : undefined };
+	const configured = momConfiguration(identity, { ...flags, "mom-decider": "local-llm/beverly-4B" }, registry);
+	assert.deepEqual(readSettings(configured.instructions).classifier, { url: "http://127.0.0.1:8000/v1/systemone", model: "beverly-4B", timeoutMs: 15000 });
+	assert.deepEqual(deciderFor({ "mom-decider": " local-llm/beverly-4B " }, registry), { ref: "local-llm/beverly-4B", classifier: { url: "http://127.0.0.1:8000/v1/systemone", model: "beverly-4B" } });
+	// Unregistered, not System One, or not local: Mom still starts, with no decision model, and the ref is
+	// reported unresolved so the client can say so.
+	const incompatible = { findOfType: () => ({ id: "model", api: "openai-chat-completions", baseUrl: "https://example.test/v1" }) };
+	const remote = { findOfType: () => ({ id: "model", api: "typesafe-system-one", baseUrl: "https://example.test/v1" }) };
+	for (const [ref, from] of [["missing/model", registry], ["provider/model", incompatible], ["provider/model", remote], ["local-llm/beverly-4B", undefined]] as const) {
+		assert.equal(readSettings(momConfiguration(identity, { ...flags, "mom-decider": ref }, from).instructions).classifier, undefined);
+		assert.deepEqual(deciderFor({ "mom-decider": ref }, from), { ref, classifier: undefined });
+	}
+	const disabled = momConfiguration(identity, { ...flags, "mom-decider": "" }, registry);
+	assert.equal(readSettings(disabled.instructions).classifier, undefined);
+	assert.deepEqual(deciderFor({ "mom-decider": "" }, registry), { ref: "" });
+});
+
+test("the decision-model picker excludes classifier models Mom cannot call", async () => {
+	const { deciderModels } = await import("../src/mom/model-picker.ts");
+	const models = [
+		{ provider: "local-llm", id: "beverly-4B", name: "Beverly", api: "typesafe-system-one", baseUrl: "http://127.0.0.1:8000/v1" },
+		{ provider: "remote", id: "classifier", name: "Remote", api: "typesafe-system-one", baseUrl: "https://example.test/v1" },
+		{ provider: "chat", id: "chat", name: "Chat", api: "openai-completions", baseUrl: "http://127.0.0.1:8000/v1" },
+	];
+	const registry = { getModelsOfType: () => models, findOfType: (_type: "classifier", provider: string, id: string) => models.find(model => model.provider === provider && model.id === id) };
+	const context = { modelRegistry: registry } as never;
+	assert.deepEqual(deciderModels(context), [{ value: "local-llm/beverly-4B", label: "local-llm/beverly-4B", description: "Beverly" }]);
+	const { initTheme } = await import("@earendil-works/pi-coding-agent");
+	const { momDeciderSelector } = await import("../src/mom/model-picker.ts");
+	initTheme("dark");
+	let selected: string | undefined;
+	const picker = momDeciderSelector(context, undefined, "local-llm/beverly-4B", value => { selected = value; });
+	picker.handleInput?.("\r");
+	assert.equal(selected, "local-llm/beverly-4B");
+});
+
+test("the persisted decision-model control survives sidecar loading, including an explicit disable", async () => {
+	const { loadState } = await import("../src/mom/checkpoint.ts");
+	const read = async (decider: string) => loadState({ load: async () => [{ id: "control", sessionId: "session", type: "map", at: 1, data: { decider } }] } as never,
+		{ getBranch: () => [] } as never);
+	assert.equal((await read("local-llm/beverly-4B")).decider, "local-llm/beverly-4B");
+	assert.equal((await read("")).decider, "");
+
+	// Global controls outrank older sidecar values when a session loads its settings.
+	const file = settingsFile();
+	const saved = await readMomGlobals(file);
+	try {
+		await writeMomGlobals({ mode: "v2", decider: "local-llm/beverly-4B", enabled: false }, file);
+		const withGlobals = await loadState({ load: async () => [{ id: "legacy", sessionId: "session", type: "map", at: 1, data: { mode: "commit_graph", decider: "" } }] } as never,
+			{ getBranch: () => [] } as never);
+		assert.equal(withGlobals.mode, "v2", "the global mode wins over the session's older one");
+		assert.equal(withGlobals.decider, "local-llm/beverly-4B", "and so does the global decision model");
+		assert.equal(withGlobals.enabled, false, "the loader applies the global pause");
+	} finally {
+		await rm(file, { force: true });
+		if (Object.keys(saved).length) await writeMomGlobals(saved, file);
+	}
 });

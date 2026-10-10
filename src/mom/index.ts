@@ -1,18 +1,18 @@
 /** Mom runs in oven (her slice follows this session); the lead shows her state, sends the user's requests and adds her hints. */
-import { copyToClipboard, getAgentDir, SettingsManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { copyToClipboard, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text, matchesKey, isKittyProtocolActive } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { MomClient, type Command, type Snapshot, type SourcePage } from "./client.ts";
 import { momSettings } from "./settings.ts";
 import { ANCHOR, clockTime } from "./anchor.ts";
-import type { FindingAction } from "./process-health.ts";
+import type { FindingRequest } from "./operation.ts";
 import { CORRECTION } from "./feed.ts";
-import { COMPACT_KEY, FOCUS_KEY, MomConversationView, MomPanel, momToolPreview, type MomExchange, type PanelDiagnostics, type PanelView } from "../ui/panel.ts";
+import { COMPACT_KEY, FOCUS_KEY, MomPanel, MomView, momToolPreview, type PanelDiagnostics, type PanelView } from "../ui/panel.ts";
 import { activityFor } from "../ui/activity.ts";
-import { isStatusPing, updateErrorSummary } from "./status.ts";
+import { updateErrorSummary } from "./status.ts";
 import { presentGraph, readText, summaryText } from "../ui/presentation.ts";
 import { DEFAULT_MODE, modeNames } from "./modes.ts";
-import { momModelSelector, pickMomModel } from "./model-picker.ts";
+import { momDeciderSelector, momModelSelector, pickMomModel } from "./model-picker.ts";
 
 const FLAGS = {
 	"mom-model": ["Exact provider/model for Mom; never inherits the lead model", "openai-codex/gpt-5.6-sol"],
@@ -21,6 +21,7 @@ const FLAGS = {
 	"mom-max-wait-ms": ["Longest Mom waits for a turn to end before updating anyway, in milliseconds", "1800000"],
 	"mom-retry-ms": ["Automatic retry delays after a failed update, comma-separated milliseconds", "5000,60000,300000"],
 	"mom-advisor-url": ["Optional System One endpoint. Empty disables it", ""],
+	"mom-decider": ["Pi classifier model (local System One) for Mom's decisions: the v2 change check before her model reads a batch. Empty or unavailable: Mom runs without it", "local-llm/beverly-4B"],
 	"mom-decider-url": ["Local decider (System One, decider/serve.py) for continuity checks and state-change shadowing. Empty disables it", ""],
 	"mom-decider-clear": ["The decider skips a continuity model check when it is at least this sure the turn continues", "0.9"],
 	"mom-advisor-model": ["Native System One model ID", "beverly-4B"],
@@ -42,9 +43,7 @@ export function installMom(pi: ExtensionAPI) {
 	let ready: Promise<void> = Promise.resolve(), epoch = 0, readError: string | undefined;
 	let widgetSignature: string | undefined;
 	let heldWidget: PanelView | undefined;
-	let conversationOpen = false, closeConversation: (() => void) | undefined, conversationDraft = "";
-	let conversationView: MomConversationView | undefined;
-	let conversationExchanges: MomExchange[] = [];
+	let viewOpen = false, closeView: (() => void) | undefined, momView: MomView | undefined;
 	const sentAnchors = new Set<string>();
 	const COMPACT = Symbol.for("@ssweens/pi-tether/compact");
 	const compact = () => Reflect.get(globalThis, COMPACT) === true;
@@ -59,7 +58,7 @@ export function installMom(pi: ExtensionAPI) {
 	}
 	const activity = activityFor(pi);
 	function sync() {
-		conversationView?.statusChanged();
+		momView?.statusChanged();
 		const signature = JSON.stringify(view(false, false));
 		if (signature === widgetSignature) return;
 		widgetSignature = signature;
@@ -73,7 +72,6 @@ export function installMom(pi: ExtensionAPI) {
 	function reset(context: ExtensionContext) {
 		const token = ++epoch; client?.close(); client = undefined; ctx = context; readError = undefined;
 		widgetSignature = undefined; sentAnchors.clear();
-		conversationDraft = ""; conversationExchanges = [];
 		const flags = Object.fromEntries(Object.entries(FLAGS).map(([name, [, value]]) => [name, pi.getFlag(name) ?? value]));
 		let connection: MomClient;
 		try {
@@ -91,11 +89,8 @@ export function installMom(pi: ExtensionAPI) {
 		if (token !== epoch || !client) throw new Error(readError ?? "Mom session changed or is unavailable.");
 		return client.request(command, signal);
 	}
-	async function run(question?: string, signal?: AbortSignal, refresh = false): Promise<string | undefined> {
-		const value = await request({ kind: "update", operation: { question, refresh } }, signal);
-		return typeof value === "string" ? value : undefined;
-	}
-	async function findingAction(action: Exclude<FindingAction, "delivered" | "backoff">, finding?: string) { await request({ kind: "finding", action, finding }); }
+	async function refresh(): Promise<void> { await request({ kind: "refresh" }); }
+	async function findingAction(action: FindingRequest, finding: string) { await request({ kind: "finding", action, finding }); }
 	pi.on("session_start", (_event, context) => reset(context));
 	// A new branch: her work on the old one is stopped in oven, and she follows the selected branch.
 	pi.on("session_tree", (_event, context) => { void client?.halt(); reset(context); });
@@ -111,11 +106,6 @@ export function installMom(pi: ExtensionAPI) {
 		delete started.systemPromptOptions.sections.mom_lead_behavior;
 	});
 	pi.on("agent_settled", (_event, context) => { updateContext(context); void client?.reload(); });
-	pi.on("input", (input, context) => {
-		updateContext(context);
-		if (input.source !== "extension" && isStatusPing(input.text) && context.hasUI) { context.ui.notify(cached(), "info"); return { action: "handled" }; }
-		return { action: "continue" };
-	});
 	function diagnostics(): PanelDiagnostics {
 		const saved = client?.snapshot?.diagnostics ?? { sections: [], raw: "{}" }, error = client?.error ?? readError;
 		return error ? { ...saved, sections: [...saved.sections, { title: "Last problem", text: updateErrorSummary(error) }] } : saved;
@@ -124,17 +114,16 @@ export function installMom(pi: ExtensionAPI) {
 		if (context.mode !== "tui") { context.ui.notify(cached(), "info"); return; }
 		await context.ui.custom<void>((tui, theme, _keys, done) => new MomPanel(() => view(true), theme, () => Math.max(5, tui.terminal.rows - 6), () => done()));
 	}
-	async function talk(context: ExtensionContext) {
+	async function open(context: ExtensionContext) {
 		if (context.mode !== "tui") {
 			const error = view(true).error;
 			context.ui.notify(`${error ? `What happened: ${error}\n\n` : ""}${cached()}`, "info"); return;
 		}
-		if (conversationOpen) closeConversation?.();
-		conversationOpen = true; const held = heldWidget = structuredClone(view(false, false));
+		if (viewOpen) closeView?.();
+		viewOpen = true; const held = heldWidget = structuredClone(view(false, false));
 		try {
-			await context.ui.custom<void>((tui, theme, keys, done) => { closeConversation = () => done(); return conversationView = new MomConversationView({
-				view: () => view(true, false), ask: async (question, signal) => { await findingAction("asked"); return run(question, signal); },
-				findingAction, copy: copyToClipboard, retry: async () => { await run(undefined, undefined, true); }, diagnostics,
+			await context.ui.custom<void>((tui, theme, _keys, done) => { closeView = () => done(); return momView = new MomView({
+				view: () => view(true, false), findingAction, copy: copyToClipboard, retry: refresh, diagnostics,
 				status: () => ({ connection: client?.error ? "disconnected" : client?.snapshot ? "connected" : "connecting", project: context.cwd,
 					host: client?.snapshot?.host, telemetry: client?.snapshot?.telemetry, usage: client?.snapshot?.usage, enabled: client?.snapshot?.controls.enabled }),
 				refreshStatus: async () => { await request({ kind: "status" }); },
@@ -143,11 +132,10 @@ export function installMom(pi: ExtensionAPI) {
 				draftForLead: text => { const draft = context.ui.getEditorText(); context.ui.setEditorText(`${draft}${draft ? "\n\n" : ""}${text}`); },
 				prepareLeadDraft: async finding => { await findingAction("discuss", finding); const draft = context.ui.getEditorText();
 					context.ui.setEditorText(`${draft}${draft ? "\n\n" : ""}Mom suggested: ${finding}\nLet's discuss this before acting.`); },
-			}, theme, tui, keys, SettingsManager.create(context.cwd, getAgentDir()), () => done(), conversationDraft,
-				draft => { conversationDraft = draft; }, conversationExchanges); },
+			}, theme, tui, () => done()); },
 			{ overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left", margin: 0 } });
 		} catch (error) { context.ui.notify(`Cannot open Mom: ${String(error)}`, "error"); }
-		finally { if (heldWidget === held) { conversationView = undefined; conversationOpen = false; closeConversation = undefined; heldWidget = undefined; sync(); } }
+		finally { if (heldWidget === held) { momView = undefined; viewOpen = false; closeView = undefined; heldWidget = undefined; sync(); } }
 	}
 	async function showSettings(context: ExtensionContext) {
 		if (context.mode !== "tui") throw new Error("Mom settings requires interactive mode.");
@@ -162,7 +150,8 @@ export function installMom(pi: ExtensionAPI) {
 			// `done(selected)` is the settings row's own save trigger: hand the pick straight back and
 			// let momSettings persist it. Saving here as well would fire twice, and a throw would leave
 			// the submenu open for good.
-			(current, finished) => momModelSelector(context, tui, current, fallback, finished) as never));
+			(current, finished) => momModelSelector(context, tui, current, fallback, finished) as never,
+			(current, finished) => momDeciderSelector(context, tui, current, finished) as never));
 	}
 	async function checkKeys(context: ExtensionContext) {
 		if (context.mode !== "tui") throw new Error("The key check requires an interactive terminal.");
@@ -182,17 +171,16 @@ export function installMom(pi: ExtensionAPI) {
 				handleInput: data => { if (matchesKey(data, "enter")) done(); }, invalidate() {} };
 		}, { overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left", margin: 0 } }); } finally { unsubscribe?.(); }
 	}
-	pi.registerShortcut(FOCUS_KEY, { description: "Switch to Mom conversation (Esc or Ctrl+Shift+J returns)", handler: talk });
+	pi.registerShortcut(FOCUS_KEY, { description: "Open Mom's view (Esc or Ctrl+Shift+J returns)", handler: open });
 	pi.registerShortcut(COMPACT_KEY, { description: "Toggle Mom's widget between full and one line", handler: async context => { ctx = context; toggleCompact(); } });
-	pi.registerTool({ name: "mom", label: "Mom", description: "Read Mom's saved story map, selected records, or original evidence without a model call. The widget already shows your current place; use this for more detail or a real question. question asks Mom to reason about the work. Read-only: working agents never maintain Mom's notes. Choose at most one of graph, source, question.",
-		parameters: Type.Object({ question: Type.Optional(Type.String({ description: "A question for Mom's bounded source-backed reasoning; omit for cached reads." })),
-			graph: Type.Optional(Type.Object({
+	pi.registerTool({ name: "mom", label: "Mom", description: "Read Mom's saved story map, selected records, or original evidence without a model call. The widget already shows your current place; use this for more detail. Read-only: working agents never maintain Mom's notes. Choose at most one of graph, source.",
+		parameters: Type.Object({ graph: Type.Optional(Type.Object({
 				nodes: Type.Optional(Type.Array(Type.String(), { minItems: 1, maxItems: 20, description: "IDs of endeavors or attached notes from a previous read. Omit to see the whole map." })),
 				depth: Type.Optional(Type.Integer({ minimum: 0, maximum: 3, description: "How much surrounding work to include (0–3, default 1). Even 0 explains the goal, your place in it, and what is outside the view." })),
 				checkpoint: Type.Optional(Type.String({ description: "A saved-view ID from history or previousCheckpoint. Omit for the current view. Old records remain readable without reopening their work." })),
 			}, { additionalProperties: false })),
 			source: Type.Optional(Type.Object({ ref: Type.String({ minLength: 1 }), offset: Type.Optional(Type.Integer({ minimum: 0 })) }, { additionalProperties: false })) }, { additionalProperties: false }),
-		renderCall(args, theme) { return new Text(theme.fg("toolTitle", theme.bold("Mom")) + theme.fg("muted", ` · ${args.question ? "asking about the work" : args.source ? "reading original evidence" : "finding our place"}`), 0, 0); },
+		renderCall(args, theme) { return new Text(theme.fg("toolTitle", theme.bold("Mom")) + theme.fg("muted", ` · ${args.source ? "reading original evidence" : "finding our place"}`), 0, 0); },
 		renderResult(result, { expanded }, theme) {
 			const text = result.content.filter(part => part.type === "text").map(part => part.text).join("\n");
 			const details = result.details;
@@ -202,30 +190,27 @@ export function installMom(pi: ExtensionAPI) {
 			return new Text(expanded ? text : `${preview}${expandable ? `\n${theme.fg("dim", "Expand for the selected records and sources.")}` : ""}`, 0, 0);
 		},
 		async execute(_id, args, signal) {
-			if ([args.graph, args.source, args.question?.trim()].filter(Boolean).length > 1) throw new Error("Choose one of graph, source, or question.");
+			if (args.graph && args.source) throw new Error("Choose one of graph or source.");
 			try {
 				await ready;
 				let text: string, overview: string, preview: string, data: unknown, expandable = false;
 				if (args.source) { data = await request({ kind: "source", ...args.source }, signal); overview = "Original recorded evidence, not new work or permission to act."; preview = overview; text = `${overview}\n\n${JSON.stringify(data, null, 2)}`; expandable = true; }
 				else if (args.graph) { data = await request({ kind: "graph", options: args.graph }, signal); const work = presentGraph(data); overview = summaryText(work); const current = view(false, false); preview = momToolPreview({ ...current, work, summary: overview }); expandable = Boolean(args.graph.nodes?.length || args.graph.checkpoint); text = readText(work, expandable); }
-				else {
-					if (args.question?.trim()) { text = await run(args.question, signal) ?? "Mom returned no answer."; overview = text; preview = text; }
-					else { await request({ kind: "graph", options: {} }, signal); text = cached(); overview = text; preview = momToolPreview(view(true, false)); }
-				}
+				else { await request({ kind: "graph", options: {} }, signal); text = cached(); overview = text; preview = momToolPreview(view(true, false)); }
 				return { content: [{ type: "text" as const, text }], details: { overview, preview, expandable, data, at: client?.snapshot?.explicit.work?.at } };
 			} catch (error) {
 				failure(error);
-				throw new Error(`Mom couldn't ${args.question ? "answer that question" : "read that saved view or source"}. Her last saved notes are unchanged. ${args.question ? "Use /mom detail for the reason." : "Use an ID from a previous Mom read; /mom detail shows the reason."}`);
+				throw new Error("Mom couldn't read that saved view or source. Her last saved notes are unchanged. Use an ID from a previous Mom read; /mom detail shows the reason.");
 			}
 		},
 	});
-	pi.registerCommand("mom", { description: "Talk to Mom · compact · overview · status · map|graph [endeavor] [depth] · detail · keys · ask <question> · correct <text> · source <id> [offset] · log · refresh · relabel · pause · resume · settings · model",
+	pi.registerCommand("mom", { description: "Open Mom · compact · overview · status · map|graph [endeavor] [depth] · detail · keys · correct <text> · source <id> [offset] · log · refresh · relabel · pause · resume · settings · model",
 		handler: async (args, context) => {
 			ctx = context;
 			const commandEpoch = epoch;
 			const [command, ...parts] = args.trim().split(/\s+/), text = parts.join(" ");
 			try {
-				if (!command || command === "detail") return await talk(context);
+				if (!command || command === "detail") return await open(context);
 				if (command === "overview") return await show(context);
 				if (command === "compact") { toggleCompact(); return; }
 				if (command === "status") { context.ui.notify(cached(), "info"); return; }
@@ -282,10 +267,9 @@ export function installMom(pi: ExtensionAPI) {
 					});
 					context.ui.notify(lines.length ? `Mom findings and continuity events (oldest first):\n${lines.join("\n")}` : "Mom has not recorded findings or continuity events yet.", "info"); return;
 				}
-				if (command === "refresh") { await run(undefined, undefined, true); return; }
+				if (command === "refresh") { await refresh(); return; }
 				if (command === "relabel") { await request({ kind: "relabel" }); return; }
-				if (command === "ask" && text) { context.ui.notify(await run(text) ?? "Mom returned no answer.", "info"); return; }
-				throw new Error("Use /mom, overview, status, map, graph, detail, ask, correct, source, log, refresh, relabel, pause, or resume.");
+				throw new Error("Use /mom, overview, status, map, graph, detail, correct, source, log, refresh, relabel, pause, or resume.");
 			} catch (error) {
 				if (commandEpoch === epoch) { failure(error); context.ui.notify("Mom couldn't complete that request. Your last saved view is unchanged. Use /mom detail for the reason and /mom for your place in the work.", "error"); }
 			}

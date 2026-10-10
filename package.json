@@ -39,8 +39,7 @@
   },
   "oven": {
     "extensions": {
-      "mom": "./src/mom/mom-tools.ts",
-      "mom-ask": "./src/mom/mom-ask.ts"
+      "mom": "./src/mom/mom-tools.ts"
     }
   },
   "peerDependencies": {

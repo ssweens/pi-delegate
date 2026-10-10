@@ -2,6 +2,7 @@ import type { Cut, Observation, SessionReader } from "./feed.ts";
 import type { Notice } from "./contract.ts";
 import { PROCESS_RISK_CLASSES, processNoticeKey, FINDING_ACTIONS, emptyEngagement, recordEngagement, type Engagement, type FindingFeedback, type ProcessRiskClass } from "./process-health.ts";
 import { CONTROL_KEYS } from "./sidecar.ts";
+import { mergeGlobals, readMomGlobals } from "./globals.ts";
 import { DEFAULT_MODE, modeFor } from "./modes.ts";
 import { isAdvisorScreenRecord, type AdvisorScreenRecord } from "./advisor.ts";
 import type { MomStore, SidecarRecord } from "./sidecar.ts";
@@ -86,8 +87,8 @@ export interface WindowLive { key: string; compaction: string; at: number; turns
 export interface WindowOutcome { key: string; compaction: string; at: number; held: boolean; reason: WindowCloseReason }
 /** Durable delivery controls. `enabled` gates Mom entirely; the rest gate one injection surface
  * each, so the user can silence advice without losing her saved map or background maintenance. */
-export interface MomControls { enabled: boolean; inject: boolean; nudgedClasses: ProcessRiskClass[]; mode: string; model: string }
-export interface MomState { observations: Observation[]; checkpoint?: Checkpoint; checkpointId?: string; coverageCut?: Cut; enabled: boolean; inject: boolean; nudgedClasses: ProcessRiskClass[]; mode: string; model: string; unresolvedNotices: string[]; feedback: Record<string, FindingFeedback>; engagement: Engagement; usage?: Usage; error?: string; failure?: CursorFailure; gaps: SkippedGap[]; screen?: AdvisorScreenRecord; cutover?: boolean; pendingAnchor?: AnchorState; lastAnchor?: AnchorState; reservedAnchor?: AnchorState & { content: string }; window?: WindowLive; lastWindow?: WindowOutcome }
+export interface MomControls { enabled: boolean; inject: boolean; nudgedClasses: ProcessRiskClass[]; mode: string; model: string; decider: string }
+export interface MomState { observations: Observation[]; checkpoint?: Checkpoint; checkpointId?: string; coverageCut?: Cut; enabled: boolean; inject: boolean; nudgedClasses: ProcessRiskClass[]; mode: string; model: string; decider?: string; unresolvedNotices: string[]; feedback: Record<string, FindingFeedback>; engagement: Engagement; usage?: Usage; error?: string; failure?: CursorFailure; gaps: SkippedGap[]; screen?: AdvisorScreenRecord; cutover?: boolean; pendingAnchor?: AnchorState; lastAnchor?: AnchorState; reservedAnchor?: AnchorState & { content: string }; window?: WindowLive; lastWindow?: WindowOutcome }
 
 const failureLike = (x: unknown): x is CursorFailure => record(x) && typeof x.key === "string" && cutLike(x.from) && cutLike(x.through) &&
 	typeof x.firstRef === "string" && typeof x.lastRef === "string" && integer(x.count) && x.count > 0 &&
@@ -238,6 +239,12 @@ export async function loadState(store: MomStore, manager: SessionReader): Promis
 			state.model = item.data.model.trim();
 			if (state.model && !/^[\w.-]+\/[\w./:-]+$/.test(state.model)) throw new Error(`Invalid Mom model ${JSON.stringify(state.model)}; expected provider/id.`);
 		}
+		if (item.data.decider !== undefined) {
+			// Unlike Mom's model, empty deliberately disables semantic classification.
+			if (typeof item.data.decider !== "string") throw new Error("Invalid Mom decision model in her sidecar.");
+			state.decider = item.data.decider.trim();
+			if (state.decider && !/^[\w.-]+\/[\w./:-]+$/.test(state.decider)) throw new Error(`Invalid Mom decision model ${JSON.stringify(state.decider)}; expected provider/id.`);
+		}
 		if (item.data.nudgedClasses !== undefined) {
 			if (!Array.isArray(item.data.nudgedClasses) || item.data.nudgedClasses.some((value: unknown) => !PROCESS_RISK_CLASSES.includes(value as never)))
 				throw new Error("Invalid Mom nudge control in her sidecar.");
@@ -287,6 +294,18 @@ export async function loadState(store: MomStore, manager: SessionReader): Promis
 		if (screenRecord !== undefined && applies) state.screen = screenRecord as AdvisorScreenRecord;
 	}
 	state.gaps = [...gaps.values()]; state.unresolvedNotices = [...unresolvedNotices];
+	// Mom's controls are global (globals.ts) and win over anything a session saved before them. Both
+	// sides read this — the lead's client and her slice in oven — so a setting saved once holds
+	// everywhere, and a value that is not valid is simply absent.
+	const globals = readMomGlobals();
+	const saved = mergeGlobals(globals, { enabled: state.enabled, inject: state.inject, nudgedClasses: state.nudgedClasses,
+		mode: state.mode, model: state.model, ...(state.decider === undefined ? {} : { decider: state.decider }) });
+	state.enabled = saved.enabled as boolean;
+	state.inject = saved.inject as boolean;
+	state.nudgedClasses = saved.nudgedClasses as ProcessRiskClass[];
+	state.mode = String(saved.mode ?? "");
+	state.model = String(saved.model ?? "");
+	state.decider = saved.decider === undefined ? undefined : String(saved.decider);
 	return state;
 }
 

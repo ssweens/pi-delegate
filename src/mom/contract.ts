@@ -33,7 +33,6 @@ const modelGroups = {
 	removeNodes: Type.Optional(Type.Array(Type.Object({ id: nodeFields.id, ...citedReason }, object), { maxItems: 64 })),
 	note: Type.Optional(notice),
 	resolutions: Type.Optional(Type.Array(resolution, { maxItems: 4 })),
-	answer: Type.Optional(Type.String({ maxLength: 6000 })),
 };
 const WorkChange = Type.Object({ id: nodeFields.id, parent: nodeFields.parent, state: nodeFields.state,
 	label: Type.Optional(nodeFields.label), why: Type.Optional(nodeFields.intent),
@@ -47,7 +46,7 @@ const smallGroups = { work: Type.Optional(Type.Array(WorkChange)), notes: Type.O
 	focus: Type.Optional(Type.Union([nodeFields.id, Type.Null()])), upsertEdges: modelGroups.upsertEdges, removeEdges: modelGroups.removeEdges };
 const SmallTransaction = Type.Object(smallGroups, object);
 // Durable may resume a call admitted by an older schema. acceptGraph checks those legacy groups.
-const exposedTransaction = (answering: boolean) => Type.Object({ ...smallGroups, ...(answering ? { answer: modelGroups.answer } : {}) });
+const exposedTransaction = Type.Object(smallGroups);
 /** What acceptGraph accepts: the model contract plus internal legacy groups (folds, merges, explicit unfinished). */
 const AcceptedTransaction = Type.Object({ ...modelGroups,
 	unfinished: Type.Optional(Unfinished),
@@ -73,8 +72,7 @@ function resolveNode(patch: NodePatchValue, before: ResolvedNode | undefined): R
 
 function expandChanges(value: Record<string, unknown>, previous: WorkGraph): Record<string, unknown> {
 	if (!("work" in value) && !("notes" in value)) return value;
-	const { answer, ...groups } = value;
-	const normalized = Object.fromEntries(Object.entries(groups).filter(([, entry]) => entry != null));
+	const normalized = Object.fromEntries(Object.entries(value).filter(([, entry]) => entry != null));
 	if (!Check(SmallTransaction, normalized)) throw shapeError("Invalid work changes:", SmallTransaction, normalized, "work");
 	const saved = new Map(previous.nodes.map(node => [node.id, node]));
 	const work = (normalized.work ?? []).map(change => {
@@ -91,7 +89,7 @@ function expandChanges(value: Record<string, unknown>, previous: WorkGraph): Rec
 			label: change.text.slice(0, 160), intent: change.text, observed: change.text, sources: change.sources };
 	});
 	return { upsertNodes: [...work, ...notes], focus: normalized.focus, upsertEdges: normalized.upsertEdges,
-		removeEdges: normalized.removeEdges, ...(answer != null ? { answer } : {}) };
+		removeEdges: normalized.removeEdges };
 }
 
 /** The fixed chapter-state schema every update diffs against the prior graph. Host structure only:
@@ -150,12 +148,6 @@ Keep existing relationships. When needed, link returns_to to work to resume, dep
 
 `;
 
-export const CONVERSATION_PROMPT = `
-
-Answer the user’s explicit question directly and warmly from the reconciled account and inspected evidence. Use answer_question with only { answer }. A question does not require a graph update or reviewed-coverage update. If investigation reveals a material graph change, maintain it separately through the normal maintenance path.
-
-`;
-
 export const REFLECTION_PROMPT = `
 
 Reflect only to shorten settled detail and consolidate duplicate understanding. Preserve unresolved work, scoped constraints, decisions and reasons, rejected alternatives, return conditions, source access, and the distinction between reports and inspected outcomes. Do not turn structural cleanup into semantic completion.
@@ -173,16 +165,13 @@ export function validateSearchQuery(value: unknown, shorterThan?: string): strin
 	return query;
 }
 
-export function momTools(answering = false): Tool[] {
-	const tools: Tool[] = [{ name: "commit_graph", description: "Atomically apply meaningful graph changes. Unmentioned records and omitted node fields stay unchanged; omit unused groups.",
-		constrainedSampling: { type: "json_schema", strict: "prefer" }, parameters: exposedTransaction(answering) },
+export function momTools(): Tool[] {
+	return [{ name: "commit_graph", description: "Atomically apply meaningful graph changes. Unmentioned records and omitted node fields stay unchanged; omit unused groups.",
+		constrainedSampling: { type: "json_schema", strict: "prefer" }, parameters: exposedTransaction },
 		{ name: "inspect_evidence", description: "Read original evidence or saved node details. Tool records include their counterpart. Partial pages include nextOffset.",
 			constrainedSampling: { type: "json_schema", strict: "prefer" }, parameters: Type.Object({ ref: Type.String({ minLength: 1, description: "SOURCE_ID or node:ID for saved details." }), offset: Type.Integer({ minimum: 0 }), limit: Type.Integer({ minimum: 1, maximum: 24000 }) }, object) },
 		{ name: "search_history", description: "Find a short literal phrase in narrative, metadata, or original argument/output text. Returns at most five timestamp-ranked refs; payloadMatched does not expose payload. Inspect original evidence before relying on a match.",
 			constrainedSampling: { type: "json_schema", strict: "prefer" }, parameters: Type.Object({ query: Type.String({ minLength: 1, maxLength: SEARCH_QUERY_MAX }) }, object) }];
-	if (answering) tools.splice(1, 0, { name: "answer_question", description: "Answer the explicit user question without changing graph coverage.",
-		constrainedSampling: { type: "json_schema", strict: "prefer" }, parameters: Type.Object({ answer: Type.String({ minLength: 1, maxLength: 6000 }) }, object) });
-	return tools;
 }
 
 export interface GraphRepair { from: string; to: string }
@@ -227,12 +216,12 @@ export function repairSources<T>(value: T, known: Iterable<string>): { value: T;
 }
 
 /** Validate shape, provenance identity and notice eligibility, not semantic truth. */
-export function acceptGraph(value: unknown, previous: WorkGraph, checkpoint: string | undefined, known: ReadonlyMap<string, FeedEvent>, newRefs: ReadonlySet<string>, inspected: ReadonlySet<string>, question?: string, compactionReview = false, unresolvedNotices: ReadonlySet<string> = new Set()) {
+export function acceptGraph(value: unknown, previous: WorkGraph, checkpoint: string | undefined, known: ReadonlyMap<string, FeedEvent>, newRefs: ReadonlySet<string>, inspected: ReadonlySet<string>, compactionReview = false, unresolvedNotices: ReadonlySet<string> = new Set()) {
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid graph transaction shape.");
 	const supplied = expandChanges(value as Record<string, unknown>, previous);
 	const explicitUnfinished = supplied.unfinished !== undefined && supplied.unfinished !== null;
 	// Strict provider transport represents optional properties as null; internal data omits them.
-	const { note: rawNote, answer: rawAnswer, resolutions: rawResolutions,
+	const { note: rawNote, resolutions: rawResolutions,
 		revision: _revision, purpose: _purpose, supersessions: _supersessions, ...rest } = supplied;
 	const rawNodes = Array.isArray(rest.upsertNodes) ? rest.upsertNodes.map(node => {
 		if (!node || typeof node !== "object" || Array.isArray(node)) return node;
@@ -242,7 +231,7 @@ export function acceptGraph(value: unknown, previous: WorkGraph, checkpoint: str
 	const arrays = ["unfinished", "upsertNodes", "upsertEdges", "removeEdges", "merges", "folds", "removeNodes"] as const;
 	const normalizedGroups = Object.fromEntries(arrays.map(key => [key, key === "upsertNodes" ? (rawNodes ?? []) : (rest[key] ?? [])]));
 	const normalized = { ...rest, ...normalizedGroups, focus: rest.focus ?? previous.focus,
-		...(rawNote != null ? { note: rawNote } : {}), ...(rawAnswer != null ? { answer: rawAnswer } : {}), ...(rawResolutions != null ? { resolutions: rawResolutions } : {}) };
+		...(rawNote != null ? { note: rawNote } : {}), ...(rawResolutions != null ? { resolutions: rawResolutions } : {}) };
 	const repaired = repairSources(normalized, known.keys());
 	if (!Check(AcceptedTransaction, repaired.value)) throw shapeError("Invalid graph transaction shape:", AcceptedTransaction, repaired.value, "upsertNodes");
 	const proposed = repaired.value as NormalizedTransaction, repairs = repaired.repairs;
@@ -251,7 +240,6 @@ export function acceptGraph(value: unknown, previous: WorkGraph, checkpoint: str
 	const incomplete = resolved.filter(node => typeof node === "string");
 	if (incomplete.length) throw new Error(`Graph transaction defects:\n- ${incomplete.join("\n- ")}`);
 	const resolvedNodes = resolved as ResolvedNode[];
-	if (!question && proposed.answer !== undefined) throw new Error("Background updates must maintain the graph, not answer historical questions. Update the affected work from newEvents and omit answer.");
 	const sourceOrder = new Map([...known.keys()].map((source, index) => [source, index]));
 	const authority = (source: string) => {
 		const event = known.get(source);
@@ -317,7 +305,6 @@ export function acceptGraph(value: unknown, previous: WorkGraph, checkpoint: str
 		declaredUnfinished = [];
 	}
 	const v = { ...proposed, focus, upsertNodes, unfinished: declaredUnfinished };
-	if (question && !v.answer?.trim()) throw new Error("Answer the explicit question in answer.");
 	// Process notices and resolutions are advisories riding on the map update. An invalid advisory
 	// is dropped and recorded as a repair; it never voids the map the model got right.
 	let note: Notice | null = (v.note as Notice | undefined) ?? null;
@@ -463,5 +450,5 @@ export function acceptGraph(value: unknown, previous: WorkGraph, checkpoint: str
 	if (echoes.length) throw new Error(`Graph transaction defects:\n- ${echoes.join("\n- ")}`);
 	if (known.size && !graph.nodes.length) throw new Error("Observed work needs a purpose node; do not erase the graph.");
 	if (note) { try { validateProcessNotice(note, graph, known, newRefs, compactionReview); } catch (error) { dropNote(String(error)); } }
-	return { graph, note, resolutions, unfinished, repairs, ...(question && v.answer ? { answer: v.answer } : {}) };
+	return { graph, note, resolutions, unfinished, repairs };
 }

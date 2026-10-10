@@ -1,6 +1,6 @@
 import { stripVTControlCharacters } from "node:util";
-import { CustomEditor, getSelectListTheme, type KeybindingsManager, type SettingsManager, type Theme } from "@earendil-works/pi-coding-agent";
-import { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type Focusable, type TUI } from "@earendil-works/pi-tui";
+import type { Theme } from "@earendil-works/pi-coding-agent";
+import { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type TUI } from "@earendil-works/pi-tui";
 import type { AnnotationView, EndeavorView, WorkView } from "./presentation.ts";
 import { formatElapsed, updateErrorSummary } from "../mom/status.ts";
 import { GraphBrowser } from "./graph-browser.ts";
@@ -18,11 +18,10 @@ export interface WorkspaceStatus {
 }
 export interface PanelSource {
 	view(): PanelView;
-	ask(question: string, signal: AbortSignal): Promise<string | undefined>;
 	diagnostics?(): PanelDiagnostics;
 	copy?(text: string): Promise<void>;
 	retry?(): Promise<void>;
-	findingAction?(action: FindingDisposition | "explained", finding: string): void | Promise<void>;
+	findingAction?(action: FindingDisposition, finding: string): void | Promise<void>;
 	prepareLeadDraft?(finding: string): void | Promise<void>;
 	status?(): WorkspaceStatus;
 	refreshStatus?(): Promise<void>;
@@ -30,9 +29,6 @@ export interface PanelSource {
 	readSource?(ref: string, offset: number): Promise<SourcePage>;
 	draftForLead?(text: string): void | Promise<void>;
 }
-/** Compatibility name for existing integrations. */
-export type MomConversationSource = PanelSource;
-export interface MomExchange { question: string; scope?: string; answer?: string; error?: string }
 
 const PREVIEW_NEIGHBORS = 6;
 const finished = (state: string) => ["settled", "finished", "completed", "done"].includes(state);
@@ -294,23 +290,18 @@ function compactLine(view: PanelView, theme: Theme, width: number): string {
 	return primary + clip(status, Math.max(0, width - visibleWidth(primary)));
 }
 
-/** Full-viewport, sidecar-backed conversation. It owns neither the lead editor nor lead messages. */
-export class MomConversationView implements Component, Focusable {
-	private editor: CustomEditor;
-	private controller?: AbortController;
-	private asking = false;
+/** Mom's full-viewport view: her saved map, its original sources, and her status. It owns neither the
+ *  lead editor nor lead messages. It shows what she saved; R reads it again and T retries her update. */
+export class MomView implements Component {
 	private notice = "";
 	private scroll = 0;
 	private pageRows = 1;
-	private draft: string;
 	private snapshot: PanelView;
 	private diagnostics?: PanelDiagnostics;
 	private status?: WorkspaceStatus;
 	private headerSignature = "";
-	private tab: "Overview" | "Map" | "Chat" | "Status" = "Overview";
-	private inputFocus = true;
+	private tab: "Overview" | "Map" | "Status" = "Overview";
 	private browser: GraphBrowser;
-	private scope?: { id: string; label: string; checkpoint?: string };
 	private mapPane: "tree" | "details" | "source" = "tree";
 	private sourceRead?: { kind: "loading" } | { kind: "loaded"; page: SourcePage } | { kind: "failed"; error: string };
 	private sourceIndex = 0;
@@ -319,152 +310,84 @@ export class MomConversationView implements Component, Focusable {
 	private pendingAction = false;
 	private raw = false;
 
-	get focused() { return this.editor.focused; }
-	set focused(value: boolean) { this.editor.focused = value && this.inputFocus; }
-
-	constructor(private source: MomConversationSource, private theme: Theme, private tui: TUI,
-		keybindings: KeybindingsManager, settings: SettingsManager, private done: () => void,
-		draft = "", private saveDraft: (text: string) => void = () => {}, private exchanges: MomExchange[] = []) {
-		this.draft = draft;
+	constructor(private source: PanelSource, private theme: Theme, private tui: TUI, private done: () => void) {
 		this.snapshot = structuredClone(source.view());
 		this.diagnostics = structuredClone(source.diagnostics?.());
 		this.status = structuredClone(source.status?.());
 		this.browser = new GraphBrowser(this.snapshot.work);
-		this.editor = new CustomEditor(tui, {
-			borderColor: theme.fg.bind(theme, "borderAccent"),
-			selectList: getSelectListTheme(),
-		}, keybindings, { paddingX: settings.getEditorPaddingX(), autocompleteMaxVisible: settings.getAutocompleteMaxVisible() });
-		this.editor.setText(draft);
-		this.editor.onSubmit = (text) => { void this.ask(text); };
 	}
 
-	private async ask(text: string, clearEditor = true) {
-		const question = text.trim();
-		if (!question) return;
-		if (["/refresh", "/copy", "/debug", "/raw", "/retry", "/overview", "/map", "/chat", "/status", "/pause", "/resume", "/unscope"].includes(question)) {
-			if (clearEditor) { this.draft = ""; this.editor.setText(""); }
-			try {
-				if (question === "/unscope") this.scope = undefined;
-				else if (question === "/pause" || question === "/resume") await this.control(question === "/resume");
-				else if (question === "/overview") this.switchTab("Overview");
-				else if (question === "/map") this.switchTab("Map");
-				else if (question === "/chat") this.switchTab("Chat");
-				else if (question === "/status") this.switchTab("Status");
-				else if (question === "/copy") {
-					if (!this.source.copy) throw new Error("Clipboard is unavailable in this view.");
-					const width = this.tui.terminal.columns;
-					const lines = this.content(width);
-					if (this.tab === "Map") {
-						lines.unshift(...this.browser.render(this.theme, width, Number.MAX_SAFE_INTEGER), "");
-						for (const exchange of this.exchanges.slice(-1)) lines.push("", ...(exchange.scope ? [`About: ${exchange.scope}`] : []),
-							`You: ${exchange.question}`, `Mom: ${exchange.answer ?? exchange.error ?? "reading…"}`);
-					}
-					await this.source.copy(stripVTControlCharacters(lines.join("\n")));
-					this.notice = "Copied the displayed notes and conversation.";
-				} else if (question === "/debug") {
-					this.switchTab(this.tab === "Status" ? "Overview" : "Status"); this.raw = false;
-				} else if (question === "/raw") {
-					this.switchTab("Status"); this.raw = !this.raw;
-				} else {
-					if (question === "/retry") {
-						if (!this.source.retry) throw new Error("Retry is unavailable in this view.");
-						this.notice = "Retrying the update…"; this.tui.requestRender();
-						await this.source.retry();
-					}
-					await this.source.refreshStatus?.();
-					this.snapshot = structuredClone(this.source.view());
-					this.diagnostics = structuredClone(this.source.diagnostics?.());
-					this.status = structuredClone(this.source.status?.());
-					this.browser.update(this.snapshot.work);
-					this.sourceRequest++; this.sourceRead = undefined; this.sourceOffsets = []; this.sourceIndex = 0;
-					if (this.mapPane === "source") this.mapPane = "details";
-					this.notice = "Showing the latest saved view.";
-				}
-			} catch (error) { this.notice = updateErrorSummary(String(error)); }
-			this.tui.requestRender();
-			return;
-		}
-		if (this.asking) return;
-		if (clearEditor) {
-			this.draft = "";
-			this.editor.setText("");
-		}
-		this.asking = true;
-		this.editor.disableSubmit = true;
-		this.controller = new AbortController();
-		const exchange: MomExchange = { question, scope: this.scope ? `${this.scope.label} [${this.scope.id}]${this.scope.checkpoint ? ` at ${this.scope.checkpoint}` : ""}` : undefined };
-		this.exchanges.push(exchange);
-		this.notice = "Reading the saved map and its sources…";
-		const replyTab = this.tab;
-		if (replyTab !== "Map") this.scroll = Number.POSITIVE_INFINITY;
-		this.tui.requestRender();
+	/** Show her latest saved view; with `retry`, run the failed update again first. */
+	private async refresh(retry = false): Promise<void> {
 		try {
-			const scoped = this.scope ? `About saved map item ${this.scope.label} [${this.scope.id}]${this.scope.checkpoint ? ` at checkpoint ${this.scope.checkpoint}` : ""}:\n${question}` : question;
-			exchange.answer = await this.source.ask(scoped, this.controller.signal) ?? "Mom returned no answer.";
-			this.notice = "";
-		} catch (error) {
-			if (this.controller.signal.aborted) exchange.error = "Question cancelled. The saved map is unchanged.";
-			else exchange.error = `Mom couldn't answer: ${updateErrorSummary(String(error))}`;
-			this.notice = "";
-		} finally {
-			this.asking = false;
-			this.editor.disableSubmit = false;
-			this.controller = undefined;
-			if (this.tab === replyTab && replyTab !== "Map") this.scroll = Number.POSITIVE_INFINITY;
-			this.tui.requestRender();
-		}
+			if (retry) {
+				if (!this.source.retry) throw new Error("Retry is unavailable in this view.");
+				this.notice = "Retrying the update…"; this.tui.requestRender();
+				await this.source.retry();
+			}
+			await this.source.refreshStatus?.();
+			this.snapshot = structuredClone(this.source.view());
+			this.diagnostics = structuredClone(this.source.diagnostics?.());
+			this.status = structuredClone(this.source.status?.());
+			this.browser.update(this.snapshot.work);
+			this.sourceRequest++; this.sourceRead = undefined; this.sourceOffsets = []; this.sourceIndex = 0;
+			if (this.mapPane === "source") this.mapPane = "details";
+			this.notice = "Showing the latest saved view.";
+		} catch (error) { this.notice = updateErrorSummary(String(error)); }
+		this.tui.requestRender();
+	}
+
+	private async copy(): Promise<void> {
+		try {
+			if (!this.source.copy) throw new Error("Clipboard is unavailable in this view.");
+			const width = this.tui.terminal.columns;
+			const lines = this.content(width);
+			if (this.tab === "Map") lines.unshift(...this.browser.render(this.theme, width, Number.MAX_SAFE_INTEGER), "");
+			await this.source.copy(stripVTControlCharacters(lines.join("\n")));
+			this.notice = "Copied the displayed view.";
+		} catch (error) { this.notice = updateErrorSummary(String(error)); }
+		this.tui.requestRender();
 	}
 
 	handleInput(data: string): void {
-		for (const [key, tab] of ([["f1", "Overview"], ["f2", "Map"], ["f3", "Chat"], ["f4", "Status"]] as const)) {
-			if (matchesKey(data, key)) { this.switchTab(tab); this.inputFocus = tab === "Chat"; this.editor.focused = this.inputFocus; this.tui.requestRender(); return; }
+		for (const [key, tab] of ([["f1", "Overview"], ["f2", "Map"], ["f3", "Status"]] as const)) {
+			if (matchesKey(data, key)) { this.switchTab(tab); this.tui.requestRender(); return; }
 		}
-		if (matchesKey(data, "tab")) { this.inputFocus = !this.inputFocus; this.editor.focused = this.inputFocus; this.tui.requestRender(); return; }
 		if (matchesKey(data, "escape") && this.tab === "Map" && this.mapPane !== "tree") {
 			this.mapPane = this.mapPane === "source" ? "details" : "tree"; this.sourceRequest++; this.scroll = 0; this.tui.requestRender(); return;
 		}
-		if (matchesKey(data, "escape") || matchesKey(data, FOCUS_KEY)) {
-			this.controller?.abort();
-			this.done();
-			return;
-		}
+		if (matchesKey(data, "escape") || matchesKey(data, FOCUS_KEY)) { this.done(); return; }
 		const finding = this.snapshot.note;
 		const actions = this.source.findingAction || this.source.prepareLeadDraft;
-		if (finding && actions && matchesKey(data, "alt+e")) void this.explain(finding);
-		else if (finding && actions && matchesKey(data, "alt+u")) void this.findingAction("understood", finding);
+		if (finding && actions && matchesKey(data, "alt+u")) void this.findingAction("understood", finding);
 		else if (finding && actions && matchesKey(data, "alt+d")) void this.findingAction("dismiss", finding);
 		else if (finding && actions && matchesKey(data, "alt+i")) void this.findingAction("incorrect", finding);
 		else if (finding && actions && matchesKey(data, "alt+l")) void this.prepareLeadDraft(finding);
-		else if (matchesKey(data, "ctrl+x") && this.asking) {
-			this.notice = "Cancelling Mom's answer…";
-			this.controller?.abort();
-		} else if (!this.inputFocus && this.tab === "Map" && this.mapInput(data)) {
-			// Navigation does not pass its keystrokes into the question draft.
-		} else if (!this.inputFocus && this.tab === "Status" && data === "p") {
+		else if (this.tab === "Map" && this.mapInput(data)) {
+			// Map navigation consumed the key.
+		} else if (this.tab === "Status" && data === "p") {
 			const enabled = this.source.status?.().enabled;
 			if (enabled !== undefined) void this.control(!enabled);
-		} else if (!this.inputFocus && data === "r") {
-			void this.ask("/refresh", false);
-		} else if (matchesKey(data, "pageUp")) this.scroll = Math.max(0, (Number.isFinite(this.scroll) ? this.scroll : Number.MAX_SAFE_INTEGER) - this.pageRows);
+		} else if (this.tab === "Status" && data === "t") void this.refresh(true);
+		else if (this.tab === "Status" && data === "v") this.raw = !this.raw;
+		else if (data === "r") void this.refresh();
+		else if (data === "c") void this.copy();
+		else if (matchesKey(data, "pageUp")) this.scroll = Math.max(0, (Number.isFinite(this.scroll) ? this.scroll : Number.MAX_SAFE_INTEGER) - this.pageRows);
 		else if (matchesKey(data, "pageDown")) this.scroll = Number.isFinite(this.scroll) ? this.scroll + this.pageRows : this.scroll;
 		else if (matchesKey(data, "ctrl+end")) this.scroll = Number.POSITIVE_INFINITY;
-		else if (this.inputFocus) this.editor.handleInput(data);
 		this.tui.requestRender();
 	}
 
 	private switchTab(tab: typeof this.tab): void {
 		this.sourceRequest++;
 		if (this.mapPane === "source" && this.sourceRead?.kind !== "loaded") this.mapPane = "details";
-		this.tab = tab; this.scroll = tab === "Chat" ? Number.POSITIVE_INFINITY : 0; this.notice = "";
+		this.tab = tab; this.scroll = 0; this.notice = "";
 	}
 
 	private mapInput(data: string): boolean {
 		const selected = this.browser.selected;
 		const page = this.sourceRead?.kind === "loaded" ? this.sourceRead.page : undefined;
-		if (data === "a" && selected) {
-			this.scope = { id: selected.id, label: selected.label, checkpoint: this.snapshot.work?.checkpoint };
-			this.inputFocus = true; this.editor.focused = true;
-		} else if (data === "d" && selected && this.source.draftForLead) {
+		if (data === "d" && selected && this.source.draftForLead) {
 			void Promise.resolve(this.source.draftForLead(`Let's discuss ${selected.label} [${selected.id}].\n${selected.intent}`))
 				.then(() => { this.notice = "Prepared a lead draft; nothing was sent."; }, error => { this.notice = String(error); }).finally(() => this.tui.requestRender());
 		} else if (data === "s") { this.sourceOffsets = []; void this.openSource(0); }
@@ -518,14 +441,6 @@ export class MomConversationView implements Component, Focusable {
 		finally { this.pendingAction = false; this.tui.requestRender(); }
 	}
 
-	private async explain(finding: string) {
-		if (this.asking) return;
-		try {
-			await this.source.findingAction?.("explained", finding);
-			await this.ask(`Please explain this finding: ${clean(finding)}`, false);
-		} catch { this.notice = "That finding action could not be saved."; this.tui.requestRender(); }
-	}
-
 	private async findingAction(action: FindingDisposition, finding: string) {
 		if (!this.source.findingAction) return;
 		try {
@@ -563,7 +478,7 @@ export class MomConversationView implements Component, Focusable {
 				if (telemetry?.timing) lines.push(...wrap(`Last operation: ${formatElapsed(telemetry.timing.totalMs)} · Startup ${formatElapsed(telemetry.timing.startupMs)} · Request ${formatElapsed(telemetry.timing.requestMs)}`));
 				if (usage) lines.push(...wrap(`Session: ${usage.calls} model calls · ${usage.input.toLocaleString()} input · ${usage.output.toLocaleString()} output tokens`),
 					...wrap(`Cache read ${usage.cacheRead.toLocaleString()} · Cache write ${usage.cacheWrite.toLocaleString()} · $${usage.nominalCost.toFixed(4)} nominal`));
-				lines.push(...wrap("P pause/resume · /retry update · /raw technical records"), "");
+				lines.push(...wrap("P pause/resume · T retry update · V raw records"), "");
 			}
 			for (const section of this.diagnostics?.sections ?? []) {
 				lines.push(...wrap(this.theme.bold(this.theme.fg("accent", section.title))),
@@ -572,7 +487,7 @@ export class MomConversationView implements Component, Focusable {
 			if (!this.diagnostics) lines.push(...wrap("No diagnostics are available for this session."), "");
 			else {
 				lines.push(this.theme.bold(this.theme.fg("accent", "Raw records")),
-					...wrap(this.theme.fg("muted", this.raw ? "/raw to collapse · /copy includes these records" : "Hidden · /raw to expand")));
+					...wrap(this.theme.fg("muted", this.raw ? "V to collapse · C copies these records" : "Hidden · V to expand")));
 				if (this.raw) lines.push("", ...this.diagnostics.raw.split("\n").flatMap(wrap));
 			}
 		}
@@ -580,13 +495,13 @@ export class MomConversationView implements Component, Focusable {
 			lines.push(this.theme.bold(this.theme.fg("accent", "Current work")));
 			if (view.error) lines.push(...wrap(this.theme.fg("warning", view.error)),
 				...wrap(this.theme.fg("muted", view.status === "reconnecting"
-					? "Mom must reconnect before questions or updates can run."
-					: "Ask about it below, or /retry the update. Saved notes are unchanged.")), "");
+					? "Mom must reconnect before updates can run."
+					: "T on F3 Status retries the update. Saved notes are unchanged.")), "");
 			if (view.work?.endeavors.length) lines.push(...hierarchy(view.work, this.theme, width, false));
 			else lines.push(...wrap(this.theme.fg("muted", fallback(view.summary) ||
 				(view.status === "reconnecting" || view.status === "connecting"
 					? "Waiting for Mom's saved view. Existing notes have not been loaded."
-					: "No saved work yet. Mom can answer after the map has a saved view."))));
+					: "No saved work yet."))));
 			if (view.note) lines.push("", ...wrap(this.theme.fg("accent", `${view.noteTag ?? "Worth considering"}: ${clean(view.note)}`)));
 			if (view.work) {
 				lines.push("", this.theme.bold(this.theme.fg("accent", "Saved map")),
@@ -596,15 +511,6 @@ export class MomConversationView implements Component, Focusable {
 				if (pending.length) lines.push("", this.theme.bold(this.theme.fg("accent", "Waiting work")), ...pending.flatMap(node => wrap(`• ${node.label}`)));
 			}
 			if (view.coverage) lines.push(...wrap(`History reviewed: ${view.coverage.consumed.toLocaleString()} / ${view.coverage.total.toLocaleString()} entries`));
-		}
-		else if (this.tab === "Chat" && !this.exchanges.length) lines.push(...wrap("Ask Mom about the work, a decision, or something that needs attention."), "",
-			...wrap("Questions and answers stay out of the lead conversation. Use Map to ask about a particular item."));
-		for (const exchange of this.exchanges) {
-			if (exchange.scope) lines.push("", ...wrap(this.theme.fg("accent", `About: ${exchange.scope}`)));
-			lines.push("", ...wrap(this.theme.bold(this.theme.fg("text", `You: ${exchange.question}`))));
-			if (exchange.answer) lines.push(...wrap(this.theme.fg("text", `Mom: ${exchange.answer}`)));
-			else if (exchange.error) lines.push(...wrap(this.theme.fg("warning", exchange.error)));
-			else lines.push(this.theme.fg("dim", "Mom: reading…"));
 		}
 		return lines.map(line => clip(line, width));
 	}
@@ -618,7 +524,7 @@ export class MomConversationView implements Component, Focusable {
 				`Characters ${page.offset + 1}–${Math.min(page.totalChars, page.offset + page.text.length)} of ${page.totalChars}`,
 				"[ ] source · N next page · B previous · Esc node", "", ...page.text.split("\n")];
 		}
-		return [...this.browser.details(), "", "A ask about this · S sources · D draft for lead", "← parent · → expand/collapse · Enter inspect"];
+		return [...this.browser.details(), "", "S sources · D draft for lead", "← parent · → expand/collapse · Enter inspect"];
 	}
 
 	statusChanged(): void {
@@ -631,36 +537,22 @@ export class MomConversationView implements Component, Focusable {
 	render(width: number): string[] {
 		const w = Math.max(1, Math.floor(width));
 		const height = Math.max(5, this.tui.terminal.rows);
-		const editor = this.editor.render(w);
 		const status = this.source.status?.();
 		const heading = this.theme.bold(this.theme.fg("accent", "Mom")) + this.theme.fg("dim", ` · ${this.tab === "Status" ? "diagnostics" : this.snapshot.status}`);
-		const tabs = (["Overview", "Map", "Chat", "Status"] as const).map((tab, index) => tab === this.tab
+		const tabs = (["Overview", "Map", "Status"] as const).map((tab, index) => tab === this.tab
 			? this.theme.bg("selectedBg", this.theme.bold(this.theme.fg("accent", ` F${index + 1} ${tab} `))) : ` F${index + 1} ${tab} `);
 		const header = [clip(heading + (status ? ` · ${status.project.split("/").at(-1)} · ${status.connection}` : ""), w),
-			clip(status?.telemetry ? `${status.telemetry.model} · ${status.telemetry.activity}${status.host ? ` · PID ${status.host.pid}` : ""}` : "Questions and answers stay out of the lead conversation.", w),
+			...(status?.telemetry ? [clip(`${status.telemetry.model} · ${status.telemetry.activity}${status.host ? ` · PID ${status.host.pid}` : ""}`, w)] : []),
 			...(visibleWidth(tabs.join(" ")) <= w ? [tabs.join(" ")] : [tabs.slice(0, 2).join(" "), tabs.slice(2).join(" ")]), ""];
-		const dock = this.tab === "Map" ? this.exchanges.slice(-1).flatMap(exchange => [
-			clip(`You${exchange.scope ? ` (${exchange.scope})` : ""}: ${exchange.question}`.replace(/\s+/g, " "), w),
-			clip(`Mom: ${exchange.answer ?? exchange.error ?? "reading…"}`.replace(/\s+/g, " "), w),
-		]) : [];
-		const scopeHint = this.scope ? " · /unscope" : "";
-		const prompt = clip(`Ask Mom · ${this.scope ? `About: ${this.scope.label}` : "whole project"}`, Math.max(1, w - visibleWidth(scopeHint))) + scopeHint;
-		const findingKeys = w < 80 && this.tab !== "Overview" ? "Alt+E explain · F1 finding actions"
-			: "Alt+E explain · Alt+U understood · Alt+D dismiss · Alt+I incorrect · Alt+L discuss with lead";
-		const navigation = this.inputFocus ? "Enter ask" : this.tab === "Map"
-			? `${this.mapPane === "tree" ? "↑↓ select · Enter inspect · " : ""}A ask · S source`
-			: this.tab === "Status" ? "P pause/resume · R refresh" : "R refresh";
+		const findingKeys = w < 80 ? "Alt+U understood · Alt+D dismiss · Alt+I incorrect · Alt+L discuss"
+			: "Alt+U understood · Alt+D dismiss · Alt+I incorrect · Alt+L discuss with lead";
+		const navigation = this.tab === "Map" ? `${this.mapPane === "tree" ? "↑↓ select · Enter inspect · " : ""}S source · D draft · `
+			: this.tab === "Status" ? "P pause/resume · T retry · V raw · " : "";
 		const footer = [
-			...dock,
 			...(this.notice ? [clip(this.theme.fg("dim", this.notice), w)] : []),
-			this.theme.fg(this.inputFocus ? "accent" : "muted", prompt),
-			...editor,
 			...(this.snapshot.note && (this.source.findingAction || this.source.prepareLeadDraft)
 				? wrapTextWithAnsi(this.theme.fg("dim", findingKeys), w) : []),
-			...wrapTextWithAnsi(this.theme.fg("dim", this.tab === "Status"
-				? "View held steady · /refresh · /copy · /raw · /debug"
-				: "View held steady · /refresh · /copy · /debug"), w),
-			...wrapTextWithAnsi(this.theme.fg("dim", `${this.asking ? "Ctrl+X cancel · " : ""}${navigation} · Tab ${this.inputFocus ? "browse" : "type"} · Esc back · PgUp/PgDn scroll`), w),
+			...wrapTextWithAnsi(this.theme.fg("dim", `${navigation}R refresh · C copy · Esc back · PgUp/PgDn scroll · View held steady until R`), w),
 		];
 		const available = Math.max(1, height - footer.length - header.length);
 		this.pageRows = Math.max(1, available - 1);
@@ -678,16 +570,12 @@ export class MomConversationView implements Component, Focusable {
 				: tree[i] ?? "");
 		}
 		while (visible.length < this.pageRows) visible.push("");
-		if (available > 1) visible.push(clip(this.theme.fg("dim", this.scroll < max ? "More below · PgDn" : this.scroll ? "More above · PgUp" : this.tab === "Map" ? "Map held steady · → expand/collapse · A ask about selected" : ""), w));
+		if (available > 1) visible.push(clip(this.theme.fg("dim", this.scroll < max ? "More below · PgDn" : this.scroll ? "More above · PgUp" : this.tab === "Map" ? "Map held steady · → expand/collapse" : ""), w));
 		return [...header, ...visible, ...footer].slice(0, height).map(line => clip(line, w) + " ".repeat(Math.max(0, w - visibleWidth(line))));
 	}
 
-	invalidate(): void { this.editor.invalidate(); }
-	dispose(): void {
-		this.sourceRequest++;
-		this.controller?.abort();
-		this.saveDraft(this.editor.getExpandedText() || this.draft);
-	}
+	invalidate(): void {}
+	dispose(): void { this.sourceRequest++; }
 }
 
 /** Scrollable version of the same cached hierarchy, not a separately maintained map. */

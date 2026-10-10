@@ -1,13 +1,13 @@
 import type { AdvisorScreenRecord } from "./advisor.ts";
-import type { Candidate } from "./candidate.ts";
 import type { Cut, FeedEvent } from "./feed.ts";
+import type { SpecOp } from "./v2.ts";
 
 /**
  * One Mom step as her tools in oven see it: the header her tools read (from the first
  * message of the operation's fresh context) and the lead reads back after a reload. Everything else her
  * tools need is in the session file and her `.mom` file. The model never sees the header.
  */
-export type OperationMode = "update" | "ask" | "audit" | "check";
+export type OperationMode = "update" | "audit" | "check";
 
 export interface OperationHeader {
 	job: string;
@@ -20,8 +20,6 @@ export interface OperationHeader {
 	digest?: boolean;
 	/** This request repairs existing model labels without changing graph structure or evidence. */
 	relabel?: boolean;
-	/** Exactly the fragments supplied to the model, not re-enumerated after inspections. */
-	candidates?: Candidate[];
 	session: { file: string; id: string; cwd: string; leaf: string | null };
 	/** Evidence boundary: the feed her tools rebuild, and the coverage an accepted map records. */
 	cut?: Cut;
@@ -31,10 +29,12 @@ export interface OperationHeader {
 	more?: boolean;
 	gaps?: number;
 	retryGap?: { id: string; remaining: string[] };
-	question?: string;
 	/** A compaction review: its trigger is known evidence beyond the session's own entries. */
 	trigger?: FeedEvent;
 	auditedGaps?: string[];
+	/** v2: the ops the decision model decided, when it read this batch. Her finalizer is checked
+	 *  against them; absent means the batch ran with structural checks alone. */
+	spec?: SpecOp[];
 	screen?: AdvisorScreenRecord;
 	/** The lead's own evidence could not be read; an empty commit cannot certify the batch. */
 	leadUnreadable?: boolean;
@@ -60,15 +60,17 @@ export function decodeOperation(text: string): { header?: OperationHeader; text:
 /** A tool result that ends the operation because Mom's own tooling failed, not because her notes were rejected. */
 export const OPERATION_FAILED = "Mom operation failed: ";
 
+/** What the user did with Mom's finding. */
+export type FindingRequest = "understood" | "dismiss" | "incorrect" | "discuss";
+
 /** What the lead's client asks of Mom's slice; the session names the lead's session file. */
 export type MomRequest =
 	| { kind: "update" }
 	| { kind: "refresh" }
 	| { kind: "relabel" }
 	| { kind: "resume" }
-	| { kind: "question"; id: string; question: string }
-	| { kind: "controls"; id: string; change: { inject: boolean } | { nudgedClasses: string[] } | { enabled: boolean } | { mode: string } | { model: string } }
-	| { kind: "finding"; action: "understood" | "dismiss" | "incorrect" | "discuss" | "explained"; finding: string };
+	| { kind: "controls"; id: string; change: { inject: boolean } | { nudgedClasses: string[] } | { enabled: boolean } | { mode: string } | { model: string } | { decider: string } }
+	| { kind: "finding"; action: FindingRequest; finding: string };
 const REQUEST = "mom.request";
 export const encodeRequest = (session: string, request: MomRequest) => JSON.stringify({ [REQUEST]: { session, ...request } });
 

@@ -9,26 +9,27 @@
 // Why modes exist: the map-maintenance judgment (Mom's "soul") is encoded as prose in one prompt,
 // and a small local model cannot hold it all at once. Competing designs move different parts of
 // that judgment between the model and host code. A mode names which split is in force.
-import { ACT_LABEL_PROMPT, deriveActs, parseActs } from "./act-derivation.ts";
-import type { Candidate } from "./candidate.ts";
 import { MOM_PROMPT } from "./contract.ts";
 import type { FeedEvent } from "./feed.ts";
 import type { WorkGraph } from "./graph.ts";
+import { applySpec, applyV2, fromWorkGraph, toWorkGraph, V2_OPERATION, V2_PROMPT, type SpecOp } from "./v2.ts";
 
-/** What a mode's apply step is handed: the map to change, the staged fragments, the model's
- *  committed payload, and the evidence it may cite. */
+/** What a mode's apply step is handed: the map to change, the model's committed payload, and the
+ *  evidence refs it may cite. */
 export interface ModeApplyInput {
 	prior: WorkGraph;
-	candidates: readonly Candidate[];
 	committed: unknown;
 	known: ReadonlyMap<string, FeedEvent>;
-	events: readonly FeedEvent[];
+	/** The ops decided for this batch, when the decision model read it (v2). */
+	spec?: readonly SpecOp[];
 }
 
 export interface ModeApplyResult {
 	graph: WorkGraph;
 	/** Why the host declined part of the payload. Reported, never silently dropped. */
 	declined: string[];
+	/** Permitted changes that the payload omitted. Kept as diagnostics, never manufactured. */
+	unmet?: string[];
 }
 
 export interface MapMode {
@@ -38,6 +39,8 @@ export interface MapMode {
 	/** The model's standing map-maintenance instructions. The host appends the operation prompt
 	 *  and the settings line; a mode never supplies those. */
 	readonly prompt: string;
+	/** The operation instructions that follow the prompt. Omitted: the shared operation prompt. */
+	readonly operation?: string;
 	/** The finalizer tool this mode's model calls to commit one update. */
 	readonly finalizer: string;
 	/** Classification rounds required, excluding preparation, audits, and one repair.
@@ -50,7 +53,7 @@ export interface MapMode {
 	 * A mode whose model emits anything else (acts, facts) MUST supply this, so host code derives
 	 * every write and the model never does.
 	 */
-	readonly apply?: (input: ModeApplyInput) => ModeApplyResult;
+	readonly apply?: (input: ModeApplyInput) => ModeApplyResult | Promise<ModeApplyResult>;
 }
 
 /** How the checked-in working approach maintains the map: the model reads the evidence and commits
@@ -66,26 +69,34 @@ export const COMMIT_GRAPH_MODE: MapMode = {
 };
 
 /**
- * Act labeling: the model decides each fragment's act and writes concise labels for new work;
- * host code decides everything else the graph does about it. Selected with --mom-mode act_labels.
+ * The minimal map (src/mom/v2.ts): the model edits one tree of work, rules and notes directly with
+ * commit_v2; the host checks structure and, when present, a per-node change spec. The decision model
+ * reads eligible background batches before her model. Stored in the shared map record, so commit_graph
+ * and every map reader are unchanged.
  */
-export const ACT_LABELS_MODE: MapMode = {
-	name: "act_labels",
-	description: "The model labels each fragment with one linguistic act and labels new work; host code derives graph operations. Native updates normally take two requests.",
-	prompt: ACT_LABEL_PROMPT,
-	finalizer: "commit_acts",
+export const V2_MODE: MapMode = {
+	name: "v2",
+	description: "Minimal map: one tree of work, rules and notes with a focus. The model edits it directly; host checks structure and eligible change specs.",
+	prompt: V2_PROMPT,
+	operation: V2_OPERATION,
+	finalizer: "commit_v2",
 	turns: 1,
-	apply: ({ prior, candidates, committed, known, events }) => {
-		const ids = candidates.map(candidate => candidate.id);
-		const { acts, labels, defects } = parseActs(committed, ids);
-		if (defects.length) return { graph: prior, declined: defects };
-		const derived = deriveActs(prior, candidates, acts, known, events, labels);
-		return { graph: derived.graph, declined: [] };
+	apply: ({ prior, committed, known, spec }) => {
+		const observed = new Set(known.keys());
+		// With a spec, the commit is checked against what the decision model decided and nothing else;
+		// without one (no decision model, a batch it could not read) structure is all the host checks.
+		const input = fromWorkGraph(prior);
+		let graph: ReturnType<typeof fromWorkGraph>, defects: string[], unmet: string[] | undefined;
+		if (spec?.length) ({ graph, defects, unmet } = applySpec(spec, input, committed, observed));
+		else ({ graph, defects } = applyV2(input, committed, observed));
+		return defects.length
+			? { graph: prior, declined: defects, ...(unmet?.length ? { unmet } : {}) }
+			: { graph: toWorkGraph(graph, prior), declined: [], ...(unmet?.length ? { unmet } : {}) };
 	},
 };
 
 /** Every declared mode. The default is the shipped behaviour: selecting no mode changes nothing. */
-export const MODES: readonly MapMode[] = [COMMIT_GRAPH_MODE, ACT_LABELS_MODE];
+export const MODES: readonly MapMode[] = [COMMIT_GRAPH_MODE, V2_MODE];
 
 export const DEFAULT_MODE = COMMIT_GRAPH_MODE.name;
 
@@ -121,7 +132,5 @@ export function modeFor(name: string | undefined): MapMode {
  * exactly; test/mom-modes.test.ts pins that.
  */
 export function modeInstructions(mode: MapMode, operationPrompt: string, settingsLine: string): string {
-	const operation = mode.name === "commit_graph" ? operationPrompt.trim()
-		: "Every message starts one operation. Call mom_begin first, alone. If it reports nothing to do, stop. For a normal background update, label exactly the supplied fragments and finish with commit_acts as a sole direct call. A historical catch-up task may supply a host-compressed thread-map digest; in that case reconcile it once with commit_graph and do not call commit_acts. For an explicit question, use answer_question as a sole direct call.";
-	return `${mode.prompt}\n\n${operation}\n\n${settingsLine}`;
+	return `${mode.prompt}\n\n${mode.operation ?? operationPrompt.trim()}\n\n${settingsLine}`;
 }

@@ -27,15 +27,38 @@ export async function provider() {
 	const arrivals = new Map<string, ReturnType<typeof deferred<any>>>();
 	const requests: any[] = [];
 	let onUnscripted: ((request: any) => Reply) | undefined;
+	let onClassify: ((request: any) => Record<string, number | Record<string, number>> | undefined) | undefined;
 	const errors: string[] = [];
 	const sockets = new Set<ServerResponse>();
 	const server = createServer(async (req, res) => {
 		sockets.add(res); res.on("close", () => sockets.delete(res));
 		try {
-			assert.equal(req.url, "/v1/chat/completions");
 			let body = "";
 			for await (const chunk of req) body += chunk;
-			const request = JSON.parse(body); requests.push(request);
+			const request = JSON.parse(body);
+			if (req.url === "/v1/systemone") {
+				const chosen = onClassify?.(request);
+				// A choice question is answered in the shape the endpoint sends: one name plus a
+				// probability per name. Left alone it says "nothing happened", which is what the
+				// fixture's callers expect of a batch they are not testing decisions about.
+				const answers = Object.fromEntries(Object.keys(request.questions ?? {}).map(name => {
+					const question = request.questions[name];
+					if (question?.type === "choice") {
+						const told = chosen?.[name];
+						const probabilities: Record<string, number> = { ...Object.fromEntries(Object.keys(question.criteria ?? {}).map(key => [key, 0.01])) };
+						if (told && typeof told === "object") Object.assign(probabilities, told);
+						else if (probabilities.none !== undefined) probabilities.none = 0.9;
+						else if (probabilities.nothing !== undefined) probabilities.nothing = 0.9;
+						else { const first = Object.keys(probabilities)[0]; if (first) probabilities[first] = 0.9; }
+						const choice = Object.entries(probabilities).sort((a, b) => b[1] - a[1])[0]?.[0] ?? "none";
+						return [name, { choice, probabilities }];
+					}
+					return [name, { noul: typeof chosen?.[name] === "number" ? chosen[name] : (name === "durable_work" ? 0.99 : 0.01) }];
+				}));
+				res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ answers })); return;
+			}
+			assert.equal(req.url, "/v1/chat/completions");
+			requests.push(request);
 			const user = request.messages.findLast((m: any) => m.role === "user");
 			const text = typeof user?.content === "string" ? user.content : user?.content?.filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n");
 			const reply = scripts.get(text)?.shift() ?? onUnscripted?.(request);
@@ -59,6 +82,9 @@ export async function provider() {
 	return {
 		url: `http://127.0.0.1:${address.port}/v1`, requests, errors,
 		onUnscripted(handler?: (request: any) => Reply) { onUnscripted = handler; },
+		/** The fixture System One classifier's answers by question name: a number for a noul question, a
+		 *  name-to-probability record for a choice. Unnamed questions keep the defaults. */
+		classify(handler?: (request: any) => Record<string, number | Record<string, number>> | undefined) { onClassify = handler; },
 		script(text: string, ...replies: Reply[]) { scripts.set(text, replies); const arrival = deferred<any>(); arrivals.set(text, arrival); return arrival.promise; },
 		async close() { for (const res of sockets) res.destroy(); server.close(); await once(server, "close"); },
 	};
@@ -74,9 +100,11 @@ export function sandbox(url: string, root = mkdtempSync(join(tmpdir(), "pi-deleg
 	if (!options.ownAgentDir) rmSync(agentDir, { recursive: true, force: true });
 	mkdirSync(cwd, { recursive: true }); mkdirSync(agentDir, { recursive: true });
 	// Pi 0.99 sends strict tool schemas only to endpoints that advertise support; the loopback accepts them, as real strict-capable providers do.
-	writeFileSync(join(agentDir, "models.json"), JSON.stringify({ providers: { fixture: { api: "openai-completions", baseUrl: url, apiKey: "loopback-only", models: [{ id: "fixture", name: "Deterministic fixture", reasoning: false, input: ["text"], contextWindow: 32768, maxTokens: 4096, compat: { supportsStrictMode: true }, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }] } } }));
+	writeFileSync(join(agentDir, "models.json"), JSON.stringify({ providers: { fixture: { api: "openai-completions", baseUrl: url, apiKey: "loopback-only", models: [
+		{ id: "fixture", name: "Deterministic fixture", reasoning: false, input: ["text"], contextWindow: 32768, maxTokens: 4096, compat: { supportsStrictMode: true }, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
+	] } } }));
 	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ defaultProvider: "fixture", defaultModel: "fixture", defaultThinkingLevel: "off", retry: options.retry ?? { enabled: false }, compaction: { enabled: false }, defaultProjectTrust: "full", quietStartup: true, hideThinkingBlock: true }));
-	return { root, cwd, agentDir, env: { ...process.env, HOME: root, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", PI_TELEMETRY: "0", DO_NOT_TRACK: "1" } };
+	return { root, cwd, agentDir, url, env: { ...process.env, HOME: root, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", PI_TELEMETRY: "0", DO_NOT_TRACK: "1" } };
 }
 export type Sandbox = ReturnType<typeof sandbox>;
 
@@ -143,6 +171,7 @@ export async function harness(box: Sandbox, parent?: string, hooks: { beforeNoti
 	process.env.DO_NOT_TRACK = "1";
 	process.env.PI_TELEMETRY = "0";
 	const sdk = await import("@earendil-works/pi-coding-agent");
+	const { classify: classifySystemOne } = await import("@earendil-works/pi-ai/api/typesafe-system-one");
 	const { default: extension, AGENT_DIR } = await import("../src/index.ts");
 	// Before anything launches: src/index.ts resolved its agent directory once, when first loaded. A
 	// test file that loaded it before test/setup.ts would point it at the real home.
@@ -155,6 +184,12 @@ export async function harness(box: Sandbox, parent?: string, hooks: { beforeNoti
 	const notices: any[] = [], errors: any[] = [];
 	const notice = deferred<any>();
 	const factory = (pi: any) => {
+		pi.registerProvider("fixture-classifier", {
+			name: "Deterministic fixture classifier", baseUrl: box.url, apiKey: "loopback-only",
+			classifiers: { "typesafe-system-one": { classify: classifySystemOne } },
+			models: [{ id: "fixture-decider", name: "Deterministic fixture classifier", type: "classifier", api: "typesafe-system-one",
+				input: ["text"], contextWindow: 32768, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
+		});
 		extensionApi = pi;
 		extension(new Proxy(pi, { get(target, key) {
 			if (key === "getFlag") return (name: string) => Object.prototype.hasOwnProperty.call(hooks.flags ?? {}, name) ? hooks.flags![name] : target.getFlag(name);

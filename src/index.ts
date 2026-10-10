@@ -25,6 +25,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { keyHint } from "@earendil-works/pi-coding-agent";
+import { readLegacySection, readSettings, settingsFile, writeSettings } from "./settings-file.ts";
 import { AgentHistory, ChildView, type LiveSource } from "./inspector.js";
 import type { ActiveTool, ChildActivity } from "./transcript.js";
 import { type AAIndices, acpRowView, asRunView, elapsed, empty, framed, type LiveFacts, type ModelRow, type ModelsDetails, resultLines, resultView, type RunView } from "./render.js";
@@ -45,8 +46,7 @@ import { activityFor } from "./ui/activity.js";
 /** Resolved once, at load, by Pi's own rule (PI_CODING_AGENT_DIR with `~` expanded, else ~/.pi/agent), so this file and Pi read the same mcp.json and settings. */
 export const AGENT_DIR = getAgentDir();
 const LOG_FILE = join(AGENT_DIR, "delegate-runs.jsonl");
-const DEFAULTS_FILE = join(AGENT_DIR, "delegate-models.json");
-const RATINGS_FILE = join(AGENT_DIR, "delegate-ratings.json");
+const SETTINGS_PATH = settingsFile(AGENT_DIR);
 const STALE_DAYS = 30;
 const RATINGS_STALE_DAYS = 14;
 const OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models";
@@ -726,21 +726,14 @@ interface Defaults {
 }
 
 function loadDefaults(): Defaults {
-	try {
-		const d = JSON.parse(readFileSync(DEFAULTS_FILE, "utf8"));
-		return { approved: d.approved ?? {}, catalogAtApproval: d.catalogAtApproval ?? [] };
-	} catch {
-		return { approved: {}, catalogAtApproval: [] };
-	}
+	// The `defaults` section of the settings file, or the file this used to live in.
+	const d = readSettings(SETTINGS_PATH).defaults ?? readLegacySection("defaults", AGENT_DIR);
+	return { approved: d?.approved ?? {}, catalogAtApproval: d?.catalogAtApproval ?? [] };
 }
 
 /** Written by delegate_ctl approve after the user agreed in conversation, or by the user's editor. Snapshot is the full catalog. */
-function saveDefault(role: string, entry: ApprovedModel, available: any[]) {
-	const d = loadDefaults();
-	d.approved[role] = entry;
-	d.catalogAtApproval = available.map(modelKey).sort();
-	mkdirSync(dirname(DEFAULTS_FILE), { recursive: true });
-	writeFileSync(DEFAULTS_FILE, `${JSON.stringify(d, null, 2)}\n`);
+async function saveDefault(role: string, entry: ApprovedModel, available: any[]) {
+	await writeSettings({ defaults: { approved: { [role]: entry }, catalogAtApproval: available.map(modelKey).sort() } }, SETTINGS_PATH);
 }
 
 function modelKey(m: any): string {
@@ -758,21 +751,14 @@ interface Ratings {
 }
 
 function loadRatings(): Ratings {
-	try {
-		const d = JSON.parse(readFileSync(RATINGS_FILE, "utf8"));
-		return { updatedAt: d.updatedAt ?? 0, entries: d.entries ?? {} };
-	} catch {
-		return { updatedAt: 0, entries: {} };
-	}
+	const d = readSettings(SETTINGS_PATH).ratings ?? readLegacySection("ratings", AGENT_DIR);
+	return { updatedAt: d?.updatedAt ?? 0, entries: d?.entries ?? {} };
 }
 
-function saveRatings(items: { model: string; score: number; source: string; note?: string }[]): Ratings {
-	const r = loadRatings();
-	for (const it of items) r.entries[it.model] = { score: it.score, source: it.source, note: it.note };
-	r.updatedAt = Date.now();
-	mkdirSync(dirname(RATINGS_FILE), { recursive: true });
-	writeFileSync(RATINGS_FILE, `${JSON.stringify(r, null, 2)}\n`);
-	return r;
+async function saveRatings(items: { model: string; score: number; source: string; note?: string }[]): Promise<Ratings> {
+	const entries = Object.fromEntries(items.map(it => [it.model, { score: it.score, source: it.source, ...(it.note === undefined ? {} : { note: it.note }) }]));
+	const written = await writeSettings({ ratings: { updatedAt: Date.now(), entries } }, SETTINGS_PATH);
+	return { updatedAt: written.ratings?.updatedAt ?? Date.now(), entries: written.ratings?.entries ?? {} };
 }
 
 /** Live OpenRouter catalog: per-token pricing, tiered overrides, expiration, Artificial Analysis indices. Public endpoint, no key. */
@@ -2214,12 +2200,12 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 				const { model, thinking } = resolveModel(p.model, ctx);
 				if (!model) return { content: [{ type: "text", text: `model not found: ${p.model}` }], isError: true, details: undefined };
 				const spec = `${modelKey(model)}${thinking ? `:${thinking}` : ""}`;
-				saveDefault(p.role, { spec, reason: p.message, approvedAt: Date.now(), cost: model.cost ? { input: model.cost.input, output: model.cost.output } : undefined }, (ctx.modelRegistry as any).getAvailable());
-				return { content: [{ type: "text", text: `${p.role} \u2192 ${spec} saved as default (${DEFAULTS_FILE.replace(homedir(), "~")}). Only call this after the user has agreed in conversation.` }], details: undefined };
+				await saveDefault(p.role, { spec, reason: p.message, approvedAt: Date.now(), cost: model.cost ? { input: model.cost.input, output: model.cost.output } : undefined }, (ctx.modelRegistry as any).getAvailable());
+				return { content: [{ type: "text", text: `${p.role} \u2192 ${spec} saved as default (${SETTINGS_PATH.replace(homedir(), "~")}). Only call this after the user has agreed in conversation.` }], details: undefined };
 			}
 			if (p.action === "rate") {
 				if (!p.ratings?.length) return { content: [{ type: "text", text: "rate requires ratings: [{model, score, source, note?}]" }], isError: true, details: undefined };
-				const r = saveRatings(p.ratings);
+				const r = await saveRatings(p.ratings);
 				return { content: [{ type: "text", text: `stored ${p.ratings.length}; ${Object.keys(r.entries).length} rated in total. Run models to see them applied.` }], details: undefined };
 			}
 			if (p.action === "deals") {

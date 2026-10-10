@@ -62,14 +62,14 @@ test("act-label preparation uses the local digest before asking the model", asyn
 	};
 	const mom = new Mom({
 		ctx: { cwd: "/tmp", isIdle: () => true, sessionManager: manager, ui: { notify() {} } },
-		mapMode: "act_labels", model: "omlx/test", bootstrapPolicy: { maxChapters: 2, maxDigestChars: 6000, maxWindows: 10 },
+		mapMode: "v2", model: "omlx/test", bootstrapPolicy: { maxChapters: 2, maxDigestChars: 6000, maxWindows: 10 },
 		store: { append: async () => ({ id: "record" }) }, steps: async () => ({ messages: [] }), changed() {},
 	} as any);
 	(mom as any).feed = feed;
 	const prepared = await mom.prepare({ refresh: false, job: "job" });
 	assert.equal(prepared.kind, "work");
 	if (prepared.kind !== "work") return;
-	assert.equal(calls, 3, "act_labels drains all backlog windows locally");
+	assert.equal(calls, 3, "the cold backlog is drained locally, window by window");
 	assert.match(prepared.batch.digest ?? "", /BOOTSTRAP CHAPTER CHAIN/);
 	assert.equal(prepared.batch.more, false);
 });

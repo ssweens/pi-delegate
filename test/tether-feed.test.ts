@@ -12,7 +12,7 @@ test("Mom batches settled worker evidence until lead cadence is due, without ext
 	const { SidecarStore } = await import("../src/mom/sidecar.ts");
 	const { LiveFeed } = await import("../src/mom/feed.ts");
 	const h = await harness(box, undefined, { flags: {
-		"mom-model": "fixture/fixture", "mom-interval-ms": "0", "mom-quiet-ms": "0", "mom-max-wait-ms": "0", "mom-retry-ms": "100,100,100",
+		"mom-model": "fixture/fixture", "mom-decider": "fixture-classifier/fixture-decider", "mom-interval-ms": "0", "mom-quiet-ms": "0", "mom-max-wait-ms": "0", "mom-retry-ms": "100,100,100",
 	} });
 	const gate = deferred<void>(), firstGate = deferred<void>();
 	writeFileSync(join(box.cwd, "seed.txt"), "seed");

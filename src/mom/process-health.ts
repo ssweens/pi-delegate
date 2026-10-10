@@ -14,6 +14,7 @@ export interface ProcessNotice {
 }
 export interface ProcessResolution { riskClass: ProcessRiskClass; target: string; resolutionRefs: string[] }
 export interface FindingFeedback { action: "understood" | "dismiss" | "incorrect" | "ignored" | "backoff"; riskRefs: string[] }
+// `explained` and `asked` are legacy record values: her sidecar keeps reading them, nothing writes them now.
 export const FINDING_ACTIONS = ["delivered", "understood", "dismiss", "incorrect", "discuss", "explained", "asked", "ignored", "backoff"] as const;
 export type FindingAction = typeof FINDING_ACTIONS[number];
 export interface Engagement {

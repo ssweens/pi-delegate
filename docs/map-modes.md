@@ -1,27 +1,40 @@
 # Map modes
 
-`commit_graph` remains the default. `act_labels` is an opt-in mode with known inherited live-map
-semantic failures. Those failures are post-move follow-up work. `extract_place` remains an offline
-experiment, not a registered mode.
+`commit_graph` remains the default. `v2` is the opt-in minimal map. On eligible background batches, a decision model writes a per-node change spec; an empty spec skips Mom's model. When no usable spec is available, v2 fails open to Mom's model and checks structure only. (`act_labels` was deleted; see **Current evidence**.)
 
 ## Purpose
 
 A mode defines the split between model judgment and host code:
 
-| Mode | Model decides | Host decides |
-|---|---|---|
-| `commit_graph` | Graph changes, targets, states, and focus | Validation, source repair, and single-writer acceptance |
-| `act_labels` | One linguistic act per supplied fragment and a short label for each request or assent | Targets, graph changes, states, focus, and role authority |
-| `extract_place` (unregistered) | Facts, then their placement | Retrieval, writes, states, and focus |
+| Mode | Mom model decides | Decision model classifies | Host decides |
+|---|---|---|---|
+| `commit_graph` | Graph changes, targets, states, and focus | Whether parked work is retired | Validation, source repair, and single-writer acceptance |
+| `v2` | The contents of each accepted map edit | Per-node state, attachment and new-work ops for eligible background batches | Structural invariants, plus state/removal compliance with a non-empty spec |
 
 ## Selection and persistence
 
-Select **Map mode** and **Model** in `/mom settings`. Both are durable sidecar controls.
-`--mom-mode <name>` supplies the initial mode; a saved control takes precedence.
-Unknown modes are refused rather than replaced with the default.
+Select **Tracking**, **Suggestions**, **Automatic continuity**, **Map mode**, **Model**, and **Decision
+model** in `/mom settings`. The client stores them in `<agentDir>/pi-delegate.json`, in the `mom`
+section beside `defaults` and `ratings`. It writes the file atomically with mode `0600` before the
+slice hears about a change, so the save succeeds when Oven is down. New or reconfigured Mom slices
+read the saved value. Saving a control in one Pi session does not reconfigure slices in other running
+sessions. Those slices keep the configuration they last received. `Quiet this session` is the one
+exception. It is a session toggle and is never persisted.
+
+`--mom-mode <name>` and `--mom-decider <provider/id>` supply the initial values. A saved setting takes
+precedence over them, and older session control records remain as a fallback. The loader drops malformed
+fields instead of throwing, so one bad value does not prevent a Mom slice from loading. The former
+settings files (`delegate-models.json`, `delegate-ratings.json`) are folded in on the first write.
+
+The decision-model picker lists Pi's registered private-IPv4 System One classifiers and resolves their
+endpoint from the registry. With no usable decision model, `v2` sends every update to Mom without a
+change spec; the host then checks structure only. A missing classifier, failed/slow endpoint, oversized
+batch or incomplete answer fails open the same way. The client warns once per session when a chosen
+reference does not resolve to a registered local System One classifier. Unknown modes are refused rather
+than replaced with defaults.
 
 After the save acknowledgment, the client reconfigures Mom's slice. A busy slice takes the
-new configuration for its next operation. Each operation pins its mode and supplied fragments,
+new configuration for its next operation. Each operation pins its mode and its evidence,
 so a settings change cannot alter an update already in progress.
 
 Pi `/reload` reloads the client, not the shared Oven daemon's cached extension modules.
@@ -34,41 +47,84 @@ node ../oven/bin/oven.mjs start
 
 Restarting Oven is not required for an ordinary mode or model settings change.
 
-## Native act-label lifecycle
+## The operation
 
-1. The model calls `mom_begin`. The host stages numbered fragments, roles, full quotes,
-   resolved antecedents, and unfinished obligations.
-2. The model calls `commit_acts` with exactly one act for every supplied ID. Request and assent entries also carry a concise model-written work label.
-3. Host code derives changes and checks sources, unfinished obligations, and the checkpoint
-   before saving it. Missing, duplicate, or invented fragment IDs are refused.
+1. The model calls `mom_begin`. The host stages the operation: the mode's map, the new evidence,
+   and the obligations the mode tracks.
+2. The model finishes with the mode's own finalizer as a sole direct call. The host validates it
+   against the mode's contract and the observed evidence before saving.
+3. A rejected payload gets one repair. A second failure ends the operation; an update's turn fails
+   so oven retries it.
 
-The tool list is phase-specific: `mom_begin` before preparation, then `commit_acts` for an
-act-label update. The finalizer also checks the pinned mode. A rejected payload gets one repair.
+The tool list is phase-specific: `mom_begin` alone before preparation, then the finalizer and the
+evidence tools. Each operation starts a fresh context; earlier operations stay in her slice's
+storage and out of the model's input.
 
-`/mom relabel` repairs the saved map without consuming the live backlog. Before asking the
-model for work labels, it removes older work fabricated from structured dialog answers or
-assistant status mistaken for a todo-reminder offer; direct user complaints remain as notes.
-The model supplies IDs and labels through `commit_labels`; the host applies them using the
-saved sources. IDs, structure, evidence, notes, and unfinished obligations are preserved;
-ordinary backlog processing continues on the next update.
+Large historical catch-up is never raw evidence. The host compresses the backlog locally into a
+thread-map chapter digest, and either mode reconciles that digest with its own finalizer. The
+default `commit_graph` also uses that path for its frontier updates.
 
-A normal update takes **two provider requests**, not one. One classification response is not
-one end-to-end request. Large historical catch-up is intentionally not a normal update: the host
-compresses the backlog locally and Mom reconciles one thread-map digest with `commit_graph`.
-If there are no fragments, an existing map, and no unresolved coverage problem, `mom_begin` saves
-the coverage cursor without asking for labels or rewriting the map.
+Compaction retains the independent thread-map mechanism: a child step reconstructs chapter state
+from the raw evidence before the operation reconciles it. Raw tool or receipt evidence can require
+inspection; a summary-only section establishes no new raw facts. Historical gaps are not marked
+audited merely because current evidence was reconciled. Recovery processes bounded prefixes and
+preserves the unattempted suffix and the coverage cursor.
 
-Frontier preparation admits at most 60 narrative fragments per batch, preserving whole source
-entries and full quotes. An individual entry over that bound is refused, not truncated. Large
-historical catch-up never processes consecutive raw-evidence batches. It uses the local
-thread-map chapter digest and temporarily pins that operation to `commit_graph`; the next
-frontier update returns to `act_labels`. The default mode uses the same digest path.
+`/mom relabel` repairs saved labels without consuming the live backlog. The model supplies IDs and
+labels through `commit_labels`; the host applies them using the saved sources, and the decision
+model guards the rewrite — it refuses a label that describes the conversation rather than the work,
+and a replacement that names nothing in that work's intent. IDs, structure, evidence, notes, and
+unfinished obligations are preserved; ordinary backlog processing continues on the next update.
 
-Compaction retains the independent thread-map mechanism. Act-label audits use inline narrative
-evidence and short source aliases; raw tool or receipt evidence can require inspection. A
-summary-only section establishes no new raw facts. Pending raw directions are still audited
-and labeled. Historical gaps are not marked audited merely because current fragments were labeled.
-Recovery processes bounded prefixes and preserves the unattempted suffix and coverage cursor.
+## v2: the minimal map
+
+`v2` maintains one tree with three node kinds and one pointer:
+
+```ts
+type V2Graph = { focus: ID | null; nodes: V2Node[] };
+type V2Node = { id; parent: ID | null; kind: "work" | "rule" | "note"; state?: "active" | "parked" | "settled"; label; sources };
+```
+
+Mom commits with `commit_v2 { put, remove, focus }`. A `put` replaces the whole node, except that
+`sources` accumulate. `commit_v2 {}` records that nothing durable changed. The host always checks
+structure and reports every defect at once:
+
+1. IDs are unique; every cited source is an observed evidence ID.
+2. Exactly one root, and it is work. The root is the purpose.
+3. Every parent is work, with no cycles. Only work has a state.
+4. `focus` is null only for an empty map; otherwise it is work.
+5. Settled work holds no active or parked work.
+6. Without a non-empty change spec, a commit never empties a non-empty map. With a spec, every
+   removed work item must be individually authorized as dropped.
+
+There are no edges, prose fields beyond the label, fold or merge, or unfinished ledger. Historical
+catch-up digests use `commit_v2`, not `commit_graph`. The map is stored in the shared map record (work
+as `feature`, notes as `observation`, empty `intent`/`observed`), so existing readers still work.
+Converting a richer map to v2 is lossy: unsupported edges and prose are dropped. The model sees the
+map without sources.
+
+### The change spec
+
+For an eligible background delivery with an existing map and a usable decision model, `readSpec`
+(`src/mom/spec.ts`) asks one choice question per work node for state and attachment, plus one question
+for new work. The answers become `SpecOp`s and are included as `changes` in Mom's request. `applySpec`
+checks her commit against that spec: state changes and removals are constrained; additions are
+permitted, not required, because the attachment classifier has known holdout misses. An existing
+rule or note may be rewritten only under work the spec touched; its kind and parent cannot change.
+Focus is derived from the accepted ops, not chosen by Mom.
+
+If the decision model returns a complete set of answers but no ops, the host saves evidence coverage
+and skips Mom's model. A spec never writes edits itself: it enforces state/drop decisions and permits
+some additions. It does not validate labels or other prose.
+
+The decision path is fail-open. A first map, explicit request, correction, review, catch-up, retry or
+recovery does not get a spec. Nor does a batch if the classifier is absent, fails, times out, exceeds
+`SPEC_CHARS`, or omits an answer. Mom then runs with structural checks only, including the non-empty
+map guard. This preserves progress but means the per-node protection is not active on those paths.
+V2 decision records are logged beside the session as `v2-spec`. Eligible fail-open reads include `no-client`, `oversized`, `incomplete`, or `classifier-error`; ineligible operations record their skip reason (for example `no-checkpoint`, `retry-gap`, or `correction`).
+
+The spec's deliberate asymmetries and measured tuning are documented in
+[`v2-change-spec.md`](v2-change-spec.md).
 
 ## Mode contract
 
@@ -79,9 +135,10 @@ MapMode
   name        stable lowercase_underscore id
   description human-readable description
   prompt      standing map-maintenance instructions
+  operation   optional operation instructions (commits to the shared one)
   finalizer   tool that commits this mode's output
   turns       classification rounds required, excluding preparation and repair
-  apply       optional host derivation of non-transaction output
+  apply       optional host application of non-transaction output
 ```
 
 ### M1 — default instructions are byte-identical
@@ -105,16 +162,12 @@ operation-seam change before it can be selected.
 The tool registry must register the declared finalizer. Tool visibility and finalizer guards
 must agree with the operation's pinned mode.
 
-### M5 — non-transaction output requires host derivation
+### M5 — non-transaction output requires host application
 
-| Mode | Finalizer | Graph derivation |
+| Mode | Finalizer | Graph application |
 |---|---|---|
-| `commit_graph` | `commit_graph` | Model-authored transaction, checked and applied by the host |
-| `act_labels` | `commit_acts` | `deriveActs` through `ACT_LABELS_MODE.apply`, then host checks. Work labels remain model-authored; source metadata prevents dialog answers from becoming new work. |
-
-Independent constraints append rules. Only an explicit reference to an existing rule replaces
-that rule. Assistant suggestions cannot create user rules. Completion negation prevents settlement.
-These safeguards do not prove that heuristic target matching is correct for every conversation.
+| `commit_graph` | `commit_graph` | Model-authored transaction, checked and applied by the host through `acceptGraph` |
+| `v2` | `commit_v2` | Model-authored edits applied and checked by `V2_MODE.apply` (`src/mom/v2.ts`); `acceptGraph` is not used. |
 
 ## Adding a mode
 
@@ -129,14 +182,18 @@ Offline variant results are hypothesis-selection evidence, not native readiness 
 
 ## Current evidence
 
-The separate Mom-modes checkout exercised native Mom and isolated Oven against
-`omlx/Qwen3.5-4B-MLX-4bit`. Earlier synthetic verification passed **112/112 cases across eight
-sessions**; the latest synthetic recheck passed **14/14**. Ordinary updates used two requests;
-summary-only compaction used one; pending-direction compaction used three or four; a 102-fragment
-backlog used four requests across two batches.
+`act_labels` was deleted after its live-map semantic gate failed **0/12 phases across three
+replays** against `omlx/Qwen3.5-4B-MLX-4bit`: focus, current findings, abandoned-work handling, and
+stale-state complaint retention failed even though every operation was accepted and nine
+`commit_acts` calls landed. Accepted writes and fresh timestamps did not make the map semantically
+current — the host inferred targets and actions from prose with token matching, and that inference
+was wrong. `v2` removes the inference: the model writes the map, and the host checks structure plus any available per-node spec.
 
-The inherited-map gate passed **0/12 phases across three replays**, despite successful native
-operations and nine actual `commit_acts` calls. Focus, current findings, abandoned-work handling,
-and stale-state complaint retention failed. Preservation and authority checks passed. This
-separates accepted writes and fresh timestamps from a semantically current map. Keep this evidence
-as post-move follow-up; it does not block the current contract port.
+`test/mom-v2.test.ts` covers map invariants, change-spec enforcement, source accumulation, and
+save/reload round trips. `test/mom-v2-live.test.ts` exercises the finalizer and decision-model
+skip/run behavior through a real Oven daemon with fixture models. The opt-in
+`test/mom-v2-semantic.test.ts` gate passed on October 10, 2026 with Qwen3.6-35B-A3B-8bit: the direct
+no-classifier scenario passed 33/33 checks, and the root-drop guard passed 6/6 after its repair prompt
+was clarified. With Beverly 4B enabled as the System One classifier, the end-to-end scenario passed
+16/16 checks, including new work, finish, drop, and no-op skip. These results cover the tested paths;
+without a usable spec the host still enforces structure only.

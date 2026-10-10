@@ -16,15 +16,18 @@ import { emptyUsage, graphChange, isCheckpoint, loadState, noticeKey, sumUsage, 
 import { reviewFromSession, type CompactionReview } from "./compaction.ts";
 import { extractEvents, isUserDirection, renderEvents, type FeedEvent, type SessionReader } from "./feed.ts";
 import { Mom, readStep, type StepRequest, type StepRunner } from "./mother.ts";
-import { isEndeavor, isObsoleteParkedWork } from "./graph.ts";
-import { ACT_LABELS_MODE, COMMIT_GRAPH_MODE, modeFor } from "./modes.ts";
-import { repairWorkProvenance } from "./act-derivation.ts";
-import { enumerateCandidates } from "./enumerate.ts";
+import { isEndeavor } from "./graph.ts";
+import { Beverly } from "./classify.ts";
+import { COMMIT_GRAPH_MODE, V2_MODE, modeFor } from "./modes.ts";
+import { fromWorkGraph, v2Body, V2_AUDIT_TASK, V2_DIGEST_TASK, V2_UPDATE_TASK, type V2BodyParts } from "./v2.ts";
+import { readSpec } from "./spec.ts";
+import { writeMomGlobals } from "./globals.ts";
+import type { SpecOp } from "./v2.ts";
 import { decodeStart, encodeOperation, OPERATION_FAILED, type MomRequest, type OperationHeader, type OperationStart } from "./operation.ts";
 import { feedbackApplies, recordEngagement } from "./process-health.ts";
 import { currentSession, leadRunning } from "./session-file.ts";
 import { SidecarStore } from "./sidecar.ts";
-import { formatElapsed, isStatusPing } from "./status.ts";
+import { formatElapsed } from "./status.ts";
 import { collectTurnSignals, lastDirectionOf, MAX_WINDOW_CHECKS, MAX_WINDOW_TURNS, offeredRefs, parseWindowVerdict, renderCorrection, stageOne, windowMessages, windowPurpose } from "./window.ts";
 
 /** The operation in her slice's current context. */
@@ -34,7 +37,7 @@ export interface OperationState {
 	job?: string;
 	header?: OperationHeader;
 	start?: OperationStart;
-	status: "none" | "open" | "accepted" | "answered" | "rejected" | "done";
+	status: "none" | "open" | "accepted" | "rejected" | "done";
 	rejection?: string;
 	/** Set when the operation failed in a way oven should retry: her turn ends as a failed turn. */
 	fault?: string;
@@ -44,11 +47,13 @@ export interface OperationState {
 	baseUsage?: Usage;
 	/** Shadow: the decider's guess per open item, made before her model saw the batch; compared once she saves. */
 	shadow?: { guesses: { id: string; label: string; state: string; guess: string; p: number }[]; latencyMs: number };
+	/** v2: the ops the decision model decided for this batch, and the names it chose; logged once she saves. */
+	read?: { ops: SpecOp[]; chosen: Record<string, string> };
 }
 
 /** What clients show of her: what she is doing, and what the `.mom` file cannot say. */
 export interface MomStatus {
-	op?: { job: string; mode: string; startedAt: number; thinkingAt?: number; activity: string; target?: string | null; recovering?: boolean; question?: string; section?: { section: number; of: number } };
+	op?: { job: string; mode: string; startedAt: number; thinkingAt?: number; activity: string; target?: string | null; recovering?: boolean; section?: { section: number; of: number } };
 	waitingForWorkers?: boolean;
 	deferredUntil?: number;
 	more?: boolean;
@@ -63,9 +68,7 @@ export interface MomStatus {
 	uncertainEffects?: { ref: string; name?: string }[];
 	/** Messages for the user, newest last. */
 	notices: { at: number; text: string; level: "info" | "warning" | "error" }[];
-	/** The last eight answered questions: follow-ups see them. */
-	conversation?: { question: string; answer: string }[];
-	/** Answers to questions, by request ID. */
+	/** Replies to control requests, by request ID: the client waits for its own. */
 	answers: Record<string, { answer?: string; error?: string; at: number }>;
 	/** Failed compaction audits, by trigger; two retire the audit. */
 	auditAttempts: Record<string, number>;
@@ -80,7 +83,9 @@ export const GIVE_UP = "You ended without finishing, twice. Call mom_begin.";
 const emptyStatus = (): MomStatus => ({ rejectedStreak: 0, notices: [], answers: {}, auditAttempts: {} });
 
 /** Settings the lead passes in her instructions (the `--mom-*` flags). */
-export interface MomSettings { mapMode?: string; bootstrap?: false | BootstrapPolicy; advisor?: { url: string; model: string; threshold: number; timeoutMs: number }; decider?: { url: string; clear: number } }
+export interface MomSettings { mapMode?: string; bootstrap?: false | BootstrapPolicy; advisor?: { url: string; model: string; threshold: number; timeoutMs: number }; decider?: { url: string; clear: number };
+	/** The decision model every semantic gate asks (classify.ts), resolved from the chosen decider. */
+	classifier?: { url: string; model: string; timeoutMs?: number } }
 const SETTINGS = /<!-- mom-settings (\{.*\}) -->/;
 export const settingsLine = (settings: MomSettings) => `<!-- mom-settings ${JSON.stringify(settings)} -->`;
 export function readSettings(instructions: string | undefined): MomSettings {
@@ -221,11 +226,6 @@ async function settlePrevious(engine: Engine, api: Durable.ToolExecutionApi, ctx
 	const settled = await mom.settle(previous.header, outcome, usage);
 	if (settled.retiredRejection) { status.rejectedStreak++; status.lastRejection = settled.retiredRejection; }
 	if (settled.error) status.lastError = settled.error;
-	const question = previous.start?.kind === "request" && previous.start.request.kind === "question" ? previous.start.request : undefined;
-	if (question && !status.answers[question.id]) {
-		status.answers[question.id] = { error: outcome.answer ? undefined : settled.error ?? "Mom returned no answer.", answer: outcome.answer, at: Date.now() };
-		if (outcome.answer) status.conversation = [...(status.conversation ?? []), { question: question.question, answer: outcome.answer }].slice(-8);
-	}
 	return true;
 }
 
@@ -241,7 +241,7 @@ export async function begin(engine: Engine, api: Durable.ToolExecutionApi, ctx: 
 		if (previous.status === "open" && previous.header && previous.startEntry !== undefined) {
 			const messages = (await entriesFrom(api, ctx, api.conversationId as any, previous.startEntry)).flatMap(entry => entry.model);
 			if (messages.some((message: any) => message.role === "user" && (typeof message.content === "string" ? message.content : message.content.map((part: any) => part.text ?? "").join("")).startsWith(GIVE_UP))) {
-				const message = previous.header.mode === "ask" ? "Mom finished without an answer." : "Mom finished without an accepted background graph transaction.";
+				const message = "Mom finished without an accepted background graph transaction.";
 				await rejected(engine, api, ctx, previous.header, message);
 				const failedOp = await readOperation(engine, api, ctx);
 				return failedOp.fault ? { content: text(`${OPERATION_FAILED}${message}`), isError: true, control: { terminate: true } } : { content: text(`${OPERATION_FAILED}${message}`), control: { terminate: true } };
@@ -264,14 +264,18 @@ export async function begin(engine: Engine, api: Durable.ToolExecutionApi, ctx: 
 		bootstrapPolicy: settings.bootstrap === false ? undefined : settings.bootstrap ?? DEFAULT_BOOTSTRAP_POLICY,
 		advisor: settings.advisor?.url ? new SystemOneAdvisor(settings.advisor) : undefined,
 		changed: progress });
-	const question = start.kind === "request" && start.request.kind === "question" ? start.request : undefined;
 	const relabel = start.kind === "request" && start.request.kind === "relabel";
+	// The decider every semantic gate asks. A configured-but-bad endpoint throws here: begin fails
+	// loudly rather than deriving from word lists.
+	const beverly = settings.classifier ? new Beverly(settings.classifier) : undefined;
+	// The spec's questions are answered by name (choices), so the batch spec reads the endpoint directly.
+	const classifier: Decider | undefined = settings.classifier
+		? new Decider(settings.classifier.url, settings.classifier.timeoutMs ?? 15000, settings.classifier.model) : undefined;
 	let decider: { client: Decider; clear: number } | undefined;
 	try { if (settings.decider?.url) decider = { client: new Decider(settings.decider.url), clear: settings.decider.clear }; } catch { /* a bad URL disables it */ }
-	// A question's finalizers are mom-ask's (an answer); maintenance offers none. The change applies from her next request.
-	const selected = agent.extensions.map(extension => extension.name);
-	if (selected.includes("mom-ask") !== Boolean(question)) {
-		const wanted = ["mom", ...(question ? ["mom-ask"] : [])].map(name => api.registry.extension(name)).filter((e): e is Durable.Extension => Boolean(e));
+	// A slice configured by an older package may still select the retired `mom-ask` extension: Mom has only `mom`.
+	if (agent.extensions.some(extension => extension.name !== "mom")) {
+		const wanted = [api.registry.extension("mom")].filter((e): e is Durable.Extension => Boolean(e));
 		await api.commit(tx => engine.durable.configure(tx, api.conversationId, { extensions: wanted }), ctx);
 	}
 	const save = async (op: Partial<OperationState>, change?: (status: MomStatus) => void) => {
@@ -286,11 +290,10 @@ export async function begin(engine: Engine, api: Durable.ToolExecutionApi, ctx: 
 	const controls = async () => {
 		const request = start.kind === "request" && start.request.kind === "controls" ? start.request : undefined;
 		if (!request) return undefined;
-		let error: string | undefined;
-		try { await new SidecarStore(() => start.session, currentSession(start.session).getSessionId()).append("control", request.change); }
-		catch (cause) { error = cause instanceof Error ? cause.message : String(cause); }
-		await save({ status: "done" }, current => { current.answers[request.id] = error ? { error, at: Date.now() } : { answer: "Saved.", at: Date.now() }; });
-		return done(error ? `Not saved: ${error}` : "Saved.");
+		// Her controls are saved globally by the client (globals.ts) before this request arrives; her
+		// slice only acknowledges it and re-reads the file on its next operation.
+		await save({ status: "done" }, current => { current.answers[request.id] = { answer: "Saved.", at: Date.now() }; });
+		return done("Saved.");
 	};
 	let mom: Mom;
 	const open = async () => { const opened = host(start.session); lead = opened.ctx; const made = new Mom(opened); await made.open(); current = made; return made; };
@@ -300,12 +303,10 @@ export async function begin(engine: Engine, api: Durable.ToolExecutionApi, ctx: 
 		if (saved) return saved;
 		status.openingError = String(error);
 		notices.push({ at: Date.now(), text: `Mom needs you: she couldn't open her saved notes. ${String(error)}`, level: "warning" });
-		if (question) status.answers[question.id] = { error: `Mom couldn't open her saved notes: ${String(error)}`, at: Date.now() };
 		await save({ status: "done" });
 		return done(`Mom couldn't open her saved notes: ${String(error)}`);
 	}
 	status.openingError = undefined;
-	mom.conversation = [...(status.conversation ?? [])];
 	try {
 		if (await settlePrevious(engine, api, ctx, previous, latest.entry, mom, status)) mom = await open();
 	} catch (error) { status.lastError = `Mom could not record her last operation: ${String(error)}`; }
@@ -323,115 +324,92 @@ export async function begin(engine: Engine, api: Durable.ToolExecutionApi, ctx: 
 			await save({ status: "done" });
 			return done("Recorded.");
 		}
-		if (request.kind === "resume" && !mom.enabled) { await store.append("control", { enabled: true }); mom = await open(); }
+		if (request.kind === "resume" && !mom.enabled) { await writeMomGlobals({ enabled: true }); mom = await open(); }
 	}
 	if (!mom.enabled) {
-		if (question) status.answers[question.id] = { error: "Mom is paused.", at: Date.now() };
 		await save({ status: "done" });
 		return done("Mom is paused; nothing to do.");
 	}
-	if (relabel && mom.checkpoint) {
-		const repaired = repairWorkProvenance(mom.graph, mom.feed.byRef);
-		if (repaired.removed.length) {
-			const checkpoint: Checkpoint = { ...mom.checkpoint, graph: repaired.graph, change: graphChange(mom.graph, repaired.graph),
-				unfinished: (mom.checkpoint.unfinished ?? []).filter(item => !repaired.removed.includes(item.node)), at: Date.now(), model };
-			await store.append("map", { snapshot: checkpoint, failure: null }, `${job}:provenance`);
-			mom = await open();
-		}
-	}
-	if (question) await store.append("notice", { key: "conversation", action: "asked", parent: leaf });
 	let review: CompactionReview | undefined;
 	try {
 		const reviewing = await continuity(mom, start, host(start.session), store, decider);
 		if (reviewing) mom = await open();
-		review = !relabel && (start.kind === "delivery" || (start.kind === "request" && start.request.kind !== "question")) ? compactionToReview(mom, reader, status) : undefined;
-		await writeStatus(engine, api, ctx, current => { current.op = { job, mode: question ? "ask" : review ? "audit" : "update", startedAt: Date.now(), activity: "reading history", ...(question ? { question: question.question } : {}) }; });
-		let prepared = await mom.prepare({ question: question?.question, refresh: start.kind === "request" && start.request.kind !== "update" && !relabel, review, force: relabel && Boolean(mom.checkpoint), relabel, job, signal: ctx?.abortSignal });
+		review = relabel ? undefined : compactionToReview(mom, reader, status);
+		await writeStatus(engine, api, ctx, current => { current.op = { job, mode: review ? "audit" : "update", startedAt: Date.now(), activity: "reading history" }; });
+		let prepared = await mom.prepare({ refresh: start.kind === "request" && start.request.kind !== "update" && !relabel, review, force: relabel && Boolean(mom.checkpoint), relabel, job, signal: ctx?.abortSignal });
 		while (prepared.kind === "defer") {
 			await writeStatus(engine, api, ctx, current => { current.waitingForWorkers = mom.waitingForWorkers; current.deferredUntil = prepared.kind === "defer" ? prepared.until : undefined; });
 			await sleep(Math.max(250, Math.min(2000, prepared.until - Date.now())), ctx?.abortSignal);
 			lead?.refresh();
-			prepared = await mom.prepare({ question: question?.question, refresh: start.kind === "request" && start.request.kind !== "update" && !relabel, review, force: relabel && Boolean(mom.checkpoint), relabel, job, signal: ctx?.abortSignal });
+			prepared = await mom.prepare({ refresh: start.kind === "request" && start.request.kind !== "update" && !relabel, review, force: relabel && Boolean(mom.checkpoint), relabel, job, signal: ctx?.abortSignal });
 		}
 		status.waitingForWorkers = false; status.deferredUntil = undefined;
 		status.unavailable = [...mom.feed.gaps.values()]; status.uncertainEffects = mom.feed.uncertainEffects();
 		if (prepared.kind === "idle") {
-			const mode = modeFor(settings.mapMode ?? mom.mode);
-			if (start.kind === "request" && start.request.kind === "refresh" && mode.name === "act_labels" && mom.checkpoint && mom.checkpointId) {
-				const known = new Map(mom.feed.byRef);
-				const manager = lead?.sessionManager;
-				if (manager) {
-					const session = manager.getSessionId();
-					for (const ref of mom.graph.nodes.flatMap(node => node.sources)) {
-						const parts = ref.split(":");
-						if (parts[0] !== session || !parts[1]) continue;
-						const entry = manager.getEntry(parts[1]);
-						if (!entry) continue;
-						for (const event of extractEvents({ key: session, actor: "lead" }, entry)) known.set(event.ref, event);
-					}
-				}
-
-				const derived = ACT_LABELS_MODE.apply!({ prior: mom.graph, candidates: [], committed: { acts: [] }, known, events: [...known.values()] });
-				if (derived.declined.length) throw new Error(derived.declined.join("; "));
-				const live = new Map(derived.graph.nodes.map(node => [node.id, node]));
-				const unfinished = (mom.checkpoint.unfinished ?? []).filter(item => {
-					const node = live.get(item.node);
-					return item.disposition !== "resolved" && ["active", "parked"].includes(node?.state ?? "") && Boolean(node && !isObsoleteParkedWork(node));
-				});
-				const cut = mom.target ?? mom.checkpoint.cut;
-				const material = JSON.stringify(derived.graph) !== JSON.stringify(mom.graph) || JSON.stringify(unfinished) !== JSON.stringify(mom.checkpoint.unfinished);
-				if (material) {
-					const checkpoint: Checkpoint = { sessionId: reader.getSessionId(), graph: derived.graph, change: graphChange(mom.graph, derived.graph), note: mom.checkpoint.note,
-						unfinished, cut, at: Date.now(), model };
-					if (!isCheckpoint(checkpoint)) throw new Error("Host-derived refresh checkpoint is invalid; last checkpoint unchanged.");
-					await store.append("map", { snapshot: checkpoint, failure: null }, `${job}:refresh`);
-				} else await store.append("map", { base: mom.checkpointId, cut, failure: null }, `${job}:refresh`);
-				await save({ status: "done" }, current => { delete current.op; });
-				return done(material ? "Map refreshed." : "Map unchanged; evidence coverage saved. Nothing to refresh.");
-			}
-			if (question) status.answers[question.id] = { error: "Mom has nothing to answer from yet.", at: Date.now() };
 			status.more = false;
 			await save({ status: "done" }, current => { delete current.op; });
 			return done(prepared.reason);
 		}
 		const mode = modeFor(settings.mapMode ?? mom.mode);
 		// Historical catch-up is a chapter-chain thread-map operation. It deliberately uses the
-		// transaction finalizer for this operation, then returns to the saved frontier mode.
-		const operationMode = prepared.batch.digest || relabel ? COMMIT_GRAPH_MODE : mode;
+		// transaction finalizer for this operation, then returns to the saved frontier mode. v2 owns
+		// every write to its map, so it reconciles the digest itself.
+		const operationMode = relabel || (prepared.batch.digest && mode !== V2_MODE) ? COMMIT_GRAPH_MODE : mode;
 		prepared.header.mapMode = operationMode.name;
 		prepared.header.digest = Boolean(prepared.batch.digest);
 		prepared.header.relabel = relabel;
+		const correction = prepared.batch.events.some(event => event.correction === true);
+		const specSkip = operationMode !== V2_MODE ? undefined
+			: start.kind !== "delivery" ? "not-delivery"
+			: !mom.checkpointId ? "no-checkpoint"
+			: review ? "review"
+			: prepared.batch.digest ? "digest"
+			: prepared.header.leadUnreadable ? "lead-unreadable"
+			: prepared.header.retryGap ? "retry-gap"
+			: prepared.batch.gaps.length ? "gaps"
+			: mom.recovering ? "recovery"
+			: correction ? "correction" : undefined;
+		const specifiable = operationMode === V2_MODE && specSkip === undefined;
+		if (operationMode === V2_MODE && specSkip) specLog(start.session, { job, ran: true, ops: [], skipped: specSkip });
+		else if (mode.name === "v2" && operationMode !== V2_MODE && start.kind === "delivery")
+			specLog(start.session, { job, ran: true, ops: [], skipped: `mode-${operationMode.name}` });
+		const read = specifiable ? await readSpec(classifier, fromWorkGraph(mom.graph), prepared.batch.events,
+			reason => specLog(start.session, { job, ran: true, ops: [], failOpen: reason })) : undefined;
+		if (read) prepared.header.spec = read.ops;
 		let body: Record<string, unknown> = { ...prepared.body, ...(prepared.guidance.trim() ? { guidance: prepared.guidance.trim() } : {}) };
 		if (relabel) body = { task: "Repair the saved work map. Give a decision only for the work that needs one: a concise, meaningful label to keep it, or retired with a short reason. An ID you leave out keeps its saved label. Mom tracks only durable, multi-turn things — retire status questions, one-off meta questions, and instructions the next turn fully satisfied. Keep genuine multi-turn work even when phrased as a question. Never retire settled work or work holding unfinished work. The host preserves sources, structure, notes and obligations.",
 			work: mom.graph.nodes.filter(isEndeavor).map(node => ({ id: node.id, label: node.label, intent: node.intent, observed: node.observed, state: node.state })) };
-		else if (prepared.batch.digest) body.task = "Fast historical catch-up. This is a host-compressed thread-map digest, not raw fragment labeling. Reconcile it once with commit_graph and preserve cited sources. Do not call commit_acts.";
-		if (operationMode.name === "act_labels" && !question) {
-			const staged = enumerateCandidates(mom.graph, prepared.batch.events, mom.feed.byRef, mom.feed.events, { fullQuotes: true });
-			prepared.header.candidates = staged.candidates;
-			body = {
-				task: "Label every supplied fragment with one act. Call commit_acts with exactly these ids; do not answer the recorded conversation.",
-				fragments: staged.candidates.map(candidate => ({ id: candidate.id, role: candidate.source_role, kind: candidate.source_kind, quote: candidate.quote,
-					...(candidate.antecedent_ref ? { inReplyTo: mom.feed.byRef.get(candidate.antecedent_ref)?.text ?? "" } : {}) })),
-				unfinished: mom.checkpoint?.unfinished ?? [], pendingMore: prepared.header.more ?? false,
-				gaps: prepared.batch.gaps,
-				...(prepared.body.independentThreadMap ? { independentThreadMap: prepared.body.independentThreadMap } : {}),
-			};
-			// Labeling current raw fragments does not reconcile previously skipped ranges.
-			delete prepared.header.auditedGaps;
+		else if (prepared.batch.digest) body.task = "Fast historical catch-up. This is a host-compressed thread-map digest, not raw evidence: reconcile it once and preserve cited sources.";
+		if (operationMode === V2_MODE) {
+			// v2's own body: the map in its v2 form, and nothing of commit_graph's vocabulary.
+			body = v2Body({ map: fromWorkGraph(mom.graph), ...(read ? { changes: read.ops } : {}),
+				task: prepared.body.independentThreadMap ? V2_AUDIT_TASK : prepared.batch.digest ? V2_DIGEST_TASK : V2_UPDATE_TASK,
+				newEvents: prepared.body.newEvents as string,
+				newUserDirections: prepared.body.newUserDirections as V2BodyParts["newUserDirections"],
+				instruction: prepared.body.instruction as string | undefined,
+				independentThreadMap: prepared.body.independentThreadMap,
+				recovery: prepared.body.recovery as Record<string, unknown> | undefined,
+				guidance: prepared.guidance });
 		}
 		status.operationTiming = mom.operationTiming;
 		status.more = prepared.header.more;
-		const shadow = decider && prepared.kind === "work" && !question && mom.checkpoint ? await shadowGuesses(decider.client, mom, prepared.batch.events) : undefined;
-		await save({ status: "open", job, header: prepared.header, childUsage: usage.total, baseUsage: mom.usage, ...(shadow ? { shadow } : {}) }, current => {
-			current.op = { job, mode: question ? "ask" : review ? "audit" : "update", startedAt: current.op?.startedAt ?? Date.now(), thinkingAt: Date.now(), activity: "thinking",
-				target: prepared.kind === "work" ? prepared.header.cut?.parent ?? null : null, recovering: mom.recovering, ...(question ? { question: question.question } : {}) };
+		// v2: only a background batch the decision model can read is decided up front. An explicit
+		// request, a correction, a first map, catch-up, an audit, a retry and a recovery all skip the
+		// questions and go straight to her model, which then runs on structural checks alone.
+		const shadow = decider && prepared.kind === "work" && mom.checkpoint && read?.ops.length !== 0 ? await shadowGuesses(decider.client, mom, prepared.batch.events) : undefined;
+		await save({ status: "open", job, header: prepared.header, childUsage: usage.total, baseUsage: mom.usage, ...(shadow ? { shadow } : {}),
+			// Recorded only when her model will run on it: the skip below logs its own `ran: false`, and
+			// one batch must produce exactly one line either way.
+			...(read?.ops.length ? { read: { ops: read.ops, chosen: read.chosen } } : {}) }, current => {
+			current.op = { job, mode: review ? "audit" : "update", startedAt: current.op?.startedAt ?? Date.now(), thinkingAt: Date.now(), activity: "thinking",
+				target: prepared.kind === "work" ? prepared.header.cut?.parent ?? null : null, recovering: mom.recovering };
 		});
-		if (operationMode.name === "act_labels" && !question && prepared.header.candidates?.length === 0 && mom.checkpointId
-			&& !prepared.header.leadUnreadable && !prepared.header.retryGap && !prepared.batch.gaps.length) {
-			// No linguistic decision exists. Preserve the map and advance only the reviewed cursor.
-			await store.append("map", { base: mom.checkpointId, cut: prepared.header.cut, failure: null }, `${job}:map`);
+		if (read && !read.ops.length) {
+			// The decision model read the batch and found nothing to record: save coverage, skip her model.
+			specLog(start.session, { job, ran: false, ops: [], chosen: read.chosen });
+			await store.append("map", { base: mom.checkpointId, cut: prepared.header.cut, failure: null, ...(prepared.header.screen ? { screen: prepared.header.screen } : {}) }, `${job}:map`);
 			await accepted(engine, api, ctx, prepared.header);
-			return done("Map unchanged; evidence coverage saved. Nothing to label.");
+			return done("Map unchanged: the decision model found nothing to record. Evidence coverage saved.");
 		}
 		return { content: text(JSON.stringify(body)) };
 	} catch (error) {
@@ -441,7 +419,6 @@ export async function begin(engine: Engine, api: Durable.ToolExecutionApi, ctx: 
 		status.lastError = message;
 		// A review that failed still watches the lead after the compaction, from her last accepted map.
 		if (review && mom.inject && mom.checkpoint) try { await openWindow(store, reader, mom.window, review.triggerRef); } catch { /* the failure stays visible */ }
-		if (question) { status.answers[question.id] = { error: message, at: Date.now() }; await save({ status: "done" }, current => { delete current.op; }); return done(`${OPERATION_FAILED}${message}`); }
 		await save({ status: "done", fault: message }, current => { delete current.op; });
 		return { content: text(`${OPERATION_FAILED}${message}`), isError: true, control: { terminate: true } };
 	}
@@ -467,7 +444,8 @@ function compactionToReview(mom: Mom, reader: ReturnType<typeof currentSession>,
  * Post-compaction continuity, before the review: the anchor for a new compaction, the receipt of one the
  * lead delivered, and the check of a settled lead turn while a continuity window is open.
  */
-async function continuity(mom: Mom, start: OperationStart, host: ConstructorParameters<typeof Mom>[0], store: SidecarStore, decider?: { client: Decider; clear: number }): Promise<boolean> {
+async function continuity(mom: Mom, start: OperationStart, host: ConstructorParameters<typeof Mom>[0], store: SidecarStore,
+	decider: { client: Decider; clear: number } | undefined): Promise<boolean> {
 	let changed = false;
 	const reader = host.ctx.sessionManager, branch = reader.getBranch(), leaf = reader.getLeafId();
 	// The lead delivered the anchor she prepared: record it.
@@ -492,7 +470,7 @@ async function continuity(mom: Mom, start: OperationStart, host: ConstructorPara
 	const active = mom.engagement.active, note = mom.checkpoint?.note;
 	if (active && note && active.key === noticeKey(note) && !feedbackApplies(mom.findingFeedback.get(active.key), note)) {
 		const since = active.parent === null ? -1 : branch.findIndex(entry => entry.id === active.parent);
-		const messages = branch.slice(since + 1).filter(entry => entry.type === "message" && entry.message.role === "user" && !isStatusPing(textOf(entry.message)));
+		const messages = branch.slice(since + 1).filter(entry => entry.type === "message" && entry.message.role === "user");
 		if (since >= -1 && messages.length >= 2) { await store.append("notice", { key: active.key, action: "ignored", note, parent: leaf }); changed = true; }
 	}
 	const win = mom.window;
@@ -507,7 +485,8 @@ async function continuity(mom: Mom, start: OperationStart, host: ConstructorPara
 	if (!turn.length) return changed;
 	const compactAt = events.findIndex(event => event.ref === win.compaction);
 	const close = (reason: string, held: boolean, turns: number) => store.append("injection", { kind: "window", action: "closed", key: win.key, compaction: win.compaction, reason, held, turns, parent: leaf });
-	if (events.slice(Math.max(compactAt + 1, from)).some(event => isUserDirection(event) && !isStatusPing(event.text ?? ""))) { await close("user-message", win.turns > 0, win.turns); return true; }
+	// The user's own message is direction: it supersedes the record, so the window closes.
+	if (events.slice(Math.max(compactAt + 1, from)).some(isUserDirection)) { await close("user-message", win.turns > 0, win.turns); return true; }
 	let error: string | undefined;
 	const signals = await collectTurnSignals(check.feed, turn);
 	let flags: Awaited<ReturnType<typeof stageOne>> = [];
@@ -573,6 +552,13 @@ async function shadowGuesses(client: Decider, mom: Mom, events: readonly FeedEve
 	return { guesses, latencyMs };
 }
 
+/** What the decision model decided, and once known what her model then did with it: evaluation data in
+ *  its own log beside her .mom file, never her state. Best-effort, and the record the constants are
+ *  re-fitted from (docs/v2-change-spec.md). */
+function specLog(sessionFile: string, entry: Record<string, unknown>) {
+	try { appendFileSync(sessionFile.replace(/\.jsonl$/, "") + ".mom-decider", JSON.stringify({ at: Date.now(), kind: "v2-spec", ...entry }) + "\n"); } catch { /* evaluation data */ }
+}
+
 /** A compaction's continuity window opens (a window still open for an earlier one closes as superseded). */
 async function openWindow(store: SidecarStore, reader: ReturnType<typeof currentSession>, open: WindowLive | undefined, trigger: string) {
 	if (open?.key === trigger) return; // a retry of the same review
@@ -581,10 +567,10 @@ async function openWindow(store: SidecarStore, reader: ReturnType<typeof current
 }
 
 /**
- * After her finalizer saved the map (or an answer): usage, her finding for the user, and for a compaction
- * review the continuity window. Runs in the finalizer's tool call.
+ * After her finalizer saved the map: usage, her finding for the user, and for a compaction review the
+ * continuity window. Runs in the finalizer's tool call.
  */
-export async function accepted(engine: Engine, api: Durable.ToolExecutionApi, ctx: any, header: OperationHeader, answer?: string) {
+export async function accepted(engine: Engine, api: Durable.ToolExecutionApi, ctx: any, header: OperationHeader, diagnostics?: { unmet?: string[] }) {
 	const op = await readOperation(engine, api, ctx);
 	if (op.job !== header.job || op.status !== "open") return;
 	const file = header.session.file;
@@ -597,7 +583,9 @@ export async function accepted(engine: Engine, api: Durable.ToolExecutionApi, ct
 	await store.append("usage", { usage, error: null }, `${header.job}:usage`);
 	const reader = currentSession(file);
 	const state = await loadState(store, reader);
-	const question = op.start?.kind === "request" && op.start.request.kind === "question" ? op.start.request : undefined;
+	// The spec read this batch: whether her model then changed the map is what labels the ops.
+	if (op.read) specLog(file, { job: header.job, ran: true, ...op.read, ...(diagnostics?.unmet?.length ? { unmet: diagnostics.unmet } : {}),
+		changed: (await store.load()).some(record => record.id === `${header.job}:map` && record.data.snapshot !== undefined) });
 	if (op.shadow?.guesses.length) {
 		const after = new Map((state.checkpoint?.graph.nodes ?? []).map(node => [node.id, node.state]));
 		const actual = (before: string, now: string | undefined) => now === undefined ? "removed" : now === before ? "unchanged"
@@ -609,7 +597,7 @@ export async function accepted(engine: Engine, api: Durable.ToolExecutionApi, ct
 		} catch { /* shadow data is best-effort */ }
 	}
 	const notices: MomStatus["notices"] = [];
-	if (!question) {
+	{
 		// Her finding reaches the user when her account is complete and the user wants that kind of finding.
 		const note = state.checkpoint?.note, key = note ? noticeKey(note) : undefined;
 		const offered = note && state.engagement.last?.key === key && note.riskRefs.every(ref => state.engagement.last!.riskRefs.includes(ref));
@@ -624,13 +612,13 @@ export async function accepted(engine: Engine, api: Durable.ToolExecutionApi, ct
 		const superseded = at >= 0 && branch.slice(at + 1).some(entry => entry.type === "compaction");
 		if (header.trigger && state.inject && state.checkpoint && !superseded) await openWindow(store, reader, state.window, header.trigger.ref);
 	}
-	await writeOperation(engine, api, ctx, current => { current.status = question ? "answered" : "accepted"; });
+	await writeOperation(engine, api, ctx, current => { current.status = "accepted"; });
 	await writeStatus(engine, api, ctx, status => {
 		delete status.op;
 		if (status.operationTiming) status.operationTiming = { ...status.operationTiming, requestMs: turnMs, totalMs: status.operationTiming.startupMs + turnMs };
 		status.notices.push(...notices);
-		if (!question) { status.rejectedStreak = 0; delete status.lastRejection; delete status.lastError; status.more = Boolean(header.more) || state.gaps.length > 0; if (header.trigger) delete status.auditAttempts[header.trigger.ref]; }
-		if (question) { status.answers[question.id] = { answer: answer ?? "", at: Date.now() }; status.conversation = [...(status.conversation ?? []), { question: question.question, answer: answer ?? "" }].slice(-8); }
+		status.rejectedStreak = 0; delete status.lastRejection; delete status.lastError; status.more = Boolean(header.more) || state.gaps.length > 0;
+		if (header.trigger) delete status.auditAttempts[header.trigger.ref];
 	});
 }
 
@@ -641,8 +629,7 @@ export async function accepted(engine: Engine, api: Durable.ToolExecutionApi, ct
 export async function rejected(engine: Engine, api: Durable.ToolExecutionApi, ctx: any, header: OperationHeader, rejection: string) {
 	const op = await readOperation(engine, api, ctx);
 	if (op.job !== header.job || op.status !== "open") return;
-	const question = op.start?.kind === "request" && op.start.request.kind === "question" ? op.start.request : undefined;
-	const fault = !question && header.mode === "update" && !header.retryGap ? rejection : undefined;
+	const fault = header.mode === "update" && !header.retryGap ? rejection : undefined;
 	const status = await readStatus(engine, api, ctx);
 	let settled = false;
 	try {
@@ -658,7 +645,6 @@ export async function rejected(engine: Engine, api: Durable.ToolExecutionApi, ct
 	await writeOperation(engine, api, ctx, current => { current.status = settled ? "done" : "rejected"; current.rejection = rejection; if (fault) current.fault = fault; });
 	await writeStatus(engine, api, ctx, current => {
 		delete current.op; current.lastError = rejection; current.rejectedStreak = status.rejectedStreak; current.lastRejection = status.lastRejection;
-		if (question) current.answers[question.id] = { error: rejection, at: Date.now() };
 	});
 }
 
@@ -666,7 +652,6 @@ export async function rejected(engine: Engine, api: Durable.ToolExecutionApi, ct
 export async function failed(engine: Engine, api: Durable.ToolExecutionApi, ctx: any, error: string) {
 	const op = await readOperation(engine, api, ctx);
 	if (op.status !== "open") return;
-	const question = op.start?.kind === "request" && op.start.request.kind === "question" ? op.start.request : undefined;
-	await writeOperation(engine, api, ctx, current => { if (!question) current.fault = error; });
-	await writeStatus(engine, api, ctx, status => { delete status.op; status.lastError = error; if (question) status.answers[question.id] = { error, at: Date.now() }; });
+	await writeOperation(engine, api, ctx, current => { current.fault = error; });
+	await writeStatus(engine, api, ctx, status => { delete status.op; status.lastError = error; });
 }

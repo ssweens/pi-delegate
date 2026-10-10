@@ -10,13 +10,14 @@ import { branchCheckpoints, emptyUsage, loadState, noticeKey, type MomState, typ
 import { STATUS_DOC, type MomStatus } from "./engine.ts";
 import { extractEvents, LiveFeed } from "./feed.ts";
 import { readGraph } from "./mother.ts";
-import { encodeRequest, type MomRequest } from "./operation.ts";
+import { encodeRequest, type FindingRequest, type MomRequest } from "./operation.ts";
 import { oven, ovenUrl, OvenUnreachable } from "./oven.ts";
 import type { PanelDiagnostics, PanelView } from "../ui/panel.ts";
 import { feedbackApplies, type FindingAction, type ProcessRiskClass } from "./process-health.ts";
 import { coverageProgress, presentGraph, summaryText, type WorkView } from "../ui/presentation.ts";
 import { SidecarStore } from "./sidecar.ts";
-import { identityOf, momConfiguration, ownerKey, type SessionIdentity } from "./slice.ts";
+import { deciderFor, identityOf, momConfiguration, ownerKey, type SessionIdentity } from "./slice.ts";
+import { readMomGlobals, writeMomGlobals, type MomGlobals } from "./globals.ts";
 import { formatElapsed, updateErrorSummary } from "./status.ts";
 import { ANCHOR } from "./anchor.ts";
 import { WINDOW_CORRECTION } from "./window.ts";
@@ -26,7 +27,7 @@ import { projectWork, type WorkProjection } from "../work/projection.ts";
 export interface SliceHost { pid: number; slice: string; state: string; startedAt: number; sampledAt: number }
 export interface SourcePage { ref: string; text: string; offset: number; totalChars: number; nextOffset: number | null; pairedRef?: string }
 export interface PreparedAnchor { key: string; content: string; at: number }
-export interface Controls { enabled: boolean; inject: boolean; hush: boolean; nudgedClasses: ProcessRiskClass[]; mode: string; model: string }
+export interface Controls { enabled: boolean; inject: boolean; hush: boolean; nudgedClasses: ProcessRiskClass[]; mode: string; model: string; decider: string }
 export interface Telemetry {
 	model: string; activity: string; lastSavedAt?: number; pendingRanges: number; unavailableSources: number;
 	timing?: { startupMs: number; requestMs: number; totalMs: number; oldestEvidenceAgeMs: number };
@@ -35,14 +36,14 @@ export interface Snapshot {
 	passive: PanelView; explicit: PanelView; diagnostics: PanelDiagnostics; usage: Usage; controls: Controls; work?: WorkProjection;
 	startedAt?: number; preparedAnchor?: PreparedAnchor; telemetry: Telemetry; host?: SliceHost;
 }
-export type ControlChange = { enabled: boolean } | { inject: boolean } | { hush: boolean } | { nudgedClasses: ProcessRiskClass[] } | { mode: string } | { model: string };
+export type ControlChange = { enabled: boolean } | { inject: boolean } | { hush: boolean } | { nudgedClasses: ProcessRiskClass[] } | { mode: string } | { model: string } | { decider: string };
 export type Command =
-	| { kind: "update"; operation: { question?: string; refresh: boolean } }
+	| { kind: "refresh" }
 	| { kind: "relabel" }
 	| { kind: "graph"; options: { nodes?: string[]; depth?: number; checkpoint?: string } }
 	| { kind: "source"; ref: string; offset?: number; limit?: number }
 	| { kind: "log" } | { kind: "controls"; change: ControlChange }
-	| { kind: "finding"; action: Exclude<FindingAction, "delivered" | "backoff">; finding?: string }
+	| { kind: "finding"; action: FindingRequest; finding: string }
 	| { kind: "status" };
 export interface Publication { customType: string; content: string; details: { key: string } }
 
@@ -83,6 +84,7 @@ export class MomClient {
 	#work?: WorkProjection;
 	#draining = false;
 	#drained?: string;
+	#warnedDecider?: string;
 
 	constructor(private context: ExtensionContext, private readonly options: {
 		flags: Record<string, string | boolean | undefined>; changed(): void; publish(message: Publication): void;
@@ -104,7 +106,15 @@ export class MomClient {
 	async ensure(): Promise<void> {
 		// Saved settings override startup flags. Each operation pins its configured mode at begin.
 		// `create` is create-or-get: an idle slice takes this configuration, a busy one keeps it for next time.
-		const slice = await oven("create", { key: this.key, cwd: this.identity.cwd, copy: "none", config: momConfiguration(this.identity, { ...this.options.flags, ...(this.state?.mode ? { "mom-mode": this.state.mode } : {}), ...(this.state?.model ? { "mom-model": this.state.model } : {}) }) });
+		const flags = { ...this.options.flags, ...(this.state?.mode ? { "mom-mode": this.state.mode } : {}), ...(this.state?.model ? { "mom-model": this.state.model } : {}),
+			...(this.state?.decider !== undefined ? { "mom-decider": this.state.decider } : {}) };
+		// An unreachable decision model never stops Mom: she runs without it, and the user is told once.
+		const decider = deciderFor(flags, this.context.modelRegistry);
+		if (decider.ref && !decider.classifier && this.#warnedDecider !== decider.ref) {
+			this.#warnedDecider = decider.ref;
+			this.options.notify(`Mom's decision model ${decider.ref} is not available: Pi has no local System One classifier by that name. Mom runs without it: v2 sends every update to her model. Choose another in /mom settings.`, "warning");
+		}
+		const slice = await oven("create", { key: this.key, cwd: this.identity.cwd, copy: "none", config: momConfiguration(this.identity, flags, this.context.modelRegistry) });
 		if (slice.state === "failed" && !slice.conversation) throw new Error(`Mom's slice in oven failed (${slice.reason}): ${slice.detail}`);
 		this.slice = slice;
 		// Notes paused before her slice followed this session stay paused.
@@ -150,7 +160,7 @@ export class MomClient {
 			// mom_begin only starts the operation: the steps are her own turns.
 			const content = Array.isArray(event.message.content) ? event.message.content : [];
 			if (!(content.length > 0 && content.every((block: any) => block.type === "toolCall" && block.name === "mom_begin"))) this.#steps++;
-		} else if (event.type === "tool" && ["commit_graph", "commit_acts", "answer_question"].includes(event.tool?.name)) this.#saving = event.tool.status === "running";
+		} else if (event.type === "tool" && ["commit_graph", "commit_v2"].includes(event.tool?.name)) this.#saving = event.tool.status === "running";
 		this.options.changed();
 	}
 
@@ -322,7 +332,8 @@ export class MomClient {
 	get snapshot(): Snapshot | undefined {
 		const state = this.state;
 		if (!state) return undefined;
-		const controls: Controls = { enabled: !this.paused, inject: state.inject, hush: this.hush, nudgedClasses: [...state.nudgedClasses], mode: state.mode, model: state.model };
+		const controls: Controls = { enabled: !this.paused, inject: state.inject, hush: this.hush, nudgedClasses: [...state.nudgedClasses], mode: state.mode, model: state.model,
+			decider: state.decider ?? String(this.options.flags["mom-decider"] ?? "") };
 		const anchor = state.reservedAnchor && controls.enabled && state.inject && !this.hush ? { key: state.reservedAnchor.key, content: state.reservedAnchor.content, at: state.reservedAnchor.at } : undefined;
 		return { passive: this.view(false), explicit: this.view(true), diagnostics: this.diagnostics(), usage: structuredClone(state.usage ?? emptyUsage()), controls,
 			...(this.#work ? { work: structuredClone(this.#work) } : {}),
@@ -372,8 +383,7 @@ export class MomClient {
 				await this.settle(signal);
 				return undefined;
 			}
-			case "update": {
-				if (command.operation.question) return this.question(command.operation.question, signal);
+			case "refresh": {
 				if (this.paused) throw new Error("Mom is paused.");
 				// A refresh is explicit: it ends a wait she is in the middle of (for a running worker or a screen).
 				if (this.status?.waitingForWorkers || this.status?.deferredUntil) await oven("halt", { slice: this.slice.id });
@@ -401,10 +411,8 @@ export class MomClient {
 			case "controls": return this.controls(command.change);
 			case "finding": {
 				const note = this.state?.checkpoint?.note;
-				if (command.action === "asked") return null;
 				if (!note || note.text !== command.finding) throw new Error("This finding has changed; reopen Mom.");
-				if (command.action === "ignored") return null;
-				await this.send({ kind: "finding", action: command.action as "understood" | "dismiss" | "incorrect" | "discuss" | "explained", finding: command.finding! });
+				await this.send({ kind: "finding", action: command.action, finding: command.finding });
 				return null;
 			}
 			case "status": {
@@ -414,30 +422,7 @@ export class MomClient {
 		}
 	}
 
-	/** A question for Mom (mom-ask in oven): ask and wait for her answer, read from her status document. Cancelling it ends her work on it. */
-	async question(question: string, signal?: AbortSignal): Promise<string | undefined> {
-		if (this.paused) throw new Error("Mom is paused.");
-		const id = randomUUID();
-		await this.send({ kind: "question", id, question });
-		const halt = () => { void oven("halt", { slice: this.slice.id }).catch(() => {}); };
-		signal?.addEventListener("abort", halt, { once: true });
-		try {
-			for (;;) {
-				signal?.throwIfAborted();
-				await this.settle(signal);
-				const reply = this.status?.answers?.[id];
-				if (reply?.error) throw new Error(reply.error);
-				if (reply) return reply.answer;
-				// Her turn on it failed: oven retries it, unless retries ran out.
-				if (this.slice?.stage === "retrying") { await new Promise(resolve => setTimeout(resolve, 1000)); continue; }
-				if (this.slice?.stage === "failed") throw new Error(this.slice.detail ?? "Mom's turn failed.");
-				if (this.slice?.state === "running") continue;
-				throw new Error("Mom returned no answer.");
-			}
-		} finally { signal?.removeEventListener("abort", halt); }
-	}
-
-	/** Her answer to a request she was sent (by its ID), polled from her status document; undefined when she has not answered in time. */
+	/** Her reply to a control request she was sent (by its ID), polled from her status document; undefined when she has not answered in time. */
 	private async answerTo(id: string, ms: number): Promise<{ answer?: string; error?: string } | undefined> {
 		for (const end = Date.now() + ms; !this.#closed;) {
 			const doc = (await oven("state", { slice: this.slice.id, names: [STATUS_DOC] })).docs[STATUS_DOC] as MomStatus | undefined;
@@ -457,9 +442,12 @@ export class MomClient {
 	 */
 	async controls(change: ControlChange): Promise<void> {
 		if ("hush" in change) { this.hush = change.hush; this.options.changed(); return; }
+		// Save globally first. New and reconfigured slices read this value, and it survives an
+		// unreachable slice. Other running clients do not reconfigure their slices automatically.
+		await writeMomGlobals(change as MomGlobals);
 		// A mode change is refused before it is saved, and once saved it reconfigures her slice: the
 		// standing instructions are the mode, so an idle slice takes the new prompt on the next ensure.
-		const reconfiguring = "mode" in change || "model" in change;
+		const reconfiguring = "mode" in change || "model" in change || "decider" in change;
 		if (!this.slice) await this.ensure();
 		const pausing = "enabled" in change && !change.enabled, resuming = "enabled" in change && change.enabled;
 		if (pausing) await oven("halt", { slice: this.slice.id });
@@ -473,13 +461,8 @@ export class MomClient {
 			return reply;
 		});
 		const quick = await Promise.race([saved, new Promise<undefined>(resolve => setTimeout(resolve, CONTROLS_WAIT_MS))]);
-		// Her slice loads this package once; a lead reload does not restart it. A control record it
-		// rejects as unknown means it is running older code than the lead.
-		const stale = /A Mom control record needs exactly one setting/.test(quick?.error ?? "");
-		if (quick?.error) throw new Error(stale
-			? `Mom's slice is running older code than this session: ${quick.error} Restart the Oven daemon to load the current package code.`
-			: quick.error);
-		if (!quick) saved.then(late => { if (late?.error) this.options.notify(`Mom couldn't save that setting: ${late.error}${/A Mom control record needs exactly one setting/.test(late.error) ? " Restart the Oven daemon to load the current package code." : ""}`, "error"); }, () => {});
+		if (quick?.error) throw new Error(quick.error);
+		if (!quick) saved.then(late => { if (late?.error) this.options.notify(`Mom's slice did not take that setting: ${late.error} It is saved, and applies the next time she reconfigures.`, "warning"); }, () => {});
 		// The catch-up waits for her to finish the request: one queued behind work that then fails is not started again by oven.
 		if (resuming) { await this.settle().catch(() => {}); await this.send({ kind: "refresh" }); }
 		this.options.changed();

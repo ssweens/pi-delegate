@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { installMom } from "../src/mom/index.ts";
+import { FOCUS_KEY, MomView } from "../src/ui/panel.ts";
 
-const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text, bg: (_color: string, text: string) => text, dim: (text: string) => text };
 
 function momTool(): any {
 	const tools: any[] = [];
@@ -26,4 +27,30 @@ test("expanded Mom tool results retain the complete saved map", () => {
 	const output = "Mother thread: Review pi-delegate [review] — finished\nRules in force (2):\n    Why: Keep the map readable [src:session:rule]";
 	const rendered = momTool().renderResult({ content: [{ type: "text", text: output }], details: { overview: "Mom · up to date", preview: "Mom · up to date", expandable: true } }, { expanded: true }, theme);
 	assert.equal(rendered.render(120, 10).map((line: string) => line.trimEnd()).join("\n"), output);
+});
+
+/** Mom's view: what she saved, with no way to ask her a question from it. */
+test("Mom's view shows her saved map and status, and typing asks her nothing", async () => {
+	let refreshes = 0, renders = 0;
+	const source: any = {
+		view: () => ({ status: "up to date", summary: "Mother thread: Review pi-delegate — finished" }),
+		refreshStatus: async () => { refreshes++; },
+		findingAction: async () => {},
+	};
+	const view = new MomView(source, theme as any, { terminal: { rows: 24, columns: 100 }, requestRender: () => { renders++; } } as any, () => {});
+	const screen = view.render(100).join("\n").replace(/\x1b\[[0-9;]*m/g, "");
+	assert.match(screen, /F1 Overview/);
+	assert.match(screen, /F2 Map/);
+	assert.match(screen, /F3 Status/);
+	assert.doesNotMatch(screen, /Chat|ask Mom|questions and answers/i);
+	assert.match(screen, /R refresh · C copy · Esc back/);
+	// Typing lands nowhere: a character or Enter never reaches a model, and R is the only read.
+	for (const key of ["w", "\r", "y"]) view.handleInput(key);
+	assert.equal(refreshes, 0, "typing does not read her notes either");
+	view.handleInput("r");
+	await new Promise(resolve => setTimeout(resolve, 0));
+	assert.equal(refreshes, 1);
+	assert.match(view.render(100).join("\n"), /Showing the latest saved view\./);
+	view.dispose();
+	assert.ok(renders > 0);
 });

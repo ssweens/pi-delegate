@@ -4,7 +4,6 @@ import { isEndeavor, type GraphNode } from "./graph.ts";
 import { commandFromJson } from "./anchor.ts";
 import { isUserDirection, renderEvents, type FeedEvent } from "./feed.ts";
 import type { Checkpoint } from "./checkpoint.ts";
-import { isStatusPing } from "./status.ts";
 
 /** The correction rides the session as a custom message; Mom's feed skips her own injections. */
 export const WINDOW_CORRECTION = "pi-tether.mom-correction";
@@ -161,11 +160,12 @@ export function windowPurpose(checkpoint: Checkpoint): string {
 	return `Current line — “${owner.label}”${ownerIntent ? `: ${ownerIntent}` : ""} (attention on “${focus.label}”) [src:${cite}]`;
 }
 
-/** The user's last recorded direction, clipped; a bare status ping is a query, not direction. */
+/** The user's last recorded direction, clipped. */
 export function lastDirectionOf(feed: { events: readonly FeedEvent[] }): WindowDirection | null {
 	for (let i = feed.events.length - 1; i >= 0; i--) {
 		const event = feed.events[i];
-		if (isUserDirection(event) && event.text && !isStatusPing(event.text)) return { text: oneLine(event.text), ref: event.ref };
+		if (!isUserDirection(event) || !event.text) continue;
+		return { text: oneLine(event.text), ref: event.ref };
 	}
 	return null;
 }

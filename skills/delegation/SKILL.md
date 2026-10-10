@@ -167,4 +167,4 @@ How to weigh what you see — this is your judgment, the tool does not pre-diges
 5. **DRIFT** → before delegating, state what changed and propose a specific replacement with its rating and price; on agreement, `approve` the new one.
 6. **They decline** → they will say what to use; retry with it.
 
-Never carry a model name from memory, a doc, or a prior session into a call. Ratings live in `~/.pi/agent/delegate-ratings.json` (yours to refresh); approved defaults in `~/.pi/agent/delegate-models.json` (written by `approve` after the user's yes, or by their editor).
+Never carry a model name from memory, a doc, or a prior session into a call. Ratings live in the `ratings` section and approved defaults in the `defaults` section of `~/.pi/agent/pi-delegate.json` (yours to refresh; defaults written by `approve` after the user's yes, or by their editor). Mom's own controls are the `mom` section of the same file. Saving a control in one Pi session reconfigures only that session's Mom slice. Other running sessions keep their current configuration until they reconfigure or restart.

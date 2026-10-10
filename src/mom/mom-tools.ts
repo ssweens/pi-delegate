@@ -1,6 +1,6 @@
 /**
- * Mom's tools, as Durable extensions oven installs by name: `mom` (her operation, evidence and
- * finalizers) and `mom-ask` (the question variants of her finalizers). Each message her slice gets starts
+ * Mom's tools, as the Durable extension oven installs by name: `mom` (her operation, evidence and
+ * finalizers). Each message her slice gets starts
  * an operation: `mom_begin` (engine.ts) prepares it and keeps its header in a Durable document; her
  * other tools rebuild the evidence from the lead's session file and her `.mom` file, and keep
  * per-operation progress (pages read, rejections) in a Durable document. Acceptance writes the map record
@@ -16,16 +16,17 @@ import { Check } from "typebox/value";
 import { validateToolArguments } from "@earendil-works/pi-ai/utils/validation";
 import { graphChange, isCheckpoint, loadState, noticeKey, type Checkpoint } from "./checkpoint.ts";
 import { acceptGraph, momTools, validateSearchQuery } from "./contract.ts";
-import { ACT_LABELS_MODE, modeFor } from "./modes.ts";
-import { actLabelsTool } from "./act-derivation.ts";
+import { V2_MODE, modeFor } from "./modes.ts";
+import { commitV2Tool } from "./v2.ts";
 import { LiveFeed, type FeedEvent } from "./feed.ts";
-import { editGraph, emptyGraph, isEndeavor, isObsoleteParkedWork, sourceSuggestion, Unfinished, type GraphNode } from "./graph.ts";
+import { editGraph, emptyGraph, isEndeavor, sourceSuggestion, Unfinished, type GraphNode } from "./graph.ts";
+import { Beverly, type LabelVerdict } from "./classify.ts";
 import { decodeOperation, decodeStart, OPERATION_FAILED, type OperationHeader } from "./operation.ts";
 import { accepted, begin, docsFor, failed, GIVE_UP, readOperation, readSettings, rejected, type Engine } from "./engine.ts";
 import { sessionFromFile } from "./session-file.ts";
 import { SidecarStore } from "./sidecar.ts";
 
-const FINALIZERS = new Set(["commit_graph", "commit_acts", "commit_labels", "record_thread_map", "answer_question"]);
+const FINALIZERS = new Set(["commit_graph", "commit_v2", "commit_labels", "record_thread_map"]);
 const BEGIN = "mom_begin";
 const SOLE = "Mom finalization requires a sole direct tool call, never a batch or nested call.";
 
@@ -78,7 +79,7 @@ function world(op: OperationHeader): Promise<World> {
 const WHOLE = { maxBytes: 16 * 1024 * 1024, maxLines: 1_000_000 };
 const text = (value: string) => [{ type: "text" as const, text: value }];
 
-export function momExtension(durable: typeof Durable, answering: boolean): Durable.Extension {
+export default function mom(durable: typeof Durable): Durable.Extension {
 	type Progress = { inspected: string[]; auditReads: string[]; rejections: number; repaired: boolean };
 	const Progress = durable.defineDocFamily<Progress, null>({
 		kind: "pi-tether.mom-operation", version: 1, family: true, scope: "conversation", history: "latest", fork: "initial",
@@ -149,7 +150,7 @@ export function momExtension(durable: typeof Durable, answering: boolean): Durab
 		}
 	};
 
-	const definitions = momTools(answering);
+	const definitions = momTools();
 	const definition = (name: string) => { const found = definitions.find(d => d.name === name)!; return { name, description: found.description, parameters: found.parameters, constrainedSampling: found.constrainedSampling }; };
 
 	/**
@@ -162,12 +163,7 @@ const sourceAt = (node: GraphNode, known: ReadonlyMap<string, FeedEvent>): numbe
 	const at = known.get(ref)?.at;
 	return at ? Date.parse(at) : Number.NEGATIVE_INFINITY;
 }));
-const STOP = new Set(["that", "this", "with", "from", "into", "over", "under", "about", "them", "they", "their", "there", "here", "what", "when", "where", "which", "while", "would", "could", "should", "have", "been", "being", "does", "done", "also", "than", "then", "some", "more", "most", "very", "just", "only", "also"]);
-const words = (text: string): Set<string> => new Set(text.toLowerCase().match(/[a-z][a-z0-9_-]{3,}/g)?.filter(w => !STOP.has(w)) ?? []);
-/** A label that describes the conversation rather than the work: a question, or a wrapper verb
- *  around an object. Those are the ones older rules fabricated, so only those may be rewritten. */
-const CONVERSATION_LABEL = /^\s*(?:request|ask|asking|clarify|explain|determine|confirm|check|show|tell|report|give me|walk me)\b|\?\s*$/i;
-	const labelsDefinition = { name: "commit_labels", description: "Repair saved work labels and retire work that is not durable, multi-turn tracking. Supply every saved work ID: a label to keep it, or retired with a reason to drop it. The host preserves sources and evidence.",
+const labelsDefinition = { name: "commit_labels", description: "Repair saved work labels and retire work that is not durable, multi-turn tracking. Supply every saved work ID: a label to keep it, or retired with a reason to drop it. The host preserves sources and evidence.",
 		constrainedSampling: { type: "json_schema", strict: "prefer" },
 		parameters: Type.Object({ labels: Type.Array(Type.Object({ id: Type.String({ minLength: 1 }), label: Type.String({ minLength: 1, maxLength: 160 }),
 			state: Type.Optional(Type.Union([Type.Literal("active"), Type.Literal("parked")])) }, { additionalProperties: false }), { maxItems: 64 }),
@@ -177,7 +173,7 @@ const CONVERSATION_LABEL = /^\s*(?:request|ask|asking|clarify|explain|determine|
 		{ type: "toolCall", id: "check", name, arguments: JSON.parse(JSON.stringify(args ?? {})) });
 	// Transaction commits a model-authored graph; acts derives work from model-written labels;
 	// relabels apply model-written display labels. All three use the same single-writer commit tail.
-	const finalize = (form: "transaction" | "acts" | "labels" = "transaction") => ({ ...tool(form === "acts" ? actLabelsTool() : form === "labels" ? labelsDefinition : definition("commit_graph"), async (_args, op, api, ctx) => {
+	const finalize = (form: "transaction" | "v2" | "labels" = "transaction") => ({ ...tool(form === "v2" ? commitV2Tool() : form === "labels" ? labelsDefinition : definition("commit_graph"), async (_args, op, api, ctx) => {
 		const { calls } = await operationContext(api, ctx);
 		const call = calls.find(each => each.id === api.callId);
 		const attempts = calls.filter(each => FINALIZERS.has(each.name)).length;
@@ -186,15 +182,18 @@ const CONVERSATION_LABEL = /^\s*(?:request|ask|asking|clarify|explain|determine|
 			return { content: text(attempts >= 2 ? `Mom could not finalize after one repair. ${reason} No map was accepted.` : `${reason} Correct all reported defects and resubmit once.`),
 				isError: true, ...(attempts >= 2 ? { control: { terminate: true as const } } : {}) };
 		};
-		let answer: string | undefined;
 		const { store, state, known, newRefs, feed } = await world(op);
-		// A mode is in force or loudly refused (docs/map-modes.md, M2). Both finalizers are always
+		// A mode is in force or loudly refused (docs/map-modes.md, M2). Every finalizer is always
 		// registered because the extension is built statically, so each one must refuse work the
-		// active mode did not ask it to do — otherwise a small model can reach for commit_graph in
-		// act_labels mode and author writes the host is supposed to derive.
+		// active mode did not ask it to do — otherwise a small model can reach for commit_graph in v2
+		// and author edits the host is supposed to check against the minimal schema.
 		const active = modeFor(op.mapMode ?? state.mode);
-		if (op.relabel ? form !== "labels" : active.finalizer !== (form === "acts" ? "commit_acts" : "commit_graph"))
+		if (op.relabel ? form !== "labels" : active.finalizer !== (form === "v2" ? "commit_v2" : "commit_graph"))
 			return await reject(`This operation requires ${op.relabel ? "commit_labels" : active.finalizer}.`);
+		// The decider every semantic gate asks, from the same settings line `begin` read.
+		const agent = await api.agent(ctx);
+		const settings = readSettings(agent.instructions);
+		const classifier = settings.classifier ? new Beverly(settings.classifier) : undefined;
 		const records = await new SidecarStore(() => op.session.file, op.session.id).load();
 		if (records.some(record => record.id === `${op.job}:map`)) return { content: text("Map saved."), control: { terminate: true } };
 		const done = await progress(api, ctx, op.job);
@@ -203,6 +202,7 @@ const CONVERSATION_LABEL = /^\s*(?:request|ask|asking|clarify|explain|determine|
 		const unresolved = new Set(state.unresolvedNotices);
 		if (state.checkpoint?.note) unresolved.add(noticeKey(state.checkpoint.note));
 		let next;
+		let unmet: string[] | undefined;
 		try {
 			if (form === "labels") {
 				const payload = check("commit_labels", call?.arguments ?? _args) as { labels: { id: string; label: string; state?: "active" | "parked" }[]; retired?: { id: string; reason: string }[] };
@@ -215,16 +215,18 @@ const CONVERSATION_LABEL = /^\s*(?:request|ask|asking|clarify|explain|determine|
 				const dropped = new Set(retired.keys());
 				// A repair fixes labels that describe the conversation, never labels that describe the work:
 				// a model rewriting good history is how "Review pi-delegate and pi-tether…" became "Check
-				// compilation". And a label must name its own work — one sharing no content word with the
-				// intent is invented, not written.
+				// compilation". The decider judges both the saved label (a conversational wrapper?) and the
+				// proposed one (does it name this work at all?) — the old guards were word lists.
 				const settled = work.filter(node => dropped.has(node.id) && node.state === "settled").map(node => node.id);
 				if (settled.length) throw new Error(`Finished records are not retirable: ${settled.join(", ")}. Give each a label instead.`);
+				if (!classifier && work.some(node => { const wanted = byId.get(node.id); return wanted && wanted.label !== node.label; }))
+					throw new Error("The Mom decider (decision model) is not configured; labels cannot be repaired without it.");
 				for (const node of work) {
 					const wanted = byId.get(node.id);
 					if (!wanted || wanted.label === node.label) continue;
-					if (!CONVERSATION_LABEL.test(node.label)) throw new Error(`${node.id} keeps its saved label ${JSON.stringify(node.label)}: it describes the work, not the conversation.`);
-					const intent = words(node.intent);
-					if (intent.size && ![...words(wanted.label)].some(word => intent.has(word)))
+					const verdict = await classifier!.work({ state: node.state, label: node.label, intent: node.intent, observed: node.observed, proposed: wanted.label });
+					if (!verdict.wrapper_label) throw new Error(`${node.id} keeps its saved label ${JSON.stringify(node.label)}: it describes the work, not the conversation.`);
+					if (node.intent?.trim() && !verdict.names_work)
 						throw new Error(`${node.id}: label ${JSON.stringify(wanted.label)} names nothing in this work's intent. Write a label that describes it.`);
 				}
 				// Retiring is structural too: never a node whose unfinished work would be orphaned, and the
@@ -273,33 +275,16 @@ const CONVERSATION_LABEL = /^\s*(?:request|ask|asking|clarify|explain|determine|
 				const labels = new Map(updated.nodes.map(node => [node.id, node.label]));
 				next = { graph: updated, note: null, resolutions: [], repairs: [], unfinished: (state.checkpoint?.unfinished ?? [])
 					.filter(item => !dropped.has(item.node)).map(item => ({ ...item, label: labels.get(item.node) ?? item.label })) };
-			} else if (form === "acts") {
-				// Mode-owned apply (docs/map-modes.md, M5): the model labeled fragments, host code
-				// derives every write. The host then validates its own result like any other commit.
-				const payload = (call?.arguments ?? _args) as { answer?: unknown } | undefined;
-				const events = feed.events.filter(event => newRefs.has(event.ref));
-				if (!op.candidates) throw new Error("This operation has no staged fragments; prepare a new act_labels operation.");
-				const derived = ACT_LABELS_MODE.apply!({ prior: graph, candidates: op.candidates, committed: payload, known, events });
-				if (derived.declined.length) throw new Error(derived.declined.join("; "));
-				if (typeof payload?.answer === "string") answer = payload.answer;
-				const before = new Map(graph.nodes.map(node => [node.id, node]));
-				const upsertNodes = derived.graph.nodes.filter(node => JSON.stringify(before.get(node.id)) !== JSON.stringify(node));
-				next = acceptGraph({ upsertNodes, focus: derived.graph.focus }, graph, state.checkpointId, known, newRefs, inspected, op.question, Boolean(op.trigger), unresolved);
-				const live = new Map(next.graph.nodes.map(node => [node.id, node]));
-				const unfinished = new Map((state.checkpoint?.unfinished ?? [])
-					.filter(item => {
-						const node = live.get(item.node);
-						return item.disposition !== "resolved" && ["active", "parked"].includes(node?.state ?? "") && Boolean(node && !isObsoleteParkedWork(node));
-					})
-					.map(item => [item.node, { ...item, label: live.get(item.node)!.label }]));
-				for (const item of next.unfinished) unfinished.set(item.node, item);
-				next.unfinished = [...unfinished.values()];
-				if (!Check(Unfinished, next.unfinished)) throw new Error("Unfinished obligations exceed the checkpoint contract; no obligations were discarded.");
+			} else if (form === "v2") {
+				// The model edited the minimal map directly; the mode's apply checks structure and stores it.
+				const derived = await V2_MODE.apply!({ prior: graph, committed: call?.arguments ?? _args, known, ...(op.spec ? { spec: op.spec } : {}) });
+				if (derived.declined.length) throw new Error(derived.declined.join(" "));
+				unmet = derived.unmet;
+				next = { graph: derived.graph, note: null, resolutions: [], repairs: [], unfinished: [] };
 			} else {
 				const args = check("commit_graph", call?.arguments ?? _args);
-				if (typeof args?.answer === "string") answer = args.answer;
-				// acceptGraph rejects an empty commit on a cold graph or with an unanswered question.
-				next = acceptGraph(args, graph, state.checkpointId, known, newRefs, inspected, op.question, Boolean(op.trigger), unresolved);
+				// acceptGraph rejects an empty commit on a cold graph.
+				next = acceptGraph(args, graph, state.checkpointId, known, newRefs, inspected, Boolean(op.trigger), unresolved);
 			}
 			// A graph-identical commit closes nothing: it keeps the saved unfinished declarations rather than clearing them.
 			if (state.checkpoint && JSON.stringify(next.graph) === JSON.stringify(graph)) {
@@ -327,7 +312,7 @@ const CONVERSATION_LABEL = /^\s*(?:request|ask|asking|clarify|explain|determine|
 		const gapUpdate = !op.retryGap ? {} : op.retryGap.remaining.length && retried
 			? { gap: { action: "open", ...retried, ...range(op.retryGap.remaining) } } : { gap: { action: "resolved", id: op.retryGap.id } };
 		const resolutionUpdate = { ...(resolutionKeys.size ? { resolvedNotices: [...resolutionKeys] } : {}), ...(op.auditedGaps?.length ? { resolvedGaps: op.auditedGaps } : {}) };
-		const cut = op.cut!, at = Date.now(), agent = await api.agent(ctx);
+		const cut = op.cut!, at = Date.now();
 		const write = async (data: Record<string, unknown>, failure: string) => {
 			try { await store.append("map", data, `${op.job}:map`); } catch (error) { throw new Error(`${failure}: ${String(error)}`); }
 		};
@@ -343,16 +328,10 @@ const CONVERSATION_LABEL = /^\s*(?:request|ask|asking|clarify|explain|determine|
 			}
 		}
 		worlds.delete(`${op.job}:${op.step}`);
-		await accepted(engine, api, ctx, op, answer);
+		await accepted(engine, api, ctx, op, unmet?.length ? { unmet } : undefined);
 		return { content: text("Map saved."), control: { terminate: true } };
-	}), prepareArguments: (args: unknown) => { try { return validateToolArguments(form === "acts" ? actLabelsTool() as any : form === "labels" ? labelsDefinition as any : { ...definition("commit_graph") } as any,
-		{ type: "toolCall", id: "check", name: form === "acts" ? "commit_acts" : form === "labels" ? "commit_labels" : "commit_graph", arguments: JSON.parse(JSON.stringify(args ?? {})) }) as any; } catch { return {} as any; } } });
-
-	const answer = () => tool(definition("answer_question"), async (args, op, api, ctx) => {
-		if (!op.question || typeof args.answer !== "string" || !args.answer.trim()) throw new Error("An explicit question and nonempty answer are required.");
-		await accepted(engine, api, ctx, op, args.answer);
-		return { content: text("Answer recorded. Pending evidence has not been marked reviewed."), control: { terminate: true } };
-	});
+	}), prepareArguments: (args: unknown) => { try { return validateToolArguments(form === "v2" ? commitV2Tool() as any : form === "labels" ? labelsDefinition as any : { ...definition("commit_graph") } as any,
+		{ type: "toolCall", id: "check", name: form === "v2" ? "commit_v2" : form === "labels" ? "commit_labels" : "commit_graph", arguments: JSON.parse(JSON.stringify(args ?? {})) }) as any; } catch { return {} as any; } } });
 
 	const inspect = tool({ ...definition("inspect_evidence") }, async (args, op, api, ctx) => {
 		const { feed, known, missing, state } = await world(op);
@@ -409,7 +388,7 @@ const CONVERSATION_LABEL = /^\s*(?:request|ask|asking|clarify|explain|determine|
 	const search = tool(definition("search_history"), async (args, op, _api, ctx) => {
 		const { feed } = await world(op);
 		const query = validateSearchQuery(args.query);
-		return { content: text(JSON.stringify({ ...await feed.search(query, AbortSignal.any([AbortSignal.timeout(120000), ...(ctx?.abortSignal ? [ctx.abortSignal] : [])]), op.question ?? query), limit: 5 })) };
+		return { content: text(JSON.stringify({ ...await feed.search(query, AbortSignal.any([AbortSignal.timeout(120000), ...(ctx?.abortSignal ? [ctx.abortSignal] : [])])), limit: 5 })) };
 	});
 
 	const recordDefinition = { name: "record_thread_map", description: "Return exactly one source-backed chapter state for this section of the independent thread map.",
@@ -475,18 +454,17 @@ const CONVERSATION_LABEL = /^\s*(?:request|ask|asking|clarify|explain|determine|
 	const prompt = (text: string) => {
 		const start = decodeStart(text);
 		if (start?.kind === "delivery") return "The lead's session recorded new activity. Call mom_begin.";
-		if (start?.kind === "request") return start.request.kind === "question" ? `The user asks: ${start.request.question}\nCall mom_begin.`
-			: start.request.kind === "relabel" ? "The user requested a repair of saved work labels. Call mom_begin." : "The user's session sent a request. Call mom_begin.";
+		if (start?.kind === "request") return start.request.kind === "relabel" ? "The user requested a repair of saved work labels. Call mom_begin." : "The user's session sent a request. Call mom_begin.";
 		return decodeOperation(text).text;
 	};
 	const textOf = (message: any) => typeof message.content === "string" ? message.content : message.content.filter((part: any) => part.type === "text").map((part: any) => part.text).join("");
 	const REPAIR_PREFIX = "No finalizer was executed.";
-	const repair = (header: OperationHeader) => `${REPAIR_PREFIX} Review the supplied evidence and finish with ${header.question ? "answer_question" : header.relabel ? "commit_labels" : modeFor(header.mapMode).finalizer} as a sole direct call. Your previous text did not save any changes.`;
+	const repair = (header: OperationHeader) => `${REPAIR_PREFIX} Review the supplied evidence and finish with ${header.relabel ? "commit_labels" : modeFor(header.mapMode).finalizer} as a sole direct call. Your previous text did not save any changes.`;
 /** Mom's own tool surface. A stale or foreign slice configuration must never hand her native
  *  filesystem, shell or editor tools: a small model given those leaves the operation and wanders.
  *  The extension enforces its own boundary rather than trusting the allowlist it was given. */
-const MOM_TOOL_NAMES = new Set([BEGIN, "commit_graph", "commit_acts", "commit_labels", "answer_question", "record_thread_map", "inspect_evidence", "search_history"]);
-	const RELABEL_PROMPT = "You are Mom repairing her saved work map, not processing new activity or answering conversation questions. First call mom_begin alone. Then read its work list and call commit_labels once. Give a decision only for the work that needs one: a concise, meaningful label to keep it, or retired with a short reason. An ID you leave out keeps its saved label.\n\n\n\nMom tracks only durable, multi-turn things. Retire work that is not: a status or progress question (\"where are we?\", \"is it in place now?\", \"were those labels from act mode or commit mode\"), a one-off meta question, or an instruction the next turn fully satisfied. Keep genuine multi-turn work even when it is phrased as a question (\"What else is fucking idiotic in this stack?\" is a real audit request). Never retire settled work, or work that still holds unfinished work — give those a label instead.\n\n\n\nA kept work item may also carry state: active when it is being worked on now, parked when it is deliberately deferred. Set active for work in progress, including an umbrella initiative whose child is current. Never mark work settled here — a completion needs its own evidence. Base every label on that work's intent and observed outcome; do not copy terminal markup or invent new work. Never call other tools, and never alter IDs, sources, or notes.";
+const MOM_TOOL_NAMES = new Set([BEGIN, "commit_graph", "commit_v2", "commit_labels", "record_thread_map", "inspect_evidence", "search_history"]);
+	const RELABEL_PROMPT = "You are Mom repairing her saved work map, not processing new activity or answering the recorded conversation. First call mom_begin alone. Then read its work list and call commit_labels once. Give a decision only for the work that needs one: a concise, meaningful label to keep it, or retired with a short reason. An ID you leave out keeps its saved label.\n\n\n\nMom tracks only durable, multi-turn things. Retire work that is not: a status or progress question (\"where are we?\", \"is it in place now?\", \"were those labels from act mode or commit mode\"), a one-off meta question, or an instruction the next turn fully satisfied. Keep genuine multi-turn work even when it is phrased as a question (\"What else is fucking idiotic in this stack?\" is a real audit request). Never retire settled work, or work that still holds unfinished work — give those a label instead.\n\n\n\nA kept work item may also carry state: active when it is being worked on now, parked when it is deliberately deferred. Set active for work in progress, including an umbrella initiative whose child is current. Never mark work settled here — a completion needs its own evidence. Base every label on that work's intent and observed outcome; do not copy terminal markup or invent new work. Never call other tools, and never alter IDs, sources, or notes.";
 
 	const hooks = [durable.hook(durable.GenerationTask, {
 		async beforeRequest(request, api, ctx) {
@@ -504,10 +482,10 @@ const MOM_TOOL_NAMES = new Set([BEGIN, "commit_graph", "commit_acts", "commit_la
 			const operationMode = modeFor(header?.mapMode ?? settings.mapMode);
 			const givingUp = messages.some(message => message.role === "user" && textOf(message).startsWith(GIVE_UP));
 			const allowed = new Set(!header || givingUp ? [BEGIN] : header.mode === "audit" ? ["record_thread_map", ...(header.section?.needsInspection ? ["inspect_evidence"] : [])]
-				: header.question ? ["answer_question", "inspect_evidence", "search_history"]
 				: header.relabel ? ["commit_labels"]
-				: header.digest ? ["commit_graph"]
-				: operationMode.name === "act_labels" ? ["commit_acts"] : ["commit_graph", "inspect_evidence", "search_history"]);
+				// v2 owns every write, catch-up digests included; commit_graph owns its own digest.
+				: operationMode.name === "v2" ? ["commit_v2", "inspect_evidence", "search_history"]
+				: ["commit_graph", "inspect_evidence", "search_history"]);
 			return { messages: messages.map(message => {
 				if (message.role === "system") return { ...message,
 					...(header?.relabel && message.sections?.instructions ? { sections: { ...message.sections, instructions: RELABEL_PROMPT } } : {}),
@@ -525,7 +503,7 @@ const MOM_TOOL_NAMES = new Set([BEGIN, "commit_graph", "commit_acts", "commit_la
 		 */
 		async onYield(_answer, api, ctx) {
 			const op = await readOperation(engine, api as any, ctx);
-			if (op.status !== "open" || !op.header || !["update", "ask"].includes(op.header.mode)) return undefined;
+			if (op.status !== "open" || op.header?.mode !== "update") return undefined;
 			if (!await api.memo<boolean>("mom-repaired", ctx)) return { continue: repair(op.header) };
 			// Ended again without a finalizer: a hook cannot fail the turn, a tool result can. mom_begin fails the operation.
 			return await api.memo<boolean>("mom-gave-up", ctx) ? undefined : { continue: GIVE_UP };
@@ -540,13 +518,9 @@ const MOM_TOOL_NAMES = new Set([BEGIN, "commit_graph", "commit_acts", "commit_la
 	// Her operations each start a fresh context (the hook above): summarizing the stored history would only spend model calls.
 	hooks.push(durable.hook(durable.CompactionTask, { beforeCompact: () => ({ decline: true as const }) }));
 
-	// `mom-ask` only replaces her finalizers with their question variants; `mom` carries everything else.
-	if (answering) return durable.defineExtension({ name: "mom-ask", tools: [finalize(), finalize("acts"), answer()] });
 	return durable.defineExtension({
 		name: "mom",
-		tools: [beginTool, finalize(), finalize("acts"), finalize("labels"), inspect, search, record],
+		tools: [beginTool, finalize(), finalize("v2"), finalize("labels"), inspect, search, record],
 		hooks,
 	});
 }
-
-export default function mom(durable: typeof Durable): Durable.Extension { return momExtension(durable, false); }

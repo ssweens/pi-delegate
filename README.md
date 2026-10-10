@@ -41,7 +41,7 @@ In the sheet: **1–4** or **Tab/Shift+Tab** changes tabs; **↑↓**, **PgUp/Pg
 
 Value compares a stated basket of 1M prompt + 250k completion tokens using **listed model prices, not discounted endpoint prices**; frontier means the top 15% of today's AA-Intelligence-scored, tool-capable text models with at least 128k context, and light means the top half below that frontier with at least 32k context. These are relative score bands, not a guarantee of task performance. Free, `:batch`, and per-request-priced models are excluded from the value ranking; promotional offers with missing AA scores remain visible. Non-healthy endpoints are omitted. The scan checks every eligible model's endpoints in batches of eight, caches successful responses for ten minutes unless refreshed, and reports lookup failures rather than claiming a complete promotion scan. Entries absent from Pi's available OpenRouter registry are labeled **not configured**. This action never switches or approves a model.
 
-`rate` stores ratings the agent researched, keyed by exact `provider/id` (`[{model, score, source, note?}]`), in `~/.pi/agent/delegate-ratings.json`; reported stale after 14 days. Ratings appear on `models` lines.
+`rate` stores ratings the agent researched, keyed by exact `provider/id` (`[{model, score, source, note?}]`), in the `ratings` section of `~/.pi/agent/pi-delegate.json`; reported stale after 14 days. Ratings appear on `models` lines.
 
 ## Roles
 
@@ -330,7 +330,7 @@ A child runs on the parent's catalog, including providers that extensions regist
 
 ## Model approval
 
-A `delegate` call resolves its model as `model:` param → approved default for the role → role file → your current model, and runs. There is no dialog: proposing a non-default model is a conversation — the agent states offering, price, tradeoff, rating, asks, and launches on your answer. `delegate_ctl action=approve role= model= message=` records a default in `~/.pi/agent/delegate-models.json`; the skill forbids calling it without your explicit yes in the conversation. The file also snapshots the catalog so `models` can report drift and new offerings since approval.
+A `delegate` call resolves its model as `model:` param → approved default for the role → role file → your current model, and runs. There is no dialog: proposing a non-default model is a conversation — the agent states offering, price, tradeoff, rating, asks, and launches on your answer. `delegate_ctl action=approve role= model= message=` records a default in the `defaults` section of `~/.pi/agent/pi-delegate.json`; the skill forbids calling it without your explicit yes in the conversation. That section also snapshots the catalog so `models` can report drift and new offerings since approval.
 
 ## Watching children
 

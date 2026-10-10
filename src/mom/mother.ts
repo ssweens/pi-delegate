@@ -12,11 +12,9 @@ import type { AdvisorScreenRecord, SessionAdvisor } from "./advisor.ts";
 import { branchCheckpoints, emptyUsage, graphChange, loadState, noticeKey, sumUsage, type AnchorState, type Checkpoint, type CursorFailure, type SkippedGap, type Usage, type WindowLive, type WindowOutcome } from "./checkpoint.ts";
 import { extractEvents, isUserDirection, LiveFeed, renderUpdateEvent, renderUpdateEvents, suffix, type Cut, type FeedEvent, type SessionReader } from "./feed.ts";
 import type { CompactionReview } from "./compaction.ts";
-import { reconstructThreadMap, THREAD_MAP_PROMPT, LABEL_AUDIT_PROMPT, type ThreadMap } from "./audit.ts";
+import { reconstructThreadMap, THREAD_MAP_PROMPT, type ThreadMap } from "./audit.ts";
 import { bootstrapDigest, type BootstrapPolicy } from "./bootstrap.ts";
-import { candidateCount } from "./enumerate.ts";
-import { CANDIDATE_LIMIT } from "./candidate.ts";
-import { CHAPTER_STATE_FIELDS, CONVERSATION_PROMPT, REFLECTION_PROMPT, normalizeEvidence } from "./contract.ts";
+import { CHAPTER_STATE_FIELDS, REFLECTION_PROMPT, normalizeEvidence } from "./contract.ts";
 import { emptyGraph, graphForModel, graphSlice } from "./graph.ts";
 import { OPERATION_FAILED, type OperationHeader } from "./operation.ts";
 import { PROCESS_RISK_CLASSES, emptyEngagement, type FindingFeedback, type ProcessRiskClass } from "./process-health.ts";
@@ -29,17 +27,13 @@ type StagedBatch = Awaited<ReturnType<LiveFeed["capture"]>> & { from: Cut; start
 	retryGapId?: string; retryGapRemaining?: string[]; /** Bootstrap only: replaces the raw slice as this proposal's evidence. */
 	digest?: string };
 /** What a settled step's messages say happened. */
-export interface StepOutcome { usage: Usage; steps: number; accepted: boolean; answer?: string; rejection?: string; failure?: string; audit?: ThreadMap }
+export interface StepOutcome { usage: Usage; steps: number; accepted: boolean; rejection?: string; failure?: string; audit?: ThreadMap }
 
 /** Gap evidence was originally admitted under the same 24k feed budget. Keep recovery bounded too. */
-function boundedGapEvents(events: readonly FeedEvent[], limit = 24000, fragmentLimit = Infinity): { events: FeedEvent[]; remaining: string[] } {
+function boundedGapEvents(events: readonly FeedEvent[], limit = 24000): { events: FeedEvent[]; remaining: string[] } {
 	const selected: FeedEvent[] = [];
-	let count = 0;
 	for (const event of events) {
-		const next = candidateCount([event]);
-		if (next > fragmentLimit) throw new Error(`One recovery entry contains ${next} fragments; maximum ${fragmentLimit}. Nothing was truncated.`);
-		if (count + next > fragmentLimit || renderUpdateEvents([...selected, event]).length > limit) break;
-		count += next;
+		if (renderUpdateEvents([...selected, event]).length > limit) break;
 		selected.push(event);
 	}
 	if (!selected.length && events.length) throw new Error("One recorded gap event exceeds Mom's 24,000-character recovery limit; nothing was truncated.");
@@ -91,30 +85,26 @@ export type Prepared =
 	| { kind: "idle"; reason: string }
 	| { kind: "defer"; until: number };
 
-/** Read a settled step: usage, acceptance, an answer, a rejection, an operation failure, or an audit result. */
+/** Read a settled step: usage, acceptance, a rejection, an operation failure, or an audit result. */
 export function readStep(messages: readonly any[], slice?: any): StepOutcome {
 	const outcome: StepOutcome = { usage: emptyUsage(), steps: 0, accepted: false };
-	const calls = new Map<string, any>();
 	for (const message of messages) {
 		if (message.role === "assistant") {
 			outcome.steps++;
 			const u = message.usage;
 			// Every provider request counts, mom_begin's included: "model calls" is what the user pays for.
 			if (u) outcome.usage = sumUsage(outcome.usage, { calls: 1, input: u.input ?? 0, output: u.output ?? 0, cacheRead: u.cacheRead ?? 0, cacheWrite: u.cacheWrite ?? 0, nominalCost: u.cost?.total ?? 0, elapsedMs: 0 });
-			for (const block of message.content ?? []) if (block.type === "toolCall") calls.set(block.id, block);
 			if (message.stopReason === "error") outcome.failure = message.errorMessage ?? "Mom provider failed.";
 		} else if (message.role === "toolResult") {
 			const text = (message.content ?? []).filter((part: any) => part.type === "text").map((part: any) => part.text).join("\n");
-			const call = calls.get(message.toolCallId);
 			if (text.startsWith(OPERATION_FAILED)) outcome.failure = text.slice(OPERATION_FAILED.length);
-			else if (message.toolName === "commit_graph" || message.toolName === "commit_acts") {
-				if (!message.isError && text.startsWith("Map saved.")) { outcome.accepted = true; if (typeof call?.arguments?.answer === "string") outcome.answer = call.arguments.answer; }
+			else if (["commit_graph", "commit_v2"].includes(message.toolName)) {
+				if (!message.isError && text.startsWith("Map saved.")) outcome.accepted = true;
 				else if (message.isError) outcome.rejection = text;
-			} else if (message.toolName === "answer_question" && !message.isError && typeof call?.arguments?.answer === "string") outcome.answer = call.arguments.answer;
-			else if (message.toolName === "record_thread_map" && !message.isError && text.startsWith("Chapter state recorded.\n")) outcome.audit = JSON.parse(text.slice(text.indexOf("\n") + 1));
+			} else if (message.toolName === "record_thread_map" && !message.isError && text.startsWith("Chapter state recorded.\n")) outcome.audit = JSON.parse(text.slice(text.indexOf("\n") + 1));
 		}
 	}
-	if (!outcome.accepted && !outcome.answer && !outcome.failure && slice?.state === "failed") outcome.failure = slice.detail ?? `Mom's slice failed (${slice.reason ?? "unknown"}).`;
+	if (!outcome.accepted && !outcome.failure && slice?.state === "failed") outcome.failure = slice.detail ?? `Mom's slice failed (${slice.reason ?? "unknown"}).`;
 	return outcome;
 }
 
@@ -148,8 +138,6 @@ export class Mom {
 	recovering = false;
 	more = false;
 	waitingForWorkers = false;
-	/** The last answered questions, which her slice keeps for follow-ups (her status document). */
-	conversation: { question: string; answer: string }[] = [];
 	/** A screen postponed the staged batch: the next look at the session adds what arrived meanwhile. */
 	private screenDeferred = false;
 	failure?: CursorFailure;
@@ -214,9 +202,7 @@ export class Mom {
 			this.failure = undefined;
 			this.feed = new LiveFeed(this.host.ctx.sessionManager);
 		}
-		const splitRetry = retry && (this.host.mapMode ?? this.mode) === "act_labels" && candidateCount(retry.events) > CANDIDATE_LIMIT;
-		if (splitRetry) { this.feed = new LiveFeed(this.host.ctx.sessionManager); retry = undefined; }
-		if (!retry) await this.feed.restore(splitRetry ? state.failure!.from : state.coverageCut ?? this.checkpoint?.cut);
+		if (!retry) await this.feed.restore(state.coverageCut ?? this.checkpoint?.cut);
 		for (const observation of state.observations) this.feed.observe(observation);
 		if (this.checkpoint) for (const item of [...this.checkpoint.graph.nodes, ...this.checkpoint.graph.edges]) for (const ref of item.sources) {
 			if (!this.feed.byRef.has(ref)) throw new Error(`Checkpoint cites an unknown or unobserved source: ${ref}`);
@@ -252,47 +238,38 @@ export class Mom {
 	}
 
 	/**
-	 * Stage this operation's evidence and build what her turn reviews. A question reads pending evidence
-	 * without covering it; a compaction review first reconstructs an independent thread map in child steps.
+	 * Stage this operation's evidence and build what her turn reviews. A compaction review first
+	 * reconstructs an independent thread map in child steps.
 	 */
-	async prepare(options: { question?: string; refresh: boolean; review?: CompactionReview; force?: boolean; relabel?: boolean; job: string; signal?: AbortSignal }): Promise<Prepared> {
-		const { question, refresh, review: compactionReview, job } = options;
+	async prepare(options: { refresh: boolean; review?: CompactionReview; force?: boolean; relabel?: boolean; job: string; signal?: AbortSignal }): Promise<Prepared> {
+		const { refresh, review: compactionReview, job } = options;
 		this.stage("reading history");
 		const started = performance.now();
 		const timing = { startupMs: 0, requestMs: 0, totalMs: 0, oldestEvidenceAgeMs: 0 };
 		let screen: AdvisorScreenRecord | undefined;
-		const actLabels = (this.host.mapMode ?? this.mode) === "act_labels";
-		let remainingFragments = CANDIDATE_LIMIT - candidateCount(this.staged?.events ?? []);
-		const admit = actLabels ? (events: readonly FeedEvent[]) => {
-			const count = candidateCount(events);
-			if (count > CANDIDATE_LIMIT) throw new Error(`One narrative entry contains ${count} fragments; maximum ${CANDIDATE_LIMIT}. Nothing was truncated.`);
-			if (count > remainingFragments) return false;
-			remainingFragments -= count;
-			return true;
-		} : undefined;
 		if (options.relabel && this.checkpoint) {
 			// Repair saved labels without consuming or waiting for the unrelated live backlog.
 			this.staged = { events: [], cut: this.checkpoint.cut, from: this.checkpoint.cut,
 				gaps: [], more: false, startIndex: this.committed, endIndex: this.committed };
 		} else if (compactionReview) {
 			const from = this.checkpoint?.cut ?? this.feed.cut();
-			const captured = await this.feed.capture(actLabels ? 24000 : Infinity, false, admit);
+			const captured = await this.feed.capture(Infinity, false);
 			this.staged = { ...captured, events: this.feed.events.slice(this.committed), from, startIndex: this.committed, endIndex: this.feed.events.length };
 			// Optional worker history must not block reconciliation of readable lead evidence.
 			if (this.feed.gaps.has("parent")) throw new Error(`Thread-map audit cannot read lead evidence: ${this.feed.gaps.get("parent")}`);
 		} else if (!this.staged) {
 			const from = this.checkpoint?.cut ?? this.feed.cut(), startIndex = this.feed.events.length;
-			const captured = await this.feed.capture(24000, false, admit);
+			const captured = await this.feed.capture(24000, false);
 			this.staged = { ...captured, from, startIndex, endIndex: this.feed.events.length };
 		} else if (this.waitingForWorkers || this.screenDeferred) {
 			const used = renderUpdateEvents(this.staged.events).length;
-			const next = await this.feed.capture(24000 - used, false, admit);
+			const next = await this.feed.capture(24000 - used, false);
 			this.staged = { ...this.staged, events: [...this.staged.events, ...next.events], cut: next.cut,
 				gaps: [...new Set([...this.staged.gaps, ...next.gaps])], more: next.more, endIndex: this.feed.events.length };
 		}
 		this.screenDeferred = false;
 		// A failed range (restored from her `.mom` file) is retried alone; later evidence waits for the next operation.
-		const retryingGaps = () => !options.relabel && !question && (refresh || (!this.failure && !this.staged!.events.length)) && this.gaps.length > 0 && !compactionReview;
+		const retryingGaps = () => !options.relabel && (refresh || (!this.failure && !this.staged!.events.length)) && this.gaps.length > 0 && !compactionReview;
 		if (retryingGaps()) {
 			// A skipped range whose sources are gone can never be re-reviewed: retire it durably.
 			const unreadable = this.gaps.filter(gap => { try { recordedRange(this.feed.events, gap, ""); return false; } catch { return true; } });
@@ -305,7 +282,7 @@ export class Mom {
 		if (retryingGaps()) {
 			const gap = this.gaps[0];
 			const old = recordedRange(this.feed.events, gap, "Mom cannot retry a skipped range because its recorded sources are unreadable.");
-			const chunk = boundedGapEvents(old, 24000, actLabels ? CANDIDATE_LIMIT : Infinity);
+			const chunk = boundedGapEvents(old, 24000);
 			const gapStart = this.feed.events.findIndex(event => event.ref === chunk.events[0]?.ref);
 			if (gapStart < 0) throw new Error("Mom cannot locate the recorded gap boundary in the restored evidence stream.");
 			this.staged = { events: chunk.events, cut: this.coverageCut ?? gap.through, from: gap.from,
@@ -319,15 +296,14 @@ export class Mom {
 		if (this.failure && !batch.retryGapId) this.recovering = true;
 		const oldestEvidence = batch.events.reduce((oldest, event) => Math.min(oldest, Date.parse(event.at)), Date.now());
 		const deadline = oldestEvidence + MAX_DEFERRAL_MS;
-		if (!question && !refresh && !compactionReview && batch.events.length && this.feed.hasRunningWorkers && Date.now() < deadline) {
+		if (!refresh && !compactionReview && batch.events.length && this.feed.hasRunningWorkers && Date.now() < deadline) {
 			// Prefer settlement briefly, but a long worker must not hold the current account indefinitely.
 			this.waitingForWorkers = true;
 			return { kind: "defer", until: deadline };
 		}
 		this.waitingForWorkers = false;
-		if (!batch.events.length && !question && !compactionReview && !options.force) return { kind: "idle", reason: "Nothing new to review." };
-		const lastUpdateError = this.error ?? this.failure?.error;
-		if (this.host.bootstrapPolicy && !question && !compactionReview && !this.failure && !batch.retryGapId && batch.more) {
+		if (!batch.events.length && !compactionReview && !options.force) return { kind: "idle", reason: "Nothing new to review." };
+		if (this.host.bootstrapPolicy && !compactionReview && !this.failure && !batch.retryGapId && batch.more) {
 			// Any bounded backlog uses the local thread-map chapter digest: one proposal over the drained backlog,
 			// regardless of the normal frontier mode. Raw act labeling is for live increments, not catch-up.
 			const digest = await bootstrapDigest(this.feed, batch.more, this.host.bootstrapPolicy, batch.startIndex);
@@ -342,7 +318,7 @@ export class Mom {
 		const unresolved = new Set(this.unresolvedNotices);
 		if (this.checkpoint?.note) unresolved.add(noticeKey(this.checkpoint.note));
 		// A classifier may postpone routine mid-run evidence, never certify it unchanged.
-		const mandatory = Boolean(question) || refresh || Boolean(compactionReview) || batch.events.some(event => event.correction === true) ||
+		const mandatory = refresh || Boolean(compactionReview) || batch.events.some(event => event.correction === true) ||
 			Boolean(this.failure) || Boolean(batch.retryGapId) || Date.now() >= deadline;
 		if (this.host.advisor && !mandatory && this.checkpoint) {
 			this.stage("screening");
@@ -368,21 +344,13 @@ export class Mom {
 			// Her saved map already covers everything up to its cut: audit only what it has not (pending
 			// evidence plus the compaction event), not the session's whole history again.
 			const covered = new Set(this.feed.events.slice(0, batch.startIndex).map(event => event.ref));
-			const stagedRefs = new Set(batch.events.map(event => event.ref));
-			const captured = new Map(compactionReview.historyEvents.filter(event => !covered.has(event.ref) && (!actLabels || stagedRefs.has(event.ref))).map(event => [event.ref, event]));
+			const captured = new Map(compactionReview.historyEvents.filter(event => !covered.has(event.ref)).map(event => [event.ref, event]));
 			for (const event of this.feed.events.slice(batch.startIndex)) if (!captured.has(event.ref)) captured.set(event.ref, event);
 			const stepStarted = performance.now();
 			audit = await reconstructThreadMap([...captured.values()], async (section, body, name) => {
 				this.auditProgress = { section: Number(body.section), of: Number(body.sections) }; this.host.changed();
-				if (actLabels) {
-					const refs = body.rawSourceIds as string[];
-					section = { ...section, sources: Object.fromEntries(refs.map((ref, i) => [`s${i + 1}`, ref])), needsInspection: Boolean(body.needsInspection) } as typeof section;
-					let evidence = String(body.evidence);
-					for (const [alias, ref] of Object.entries((section as any).sources)) evidence = evidence.replaceAll(`[src:${ref}]`, `[src:${alias}]`);
-					body = { ...body, evidence, rawSourceIds: Object.keys((section as any).sources) };
-				}
-				const result = await this.host.steps({ header: { job, step: name, mode: "audit", ...(actLabels ? { mapMode: "act_labels" } : {}), session, cut: batch.cut, refs: [], trigger: compactionReview.triggerEvent, section },
-					body, instructions: actLabels ? LABEL_AUDIT_PROMPT : THREAD_MAP_PROMPT,
+				const result = await this.host.steps({ header: { job, step: name, mode: "audit", session, cut: batch.cut, refs: [], trigger: compactionReview.triggerEvent, section },
+					body, instructions: THREAD_MAP_PROMPT,
 					tools: ["record_thread_map", ...(body.needsInspection ? ["inspect_evidence"] : [])], thinking: "low" });
 				const outcome = readStep(result.messages);
 				this.usage = sumUsage(this.usage, outcome.usage);
@@ -398,16 +366,15 @@ export class Mom {
 		}
 		const original = this.feed.events.find((e) => e.actor === "lead" && e.kind === "user");
 		const normalized = batch.digest ? undefined : normalizeEvidence(batch.events, this.chapterBoundary);
-		const reflect = !question && Boolean(compactionReview);
-		const guidance = question ? CONVERSATION_PROMPT : reflect ? REFLECTION_PROMPT : "";
+		const reflect = Boolean(compactionReview);
+		const guidance = reflect ? REFLECTION_PROMPT : "";
 		const body = {
-			task: question ? "Answer the explicit question using the graph and evidence."
-				: audit ? "Compare the independent thread map with the saved graph. Diff chapter states within each actor's stream, then use sourceMetadata timestamps to order evidence across actors: presentation order is not chronology. An earlier worker finding may be resolved by later edits and checks; inspect original sources before treating it as still open. Reconcile material errors in one transaction. Neither map is authoritative. Preserve node identities and historical work; do not reopen resolved work merely because the audit mentions it."
+			task: audit ? "Compare the independent thread map with the saved graph. Diff chapter states within each actor's stream, then use sourceMetadata timestamps to order evidence across actors: presentation order is not chronology. An earlier worker finding may be resolved by later edits and checks; inspect original sources before treating it as still open. Reconcile material errors in one transaction. Neither map is authoritative. Preserve node identities and historical work; do not reopen resolved work merely because the audit mentions it."
 					: "Update the work graph from newEvents. This is background maintenance, not a request to answer the recorded conversation.",
 			activity: { leadRunning: !this.host.ctx.isIdle(), workersRunning: this.feed.hasRunningWorkers,
 				interpretation: "Evidence from active runs is provisional. An intermediate failure is not a final outcome; do not infer completion from a partial transcript." },
 			uncertainEffects: this.feed.uncertainEffects(),
-			original: original ? { ref: original.ref, ...(!this.checkpoint || question ? { text: original.text } : {}) } : null,
+			original: original ? { ref: original.ref, ...(!this.checkpoint ? { text: original.text } : {}) } : null,
 			graph: graphForModel(this.graph), contextBeforeBatch: prior ? renderUpdateEvent(prior) : null,
 			newEvents: audit ? "Pending evidence is included in the full thread-map audit." : batch.digest ?? normalized!.text,
 			independentThreadMap: audit,
@@ -421,16 +388,14 @@ export class Mom {
 				rawEventCount: compactionReview.rawEventCount, omittedRawEventCount: 0 } : null,
 			unresolvedProcessRisks: [...unresolved],
 			findingFeedback: Object.fromEntries(this.findingFeedback),
-			question: question ?? null,
-			...(question ? { conversation: this.conversation.slice(-8), lastUpdateError } : {}),
 			reflect,
-			...(!audit && !question && !batch.digest ? { newUserDirections: batch.events.filter(isUserDirection).map(({ ref, text }) => ({ ref, text })),
+			...(!audit && !batch.digest ? { newUserDirections: batch.events.filter(isUserDirection).map(({ ref, text }) => ({ ref, text })),
 				instruction: "Record changed requirements and reported outcomes from newEvents. Leave unrelated work and notes unchanged." } : {}),
 		};
-		const header: OperationHeader = { job, step: "map", mode: question ? "ask" : "update", session, cut: batch.cut, from: batch.from,
+		const header: OperationHeader = { job, step: "map", mode: "update", session, cut: batch.cut, from: batch.from,
 			refs: batch.events.map(event => event.ref), more: batch.more, gaps: batch.gaps.length,
 			...(batch.retryGapId ? { retryGap: { id: batch.retryGapId, remaining: batch.retryGapRemaining ?? [] } } : {}),
-			...(question ? { question } : {}), ...(compactionReview ? { trigger: compactionReview.triggerEvent } : {}),
+			...(compactionReview ? { trigger: compactionReview.triggerEvent } : {}),
 			...(auditedGaps.length ? { auditedGaps } : {}), ...(screen ? { screen } : {}), ...(this.feed.gaps.has("parent") ? { leadUnreadable: true } : {}) };
 		timing.startupMs = performance.now() - started - timing.requestMs;
 		timing.oldestEvidenceAgeMs = batch.events.length ? Math.max(0, Date.now() - oldestEvidence) : 0;
@@ -448,10 +413,10 @@ export class Mom {
 	async settle(header: OperationHeader, outcome: StepOutcome, usage: Usage): Promise<{ error?: string; retiredRejection?: string }> {
 		const job = header.job;
 		const record = (error: string | null) => this.host.store.append("usage", { usage, error }, `${job}:usage`);
-		if (outcome.accepted || (header.question && outcome.answer)) { await record(null); return {}; }
+		if (outcome.accepted) { await record(null); return {}; }
 		if (outcome.failure) { await record(outcome.failure); return { error: outcome.failure }; }
-		const failureError = outcome.rejection ?? (header.question ? "Mom finished without an accepted graph transaction. Last checkpoint retained." : "Mom finished without an accepted background graph transaction.");
-		if (header.question || header.trigger || header.mode !== "update" || header.gaps) { await record(failureError); return { error: failureError }; }
+		const failureError = outcome.rejection ?? "Mom finished without an accepted background graph transaction.";
+		if (header.trigger || header.mode !== "update" || header.gaps) { await record(failureError); return { error: failureError }; }
 		if (header.retryGap) {
 			// The range failed twice before it was skipped, and coverage already moved past it. A failed
 			// re-review retires it instead of looping or asking the user to fix the model.
