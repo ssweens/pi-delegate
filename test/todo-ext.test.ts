@@ -209,8 +209,14 @@ function agentEnd(stopReason: string, text: string) {
 	};
 }
 
-test("reminder fires once on a natural stop with open todos", () => {
+test("reminders are disabled by default", () => {
 	const h = harness();
+	h.fire("agent_end", agentEnd("stop", "working on it"), h.ctx(todoBranch()));
+	assert.deepEqual(h.sent, []);
+});
+
+test("reminder fires once on a natural stop with open todos when enabled", () => {
+	const h = harness({ remindersEnabled: () => true });
 	h.fire("agent_end", agentEnd("stop", "working on it"), h.ctx(todoBranch()));
 	assert.equal(h.sent.length, 1);
 	assert.ok(h.sent[0]!.includes("1 open todo item"));
@@ -218,30 +224,30 @@ test("reminder fires once on a natural stop with open todos", () => {
 
 test("reminder is suppressed by abort, an open question, active jobs, and its cap", () => {
 	// Escape settles the turn: never auto-restart it with a reminder.
-	const aborted = harness();
+	const aborted = harness({ remindersEnabled: () => true });
 	aborted.fire("agent_end", agentEnd("aborted", "stopped"), aborted.ctx(todoBranch()));
 	assert.deepEqual(aborted.sent, []);
 
 	// A late abort signal can arrive even when the final assistant message says stop.
-	const lateAbort = harness();
+	const lateAbort = harness({ remindersEnabled: () => true });
 	const controller = new AbortController();
 	controller.abort();
 	lateAbort.fire("agent_end", agentEnd("stop", "stopped"), { ...lateAbort.ctx(todoBranch()), signal: controller.signal });
 	assert.deepEqual(lateAbort.sent, []);
 
 	// The model asked the user something — the ball is in the human's court.
-	const asked = harness();
+	const asked = harness({ remindersEnabled: () => true });
 	asked.fire("agent_end", agentEnd("stop", "Which provider should I use?"), asked.ctx(todoBranch()));
 	assert.deepEqual(asked.sent, []);
 
 	// A background delegate child will wake the parent anyway.
-	const busy = harness({ hasActiveJobs: () => true });
+	const busy = harness({ hasActiveJobs: () => true, remindersEnabled: () => true });
 	busy.fire("agent_end", agentEnd("stop", "done for now"), busy.ctx(todoBranch()));
 	assert.deepEqual(busy.sent, []);
 });
 
 test("reminder waits for model progress and stops at the cap", () => {
-	const h = harness({ maxReminders: 2 });
+	const h = harness({ maxReminders: 2, remindersEnabled: () => true });
 	const ctx = h.ctx(todoBranch());
 	const stop = () => h.fire("agent_end", agentEnd("stop", "stopped with work open"), ctx);
 
@@ -264,7 +270,7 @@ test("reminder waits for model progress and stops at the cap", () => {
 });
 
 test("an empty todo list resets the reminder budget", () => {
-	const h = harness({ maxReminders: 1 });
+	const h = harness({ maxReminders: 1, remindersEnabled: () => true });
 	const ctx = h.ctx(todoBranch());
 	h.fire("agent_end", agentEnd("stop", "stopped"), ctx);
 	assert.equal(h.sent.length, 1);

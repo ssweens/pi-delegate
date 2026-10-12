@@ -173,6 +173,8 @@ export interface TodoInstallOptions {
 	hasActiveJobs?: () => boolean;
 	/** Reminder cap per session. Defaults to {@link TODO_MAX_REMINDERS}. */
 	maxReminders?: number;
+	/** Whether incomplete-todo follow-ups are enabled. Defaults to false. */
+	remindersEnabled?: () => boolean;
 	/** Shared persistent activity surface. */
 	activity?: ActivityCoordinator;
 }
@@ -180,6 +182,7 @@ export interface TodoInstallOptions {
 export function installTodo(pi: ExtensionAPI, options: TodoInstallOptions = {}): void {
 	const hasActiveJobs = options.hasActiveJobs ?? (() => false);
 	const maxReminders = options.maxReminders ?? TODO_MAX_REMINDERS;
+	const remindersEnabled = options.remindersEnabled ?? (() => false);
 
 	pi.registerTool({
 		name: "todo",
@@ -282,7 +285,7 @@ export function installTodo(pi: ExtensionAPI, options: TodoInstallOptions = {}):
 		},
 	});
 
-	wireTodoReminder(pi, hasActiveJobs, maxReminders);
+	wireTodoReminder(pi, hasActiveJobs, maxReminders, remindersEnabled);
 }
 
 /** The final assistant text, whitespace-normalized, when there is one. */
@@ -307,7 +310,7 @@ function finalAssistantText(messages: readonly unknown[]): { text: string; stopR
  * reminder is already waiting on the model to act, the cap is spent, or a
  * background delegate child will wake the parent anyway.
  */
-function wireTodoReminder(pi: ExtensionAPI, hasActiveJobs: () => boolean, maxReminders: number): void {
+function wireTodoReminder(pi: ExtensionAPI, hasActiveJobs: () => boolean, maxReminders: number, remindersEnabled: () => boolean): void {
 	let sent = 0;
 	let awaitingProgress = false;
 
@@ -317,6 +320,11 @@ function wireTodoReminder(pi: ExtensionAPI, hasActiveJobs: () => boolean, maxRem
 	});
 
 	pi.on("agent_end", (event, ctx) => {
+		if (!remindersEnabled()) {
+			sent = 0;
+			awaitingProgress = false;
+			return;
+		}
 		const last = finalAssistantText(event.messages);
 		// The signal can be aborted after the final assistant message was emitted,
 		// before agent_end is delivered; stop there even if stopReason still says stop.

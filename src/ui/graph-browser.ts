@@ -77,6 +77,10 @@ export class GraphBrowser {
 		this.selectedId = this.rows()[0]?.id;
 	}
 
+	last(): void {
+		this.selectedId = this.rows().at(-1)?.id;
+	}
+
 	render(theme: Theme, width: number, height: number): string[] {
 		if (width < 1 || height < 1) return [];
 		const fit = (line: string) => truncateToWidth(line, width, "…");

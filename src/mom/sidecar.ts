@@ -1,4 +1,5 @@
-import { appendFile, readFile, stat, truncate } from "node:fs/promises";
+import { open, readFile, stat } from "node:fs/promises";
+import lockfile from "proper-lockfile";
 import { randomUUID } from "node:crypto";
 
 /** The only durable Mom record families. Map records also own cursor/failure/control state. */
@@ -18,6 +19,10 @@ export interface MomStore {
 	append(type: SidecarWriteType, data: Record<string, any>, id?: string): Promise<SidecarRecord>;
 	/** Forget cached records so the next load reads what another writer appended. */
 	invalidate?(): void;
+	/** Why each unreadable line of the last load was skipped: one bad line never stops Mom. */
+	readonly skipped?: readonly string[];
+	/** Which coverage track map records written through this store belong to; `loadState` sets it. */
+	track?: "graph" | "trail";
 }
 
 // Pi's session lister scans every *.jsonl file in the session directory; the sidecar must not match.
@@ -30,8 +35,8 @@ export interface SidecarIO {
 	/** Stable file identity (device:inode), or undefined when the file does not exist. */
 	identity(file: string): Promise<string | undefined>;
 	read(file: string): Promise<Buffer>;
-	append(file: string, data: string): Promise<void>;
-	truncate(file: string, bytes: number): Promise<void>;
+	/** Append one record durably, serialized with every other writer of the file. */
+	append(file: string, data: string, beforeWrite?: () => Promise<void>): Promise<void>;
 }
 const nodeIO: SidecarIO = {
 	identity: (file) => stat(file).then(info => `${info.dev}:${info.ino}`, (error: NodeJS.ErrnoException) => {
@@ -39,22 +44,40 @@ const nodeIO: SidecarIO = {
 		throw error;
 	}),
 	read: (file) => readFile(file),
-	append: (file, data) => appendFile(file, data),
-	truncate: (file, bytes) => truncate(file, bytes),
+	append: async (file, data, beforeWrite) => {
+		// The lead and Mom's tools in oven both append: take the file's lock, and finish the previous line first when
+		// a crashed writer left it open, so a torn record stays one skippable line and never merges with this one.
+		const release = await lockfile.lock(file, { realpath: false, stale: 15_000, retries: { retries: 40, minTimeout: 25, maxTimeout: 250 } });
+		try {
+			await beforeWrite?.();
+			const handle = await open(file, "a+");
+			try {
+				const { size } = await handle.stat();
+				let prefix = "";
+				if (size > 0) { const last = Buffer.alloc(1); await handle.read(last, 0, 1, size - 1); if (last[0] !== 0x0a) prefix = "\n"; }
+				await handle.appendFile(prefix + data);
+				await handle.sync();
+			} finally { await handle.close(); }
+		} finally { await release(); }
+	},
 };
 
 export class SidecarStore implements MomStore {
 	private records?: SidecarRecord[];
-	private torn?: { file: string; bytes: number };
+	private unreadable: string[] = [];
 	/** The sidecar this instance has seen exist. Once it is deleted or replaced, this instance
 	 * never writes again: its in-memory state must not resurrect a reset Mom. */
 	private seen?: { file: string; identity: string };
 	private detached = false;
+	/** Map records written in trail mode are marked, so graph and trail keep separate coverage. */
+	track: "graph" | "trail" = "graph";
 	constructor(private readonly sessionFile: () => string | undefined, private readonly sessionId: string,
 		private readonly io: SidecarIO = nodeIO) {}
 
 	/** Forget what was read: Mom's tools in oven append to the same file. */
-	invalidate(): void { this.records = undefined; this.torn = undefined; }
+	invalidate(): void { this.records = undefined; }
+
+	get skipped(): readonly string[] { return this.unreadable; }
 
 	async load(): Promise<SidecarRecord[]> {
 		if (this.records) return this.records;
@@ -67,27 +90,29 @@ export class SidecarStore implements MomStore {
 		catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
 		const identity = await this.io.identity(file);
 		if (identity && !this.seen) this.seen = { file, identity };
-		// Locate the durable prefix in bytes, not decoded characters: a torn write may
-		// end in the middle of a UTF-8 sequence. Corrupt complete lines remain loud.
-		const newline = bytes.lastIndexOf(0x0a);
-		const durableBytes = newline + 1;
-		if (durableBytes < bytes.length) this.torn = { file, bytes: durableBytes };
+		// Only complete lines count, found in bytes not decoded characters: a torn or still-written tail may end in
+		// the middle of a UTF-8 sequence. A complete line that cannot be read is skipped and reported, never fatal.
+		this.unreadable = [];
+		const durableBytes = bytes.lastIndexOf(0x0a) + 1;
 		const text = bytes.subarray(0, durableBytes).toString("utf8");
-		for (const line of text.split("\n")) {
+		for (const [number, line] of text.split("\n").entries()) {
 			if (!line) continue;
-			const record = JSON.parse(line) as SidecarRecord;
+			let record: SidecarRecord;
+			try { record = JSON.parse(line) as SidecarRecord; }
+			catch (error) { this.unreadable.push(`line ${number + 1}: ${error instanceof Error ? error.message : String(error)}`); continue; }
 			if (!record || typeof record !== "object" || Array.isArray(record) ||
 				JSON.stringify(Object.keys(record).sort()) !== JSON.stringify(recordKeys) ||
 				typeof record.id !== "string" || typeof record.sessionId !== "string" || !types.includes(record.type) ||
 				!Number.isFinite(record.at) || !record.data || typeof record.data !== "object" || Array.isArray(record.data)) {
-				throw new Error(`Corrupt Mom state line in ${file}`);
+				this.unreadable.push(`line ${number + 1}: not a Mom record`);
+				continue;
 			}
 			if (record.sessionId === this.sessionId) this.records.push(record);
 		}
 		return this.records;
 	}
 
-	async append(type: SidecarWriteType, data: Record<string, any>, id: string = randomUUID()): Promise<SidecarRecord> {
+	async append(type: SidecarWriteType, data: Record<string, any>, id: string = randomUUID(), beforeWrite?: () => Promise<void>): Promise<SidecarRecord> {
 		const session = this.sessionFile();
 		if (!session) throw new Error("Mom needs a persisted session file for her state; in-memory sessions keep none.");
 		const file = sidecarFile(session);
@@ -97,25 +122,15 @@ export class SidecarStore implements MomStore {
 			await this.load();
 			const existing = this.records!.find(record => record.id === id);
 			if (existing) return existing;
-			if (this.torn) {
-				// Two writers share the file (the lead, and Mom's tools in oven): a line may be mid-write. Only a
-				// tail that is still partial a moment later is a torn write to repair.
-				await new Promise(resolve => setTimeout(resolve, 250));
-				this.invalidate(); await this.load();
-				const again = this.records!.find(record => record.id === id);
-				if (again) return again;
-				if (this.torn) { await this.io.truncate(this.torn.file, this.torn.bytes); this.torn = undefined; }
-			}
-			const record: SidecarRecord = { id, sessionId: this.sessionId, type, at: Date.now(), data };
-			await this.io.append(file, JSON.stringify(record) + "\n");
+			const record: SidecarRecord = { id, sessionId: this.sessionId, type, at: Date.now(), data: type === "map" && this.track === "trail" ? { ...data, trail: true } : data };
+			await this.io.append(file, JSON.stringify(record) + "\n", beforeWrite);
 			if (!this.seen || this.seen.file !== file) { const identity = await this.io.identity(file); if (identity) this.seen = { file, identity }; }
 			this.records!.push(record);
 			return record;
 		} catch (error) {
-			// The filesystem may have accepted only a prefix before rejecting. Forget
-			// both caches so the next same-instance append re-reads and repairs the file.
+			// The filesystem may have accepted only a prefix before rejecting. Forget the cache so the next
+			// same-instance append re-reads; the next record then starts on its own line.
 			this.records = undefined;
-			this.torn = undefined;
 			throw error;
 		}
 	}

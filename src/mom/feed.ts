@@ -96,6 +96,26 @@ function evidenceExcerpt(value: string, ref: string): string | undefined {
 	return `${value.slice(0, head)}${notice}${value.slice(-tail)}`;
 }
 
+const NARRATIVE_EXCERPT_CHARS = 8000;
+const SKILL_BLOCK = /<skill\b[^>]*>[\s\S]*?<\/skill>/g;
+
+/** A skill Pi expanded inline is not the user's words: name it, keep the surrounding request, point at the source. */
+function collapseSkills(value: string, ref: string): string {
+	return value.replace(SKILL_BLOCK, (block) => {
+		const name = /\bname="([^"]*)"/.exec(block.slice(0, block.indexOf(">") + 1))?.[1];
+		return `[skill${name ? ` ${name}` : ""} loaded (${block.length} chars); its instructions are not shown here; inspect_evidence ${ref} returns the original]`;
+	});
+}
+
+/** Narrative text is kept whole until one event could crowd out the batch; then a head stays and the clip is announced. */
+function narrativeExcerpt(value: string, ref: string, collapse: boolean): string {
+	const text = collapse ? collapseSkills(value, ref) : value;
+	if (text.length <= NARRATIVE_EXCERPT_CHARS) return text;
+	const notice = (left: number) => `\n\n[Clipped: ${left} of ${text.length} chars left out; inspect_evidence ${ref} returns the full original text.]`;
+	const keep = NARRATIVE_EXCERPT_CHARS - notice(text.length).length;
+	return `${text.slice(0, keep)}${notice(text.length - keep)}`;
+}
+
 /** pi-delegate's todo snapshots (and pi-omp's older ones): phase, status, content, and any blocker. */
 export const TODO_TYPES = new Set(["pi_delegate.todo", "pi_omp.todo"]);
 export const isTodoEntry = (entry: Entry): boolean => entry.type === "custom" && typeof entry.customType === "string" && TODO_TYPES.has(entry.customType);
@@ -167,7 +187,7 @@ export function extractEvents(stream: Pick<Stream, "key" | "actor">, e: Entry): 
 		emit({ kind: "delegate_receipt", name: m.details.id, status: m.details.status, ...(m.details.segment !== undefined ? { segment: m.details.segment } : {}) });
 		return events;
 	}
-	const text = textBlocks(m.content);
+	const text = narrativeExcerpt(textBlocks(m.content), ref, m.role !== "assistant");
 	if (text) emit({ kind: m.role === "custom" || m.role === "hookMessage" ? "extension" : m.role,
 		text, name: m.customType, status: m.role === "assistant" ? m.stopReason : undefined });
 	if (Array.isArray(m.content)) m.content.forEach((block: any, i: number) => {
@@ -308,7 +328,7 @@ export class LiveFeed {
 
 	private fits(events: FeedEvent[]): boolean {
 		const size = renderUpdateEvents(events).length;
-		if (size > 24000 && Number.isFinite(this.remaining)) throw new Error("One narrative entry exceeds Mom's 24,000-character batch limit; nothing was truncated.");
+		if (size > 24000 && Number.isFinite(this.remaining)) throw new Error("One entry's rendered events exceed Mom's 24,000-character batch limit even after per-event clipping (many events in one entry); inspect that entry's ref with inspect_evidence and split or shorten the source entry. Nothing was truncated.");
 		if (size > this.remaining) { this.full = true; return false; }
 		if (this.admit && !this.admit(events)) { this.full = true; return false; }
 		this.remaining -= size;

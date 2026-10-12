@@ -1,16 +1,20 @@
 import "./setup.ts";
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { MOM_PROMPT, momTools } from "../src/mom/contract.ts";
+import { Check } from "typebox/value";
+import { MOM_PROMPT, acceptGraph, momTools } from "../src/mom/contract.ts";
+import momExtension from "../src/mom/mom-tools.ts";
 import { readSettings, settingsLine, type MomSettings } from "../src/mom/engine.ts";
 import { readMomGlobals, writeMomGlobals } from "../src/mom/globals.ts";
 import { settingsFile } from "../src/settings-file.ts";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MOM_TOOLS, OPERATION_PROMPT, assertSliceSupportsMode, deciderFor, momConfiguration, type SessionIdentity } from "../src/mom/slice.ts";
-import { COMMIT_GRAPH_MODE, DEFAULT_MODE, MODES, V2_MODE, assertRunnable, modeFor, modeInstructions, modeNames, type MapMode } from "../src/mom/modes.ts";
+import { COMMIT_GRAPH_MODE, DEFAULT_MODE, MODES, TRAIL_MODE, V2_MODE, assertRunnable, modeFor, modeInstructions, modeNames, type MapMode } from "../src/mom/modes.ts";
 import { commitV2Tool } from "../src/mom/v2.ts";
+import { TRAIL_DIGEST_TASK, TRAIL_UPDATE_TASK, recordWaypointsTool, trailBody } from "../src/trail/prompt.ts";
+import { RecordWaypoints, emptyTrail } from "../src/trail/types.ts";
 import { updateErrorSummary } from "../src/mom/status.ts";
 
 const settings: MomSettings = { bootstrap: false, decider: { url: "http://127.0.0.1:8711/v1/systemone", clear: 0.9 } };
@@ -39,7 +43,7 @@ test("M1: choosing no mode, an empty mode, or the current mode changes nothing t
 });
 
 test("command errors retain their concise cause", () => {
-	assert.equal(updateErrorSummary('Error: Unknown Mom mode "act_labels"; --mom-mode accepts commit_graph, v2.'), 'Unknown Mom mode "act_labels"; --mom-mode accepts commit_graph, v2.');
+	assert.equal(updateErrorSummary('Error: Unknown Mom mode "act_labels"; --mom-mode accepts commit_graph, v2, trail.'), 'Unknown Mom mode "act_labels"; --mom-mode accepts commit_graph, v2, trail.');
 });
 
 test("retired mode history is replayed without rejecting the current saved mode", async () => {
@@ -54,12 +58,14 @@ test("retired mode history is replayed without rejecting the current saved mode"
 test("a stale Oven extension fails clearly when it lacks the selected mode's finalizer", () => {
 	assert.doesNotThrow(() => assertSliceSupportsMode("commit_graph", ["commit_v2"]));
 	assert.throws(() => assertSliceSupportsMode("v2", ["commit_v2"]), /mode v2 requires missing tool commit_v2.*Restart Oven/);
+	assert.throws(() => assertSliceSupportsMode("trail", ["record_waypoints"]), /mode trail requires missing tool record_waypoints.*Restart Oven/);
+	assert.ok(MOM_TOOLS.includes("record_waypoints"), "the slice's tool list must carry the trail's finalizer");
 });
 
 test("M2: an unknown mode is refused loudly and never falls back to the default", () => {
 	assert.throws(() => modeFor("freeform"), /Unknown Mom mode "freeform"/);
 	// The message names the flag and the declared names so a typo is fixable from the error alone.
-	assert.throws(() => modeFor("nonsense"), /--mom-mode accepts commit_graph, v2/);
+	assert.throws(() => modeFor("nonsense"), /--mom-mode accepts commit_graph, v2, trail/);
 	assert.throws(() => momConfiguration(identity, { ...flags, "mom-mode": "nonsense" }), /Unknown Mom mode/);
 });
 
@@ -73,7 +79,7 @@ test("M2: the registry is well formed — unique lowercase_underscore names, eac
 		assert.match(mode.finalizer, /^[a-z][a-z0-9_]*$/, `${mode.name} finalizer is not lowercase_underscore`);
 		assert.equal(typeof mode.turns, "number");
 	}
-	assert.deepEqual(modeNames(), ["commit_graph", "v2"]);
+	assert.deepEqual(modeNames(), ["commit_graph", "v2", "trail"]);
 });
 
 test("M3: a mode needing more than one model turn cannot be selected", () => {
@@ -105,14 +111,70 @@ test("M5: the transaction mode needs no apply; a non-transaction mode does", () 
 	assert.equal(COMMIT_GRAPH_MODE.apply, undefined, "a transaction mode uses the default acceptGraph path");
 	for (const mode of MODES) {
 		if (mode.finalizer === "commit_graph") continue;
+		// The trail keeps no graph at all: its finalizer persists waypoints itself (mom-tools), so there is no apply step to own.
+		if (mode === TRAIL_MODE) { assert.equal(mode.apply, undefined, "trail writes no graph"); continue; }
 		assert.equal(typeof mode.apply, "function", `${mode.name} emits ${mode.finalizer} and must apply its own payload`);
 	}
+});
+
+test("trail: selectable, its finalizer is record_waypoints, and its body shows an empty trail as empty", () => {
+	const mode = modeFor("trail");
+	assert.equal(mode, TRAIL_MODE);
+	assert.equal(mode.finalizer, "record_waypoints");
+	assert.ok(mode.prompt.includes("set_out") && mode.operation?.includes("record_waypoints"), "the prompt names the kinds and the finalizer");
+	assert.ok(!momTools().some(tool => tool.name === "record_waypoints"), "mode-owned tools stay out of the shared surface");
+	const tool = recordWaypointsTool();
+	assert.equal(tool.name, "record_waypoints");
+	assert.equal(tool.parameters, RecordWaypoints, "the finalizer validates exactly the shared schema");
+	assert.ok(Check(tool.parameters, { waypoints: [] }), "an empty list is a valid 'nothing worth finding again'");
+	const update = trailBody({ task: TRAIL_UPDATE_TASK, newEvents: "events", trail: emptyTrail() });
+	assert.deepEqual(update, { task: TRAIL_UPDATE_TASK, trail: { lines: [], recent: [], open: [] }, newEvents: "events" });
+	const digest = trailBody({ task: TRAIL_DIGEST_TASK, newEvents: "digest", trail: emptyTrail(), newUserDirections: [], guidance: " " });
+	assert.equal(digest.task, TRAIL_DIGEST_TASK);
+	assert.equal(digest.guidance, undefined, "blank guidance is omitted");
+	assert.equal(digest.newUserDirections, undefined, "an empty direction list is omitted");
+	const configured = momConfiguration(identity, { ...flags, "mom-mode": "trail" });
+	assert.ok(configured.instructions.startsWith(TRAIL_MODE.prompt) && configured.instructions.includes("record_waypoints"));
+	assert.deepEqual(configured.tools, [...MOM_TOOLS]);
 });
 
 test("the current mode's prompt is exactly MOM_PROMPT, with no mode-specific drift", () => {
 	// Regression guard for M1: if someone edits the mode's prompt independently of MOM_PROMPT the
 	// two would diverge silently and the shipped model input would change.
 	assert.equal(COMMIT_GRAPH_MODE.prompt, MOM_PROMPT.trim());
+});
+
+test("local settings save returns while Mom's runtime reconfiguration is still pending", async () => {
+	const { MomClient } = await import("../src/mom/client.ts");
+	const dir = await mkdtemp(join(tmpdir(), "pi-delegate-mom-fast-setting-")), session = join(dir, "session.jsonl");
+	const file = settingsFile(), previous = await readFile(file, "utf8").catch(() => undefined);
+	await writeFile(session, "{}\n");
+	let release!: () => void, entered!: () => void;
+	const pending = new Promise<void>(resolve => { release = resolve; }), startedApplying = new Promise<void>(resolve => { entered = resolve; });
+	class SlowClient extends MomClient {
+		override async ensure() { entered(); await pending; }
+	}
+	const client = new SlowClient({ cwd: dir, sessionManager: { getCwd: () => dir, getSessionFile: () => session, getSessionId: () => "fast-setting" } } as never,
+		{ flags: {}, changed() {}, publish() {}, notify() {} });
+	client.state = { enabled: true, inject: false, nudgedClasses: [], mode: "", model: "", decider: "" } as never;
+	const started = Date.now();
+	let timeout: ReturnType<typeof setTimeout> | undefined;
+	try {
+		await Promise.race([client.controls({ mode: "v2" }), new Promise<never>((_, reject) => {
+			timeout = setTimeout(() => reject(new Error("settings save waited for runtime reconfiguration")), 1000);
+		})]);
+		if (timeout) clearTimeout(timeout);
+		await startedApplying;
+		assert.ok(Date.now() - started < 1000);
+		assert.equal((client.state as unknown as { mode: string }).mode, "v2");
+		assert.equal(readMomGlobals(file).mode, "v2");
+	} finally {
+		release(); client.close();
+		if (timeout) clearTimeout(timeout);
+		if (previous === undefined) await rm(file, { force: true });
+		else await writeFile(file, previous);
+		await rm(dir, { recursive: true, force: true });
+	}
 });
 
 test("mode is a durable setting: listed, cycled to a declared name, and carried in the sidecar", async () => {
@@ -126,7 +188,28 @@ test("mode is a durable setting: listed, cycled to a declared name, and carried 
 	const rendered = component.render(120).join("\n").replace(/\x1b\[[0-9;]*m/g, "");
 	assert.match(rendered, /Map mode/);
 	assert.match(rendered, /Decision model/);
-	assert.match(rendered, /commit_graph/);
+	assert.match(rendered, /SETTING HELP/);
+	assert.match(rendered, /Background tracking/);
+	assert.match(rendered, /work map in the background/);
+	component.handleInput?.("\u001b[B");
+	const next = component.render(120).join("\n").replace(/\x1b\[[0-9;]*m/g, "");
+	assert.match(next, /SETTING HELP/);
+	assert.match(next, /eligible findings from Mom's map/);
+	// The decision-model row never shows a flag default as if the user saved it: unset is not a setting.
+	const shown = (decider: string | undefined) => momSettings({ enabled: true, inject: false, hush: false, nudgedClasses: [], mode: "", model: "", decider },
+		async () => {}, () => {}, () => {}).render(120).join("\n").replace(/\x1b\[[0-9;]*m/g, "");
+	assert.match(shown(undefined), /Decision model\s+\(not set\)/, "nothing saved is 'not set', never a model name");
+	assert.match(shown(""), /Decision model\s+\(none\)/, "an explicit empty value is a choice");
+	assert.match(shown("local-dgx/beverly-4B"), /Decision model\s+local-dgx\/beverly-4B/);
+	// The model row names the model Mom actually runs instead of hiding it behind a placeholder.
+	const modeled = (model: string, fallback: string) => momSettings({ enabled: true, inject: false, hush: false, nudgedClasses: [], mode: "", model, decider: undefined },
+		async () => {}, () => {}, () => {}, 12, undefined, undefined, fallback).render(120).join("\n").replace(/\x1b\[[0-9;]*m/g, "");
+	assert.match(modeled("", "openai-codex/gpt-5.6-sol"), /Model\s+openai-codex\/gpt-5\.6-sol/, "the default she runs is named");
+	assert.match(modeled("local-dgx/beverly-4B", "openai-codex/gpt-5.6-sol"), /Model\s+local-dgx\/beverly-4B/, "a saved model is named");
+	assert.match(modeled("", ""), /Model\s+\(not set\)/);
+	const narrow = component.render(54).join("\n").replace(/\x1b\[[0-9;]*m/g, "");
+	assert.ok(narrow.indexOf("SETTING HELP") > narrow.indexOf("Enter/Space to change"), "narrow terminals stack the help below the list");
+	assert.match(narrow, /eligible findings from Mom's map/);
 	// The sidecar accepts mode and decision-model control records alongside the existing ones.
 	assert.deepEqual([...CONTROL_KEYS], ["enabled", "inject", "nudgedClasses", "mode", "model", "decider"]);
 	assert.equal(modeFor("v2").name, "v2");
@@ -194,11 +277,95 @@ test("the model control is durable and scoped to Mom, never to Pi", async () => 
 	assert.equal(typeof picker.getModelRuntime, "function");
 });
 
+test("commit_graph applies a MiMo commit whose lists arrive JSON-encoded", () => {
+	const known = new Map([["s:u1", { ref: "s:u1", at: "2026-10-11T00:00:00.000Z", actor: "lead", kind: "user", text: "Ship the release" }]]);
+	const before = { revision: 1, purpose: null, motherThread: null, nodes: [], edges: [] };
+	// Exactly the shape that failed: every list as a JSON string, and "null" for the empty ones.
+	const commit = {
+		focus: "ship",
+		work: JSON.stringify([{ id: "ship", parent: null, state: "active", label: "Ship the release", why: "user asked", status: "in progress", sources: ["s:u1"] }]),
+		notes: JSON.stringify([{ id: "n1", on: "ship", kind: "observation", state: "active", text: "MiMo encodes lists", sources: ["s:u1"] }]),
+		upsertEdges: "null", removeEdges: "null",
+	};
+	// Exercise the Durable tool boundary: it validates before acceptGraph sees a call.
+	const durable = { defineDoc: (value: unknown) => value, defineDocFamily: (value: unknown) => value,
+		defineTool: (value: unknown) => value, defineExtension: (value: unknown) => value, hook: (value: unknown) => value };
+	const extension = momExtension(durable as never) as unknown as { tools: { name: string; prepareArguments: (args: unknown) => any }[] };
+	const tool = extension.tools.find(tool => tool.name === "commit_graph")!;
+	const prepared = tool.prepareArguments(commit);
+	assert.ok(Array.isArray(prepared.work) && Array.isArray(prepared.notes), "tool validation receives decoded lists");
+	assert.equal(prepared.upsertEdges, undefined);
+	assert.equal(prepared.removeEdges, undefined);
+	const result: any = acceptGraph(prepared, before as never, undefined, known as never, new Set(["s:u1"]), new Set());
+	const ids = result.graph.nodes.map((n: any) => n.id);
+	assert.deepEqual(new Set(ids), new Set(["ship", "n1"]), "both lists decoded and applied");
+	assert.equal(result.graph.nodes.find((n: any) => n.id === "n1").label, "MiMo encodes lists");
+	assert.throws(() => acceptGraph({ focus: "ship", notes: "[{" }, before as never, undefined, known as never, new Set(["s:u1"]), new Set()),
+		/Invalid work changes|Invalid graph transaction/, "a string that is not a list still fails loudly");
+});
+
+test("all Mom finalizers decode JSON-string lists before tool validation", () => {
+	const durable = { defineDoc: (value: unknown) => value, defineDocFamily: (value: unknown) => value,
+		defineTool: (value: unknown) => value, defineExtension: (value: unknown) => value, hook: (value: unknown) => value };
+	const extension = momExtension(durable as never) as unknown as { tools: { name: string; prepareArguments: (args: unknown) => any }[] };
+	const prepare = (name: string, args: unknown) => extension.tools.find(tool => tool.name === name)!.prepareArguments(args);
+	const chapter = { chapter: "c1", goal: [], decisions: [], artifacts: [], deadEnds: [], openQuestions: [] };
+	assert.deepEqual(prepare("record_thread_map", { states: JSON.stringify([chapter]) }).states, [chapter]);
+	const put = { id: "ship", parent: null, kind: "work", state: "active", label: "Ship", sources: ["s:u1"] };
+	assert.deepEqual(prepare("commit_v2", { put: JSON.stringify([put]), remove: "null" }).put, [put]);
+	const label = { id: "ship", label: "Ship" };
+	assert.deepEqual(prepare("commit_labels", { labels: JSON.stringify([label]), retired: "null" }).labels, [label]);
+	const waypoint = { kind: "set_out", line: "Ship", refs: ["s:u1"], caption: "Set out to ship the release." };
+	assert.deepEqual(prepare("record_waypoints", { waypoints: JSON.stringify([waypoint]) }).waypoints, [waypoint]);
+	assert.equal(prepare("record_thread_map", { states: `${JSON.stringify([chapter])}}` }).states[0].chapter, "",
+		"a malformed list is not silently repaired into an accepted audit");
+});
+
+test("commit_graph merges obsolete work into its surviving parent without losing children or history", () => {
+	const known = new Map([
+		["s:u1", { ref: "s:u1", at: "2026-10-11T00:00:00.000Z", actor: "lead", kind: "user", text: "Build the graph" }],
+		["s:u2", { ref: "s:u2", at: "2026-10-11T01:00:00.000Z", actor: "lead", kind: "user", text: "The redesign umbrella is obsolete; current work belongs under Ship" }],
+	]);
+	const source = ["s:u1"], work = (id: string, parent: string | null, label: string) =>
+		({ id, parent, state: "active", label, why: label, status: "In progress", sources: source });
+	const empty = { revision: 0, purpose: null, motherThread: null, focus: null, nodes: [], edges: [] };
+	const first: any = acceptGraph({ work: [work("ship", null, "Ship"), work("obsolete", "ship", "Old umbrella"),
+		work("current", "obsolete", "Current work"), work("sibling", "ship", "Other work")], notes: [{ id: "rule", on: "obsolete", kind: "rule", state: "active", text: "Keep this rule", sources: source }],
+		focus: "current" }, empty as never, undefined, known as never, new Set(source), new Set());
+	const merge = { work: [{ id: "ship", state: "active", status: "Current work continues", sources: ["s:u2"] }],
+		merges: JSON.stringify([{ thread: "obsolete", into: "ship", reason: "User pruned an outdated umbrella", sources: ["s:u2"] }]), focus: "current" };
+	assert.equal(Check(momTools()[0]!.parameters, { ...merge, merges: JSON.parse(merge.merges) }), true,
+		"the model can author a merge in commit_graph");
+	const durable = { defineDoc: (value: unknown) => value, defineDocFamily: (value: unknown) => value,
+		defineTool: (value: unknown) => value, defineExtension: (value: unknown) => value, hook: (value: unknown) => value };
+	const extension = momExtension(durable as never) as unknown as { tools: { name: string; prepareArguments: (args: unknown) => any }[] };
+	const prepared = extension.tools.find(tool => tool.name === "commit_graph")!.prepareArguments(merge);
+	assert.equal(prepared.merges.length, 1, "MiMo's encoded merge is decoded before tool validation");
+	const second: any = acceptGraph(prepared, first.graph, "checkpoint-1", known as never, new Set(["s:u2"]), new Set());
+	const nodes = new Map(second.graph.nodes.map((node: any) => [node.id, node]));
+	assert.equal(nodes.has("obsolete"), false, "obsolete umbrella leaves the current work map");
+	assert.equal((nodes.get("current") as any).parent, "ship", "active work moves to the surviving parent");
+	assert.equal((nodes.get("rule") as any).parent, "ship", "scoped notes survive the move");
+	assert.ok((nodes.get("ship") as any).history.nodes.includes("obsolete"), "retired work remains in history");
+	assert.equal(second.graph.focus, "current");
+	const direct: any = acceptGraph({ merges: [{ thread: "obsolete", into: "ship", reason: "User pruned old work", sources: ["s:u2"] }],
+		work: [{ id: "sibling", parent: "ship", state: "active", status: "", sources: ["s:u2"] }], focus: "current" },
+		first.graph, "checkpoint-1", known as never, new Set(["s:u2"]), new Set());
+	assert.equal(direct.graph.nodes.some((node: any) => node.id === "obsolete"), false, "a sourced direct-parent merge needs no target upsert");
+	assert.equal(direct.graph.nodes.find((node: any) => node.id === "sibling")?.observed, "In progress", "blank status keeps saved text");
+	assert.throws(() => acceptGraph({ work: [{ id: "brand_new", state: "active", label: "New work", status: "Requested", sources: ["s:u2"] }] },
+		first.graph, "checkpoint-1", known as never, new Set(["s:u2"]), new Set()), /needs a parent/);
+	assert.throws(() => acceptGraph({ work: [{ id: "brand_new", parent: "ship", state: "active", label: "New work", status: "", sources: ["s:u2"] }] },
+		first.graph, "checkpoint-1", known as never, new Set(["s:u2"]), new Set()), /needs a status/);
+	assert.throws(() => acceptGraph({ merges: [{ thread: "obsolete", into: "sibling", reason: "wrong branch", sources: ["s:u2"] }] },
+		first.graph, "checkpoint-1", known as never, new Set(["s:u2"]), new Set()), /merge across branches needs the destination target upserted/);
+});
+
 test("the decision model resolves through Pi's classifier registry; an empty or unavailable pick runs Mom without it", () => {
 	const registry = { findOfType: (_type: "classifier", provider: string, id: string) =>
 		provider === "local-llm" && id === "beverly-4B" ? { id, api: "typesafe-system-one", baseUrl: "http://127.0.0.1:8000/v1/" } : undefined };
 	const configured = momConfiguration(identity, { ...flags, "mom-decider": "local-llm/beverly-4B" }, registry);
-	assert.deepEqual(readSettings(configured.instructions).classifier, { url: "http://127.0.0.1:8000/v1/systemone", model: "beverly-4B", timeoutMs: 15000 });
+	assert.deepEqual(readSettings(configured.instructions).classifier, { url: "http://127.0.0.1:8000/v1/systemone", model: "beverly-4B", timeoutMs: 120000 });
 	assert.deepEqual(deciderFor({ "mom-decider": " local-llm/beverly-4B " }, registry), { ref: "local-llm/beverly-4B", classifier: { url: "http://127.0.0.1:8000/v1/systemone", model: "beverly-4B" } });
 	// Unregistered, not System One, or not local: Mom still starts, with no decision model, and the ref is
 	// reported unresolved so the client can say so.
@@ -230,6 +397,41 @@ test("the decision-model picker excludes classifier models Mom cannot call", asy
 	const picker = momDeciderSelector(context, undefined, "local-llm/beverly-4B", value => { selected = value; });
 	picker.handleInput?.("\r");
 	assert.equal(selected, "local-llm/beverly-4B");
+});
+
+test("continuity injection is enabled by default, and a missing global setting means inject: true", async () => {
+	const { loadState } = await import("../src/mom/checkpoint.ts");
+	const store = { load: async () => [{ id: "empty", sessionId: "session", type: "map", at: 1, data: { inject: false } }] } as never;
+	const branch = { getBranch: () => [] } as never;
+	const file = settingsFile(), previous = await readFile(file, "utf8").catch(() => undefined);
+	try {
+		await rm(file, { force: true });
+		const state = await loadState(store, branch);
+		assert.equal(state.inject, true, "no global file: continuity injection defaults to on");
+		await writeMomGlobals({ inject: false }, file);
+		assert.equal((await loadState(store, branch)).inject, false, "an explicit global inject: false is honored");
+		await writeMomGlobals({ inject: true }, file);
+		assert.equal((await loadState(store, branch)).inject, true, "an explicit global inject: true is honored");
+	} finally {
+		if (previous === undefined) await rm(file, { force: true }); else await writeFile(file, previous);
+	}
+});
+
+test("a pause saved in a session's sidecar never outlives the user's current setting: the global file alone decides, and missing means on", async () => {
+	const { loadState } = await import("../src/mom/checkpoint.ts");
+	const stale = { load: async () => [{ id: "pause", sessionId: "session", type: "map", at: 1, data: { enabled: false } }] } as never;
+	const branch = { getBranch: () => [] } as never;
+	const file = settingsFile(), previous = await readFile(file, "utf8").catch(() => undefined);
+	try {
+		await rm(file, { force: true });
+		assert.equal((await loadState(stale, branch)).enabled, true, "no global setting: a stale session pause does not hold Mom off");
+		await writeMomGlobals({ enabled: true }, file);
+		assert.equal((await loadState(stale, branch)).enabled, true, "the user's mom.enabled: true wins over the checkpoint");
+		await writeMomGlobals({ enabled: false }, file);
+		assert.equal((await loadState(stale, branch)).enabled, false, "a pause the user saved globally still pauses her");
+	} finally {
+		if (previous === undefined) await rm(file, { force: true }); else await writeFile(file, previous);
+	}
 });
 
 test("the persisted decision-model control survives sidecar loading, including an explicit disable", async () => {

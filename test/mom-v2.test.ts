@@ -5,7 +5,7 @@ import { MOM_PROMPT } from "../src/mom/contract.ts";
 import { COMMIT_GRAPH_MODE, V2_MODE, modeFor, modeInstructions } from "../src/mom/modes.ts";
 import { MOM_TOOLS, OPERATION_PROMPT, momConfiguration } from "../src/mom/slice.ts";
 import { applySpec, applyV2, commitV2Tool, EMPTY_MAP, fromWorkGraph, specFocus, toWorkGraph, v2Body, v2Defects, v2View, V2_AUDIT_TASK, V2_OPERATION, V2_PROMPT, V2_UPDATE_TASK, type SpecOp, type V2Graph } from "../src/mom/v2.ts";
-import { attachChoices, evidenceState, readSpec, SPEC_CHARS, SPEC_FLOOR, SPEC_NEW_MASS, specOps, specQuestions, stateChoices, type SpecReading } from "../src/mom/spec.ts";
+import { attachChoices, evidenceState, readSpec, SpecError, SPEC_FLOOR, SPEC_NEW_MASS, specOps, specQuestions, stateChoices, type SpecReading } from "../src/mom/spec.ts";
 
 const known = new Set(["s:u1", "s:u2", "s:a1"]);
 const root = { id: "ship", parent: null, kind: "work" as const, state: "active" as const, label: "Ship the release", sources: ["s:u1"] };
@@ -39,6 +39,25 @@ test("commit_v2 {} leaves the map unchanged; strict-transport nulls mean omitted
 	const note = applyV2(prior, { put: [{ id: "n1", parent: "ship", kind: "note", state: null, label: "Tagged v1.2", sources: ["s:a1"] }] }, known);
 	assert.deepEqual(note.defects, []);
 	assert.equal("state" in note.graph.nodes[1]!, false);
+});
+
+test("commit_v2 arrays sent JSON-encoded (MiMo's transport) apply as arrays; an undecodable string is still a defect", () => {
+	const prior = start(), note = { id: "n1", parent: "ship", kind: "note", label: "Tagged v1.2", sources: ["s:a1"] };
+	const encoded = applyV2(prior, { put: JSON.stringify([note]), remove: "null", focus: "null" }, known);
+	assert.deepEqual(encoded, applyV2(prior, { put: [note] }, known));
+	assert.equal(encoded.graph.focus, "ship");
+	assert.deepEqual(encoded.defects, []);
+	assert.deepEqual(applyV2(encoded.graph, { remove: '["n1"]' }, known).graph, prior);
+	assert.deepEqual(applyV2(prior, { put: "[{" }, known).defects, ["/put: must be array"]);
+});
+
+test("an over-long label is shortened to the display limit instead of rejecting the whole commit", () => {
+	const long = `Oven reads Pi's auth, models, settings and MCP servers straight from ~/.pi/agent ${"and keeps only its own token and state in ~/.config/oven ".repeat(3)}`;
+	const { graph, defects } = applyV2(start(), { put: [{ id: "n1", parent: "ship", kind: "note", label: long, sources: ["s:a1"] }] }, known);
+	assert.deepEqual(defects, []);
+	const label = graph.nodes.find(node => node.id === "n1")!.label;
+	assert.equal(label.length, 160);
+	assert.ok(label.endsWith("\u2026") && long.startsWith(label.slice(0, -1)));
 });
 
 test("every structural defect is reported at once, and nothing is repaired by guessing", () => {
@@ -125,7 +144,27 @@ test("the v2 mode's apply stores a valid map, or declines with every defect and 
 	const bad = await V2_MODE.apply!({ prior, committed: { put: [{ ...root, sources: ["nope"] }] }, known: events as never });
 	assert.equal(bad.graph, prior);
 	assert.ok(bad.declined.some(defect => /unobserved source nope/.test(defect)));
-	assert.ok(bad.declined.some(defect => /Set focus/.test(defect)));
+	const unfocused = await V2_MODE.apply!({ prior, committed: { put: [root] }, known: events as never });
+	assert.deepEqual(unfocused.declined, [], "a first map needs no focus from the commit: the host derives it");
+	assert.equal(fromWorkGraph(unfocused.graph).focus, "ship");
+});
+
+test("with no spec the host still owns focus: the commit's own focus is ignored, so nothing the model reacts to can move it", async () => {
+	const lint = { id: "lint", parent: "ship", kind: "work" as const, state: "active" as const, label: "Fix lint", sources: ["s:u2"] };
+	const prior = toWorkGraph({ focus: "lint", nodes: [root, lint] }, emptyGraph());
+	const events = new Map([...known].map(ref => [ref, { ref, at: "2026-10-10T00:00:00.000Z", actor: "lead", kind: "user", text: "x" }]));
+	const focusAfter = async (committed: unknown, spec?: never[]) => {
+		const out = await V2_MODE.apply!({ prior, committed, known: events as never, ...(spec ? { spec } : {}) });
+		assert.deepEqual(out.declined, []);
+		return fromWorkGraph(out.graph).focus;
+	};
+	const note = { id: "n1", parent: "ship", kind: "note" as const, label: "User says the old label still shows", sources: ["s:u2"] };
+	assert.equal(await focusAfter({ put: [note], focus: "ship" }), "lint", "a note about an item the user quoted does not make that item the focus");
+	assert.equal(await focusAfter({ put: [note], focus: "ship" }, []), "lint", "an empty spec is no spec: same rule");
+	assert.equal(await focusAfter({ focus: "ship" }), "lint", "a bare focus is ignored");
+	assert.equal(await focusAfter({ put: [{ ...lint, state: "settled", label: "Lint fixed" }], focus: "ship" }), "lint");
+	const added = { id: "docs", parent: "ship", kind: "work" as const, state: "active" as const, label: "Write the docs", sources: ["s:u2"] };
+	assert.equal(await focusAfter({ put: [added], focus: "ship" }), "docs", "work the commit adds becomes the focus, whatever focus it names");
 });
 
 test("the v2 mode preserves omitted permitted additions as unmet diagnostics", async () => {
@@ -154,22 +193,19 @@ test("the spec exists only when the decision model answered, and it narrows her 
 	assert.deepEqual(read?.ops, [{ kind: "new_work" }, { kind: "attach", node: "export", attach: "note" }, { kind: "state", node: "dark", to: "resumed" }]);
 	assert.equal(read?.chosen.new_work, "new_only");
 
-	// Fail-open: every way of not getting an answer leaves her model running on structure alone and is diagnosable.
-	const failures: string[] = [], failed = (reason: string) => { failures.push(reason); };
-	assert.equal(await readSpec(undefined, graph, events, failed), undefined, "no decision model");
-	assert.equal(await readSpec({ ask: async () => { throw new Error("HTTP 500"); } }, graph, events, failed), undefined, "an endpoint that failed");
-	assert.equal(await readSpec(answered({}), graph, events, failed), undefined, "an empty round is not 'nothing to record'");
-	assert.equal(await readSpec(answered({ ...answers, "attach__export": undefined }), graph, events, failed), undefined, "a partial round is not a spec");
+	// A spec is required: every way of not getting one throws, so no update runs on structure alone.
+	const reasonOf = async (call: () => Promise<unknown>) => { try { await call(); } catch (error) { assert.ok(error instanceof SpecError); return error.reason; } assert.fail("expected a SpecError"); };
+	assert.equal(await reasonOf(() => readSpec(undefined, graph, events)), "no-client", "no decision model");
+	assert.equal(await reasonOf(() => readSpec({ ask: async () => { throw new Error("HTTP 500"); } }, graph, events)), "classifier-error", "an endpoint that failed");
+	assert.equal(await reasonOf(() => readSpec(answered({}), graph, events)), "incomplete", "an empty round is not 'nothing to record'");
+	assert.equal(await reasonOf(() => readSpec(answered({ ...answers, "attach__export": undefined }), graph, events)), "incomplete", "a partial round is not a spec");
 	const malformed = [
 		{ ...answers, "state__export": { type: "choice", choice: "finished", probabilities: { none: 0.8, finished: "1", deferred: 0.1, dropped: 0.0 } } },
 		{ ...answers, "attach__export": { type: "choice", choice: "unoffered", probabilities: { note: 0.4, none: 0.3, child: 0.2, rule: 0.05, unoffered: 0.05 } } },
 		{ ...answers, "attach__export": { type: "choice", choice: "note", probabilities: { note: 0.4, none: 0.3, child: 0.2, rule: 0.05, unknown: 0.05 } } },
 		{ ...answers, "attach__export": { type: "choice", choice: "note", probabilities: { note: 0.4, none: 0.3, child: 0.3 } } },
 	];
-	for (const invalid of malformed) assert.equal(await readSpec(answered(invalid), graph, events, failed), undefined, "a malformed answer fails open");
-	const oversized = [{ ...events[0]!, text: "x".repeat(SPEC_CHARS) }];
-	assert.equal(await readSpec(answered(answers), graph, oversized, failed), undefined, "a batch too large to show is never truncated into a spec");
-	assert.deepEqual(failures, ["no-client", "classifier-error", "incomplete", "incomplete", "incomplete", "incomplete", "incomplete", "incomplete", "oversized"]);
+	for (const invalid of malformed) assert.equal(await reasonOf(() => readSpec(answered(invalid), graph, events)), "incomplete", "a malformed answer throws");
 
 	// A round that answers everything and decides nothing IS a spec: the empty one that skips her model.
 	const quiet = Object.fromEntries(Object.entries(specQuestions(graph)).map(([name, question]) => {

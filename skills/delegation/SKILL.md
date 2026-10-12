@@ -108,7 +108,9 @@ Never carry an agent's model ID from memory either. Read it from status.
 The old pi-strings `op_*` tools are gone. The [README](../../README.md#migrating-from-pi-strings) maps each one to these calls.
 
 ## Execution model and terminal independence
-Keep children in the parent Pi process. Here, **background means asynchronous, not a detached worker**. Use `delegate` and `delegate_ctl` for child coordination. The pinned Agents frame shows only live work; finished children leave one expandable transcript line. For human inspection, `/agents` opens finished-child history; Ctrl+J focuses live children or opens history when idle. Opening history or a child transcript does not restart work.
+Keep children in the parent Pi process. Here, **background means asynchronous, not a detached worker**. Use `delegate` and `delegate_ctl` for child coordination. The pinned Agents frame shows live work, the children your children started, and runs that settled since the user's last prompt; finished children also leave one expandable transcript line. For human inspection, ← at the start of the editor enters the frame and → opens a child; `/agents` opens finished-child history. Opening history or a child transcript does not restart work.
+
+The user's `/delegate settings` set limits you work within. A start beyond **Max running** fails with `CONCURRENCY_LIMIT` and starts nothing: `wait` for a child to finish, then start the next. A child deeper than **Max depth** cannot be started (`DEPTH_EXCEEDED`). In **orchestrator** mode your system prompt says so: delegate every task in the background, and your own `edit`/`write` calls are refused. A role whose `model:` lists several models runs on the first usable one when you pass no `model:`; its status says which and why (`model picked:`).
 
 If work must continue after a terminal disconnect, run the **parent Pi inside tmux**. Use one tmux session per independent workstream, not per subagent. Detach from tmux instead of quitting Pi. Keep using the delegation tools; do not orchestrate children through terminal panes. tmux is optional, not a package dependency.
 

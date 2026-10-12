@@ -350,7 +350,8 @@ export function editGraph(previous: WorkGraph, revision: number, edits: readonly
 				throw new Error("A governs connection needs explicit sourced handling before contraction; do not widen its scope automatically.");
 			}
 			// A fold archives settled detail with its provenance; it need not rewrite parent meaning.
-			if (edit.op === "merge" && !updated.has(target.id)) throw new Error(`merge needs the destination target upserted in this batch: ${target.id}.`);
+			if (edit.op === "merge" && target.id !== source.parent && !updated.has(target.id))
+				throw new Error(`merge across branches needs the destination target upserted in this batch: ${target.id}.`);
 			const missing = edit.sources.filter(ref => !target.sources.includes(ref));
 			const earlier = histories.get(target.id);
 			const history: NonNullable<GraphNode["history"]> = {

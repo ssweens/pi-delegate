@@ -1,8 +1,9 @@
-// Map-maintenance modes: how Mom turns new activity into an update of her work graph.
+// Map-maintenance modes: how Mom turns new activity into an update of her map — a work graph
+// (commit_graph, v2) or the trail (an append-only index into the transcript, docs/trail.md).
 //
 // One module, one responsibility — the mode DECLARATION and RESOLUTION. It deliberately does not
 // route or schedule anything: those stay on the existing seams (momConfiguration's instructions,
-// engine.begin's settlement boundary, Mom.prepare's staging, commit_graph's single-writer
+// engine.begin's settlement boundary, Mom.prepare's staging, each finalizer's single-writer
 // acceptance). Adding a mode is one entry here plus the work named in docs/map-modes.md; it is not
 // a new runtime layer.
 //
@@ -12,7 +13,8 @@
 import { MOM_PROMPT } from "./contract.ts";
 import type { FeedEvent } from "./feed.ts";
 import type { WorkGraph } from "./graph.ts";
-import { applySpec, applyV2, fromWorkGraph, toWorkGraph, V2_OPERATION, V2_PROMPT, type SpecOp } from "./v2.ts";
+import { applySpec, applyV2, fromWorkGraph, specFocus, toWorkGraph, V2_OPERATION, V2_PROMPT, type SpecOp } from "./v2.ts";
+import { TRAIL_OPERATION, TRAIL_PROMPT } from "../trail/prompt.ts";
 
 /** What a mode's apply step is handed: the map to change, the model's committed payload, and the
  *  evidence refs it may cite. */
@@ -51,7 +53,8 @@ export interface MapMode {
 	 * (docs/map-modes.md, M5). A mode that omits it emits a graph transaction and uses the default
 	 * path — `acceptGraph` then `editGraph`, which is correct only when the model authors the write.
 	 * A mode whose model emits anything else (acts, facts) MUST supply this, so host code derives
-	 * every write and the model never does.
+	 * every write and the model never does. A mode that keeps no graph at all (trail) omits it too:
+	 * its finalizer persists its own records in mom-tools and only the coverage cursor touches `.mom`.
 	 */
 	readonly apply?: (input: ModeApplyInput) => ModeApplyResult | Promise<ModeApplyResult>;
 }
@@ -88,15 +91,36 @@ export const V2_MODE: MapMode = {
 		const input = fromWorkGraph(prior);
 		let graph: ReturnType<typeof fromWorkGraph>, defects: string[], unmet: string[] | undefined;
 		if (spec?.length) ({ graph, defects, unmet } = applySpec(spec, input, committed, observed));
-		else ({ graph, defects } = applyV2(input, committed, observed));
+		else {
+			// Focus is the host's in every path (docs/v2-change-spec.md): the commit's own `focus` is ignored, so what
+			// the model reacts to in a message (a quoted label, a complaint about the map) cannot move it. It follows
+			// from the work added, else stays where it was.
+			const applied = applyV2(input, committed, observed, { focus: false });
+			graph = { ...applied.graph, focus: specFocus(input, applied.graph, []) }; defects = applied.defects;
+		}
 		return defects.length
 			? { graph: prior, declined: defects, ...(unmet?.length ? { unmet } : {}) }
 			: { graph: toWorkGraph(graph, prior), declined: [], ...(unmet?.length ? { unmet } : {}) };
 	},
 };
 
+/**
+ * The trail (src/trail, docs/trail.md): no graph. The model appends waypoints that point into the
+ * transcript with record_waypoints; the host checks structure (refs observed, links well-typed) and
+ * appends them to `session.trail`. Projections over the waypoints answer where we are and how we got
+ * here. Only the coverage cursor is written to `.mom`, so the graph readers see no map.
+ */
+export const TRAIL_MODE: MapMode = {
+	name: "trail",
+	description: "Append-only trail of waypoints that point into the transcript; projections answer where we are and how we got here.",
+	prompt: TRAIL_PROMPT,
+	operation: TRAIL_OPERATION,
+	finalizer: "record_waypoints",
+	turns: 1,
+};
+
 /** Every declared mode. The default is the shipped behaviour: selecting no mode changes nothing. */
-export const MODES: readonly MapMode[] = [COMMIT_GRAPH_MODE, V2_MODE];
+export const MODES: readonly MapMode[] = [COMMIT_GRAPH_MODE, V2_MODE, TRAIL_MODE];
 
 export const DEFAULT_MODE = COMMIT_GRAPH_MODE.name;
 

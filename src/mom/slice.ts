@@ -26,7 +26,7 @@ Every message you receive starts one operation: new activity in the lead's sessi
 `;
 
 /** Mom's bounded domain tools. Native filesystem and shell tools let a small local model leave the operation and wander. */
-export const MOM_TOOLS = ["mom_begin", "commit_graph", "commit_v2", "commit_labels", "record_thread_map", "inspect_evidence", "search_history"] as const;
+export const MOM_TOOLS = ["mom_begin", "commit_graph", "commit_v2", "commit_labels", "record_thread_map", "record_waypoints", "inspect_evidence", "search_history"] as const;
 
 const number = (value: unknown, fallback: number) => { const n = Number(value); return value !== "" && Number.isFinite(n) && n >= 0 ? n : fallback; };
 
@@ -46,7 +46,7 @@ export function resolveClassifier(registry: ClassifierRegistry | undefined, ref:
 	const model = registry?.findOfType?.("classifier", ref.slice(0, slash), ref.slice(slash + 1));
 	if (!model?.baseUrl || !model.id || model.api !== "typesafe-system-one") return undefined;
 	const base = model.baseUrl.replace(/\/+$/, "");
-	const url = /\/systemone$/i.test(base) ? base : `${base}/systemone`;
+	const url = /\/systemone$/i.test(base) ? base : `${base.replace(/\/v1$/i, "")}/v1/systemone`;
 	try { endpoint(url); } catch { return undefined; }
 	return { url, model: model.id };
 }
@@ -82,7 +82,7 @@ export function momConfiguration(identity: SessionIdentity, flags: Record<string
 		...(advisorUrl ? { advisor: { url: advisorUrl, model: String(flags["mom-advisor-model"] ?? "beverly-4B"),
 			threshold: number(flags["mom-advisor-threshold"], 0.25), timeoutMs: number(flags["mom-advisor-timeout-ms"], 1500) } } : {}),
 		...(deciderUrl ? { decider: { url: deciderUrl, clear: number(flags["mom-decider-clear"], 0.9) } } : {}),
-		...(classifier ? { classifier: { ...classifier, timeoutMs: 15000 } } : {}),
+		...(classifier ? { classifier: { ...classifier, timeoutMs: 120000 } } : {}),
 	};
 	return {
 		name: "mom", description: "Mom: keeps the lead session's map of goals, decisions and open work.", model, thinking: thinkingFor(model), context: false,

@@ -7,6 +7,8 @@ import type { TodoState } from "../todo.js";
 import { momSectionLines, type PanelView } from "./panel.ts";
 
 export const ACTIVITY_WIDGET_KEY = "pi-delegate.activity";
+/** Mom's settings panel, built for a submenu: `close` returns to the panel that opened it. Undefined until she is connected. */
+export type MomSettingsFactory = (context: ExtensionContext, tui: TUI, close: () => void) => Component | undefined;
 
 const withLegend = (lines: string[], legend: string, theme: Theme, width: number): string[] => {
 	if (width < 8 || lines.length === 0) return lines;
@@ -27,7 +29,7 @@ export function renderActivityLines(sections: readonly (readonly string[])[], th
 	}
 	if (!body.length) return [];
 	const lines = frame("Activity", body, "borderAccent", theme, outer);
-	return withLegend(lines, "Ctrl+J agents · Ctrl+Shift+J Mom · Ctrl+Shift+K compact", theme, outer);
+	return withLegend(lines, focused ? "↑↓ select · → open · ← editor" : "← agents · Ctrl+Shift+J Mom · Ctrl+Shift+K compact", theme, outer);
 }
 
 /** The widget is the focus target; AgentsPanel remains the section renderer and input delegate. */
@@ -55,6 +57,8 @@ export class ActivityCoordinator {
 	private theme?: Theme;
 	private clearOnShrink?: boolean;
 	private installed = false;
+	private settledBefore = Date.now();
+	private momPanel?: MomSettingsFactory;
 
 	install(context: ExtensionContext, live: LiveSource, openChild: (id: string) => Promise<void>): void {
 		this.context = context;
@@ -70,6 +74,7 @@ export class ActivityCoordinator {
 			this.panel?.dispose();
 			this.widget = new ActivityWidget(this);
 			this.panel = new AgentsPanel(this.live!, theme, tui, id => this.openChild!(id), this.widget);
+			this.panel.hideSettledBefore(this.settledBefore);
 			this.widget.attach(this.panel);
 			return this.widget;
 		}, { placement: "aboveEditor" });
@@ -97,6 +102,18 @@ export class ActivityCoordinator {
 	focusAgents(): void {
 		this.panel?.focus();
 	}
+
+	/** The person sent a prompt: runs that settled before it leave the Agents section. */
+	markPrompt(): void {
+		this.settledBefore = Date.now();
+		this.panel?.hideSettledBefore(this.settledBefore);
+		this.tui?.requestRender();
+	}
+
+	/** Mom offers her settings panel here, so /delegate settings can open it as a submenu. */
+	setMomSettings(factory: MomSettingsFactory | undefined): void { this.momPanel = factory; }
+	hasMomSettings(): boolean { return Boolean(this.momPanel); }
+	momSettings(context: ExtensionContext, tui: TUI, close: () => void): Component | undefined { return this.momPanel?.(context, tui, close); }
 
 	dispose(): void {
 		this.panel?.dispose();

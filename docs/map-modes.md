@@ -1,6 +1,6 @@
 # Map modes
 
-`commit_graph` remains the default. `v2` is the opt-in minimal map. On eligible background batches, a decision model writes a per-node change spec; an empty spec skips Mom's model. When no usable spec is available, v2 fails open to Mom's model and checks structure only. (`act_labels` was deleted; see **Current evidence**.)
+`commit_graph` remains the default. `v2` is the opt-in minimal map. `trail` is the append-only waypoint index that is replacing both; it is documented in [`trail.md`](trail.md) and shares only the operation seam described here (`mom_begin`, batches, digests, retries). The work-graph code as it stood before the trail is archived on branch `archive/mom-graph` (tag `mom-graph-archive`). On eligible background batches, a decision model writes a per-node change spec; an empty spec skips Mom's model. When no usable spec is available, v2 fails open to Mom's model and checks structure only. (`act_labels` was deleted; see **Current evidence**.)
 
 ## Purpose
 
@@ -10,6 +10,7 @@ A mode defines the split between model judgment and host code:
 |---|---|---|---|
 | `commit_graph` | Graph changes, targets, states, and focus | Whether parked work is retired | Validation, source repair, and single-writer acceptance |
 | `v2` | The contents of each accepted map edit | Per-node state, attachment and new-work ops for eligible background batches | Structural invariants, plus state/removal compliance with a non-empty spec |
+| `trail` | Which moments are worth finding again, their kind, line and caption | Not used | Refs exist, links resolve, kinds agree; nothing is ever mutated |
 
 ## Selection and persistence
 
@@ -69,6 +70,26 @@ from the raw evidence before the operation reconciles it. Raw tool or receipt ev
 inspection; a summary-only section establishes no new raw facts. Historical gaps are not marked
 audited merely because current evidence was reconciled. Recovery processes bounded prefixes and
 preserves the unattempted suffix and the coverage cursor.
+
+`/mom rebuild` starts reconstruction in the background and returns to the editor immediately. Mom's
+widget shows each pass, the current tool or model activity, streamed character count, elapsed time,
+and the rebuild's Oven slice URL. When complete, it prompts you to run `/mom rebuild` again to open
+the review modal. The temporary slice retires when reconstruction ends, so its URL appears only
+while it is running. Normal Mom's slice URL appears separately in the widget, `/mom status`, and
+the Status tab. Rebuild activity stays live while the map view is held steady. Mom copies the selected branch into a private, unfollowed Oven slice and reconstructs
+its map from bounded thread-map chapter digests, including a short, single-window history. Rebuild
+honors `--mom-bootstrap-chapters` (default 24) and `--mom-bootstrap-chars` (default 48000), rather
+than forcing a chapter per pass. If the next capture window would omit directions, it saves the
+complete prefix in the private map and resumes from that evidence cut; it never accepts an incomplete digest. The live
+`.mom` file is not an input or changed during reconstruction. Arrow keys browse the
+candidate tree; left at its root shows the current map, and right returns to the rebuild. Down past
+the last candidate item selects **Use rebuilt map**; Enter on that action replaces the
+saved graph. Escape discards the candidate without replacing the map. A failed rebuild appears in the
+widget; `/mom rebuild` retries it. Changing sessions cancels an in-progress rebuild.
+Incomplete/unreadable evidence or a changed branch or checkpoint blocks replacement. Accepted replacements append a new checkpoint based on the current one,
+so earlier maps remain in the sidecar and global settings are untouched. The command requires an
+interactive TUI and can run while background tracking is paused without resuming it; it does not
+create start/preview/apply subcommands.
 
 `/mom relabel` repairs saved labels without consuming the live backlog. The model supplies IDs and
 labels through `commit_labels`; the host applies them using the saved sources, and the decision

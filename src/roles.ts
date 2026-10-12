@@ -7,7 +7,14 @@ export interface Role {
 	name: string;
 	description: string;
 	systemPrompt: string;
+	/** The first entry of `models`, for display. */
 	model?: string;
+	/**
+	 * The role's models, most preferred first: `model: a, b` or a YAML list. A delegate call without a
+	 * model and a role without an approved default runs on the first entry the session can use
+	 * (delegate-settings.ts, pickModel).
+	 */
+	models?: string[];
 	thinking?: string;
 	tools?: string[];
 	context?: "fork" | "fresh";
@@ -110,6 +117,12 @@ export function toolList(v: string | undefined): string[] | undefined {
 	return list.length ? list : undefined;
 }
 
+/** A role's `model:` line: one entry, a comma list, `[a, b]`, or a YAML `- a` list. `inherit` is none. */
+export function modelList(v: string | undefined): string[] | undefined {
+	const list = toolList(v)?.filter((entry) => entry !== "-" && entry !== "inherit");
+	return list?.length ? [...new Set(list)] : undefined;
+}
+
 export function loadRoles(cwd: string, projectTrusted: boolean): Map<string, Role> {
 	const roles = new Map<string, Role>();
 	for (const dir of roleDirs(cwd, projectTrusted)) {
@@ -123,11 +136,13 @@ export function loadRoles(cwd: string, projectTrusted: boolean): Map<string, Rol
 			const { fm, body } = parseFrontmatter(text);
 			if (!fm.name) continue;
 			const ctx = (fm.context ?? fm.defaultContext) as string | undefined;
+			const models = modelList(fm.model ?? fm.models);
 			roles.set(fm.name, {
 				name: fm.name,
 				description: fm.description ?? "",
 				systemPrompt: body.trim(),
-				model: fm.model && fm.model !== "inherit" ? fm.model : undefined,
+				model: models?.[0],
+				...(models ? { models } : {}),
 				thinking: fm.thinking && fm.thinking !== "default" ? fm.thinking : undefined,
 				tools: toolList(fm.tools),
 				context: ctx === "fresh" || ctx === "fork" ? ctx : undefined,

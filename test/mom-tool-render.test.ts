@@ -33,9 +33,11 @@ test("expanded Mom tool results never print the saved map or source details", ()
 
 /** Mom's view: what she saved, with no way to ask her a question from it. */
 test("Mom's view shows her saved map and status, and typing asks her nothing", async () => {
-	let refreshes = 0, renders = 0;
+	let refreshes = 0, renders = 0, progress = "Rebuilding · pass 1 · reasoning · 100 chars streamed";
+	const sliceUrl = "http://127.0.0.1:6836/slice/s-tracking", rebuildUrl = "http://127.0.0.1:6836/slice/s-rebuild";
 	const source: any = {
-		view: () => ({ status: "up to date", summary: "Mother thread: Review pi-delegate — finished" }),
+		view: () => ({ status: "up to date", summary: "Mother thread: Review pi-delegate — finished", rebuild: progress, rebuildUrl }),
+		status: () => ({ connection: "connected", project: "/repo", sliceUrl }),
 		refreshStatus: async () => { refreshes++; },
 		findingAction: async () => {},
 	};
@@ -53,6 +55,14 @@ test("Mom's view shows her saved map and status, and typing asks her nothing", a
 	await new Promise(resolve => setTimeout(resolve, 0));
 	assert.equal(refreshes, 1);
 	assert.match(view.render(100).join("\n"), /Showing the latest saved view\./);
+	view.handleInput("\x1bOR"); // F3
+	const status = view.render(100).join("\n");
+	assert.ok(status.includes(`Slice: ${sliceUrl}`));
+	assert.ok(status.includes(`Rebuild slice: ${rebuildUrl}`));
+	assert.ok(status.includes(progress));
+	progress = "Rebuilding · pass 1 · reasoning · 200 chars streamed";
+	view.statusChanged();
+	assert.ok(view.render(100).join("\n").includes(progress), "rebuild activity stays live while the saved map is held steady");
 	view.dispose();
 	assert.ok(renders > 0);
 });

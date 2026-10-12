@@ -29,6 +29,10 @@ export interface OperationHeader {
 	more?: boolean;
 	gaps?: number;
 	retryGap?: { id: string; remaining: string[] };
+	/** Trail: the backfill range acceptance writes (new, advanced, or null when done). */
+	backfill?: { id: string; next: string; through: string } | null;
+	/** Trail: this operation indexes older history, not the live frontier. */
+	backfilling?: boolean;
 	/** A compaction review: its trigger is known evidence beyond the session's own entries. */
 	trigger?: FeedEvent;
 	auditedGaps?: string[];
@@ -67,6 +71,7 @@ export type FindingRequest = "understood" | "dismiss" | "incorrect" | "discuss";
 export type MomRequest =
 	| { kind: "update" }
 	| { kind: "refresh" }
+	| { kind: "rebuild" }
 	| { kind: "relabel" }
 	| { kind: "resume" }
 	| { kind: "controls"; id: string; change: { inject: boolean } | { nudgedClasses: string[] } | { enabled: boolean } | { mode: string } | { model: string } | { decider: string } }

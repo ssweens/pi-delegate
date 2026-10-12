@@ -45,6 +45,10 @@ export interface RunView {
 	depth?: number;
 	/** Pi runs started by a delegating child: that child's run ID. */
 	parentRunId?: string;
+	/** When the current segment settled. The Agents frame keeps runs that settled since the person's last prompt. */
+	endedAt?: number;
+	/** Started by the person with /delegate: its completion is shown without starting a model turn. */
+	userStarted?: true;
 	/** Display facts of an ACP run (acpRowView). Absent on pi runs, which are the default. */
 	backend?: "pi" | "acp";
 	agent?: string;
@@ -94,6 +98,7 @@ export function acpRowView(v: AcpRunView): RunView {
 		durationMs: taskDurationMs, segmentDurationMs: taskDurationMs, changedFiles: [], droppedTools: [], toolCalls: [],
 		revision: v.turns.length * 1_000_003 + v.output.length * 2 + (v.status === "running" ? 0 : 1),
 		...(v.error ? { error: v.error } : {}),
+		...(latest?.finishedAt && v.status !== "running" ? { endedAt: Date.parse(latest.finishedAt) } : v.endedAt && v.status !== "running" ? { endedAt: v.endedAt } : {}),
 		backend: "acp", agent: v.session.agent, origin: v.session.origin,
 		...(v.session.nativeSessionId ? { nativeSessionId: v.session.nativeSessionId } : {}),
 		...(v.session.executionEnvironment ? { executionEnvironment: v.session.executionEnvironment } : {}),

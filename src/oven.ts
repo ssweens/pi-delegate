@@ -20,6 +20,11 @@ export function ovenUrl(): string {
 	return `http://127.0.0.1:${port}`;
 }
 
+/** A browser URL for the same Oven endpoint the MCP client uses. */
+export function ovenSliceUrl(slice: string): string {
+	return `${ovenUrl()}/slice/${encodeURIComponent(slice)}`;
+}
+
 export function ovenToken(): string | undefined {
 	if (process.env.OVEN_TOKEN) return process.env.OVEN_TOKEN;
 	try { return readFileSync(join(ovenConfigDir(), "token"), "utf8").trim() || undefined; } catch { return undefined; }

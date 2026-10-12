@@ -158,6 +158,32 @@ const registry = (): Map<string, AcpRunRecord> => {
 	return g[RUNS_KEY] ??= new Map();
 };
 
+/** A run's turns as a conversation for the child view: each prompt sent, then the agent's output. */
+function recordActivity(run: AcpRunRecord): ChildActivity {
+	view(run);
+	const messages: any[] = [];
+	for (const request of run.last?.requests ?? []) {
+		const at = Date.parse(request.startedAt);
+		const prompt = run.prompts[request.id];
+		if (prompt !== undefined) messages.push({ role: "user", content: [{ type: "text", text: prompt }], timestamp: at });
+		if (request.output || request.status !== "running") {
+			messages.push({
+				role: "assistant", content: request.output ? [{ type: "text", text: request.output }] : [],
+				api: "acp", provider: run.agent, model: run.model ?? run.agent, timestamp: at,
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+				stopReason: request.status === "cancelled" ? "aborted" : request.status === "failed" || request.status === "timed_out" ? "error" : "stop",
+				...(request.failure ? { errorMessage: `${request.failure.code}: ${request.failure.message}` } : {}),
+			});
+		}
+	}
+	return { messages, activeTools: new Map() };
+}
+
+/** ACP runs of every parent in this process whose turn is still running, for the concurrency limit. */
+export function runningAcpRuns(): number {
+	return [...registry().values()].filter((run) => !run.foreign && (run.starting || view(run).status === "running")).length;
+}
+
 const WAIT_SLICE_MS = 1000;
 /** The Coordinator's default profile bound, for a run whose worker profile was never seen. */
 const DEFAULT_MAX_OUTPUT_BYTES = 256_000;
@@ -417,23 +443,7 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 	activity(runId: string): ChildActivity {
 		const run = this.find(runId, this.hooks.ownerKey());
 		if (!run) return { messages: [], activeTools: new Map() };
-		view(run);
-		const messages: any[] = [];
-		for (const request of run.last?.requests ?? []) {
-			const at = Date.parse(request.startedAt);
-			const prompt = run.prompts[request.id];
-			if (prompt !== undefined) messages.push({ role: "user", content: [{ type: "text", text: prompt }], timestamp: at });
-			if (request.output || request.status !== "running") {
-				messages.push({
-					role: "assistant", content: request.output ? [{ type: "text", text: request.output }] : [],
-					api: "acp", provider: run.agent, model: run.model ?? run.agent, timestamp: at,
-					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-					stopReason: request.status === "cancelled" ? "aborted" : request.status === "failed" || request.status === "timed_out" ? "error" : "stop",
-					...(request.failure ? { errorMessage: `${request.failure.code}: ${request.failure.message}` } : {}),
-				});
-			}
-		}
-		return { messages, activeTools: new Map() };
+		return recordActivity(run);
 	}
 
 	capabilities(run?: AcpRunView): BackendCapabilities {
@@ -941,9 +951,11 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 	 * Coordinator, as close would (a created session closed without discarding it, so it stays
 	 * resumable; an opened one only disconnected, its native work untouched), so nothing outlives
 	 * the parent. The record is saved parked, its ownership released, and the run forgotten here.
+	 * Returns each run as it was left, with its conversation, for a view that keeps showing it.
 	 */
-	async closeOwner(ownerKey: string): Promise<void> {
+	async closeOwner(ownerKey: string): Promise<{ view: AcpRunView; activity: ChildActivity }[]> {
 		const coordinator = existingAcpCoordinator();
+		const left: { view: AcpRunView; activity: ChildActivity }[] = [];
 		for (const run of [...registry().values()]) {
 			if (run.ownerKey !== ownerKey) continue;
 			registry().delete(run.id);
@@ -960,7 +972,9 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 			}
 			delete run.ownerPid; delete run.ownerHost; delete run.ownerToken;
 			this.saveQuietly(run);
+			left.push({ view: view(run), activity: recordActivity(run) });
 		}
+		return left;
 	}
 
 	/** Report a turn's settlement once, to a joined wait or else to the parent. */

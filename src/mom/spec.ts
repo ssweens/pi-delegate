@@ -44,13 +44,16 @@ export function evidenceState(graph: V2Graph, events: readonly FeedEvent[]): str
 	const lines: string[] = [];
 	const visit = (parent: string | null, depth: number) => {
 		for (const node of children.get(parent) ?? []) {
-			lines.push(`${"  ".repeat(depth)}- ${node.kind}${node.state ? ` [${node.state}]` : ""} ${node.id}: ${node.label}${node.id === graph.focus ? "  <-- current" : ""}`);
+			lines.push(`${"  ".repeat(depth)}- ${node.kind}${node.state ? ` [${node.state}]` : ""} ${node.id}: ${node.label.slice(0, 60)}${node.id === graph.focus ? "  <-- current" : ""}`);
 			visit(node.id, depth + 1);
 		}
 	};
 	visit(null, 0);
 	if (!lines.length) lines.push("(empty)");
-	return `CURRENT WORK MAP\n${lines.join("\n")}\n\nNEW ACTIVITY IN THE SESSION\n${renderUpdateEvents(events)}`;
+	// Trim the activity text: the classifier decides shape, not prose, and every extra character is
+	// prefill the 3B decider pays for on every round.
+	const trimmed = events.map(event => (event.text && event.text.length > 300 ? { ...event, text: `${event.text.slice(0, 300)}\u2026` } : event));
+	return `CURRENT WORK MAP\n${lines.join("\n")}\n\nNEW ACTIVITY IN THE SESSION\n${renderUpdateEvents(trimmed)}`;
 }
 
 /** The state menu follows the node's current state: a settled node cannot be parked, and offering it
@@ -119,37 +122,34 @@ export function specOps(graph: V2Graph, reading: SpecReading): { ops: SpecOp[]; 
 	return { ops, chosen };
 }
 
-/** The most the decision model is shown for a spec. A larger batch goes to her model unchecked rather
- *  than truncated: a spec built from part of the evidence would reject the rest of it. */
-export const SPEC_CHARS = 12000;
-
 /** The client this needs: one call, answers by name (spec.ts stays clear of the transport). */
 export interface SpecClient { ask(state: string, questions: Record<string, DeciderQuestion>): Promise<{ answers: Record<string, DeciderAnswer> }> }
 
-/**
- * Ask the spec's questions and read the ops off the answers. Fail-open everywhere: no client, a failed
- * or slow endpoint, or a batch too large to show all return `undefined`, and her model then runs with
- * the structural checks alone. The spec can only ever narrow what her model may write — it is never
- * the thing that stops an update.
- */
-export type SpecFailOpenReason = "no-client" | "oversized" | "incomplete" | "classifier-error";
+/** Why a spec round did not complete. A spec is required: every one of these throws to the caller. */
+export type SpecFailOpenReason = "no-client" | "incomplete" | "classifier-error";
 
-export async function readSpec(client: SpecClient | undefined, graph: V2Graph, events: readonly FeedEvent[], onFailOpen?: (reason: SpecFailOpenReason) => void): Promise<{ ops: SpecOp[]; chosen: Record<string, string> } | undefined> {
-	const failOpen = (reason: SpecFailOpenReason) => { try { onFailOpen?.(reason); } catch { /* diagnostics never close the fail-open path */ } return undefined; };
-	if (!client) return failOpen("no-client");
+export class SpecError extends Error {
+	constructor(readonly reason: SpecFailOpenReason, message: string) { super(message); this.name = "SpecError"; }
+}
+
+/**
+ * Ask the spec's questions and read the ops off the answers. The spec is required: no client, a failed
+ * endpoint, or a round that does not answer every question throws, so no update ever runs without one.
+ * The spec can only ever narrow what her model may write — it is never the thing that stops an update.
+ */
+export async function readSpec(client: SpecClient | undefined, graph: V2Graph, events: readonly FeedEvent[]): Promise<{ ops: SpecOp[]; chosen: Record<string, string> }> {
+	if (!client) throw new SpecError("no-client", "No decision model is configured for Mom's change spec. Choose one in /mom settings.");
 	const state = evidenceState(graph, events);
-	if (state.length > SPEC_CHARS) return failOpen("oversized");
-	try {
-		const questions = specQuestions(graph);
-		const { answers } = await client.ask(state, questions);
-		const reading: SpecReading = {};
-		for (const [name, question] of Object.entries(questions)) {
-			const answer = parseDeciderAnswer(question, answers[name]);
-			if (!answer || answer.type !== "choice") return failOpen("incomplete");
-			reading[name] = Object.entries(answer.probabilities).sort((a, b) => b[1] - a[1]);
-		}
-		// A partial or malformed round is not a spec. Reading a missing answer or probability as
-		// "no change" could skip her model on evidence nobody judged, so fail the whole read open.
-		return specOps(graph, reading);
-	} catch { return failOpen("classifier-error"); }
+	const questions = specQuestions(graph);
+	let answers: Record<string, DeciderAnswer>;
+	// One round: the 3B decider answers every question in ~30s, and splitting re-prefills the state per round.
+	try { answers = (await client.ask(state, questions)).answers; }
+	catch (error) { throw new SpecError("classifier-error", `Mom's decision model did not answer: ${error instanceof Error ? error.message : String(error)}`); }
+	const reading: SpecReading = {};
+	for (const [name, question] of Object.entries(questions)) {
+		const answer = parseDeciderAnswer(question, answers[name]);
+		if (!answer || answer.type !== "choice") throw new SpecError("incomplete", `Mom's decision model did not answer ${name} with a choice on its menu.`);
+		reading[name] = Object.entries(answer.probabilities).sort((a, b) => b[1] - a[1]);
+	}
+	return specOps(graph, reading);
 }

@@ -21,14 +21,17 @@ export interface BootstrapPolicy {
 	 * evidence. The digest's character bound IS hard.
 	 */
 	maxChapters: number;
-	/** Hard bound on digest characters, so one model message stays inside the context guard. */
+	/** Hard bound on digest characters, so one model message stays inside the context guard.
+	 *  Must match --mom-bootstrap-chars' default (mom/index.ts); one source of truth for the cap. */
 	maxDigestChars: number;
 	/** Safety net on local drain windows. Each window is one 24,000-character capture. */
 	maxWindows: number;
 }
-export const DEFAULT_BOOTSTRAP_POLICY: BootstrapPolicy = { maxChapters: 24, maxDigestChars: 56000, maxWindows: 400 };
+export const DEFAULT_BOOTSTRAP_POLICY: BootstrapPolicy = { maxChapters: 24, maxDigestChars: 48000, maxWindows: 400 };
 
 export interface ChapterDirection { ref: string; text: string }
+/** A lead direction, or the assistant text that closed a turn (its reported outcome), in recorded order. */
+export interface ChapterBeat extends ChapterDirection { kind: "direction" | "outcome" }
 export interface ChapterFile { ref: string; path: string; operations: Map<string, number> }
 export interface Chapter {
 	index: number;
@@ -37,15 +40,17 @@ export interface Chapter {
 	entries: number;
 	narrativeChars: number;
 	workersSettled: number;
-	/** Every lead direction in order; the block keeps the first, the last, and as many recent ones as its budget allows. */
-	directions: ChapterDirection[];
+	/**
+	 * Every lead direction, each followed by the assistant text that closed its turn: the thread-map pairing of
+	 * what was asked with what was reported done. The block keeps the first and last direction and the chapter's
+	 * last outcome longest; a summary claim (often a provider placeholder) never stands in for them.
+	 */
+	beats: ChapterBeat[];
 	closingCompactions: number;
 	handoffs: ChapterDirection[];
 	files: ChapterFile[];
 	lastTodo?: ChapterDirection;
 	closingClaim?: ChapterDirection;
-	/** The last few lead assistant texts, most recent last: a provisional chapter's closing claim surrogate. */
-	recentAssistants: ChapterDirection[];
 }
 export interface BootstrapDigest {
 	text: string;
@@ -57,10 +62,12 @@ export interface BootstrapDigest {
 	windows: number;
 	/** Evidence remained beyond the drain: the caller must keep catching up, not claim it. */
 	remainingMore: boolean;
+	/** Accepted prefix only: strict rebuild may have read a further window that would not fit. */
+	drainedCount: number;
 }
 
 const DIRECTION_CHARS = 320;
-const RECENT_ASSISTANTS = 3;
+const OUTCOME_CHARS = 700;
 const CLAIM_CHARS = 800;
 const ASSISTANT_CHARS = 1600;
 
@@ -68,18 +75,27 @@ const isCompaction = (event: FeedEvent) => event.actor === "lead" && event.kind 
 const isDirection = (event: FeedEvent) => event.actor === "lead" && (event.kind === "user" || event.kind === "user_answer");
 const isDelegateTool = (event: FeedEvent) => event.actor === "lead" && event.kind === "tool_call" && Boolean(event.name?.includes("delegate"));
 const flat = (text: string) => text.replace(/\s+/g, " ").trim();
+/** The file an edit or write call names. Sessions rarely carry `file_op` entries; the calls themselves do. */
+function writtenPath(event: FeedEvent): string | undefined {
+	if (event.actor !== "lead" || event.kind !== "tool_call" || !/^(edit|write)$/i.test(event.name ?? "") || !event.text) return undefined;
+	const match = /"path":("(?:[^"\\]|\\.)*")/.exec(event.text);
+	try { return match ? JSON.parse(match[1]) as string : undefined; } catch { return undefined; }
+}
 const clamp = (text: string, limit: number) => (text.length <= limit ? text : `${text.slice(0, Math.max(0, limit - 1))}…`);
 
 /** Chapters break on compaction entries; the compaction event closes the chapter it ends. */
 export function segmentChapters(events: readonly FeedEvent[]): Chapter[] {
 	const chapters: Chapter[] = [];
 	let current: Chapter | undefined;
+	/** The latest assistant text of the open turn: its outcome once the next direction or the chapter's end closes it. */
+	let report: ChapterDirection | undefined;
+	const close = () => { if (report) current!.beats.push({ kind: "outcome", ...report }); report = undefined; };
 	// A run reports once per segment: a joined result and its completion notice are the same receipt.
 	const receipts = new Set<string>();
 	for (const event of events) {
 		if (!current) {
 			current = { index: chapters.length + 1, startRef: event.ref, endRef: event.ref, entries: 0,
-				narrativeChars: 0, workersSettled: 0, directions: [], closingCompactions: 0, handoffs: [], files: [], recentAssistants: [] };
+				narrativeChars: 0, workersSettled: 0, beats: [], closingCompactions: 0, handoffs: [], files: [] };
 		}
 		current.entries++;
 		current.narrativeChars += event.text?.length ?? 0;
@@ -89,61 +105,61 @@ export function segmentChapters(events: readonly FeedEvent[]): Chapter[] {
 		if (!repeat && event.kind === "delegate_receipt" && (event.status === "complete" || event.status === "settled")) current.workersSettled++;
 		if (!repeat && (event.kind === "delegate_receipt" || isDelegateTool(event))) current.handoffs.push({ ref: event.ref,
 			text: [event.name, event.status].filter(Boolean).join(" ") || event.kind });
-		if (event.kind === "file_op" && event.text) {
-			let file = current.files.find(item => item.path === event.text);
-			if (!file) { file = { ref: event.ref, path: event.text, operations: new Map() }; current.files.push(file); }
-			const operation = event.name ?? "unknown";
+		const path = event.kind === "file_op" ? event.text : writtenPath(event);
+		if (path) {
+			let file = current.files.find(item => item.path === path);
+			if (!file) { file = { ref: event.ref, path, operations: new Map() }; current.files.push(file); }
+			const operation = (event.kind === "file_op" ? event.name : event.name?.toLowerCase()) ?? "unknown";
 			file.operations.set(operation, (file.operations.get(operation) ?? 0) + 1);
 		}
 		if (event.kind === "todo") current.lastTodo = { ref: event.ref, text: event.text || "(empty todo state)" };
-		if (event.actor === "lead" && event.kind === "assistant" && event.text) {
-			current.recentAssistants.push({ ref: event.ref, text: event.text });
-			if (current.recentAssistants.length > RECENT_ASSISTANTS) current.recentAssistants.shift();
-		}
+		if (event.actor === "lead" && event.kind === "assistant" && event.text) report = { ref: event.ref, text: event.text };
 		if (isCompaction(event)) {
 			current.closingCompactions++;
 			if (event.claim) current.closingClaim = { ref: event.ref, text: event.claim };
 		}
-		if (isDirection(event) && event.text) current.directions.push({ ref: event.ref, text: event.text });
+		if (isDirection(event) && event.text) { close(); current.beats.push({ kind: "direction", ref: event.ref, text: event.text }); }
 		current.endRef = event.ref;
-		if (isCompaction(event)) { chapters.push(current); current = undefined; }
+		if (isCompaction(event)) { close(); chapters.push(current); current = undefined; }
 	}
-	if (current) chapters.push(current);
+	if (current) { close(); chapters.push(current); }
 	return chapters;
 }
 
 /**
  * One chapter under a character budget. Lines are emitted in chronological order but trimmed by
- * class, not position: the chapter's end state (TODO@end, the closing CLAIM, or for the provisional
- * frontier chapter its last few assistant texts) and its first and last directions are never
- * dropped; then files go before handoffs, handoffs before directions, oldest first within a class.
- * Trimming a line never drops a chapter, so the cut still covers everything emitted.
+ * class, not position: TODO@end, the closing CLAIM and the first and last directions are never
+ * dropped; then files go before handoffs, handoffs before directions, directions before turn
+ * outcomes, and the chapter's last outcome last of all, oldest first within a class. Trimming a
+ * line never drops a chapter, so the cut still covers everything emitted.
  */
-const TRIM_ORDER = ["file", "handoff", "direction"] as const;
+const TRIM_ORDER = ["file", "handoff", "direction", "outcome", "end"] as const;
 type TrimClass = typeof TRIM_ORDER[number];
 interface BlockLine { text: string; cls?: TrimClass; rank: number }
 
 function chapterBlock(chapter: Chapter, budget: number): string {
 	const lines: BlockLine[] = [{ text: `Chapter ${chapter.index} · entries ${chapter.entries} · narrative ${chapter.narrativeChars} chars · workers settled ${chapter.workersSettled} · compactions ${chapter.closingCompactions}`, rank: 0 }];
 	const cite = (label: string, item: ChapterDirection, limit = DIRECTION_CHARS) => `  ${label} [src:${item.ref}] ${clamp(flat(item.text), limit)}`;
-	const first = chapter.directions[0], last = chapter.directions.at(-1);
-	chapter.directions.forEach((direction, i) => lines.push({ text: cite(direction === first ? "first direction" : direction === last ? "last direction" : "direction", direction),
-		...(direction === first || direction === last ? {} : { cls: "direction" }), rank: i }));
+	const directions = chapter.beats.filter(beat => beat.kind === "direction"), outcomes = chapter.beats.filter(beat => beat.kind === "outcome");
+	const first = directions[0], last = directions.at(-1), end = outcomes.at(-1);
+	chapter.beats.forEach((beat, i) => lines.push(beat.kind === "direction"
+		? { text: cite(beat === first ? "first direction" : beat === last ? "last direction" : "direction", beat), ...(beat === first || beat === last ? {} : { cls: "direction" }), rank: i }
+		: beat === end ? { text: cite("last outcome (reported)", beat, ASSISTANT_CHARS), cls: "end", rank: i }
+			: { text: cite("outcome (reported)", beat, OUTCOME_CHARS), cls: "outcome", rank: i }));
 	chapter.handoffs.forEach((handoff, i) => lines.push({ text: cite("delegate handoff", handoff), cls: "handoff", rank: i }));
 	chapter.files.forEach((file, i) => lines.push({ text: `  file [src:${file.ref}] ${file.path} (${[...file.operations].map(([op, count]) => `${op}×${count}`).join(", ")})`, cls: "file", rank: i }));
 	if (chapter.lastTodo) lines.push({ text: cite("TODO@end", chapter.lastTodo), rank: 0 });
 	if (chapter.closingClaim) {
+		// The closing claim is the provider's summary: context for the chapter, never citable evidence. A remote
+		// compaction's placeholder says nothing about the chapter, so only its presence is recorded.
 		const placeholder = /remote compaction applied/i.test(chapter.closingClaim.text);
-		// The closing claim is the provider's summary: context for the chapter, never citable evidence.
-		lines.push({ text: `  ${placeholder ? "CLAIM(placeholder — no content)" : "CLAIM"} ${clamp(flat(chapter.closingClaim.text), CLAIM_CHARS)}`, rank: 0 });
-	} else if (!chapter.closingCompactions) {
-		const final = chapter.recentAssistants.at(-1);
-		for (const assistant of chapter.recentAssistants) lines.push({ text: cite(assistant === final ? "last assistant text" : "recent assistant text", assistant, ASSISTANT_CHARS), rank: 0 });
+		lines.push({ text: placeholder ? "  CLAIM(placeholder — no content)" : `  CLAIM ${clamp(flat(chapter.closingClaim.text), CLAIM_CHARS)}`, rank: 0 });
 	}
-	const omitted: Record<TrimClass, number> = { file: 0, handoff: 0, direction: 0 };
+	const omitted: Record<TrimClass, number> = { file: 0, handoff: 0, direction: 0, outcome: 0, end: 0 };
 	const render = (kept: BlockLine[]) => {
 		const out = kept.map(line => line.text);
-		const notes = [omitted.direction ? `${omitted.direction} lead directions` : "", omitted.handoff ? `${omitted.handoff} delegate handoffs` : "", omitted.file ? `${omitted.file} files touched` : ""].filter(Boolean);
+		const notes = [omitted.direction ? `${omitted.direction} lead directions` : "", omitted.outcome + omitted.end ? `${omitted.outcome + omitted.end} turn outcomes` : "",
+			omitted.handoff ? `${omitted.handoff} delegate handoffs` : "", omitted.file ? `${omitted.file} files touched` : ""].filter(Boolean);
 		if (notes.length) out.splice(1, 0, `  … ${notes.join(", ")} omitted for budget`);
 		return out.join("\n");
 	};
@@ -166,7 +182,7 @@ function chapterBlock(chapter: Chapter, budget: number): string {
  * 2-direction one.
  */
 export function chapterDigest(chapters: readonly Chapter[], policy: BootstrapPolicy): string | undefined {
-	const header = "BOOTSTRAP CHAPTER CHAIN — recorded evidence compressed by the host with source pointers. No semantic judgment is added; synthesize the work map from these directions, files and todo states; closing CLAIM lines are provider summaries for orientation and carry no citable source.";
+	const header = "BOOTSTRAP CHAPTER CHAIN — recorded evidence compressed by the host with source pointers. No semantic judgment is added; synthesize the work map from these directions, the outcome each turn reported, files and todo states. Each separately requested piece of work is its own item. Outcomes are the assistant's reports, not verification; closing CLAIM lines are provider summaries for orientation and carry no citable source.";
 	const full = chapters.map(chapter => chapterBlock(chapter, Number.POSITIVE_INFINITY));
 	let remaining = policy.maxDigestChars - header.length - 2 * (chapters.length + 1), left = chapters.length;
 	const budgets = new Array<number>(chapters.length);
@@ -192,11 +208,37 @@ export interface BootstrapFeed {
  * when the digest cannot be bounded or the backlog is not a backlog, so the caller keeps the
  * ordinary per-window path.
  */
-export async function bootstrapDigest(feed: BootstrapFeed, firstMore: boolean, policy: BootstrapPolicy, fromIndex = 0): Promise<BootstrapDigest | undefined> {
-	if (!firstMore) return undefined; // a single window already holds everything: nothing to compress
+export async function bootstrapDigest(feed: BootstrapFeed, firstMore: boolean, policy: BootstrapPolicy, fromIndex = 0, singleWindowCut?: Cut): Promise<BootstrapDigest | undefined> {
+	// An explicit rebuild never drops directions to make a digest fit. Keep the last fully
+	// represented capture window, then resume from its cut in the next operation. A long
+	// chapter can therefore span several bounded, source-backed proposals.
+	if (singleWindowCut) {
+		const build = (cut: Cut, windows: number): BootstrapDigest | undefined => {
+			const drained = feed.events.slice(fromIndex), segments = segmentChapters(drained);
+			if (!segments.length) return undefined;
+			const text = chapterDigest(segments, policy);
+			if (!text || /^  … .* omitted for budget$/m.test(text)) return undefined;
+			return { text, cut, chapters: segments.length, overshoot: Math.max(0, segments.length - policy.maxChapters),
+				coveredThroughRef: segments.at(-1)!.endRef, windows, remainingMore: false, drainedCount: drained.length };
+		};
+		let best = build(singleWindowCut, 0);
+		if (!best) return undefined;
+		let more = firstMore, windows = 0;
+		while (more && windows < policy.maxWindows && best.chapters <= policy.maxChapters) {
+			const captured = await feed.capture(24000, true);
+			windows++;
+			more = captured.more && captured.events.length > 0;
+			if (!captured.events.length) break;
+			const next = build(captured.cut, windows);
+			if (!next) break;
+			best = next;
+		}
+		return { ...best, remainingMore: more || feed.events.length - fromIndex > best.drainedCount };
+	}
+	if (!firstMore) return undefined; // routine single-window updates keep raw evidence
 	// Drain readable lead history even when a worker is live or unavailable. capture(..., true)
 	// still defers worker reads; its cut never advances over that unobserved evidence.
-	let more: boolean = firstMore, windows = 0, cut: Cut | undefined;
+	let more: boolean = firstMore, windows = 0, cut: Cut | undefined = singleWindowCut;
 	// Count the chapters already present in the initial staged capture: the drain loop must not
 	// resume from zero or it keeps draining past the target (the observed 26-vs-24 overshoot).
 	let chapters = 0;
@@ -220,5 +262,5 @@ export async function bootstrapDigest(feed: BootstrapFeed, firstMore: boolean, p
 	const text = chapterDigest(segments, policy);
 	if (!text) return undefined;
 	return { text, cut, chapters: segments.length, overshoot: Math.max(0, segments.length - policy.maxChapters),
-		coveredThroughRef: segments.at(-1)!.endRef, windows, remainingMore: more };
+		coveredThroughRef: segments.at(-1)!.endRef, windows, remainingMore: more, drainedCount: drained.length };
 }

@@ -31,7 +31,7 @@ import type { ActiveTool, ChildActivity } from "./transcript.js";
 import { type AAIndices, acpRowView, asRunView, elapsed, empty, framed, type LiveFacts, type ModelRow, type ModelsDetails, resultLines, resultView, type RunView } from "./render.js";
 import { type AcpRunView, type LifecycleAction, type PiStartInput, type WaitOutcome, PI_CAPABILITIES, requireAction, validateStartInput, validateSteer } from "./backend.js";
 import { ovenCall, OvenUnreachable, type Settled, type SliceView } from "./oven.js";
-import { AcpBackend, acpModelsText, acpResultText, acpStatusText, acpSummary, DelegateError, sessionLabel, unwrap } from "./acp-backend.js";
+import { AcpBackend, runningAcpRuns, acpModelsText, acpResultText, acpStatusText, acpSummary, DelegateError, sessionLabel, unwrap } from "./acp-backend.js";
 import { shutdownAcpCoordinator } from "./acp/instance.js";
 import { DELEGATION_TOOLS, droppedTools, EVERY_TOOL, loadRoles, toolAllowlist, WRITE_TOOLS } from "./roles.js";
 import { installTodo } from "./todo-ext.js";
@@ -42,6 +42,9 @@ import { resolveChildTrust, type ChildTrust, type TrustSource } from "./project-
 import { ownedElsewhere, processOwner, readRecord, storageDir, writeRecord } from "./storage.js";
 import { installMom } from "./mom/index.js";
 import { activityFor } from "./ui/activity.js";
+import { DEFAULT_DELEGATE_SETTINGS, pickModel, readDelegateSettings, saveDelegateSettings } from "./delegate-settings.ts";
+import { DEFAULT_TODO_SETTINGS, readTodoSettings, saveTodoSettings } from "./todo-settings.ts";
+import { delegateRows, todoRows, SettingsPanel, textPage, type SettingsRow } from "./ui/delegate-settings.ts";
 
 /** Resolved once, at load, by Pi's own rule (PI_CODING_AGENT_DIR with `~` expanded, else ~/.pi/agent), so this file and Pi read the same mcp.json and settings. */
 export const AGENT_DIR = getAgentDir();
@@ -53,8 +56,18 @@ const OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models";
 const OPENROUTER_TTL_MS = 10 * 60 * 1000;
 const OPENROUTER_TIMEOUT_MS = 8000;
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
-/** The root parent is depth 0 and its children depth 1. A child may not start a child deeper than this. */
+/** The shipped depth limit. The root parent is depth 0 and its children depth 1; `maxDepth` in the settings replaces it. */
 export const MAX_DELEGATION_DEPTH = 3;
+/** The depth limit now: read at each delegate call, so a settings change applies to the next child. */
+const maxDepth = () => readDelegateSettings(SETTINGS_PATH).maxDepth;
+/** The root session's delegation mode now (opportunistic, orchestrator, off). Children never get a mode. */
+const mode = () => readDelegateSettings(SETTINGS_PATH).mode;
+/**
+ * The orchestrator's standing instruction, part of the root's `delegate` tool description while the mode
+ * is on: a description is in every turn's loadout, including turns a completion starts, which a
+ * before_agent_start prompt section is not; and it changes only when the mode does.
+ */
+const ORCHESTRATOR_PROMPT = ` Delegation mode: orchestrator (the user's setting). You coordinate; children execute. Hand every task the user gives you to a child with delegate, in the background, and stay free to keep talking with the user while children run. Do not block on delegate_ctl wait unless the user asks for a result now or your reply cannot be written without it. Read only what you need to write a good brief, and report each child's result when its completion arrives. You cannot edit or write files yourself in this mode: those calls are refused. This overrides the delegate tool's own advice on when to delegate.`;
 const SKILL_PATH = join(dirname(fileURLToPath(import.meta.url)), "..", "skills", "delegation", "SKILL.md");
 const MAX_RETAINED_SESSIONS = 8;
 const OUTPUT_CAP = 40_000;
@@ -77,10 +90,10 @@ export interface DelegateMilestone {
 	changedFiles?: string[];
 }
 
-const contractFooter = (delegates: boolean, atDepthCap = false) => `
+const contractFooter = (delegates: boolean, atDepthCap = false, cap = MAX_DELEGATION_DEPTH) => `
 
 ## Delegated worker contract
-You are working inside another agent's task. You do the work yourself with the tools listed above${delegates ? "" : `: you have no delegation tools and cannot start another agent, so a delegation call is not available to you${atDepthCap ? `. You run at the delegation depth limit, ${MAX_DELEGATION_DEPTH}` : ""}`}. That is your fixed toolset, not a broken setup — never ask anyone to reload, restart, or fix an extension, and never stop and wait for a reply. Whatever the conversation above shows another agent doing, your job is the brief below.
+You are working inside another agent's task. You do the work yourself with the tools listed above${delegates ? "" : `: you have no delegation tools and cannot start another agent, so a delegation call is not available to you${atDepthCap ? `. You run at the delegation depth limit, ${cap}` : ""}`}. That is your fixed toolset, not a broken setup — never ask anyone to reload, restart, or fix an extension, and never stop and wait for a reply. Whatever the conversation above shows another agent doing, your job is the brief below.
 
 You are not alone in this repository: preserve unrelated and concurrent edits, do not revert work you do not own, stay within the ownership stated in the brief. Do not commit or push unless the brief says so. Inspect before editing; verify before claiming. End your final message with:
 STATUS: complete | partial | blocked
@@ -89,10 +102,10 @@ VERIFIED: <commands or flows run and their concrete results>
 GAPS: <unfinished work or blockers, or none>`;
 
 /** Only for a child whose tools allow `delegate`. Its limits are stated, not implied. */
-const childrenFooter = (depth: number) => `
+const childrenFooter = (depth: number, cap = MAX_DELEGATION_DEPTH) => `
 
 ## Your own children
-Your role lets you start children of your own with \`delegate\` and control them with \`delegate_ctl\`. Read ${SKILL_PATH} before your first delegate call. Start a child only for work your brief assigns to others, such as an independent check or a separate piece of work; do everything else yourself. You run at delegation depth ${depth}. A delegate call that would start a child deeper than ${MAX_DELEGATION_DEPTH} fails, so a child at depth ${MAX_DELEGATION_DEPTH} gets neither \`delegate\` nor \`delegate_ctl\`. One writer per working directory still holds: a child that edits files needs a directory no other running writer uses, yours included. Join every child you start with delegate_ctl wait before your final report. A child that settles after your report wakes you again.`;
+Your role lets you start children of your own with \`delegate\` and control them with \`delegate_ctl\`. Read ${SKILL_PATH} before your first delegate call. Start a child only for work your brief assigns to others, such as an independent check or a separate piece of work; do everything else yourself. You run at delegation depth ${depth}. A delegate call that would start a child deeper than ${cap} fails, so a child at depth ${cap} gets neither \`delegate\` nor \`delegate_ctl\`. One writer per working directory still holds: a child that edits files needs a directory no other running writer uses, yours included. Join every child you start with delegate_ctl wait before your final report. A child that settles after your report wakes you again.`;
 
 // Stripping the delegating agent's tool calls is not enough on its own: its prose still reads as
 // "I am supervising a worker", and a child that adopts that voice inspects the job instead of doing it.
@@ -180,6 +193,10 @@ interface Run {
 	sliceId?: string;
 	/** Set when a delegating child started this run. */
 	parentRunId?: string;
+	/** Which entry of the role's model list the run got, and why earlier entries were skipped. */
+	modelPick?: string;
+	/** Started by the person with /delegate: its completion is shown without starting a model turn. */
+	userStarted?: true;
 	/** Every tool name the child's current session was offered, allowed or not; droppedTools is read from it. */
 	offered?: Set<string>;
 	/** Extensions that failed to load, or failed in a handler, in the child's current session. It ran without them. */
@@ -212,6 +229,14 @@ interface Owner {
 	parentRun?: Run;
 	/** The attached binding's steer, so a completion can revive one of this owner's settled runs. */
 	resume?: (run: Run, message: string) => Promise<void>;
+	/** The same steer for a message the person typed in the root's UI: an explicit restart request. */
+	steerFromUser?: (run: Run, message: string) => Promise<void>;
+	/** The attached binding's ACP backend: the one that reads, steers and cancels this owner's ACP runs. */
+	acp?: AcpBackend;
+	/** A root parent's view of its whole tree, as the Agents frame reads and acts on it. */
+	live?: LiveSource;
+	/** Open one of this owner's settled runs' sessions without starting a turn: a delegating run's own children reattach with it. */
+	reopen?: (run: Run) => Promise<void>;
 	/** True while one of this owner's runs, pi or ACP, has not settled. */
 	busy?: () => boolean;
 	/**
@@ -263,6 +288,32 @@ function runRecordPaths(owner: Owner): string[] {
 		paths.push(pointer.recordPath);
 	}
 	return [...new Set(paths)];
+}
+
+/**
+ * The runs a delegating child started, kept when its session closes (retired, cancelled, reopened on a
+ * new model): the root lists, reads and revives them as it does its own settled children, until the next
+ * prompt hides them. Keyed by the delegating run's id; its revival restores them live and drops the entry.
+ */
+interface Departed { pi: Run[]; acp: { view: AcpRunView; activity: ChildActivity }[] }
+const departed = new Map<string, Departed>();
+/** A delegating child's close still in progress (parking its ACP runs), by its run id. A revival waits for it. */
+const closingChildren = new Map<string, Promise<void>>();
+/** A departed run, and the delegating run whose session held it. */
+function findDeparted(id: string): { parentId: string; run?: Run; acp?: Departed["acp"][number] } | undefined {
+	for (const [parentId, gone] of departed) {
+		const run = gone.pi.find((r) => r.id === id);
+		if (run) return { parentId, run };
+		const acpRun = gone.acp.find((a) => a.view.id === id);
+		if (acpRun) return { parentId, acp: acpRun };
+	}
+	return undefined;
+}
+/** Forget a run's departed descendants: its root parent closed, so nothing shows or revives them any more. */
+function forgetDeparted(runId: string) {
+	const gone = departed.get(runId);
+	departed.delete(runId);
+	for (const run of gone?.pi ?? []) forgetDeparted(run.id);
 }
 
 /** The owner of the children a delegating run started, once its session's delegation tools attached. */
@@ -348,16 +399,21 @@ class GatedTools extends Map<string, RegisteredTool> {
 	}
 }
 
+/** Mom follows the root parent's session only. An extension that brings her is known by her tool or command. */
+const bringsMom = (extension: LoadExtensionsResult["extensions"][number]) => extension.tools.has("mom") || extension.commands.has("mom");
+
 /**
  * The extensions a child's session runs. An installed pi-delegate would add the root parent's
  * `delegate`, `delegate_ctl` and `todo`, so it is left out: the child's own nested instance is its only
- * one. Every other extension keeps only the tools the child may have.
+ * one. Mom is the root parent's alone: any extension that brings her (an installed pi-delegate, or
+ * pi-tether) is left out too, so a child never follows, maps or advises on its own session. Every
+ * other extension keeps only the tools the child may have.
  */
 function gateExtensions(run: Run, base: LoadExtensionsResult): LoadExtensionsResult {
 	const { allows } = allowlist(run);
 	const offered = run.offered = new Set(PI_BUILTIN_TOOLS);
 	const copies = new Set(base.extensions
-		.filter((extension) => extension.path !== NESTED_PATH && [...extension.tools.keys()].some((name) => DELEGATION_TOOLS.includes(name)))
+		.filter((extension) => extension.path !== NESTED_PATH && ([...extension.tools.keys()].some((name) => DELEGATION_TOOLS.includes(name)) || bringsMom(extension)))
 		.map((extension) => extension.path));
 	const extensions = base.extensions.filter((extension) => !copies.has(extension.path));
 	for (const extension of extensions) {
@@ -400,8 +456,49 @@ export const CHILD_SETTLED_PROMPT = "A child you delegated has settled; its repo
  */
 function deliver(owner: Owner, message: Notice, retry: () => void) {
 	if (!owner.binding || owner.closed) return;
-	if (owner.parentRun) wakeChild(owner.parentRun, message, retry);
-	else owner.binding.pi.sendMessage(message, { deliverAs: "followUp", triggerTurn: true });
+	if (owner.parentRun) { wakeChild(owner.parentRun, message, retry); return; }
+	// A run the person started with /delegate reports to them: shown, and in context for the next turn,
+	// without spending a model turn on it.
+	if ((message.details as any)?.userStarted) { owner.binding.pi.sendMessage(message, { triggerTurn: false }); return; }
+	// A steer reaches the parent at once: an idle one starts a turn, and a busy one reads it at its next
+	// model request, inside the run it is in. A follow-up would wait for that run to end, however long it runs.
+	inFlight(owner).set(noticeKey(message), message);
+	owner.binding.pi.sendMessage(message, { deliverAs: "steer", triggerTurn: true });
+}
+
+/** A notice's identity: its run and segment (an ACP run's turn count stands in for a segment). */
+const noticeKey = (message: Notice) => { const d = message.details as any; return `${d?.id}:${d?.segment ?? d?.turns?.length ?? ""}`; };
+/**
+ * Completion notices sent to the root parent and not yet in its conversation. Pi drops queued extension
+ * messages when the person aborts the run (it clears its queues), so whatever is still here when the
+ * run settles is sent again: see redeliver.
+ */
+const inFlightNotices = new WeakMap<Owner, Map<string, Notice>>();
+function inFlight(owner: Owner): Map<string, Notice> {
+	let map = inFlightNotices.get(owner);
+	if (!map) inFlightNotices.set(owner, map = new Map());
+	return map;
+}
+/**
+ * The parent's run settled with notices that never reached its conversation. After an abort they are
+ * appended without a turn, shown and in context for the next prompt, as the person stopped the run;
+ * otherwise they start the turn they were sent to start.
+ */
+function redeliver(owner: Owner, aborted: boolean) {
+	if (!inFlight(owner).size) return;
+	// The conversation is the record: a notice it holds was delivered, whichever way it got there (a
+	// directly appended message raises no extension event).
+	const recorded = new Set((owner.binding?.ctx.sessionManager.getEntries() ?? [])
+		.filter((entry: any) => entry.type === "custom_message" && entry.customType === "delegate")
+		.map((entry: any) => noticeKey({ details: entry.details } as Notice)));
+	const lost = [...inFlight(owner).values()].filter((message) => !recorded.has(noticeKey(message)));
+	inFlight(owner).clear();
+	if (!lost.length || !owner.binding || owner.closed) return;
+	const { pi } = owner.binding;
+	for (const message of lost) {
+		if (!aborted) inFlight(owner).set(noticeKey(message), message);
+		pi.sendMessage(message, aborted ? { triggerTurn: false } : { deliverAs: "steer", triggerTurn: true });
+	}
 }
 
 const takesFollowUp = (run: Run) => run.status === "running" && !run.completion.settled && Boolean(run.session?.isStreaming);
@@ -546,9 +643,28 @@ function resolveModel(spec: string | undefined, ctx: ExtensionContext) {
 	const reg: any = ctx.modelRegistry;
 	// A named provider is a choice between offerings of the same weights, not a search key:
 	// resolving it to another provider would silently change cost, limits, and serving.
-	const model = p.provider ? reg.find(p.provider, p.id) : reg.getAll().find((m: any) => m.id === p.id);
+	// A bare id is any provider's offering of it: prefer one the session has credentials for.
+	const model = p.provider ? reg.find(p.provider, p.id) : (reg.getAvailable?.() ?? []).find((m: any) => m.id === p.id) ?? reg.getAll().find((m: any) => m.id === p.id);
 	if (!model) throw new Error(`model not found: ${spec}`);
 	return { model, thinking: p.thinking };
+}
+
+/**
+ * A role's own models. One entry is a pin: it resolves as an explicit model does, whatever Pi's scope.
+ * Several are a preference order: the first with credentials (and, with `scoped` picking, in Pi's
+ * scoped models) wins, and the run records which and why earlier entries were skipped. None usable is
+ * an error naming each reason: a role that lists models never silently falls back to the parent's.
+ * No list at all runs on the parent's model.
+ */
+function resolveRoleModels(models: readonly string[] | undefined, ctx: ExtensionContext): { model: any; thinking?: string; pick?: string } {
+	if (!models?.length) return { model: ctx.model };
+	if (models.length === 1) return resolveModel(models[0], ctx);
+	const reg: any = ctx.modelRegistry;
+	const scoped = ((ctx as ExtensionContext & { scopedModels?: readonly { model: any }[] }).scopedModels ?? []).map((s) => s.model);
+	const picked = pickModel(models, reg.getAvailable?.() ?? [], scoped, readDelegateSettings(SETTINGS_PATH).modelPicking);
+	if (!picked.model) throw new Error(`none of the role's models can be used: ${picked.skipped.join("; ")}`);
+	const pick = picked.skipped.length ? `${picked.entry} (role list; skipped ${picked.skipped.join("; ")})` : `${picked.entry} (first of the role list)`;
+	return { model: picked.model, thinking: picked.thinking, pick };
 }
 
 /** Dirty paths (tracked+untracked) → mtime, or undefined when cwd is not a git work tree. */
@@ -1092,6 +1208,8 @@ function view(run: Run): RunView {
 		sessionFile: run.sessionFile,
 		depth: run.depth,
 		...(run.parentRunId ? { parentRunId: run.parentRunId } : {}),
+		...(run.endedAt ? { endedAt: run.endedAt } : {}),
+		...(run.userStarted ? { userStarted: true as const } : {}),
 	};
 }
 
@@ -1120,12 +1238,13 @@ function summary(run: Run): string {
 	}
 	if (run.providerRetryMs) s += `\nprovider retry wall ${Math.round(run.providerRetryMs / 1000)}s; separate from task and tool time.`;
 	if (run.failedAttempts) s += `\n${run.failedAttempts} provider attempt${run.failedAttempts === 1 ? "" : "s"} failed and were retried before this (last: ${run.lastAttemptError}) — that wall clock and any tokens are included above.`;
+	if (run.modelPick) s += `\nmodel picked: ${run.modelPick}`;
 	if (run.sessionFile) s += `\nsession: ${run.sessionFile}`;
 	s += `\nproject ${run.projectTrusted ? "trusted" : "untrusted"} (trust source: ${run.projectTrustSource})`;
 	if (run.projectTrustUnknown) s += `\n${TRUST_UNKNOWN}`;
-	if (run.parentRunId) s += `\nstarted by ${run.parentRunId} · depth ${run.depth} of ${MAX_DELEGATION_DEPTH}`;
+	if (run.parentRunId) s += `\nstarted by ${run.parentRunId} · depth ${run.depth} of ${maxDepth()}`;
 	if (run.extensionErrors?.length) s += `\nextensions that failed in the child (it ran without them):\n  ${run.extensionErrors.join("\n  ")}`;
-	if (run.droppedTools.length) s += `\ntools the child could not have (a child gets the tools its parent's extensions and MCP tools provide, limited to its role's tools; no delegate or delegate_ctl at depth ${MAX_DELEGATION_DEPTH}; no todo): ${run.droppedTools.join(", ")}`;
+	if (run.droppedTools.length) s += `\ntools the child could not have (a child gets the tools its parent's extensions and MCP tools provide, limited to its role's tools; no delegate or delegate_ctl at the depth limit, ${maxDepth()}; no todo): ${run.droppedTools.join(", ")}`;
 	if (run.changedFiles.length) s += `\nchanged: ${run.changedFiles.join(", ")}`;
 	if (run.error) s += `\nerror: ${run.error}`;
 	return s;
@@ -1291,6 +1410,9 @@ function acknowledge(owner: Owner, details: any) {
 async function closeOwner(owner: Owner) {
 	owner.binding = undefined;
 	owner.closed = true;
+	// A delegating child's runs outlive its session in the root's view; a root's take its whole tree along.
+	const closing = ownedRuns(owner);
+	if (owner.parentRun) departed.set(owner.parentRun.id, { pi: closing.filter((run) => !run.foreign), acp: departed.get(owner.parentRun.id)?.acp ?? [] });
 	await Promise.all(ownedRuns(owner).map(async (run) => {
 		if (!run.foreign) {
 			await closeChildOwner(run);
@@ -1307,6 +1429,22 @@ async function closeOwner(owner: Owner) {
 		runs.delete(run.id);
 	}));
 	state.owners.delete(owner.key);
+	// After its children's sessions closed (each kept its runs above): a root's tree goes with it.
+	if (!owner.parentRun) for (const run of closing) forgetDeparted(run.id);
+}
+
+/**
+ * The user's limit on runs running at once (`maxConcurrent`), across every parent in this process and
+ * both backends, grandchildren included. Over it, a start or revival is refused, never queued: a queued
+ * child would make a background launch's "running" untrue, and the caller can wait for one to finish.
+ */
+function capacityError(): DelegateError | undefined {
+	const limit = readDelegateSettings(SETTINGS_PATH).maxConcurrent;
+	if (!limit) return undefined;
+	const pi = [...runs.values()].filter((r) => !r.foreign && !r.completion.settled).length;
+	const running = pi + runningAcpRuns();
+	if (running < limit) return undefined;
+	return new DelegateError("CONCURRENCY_LIMIT", `${running} runs are already running, the limit set in /delegate settings is ${limit}. Wait for one to finish (delegate_ctl wait), then start this one; nothing was started.`);
 }
 
 /** Reserve a segment before awaiting setup: concurrent steers cannot create duplicate sessions. */
@@ -1403,6 +1541,8 @@ const rebinds = (run: Run, replacement?: Replacement) =>
 function beginResume(run: Run, restart: boolean, replacement?: Replacement) {
 	if (!run.completion.settled) throw new Error(`${run.id} is still stopping; wait for completion before resuming.`);
 	if (run.stopped && !restart) throw new Error(`${run.id} was explicitly stopped. Restart only at the user's request (steer with restart: true).`);
+	const full = capacityError();
+	if (full) throw full;
 	if (run.writer) {
 		const clash = [...runs.values()].find((r) => r !== run && !r.completion.settled && r.writer && r.cwd === run.cwd);
 		if (clash) throw new Error(`${clash.id} is already writing in ${run.cwd}; wait before resuming this child.`);
@@ -1527,9 +1667,15 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 	// Canonical phased todo (transferred from pi-omp; see todo-ext.ts). The reminder reads this
 	// parent's live children: while one is unsettled its completion message re-wakes the loop,
 	// so an incomplete-todo nag at agent_end would be premature.
+	/** A wait returns early while a completion notice is on its way into this turn, so the model reads it. */
+	const noticePending = () => Boolean(owner && inFlight(owner).size);
 	const busy = (target: Owner) => ownedRuns(target).some((run) => !run.completion.settled) || acp.owned(target.key).some((run) => run.status === "running");
 	// A delegating child gets the delegation pair only; the todo tool stays the root parent's.
-	if (!nesting) installTodo(pi, { hasActiveJobs: () => Boolean(owner && !owner.closed && busy(owner)), activity });
+	if (!nesting) installTodo(pi, {
+		hasActiveJobs: () => Boolean(owner && !owner.closed && busy(owner)),
+		remindersEnabled: () => readTodoSettings(SETTINGS_PATH).reminders,
+		activity,
+	});
 	function requireOwner(): Owner {
 		if (!owner || owner.closed || owner.binding?.pi !== pi) throw new Error(attachError ?? "Delegate runtime is not attached to this parent.");
 		return owner;
@@ -1576,6 +1722,12 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		const bound = owner;
 		if (nesting) bound.parentRun = nesting;
 		bound.resume = (run, message) => steer(run, message);
+		bound.steerFromUser = (run, message) => steer(run, message, true);
+		bound.acp = acp;
+		bound.reopen = (run) => openSession(run);
+		if (!nesting) bound.live = liveSource;
+		// This delegating child's runs are live again, restored from their records.
+		else departed.delete(nesting.id);
 		bound.busy = () => busy(bound);
 		bound.detach = () => shutdown("quit");
 		attachError = undefined;
@@ -1620,23 +1772,108 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		const completion = run.completion;
 		void launch(run, message).then(() => publish(completion));
 	}
+	/**
+	 * This parent's whole tree, in tree order: each run, then the runs it started, while its children's
+	 * owner is attached. A nested run's view carries its depth and parentRunId; an ACP run takes its owner's level.
+	 */
+	const treeViews = (root: Owner): RunView[] => {
+		const out: RunView[] = [];
+		const walk = (target: Owner, level: number) => {
+			for (const run of ownedRuns(target).sort((a, b) => a.startedAt - b.startedAt)) {
+				out.push(view(run));
+				const nested = childOwner(run);
+				if (nested) walk(nested, level + 1);
+				else gone(run.id, level + 1);
+			}
+			const parentRunId = target.parentRun?.id;
+			out.push(...acp.owned(target.key).map((v) => level === 1 ? acpRowView(v) : { ...acpRowView(v), depth: level, ...(parentRunId ? { parentRunId } : {}) }));
+		};
+		// Runs whose delegating child's session closed: listed as they were left, in the same place.
+		const gone = (parentRunId: string, level: number) => {
+			const entry = departed.get(parentRunId);
+			if (!entry) return;
+			for (const run of [...entry.pi].sort((a, b) => a.startedAt - b.startedAt)) { out.push(view(run)); gone(run.id, level + 1); }
+			out.push(...entry.acp.map(({ view: v }) => ({ ...acpRowView(v), depth: level, parentRunId })));
+		};
+		walk(root, 1);
+		return out;
+	};
+	/**
+	 * Reopen the session of the delegating run that held departed run `id` (and, first, its own delegating
+	 * run's, when that one departed too), so `id` is live again in its owner, restored from its record.
+	 * Nothing runs: the delegating child's session opens, its children reattach, and the steer follows.
+	 */
+	const revive = async (id: string): Promise<void> => {
+		const found = findDeparted(id);
+		if (!found) return;
+		await closingChildren.get(found.parentId)?.catch(() => undefined);
+		let parent = runs.get(found.parentId);
+		if (!parent && findDeparted(found.parentId)) { await revive(found.parentId); parent = runs.get(found.parentId); }
+		if (!inTree(parent)) throw new Error(`${id}: the child that started it is no longer in this session's tree`);
+		const reopen = state.owners.get(parent.ownerKey)?.reopen;
+		if (!reopen) throw new Error(`${id}: ${parent.id}'s owner is not attached; steer ${parent.id} instead`);
+		await reopen(parent);
+		if (findDeparted(id)) throw new Error(`${id}: ${parent.id} reopened without restoring it`);
+	};
+	/**
+	 * The owner in this parent's tree that owns ACP run `id`, with the backend that may act on it: this
+	 * binding's for its own runs, a delegating child's binding's for the runs that child started.
+	 */
+	const acpOwner = (id: string): AcpBackend | undefined => {
+		if (!owner) return undefined;
+		const search = (target: Owner): AcpBackend | undefined => {
+			if (acp.find(id, target.key)) return target === owner ? acp : target.acp;
+			for (const run of ownedRuns(target)) {
+				const nested = childOwner(run);
+				const found = nested && search(nested);
+				if (found) return found;
+			}
+			return undefined;
+		};
+		return search(owner);
+	};
+	/** A pi run anywhere in this parent's tree: its owner chain ends at this parent's owner. */
+	const inTree = (run: Run | undefined): run is Run => {
+		for (let key = run?.ownerKey; key;) {
+			if (key === owner?.key) return true;
+			key = state.owners.get(key)?.parentRun?.ownerKey;
+		}
+		return false;
+	};
 	const liveSource: LiveSource = {
-		all: () => owner ? [...ownedRuns(owner).map(view), ...acp.owned(owner.key).map(acpRowView)] : [],
+		all: () => owner ? treeViews(owner) : [],
 		activity: (id) => {
 			const r = runs.get(id);
-			if (r && r.ownerKey === owner?.key) return activityOf(r);
-			return owner && acp.find(id, owner.key) ? acp.activity(id) : { messages: [], activeTools: new Map() };
+			if (inTree(r)) return activityOf(r);
+			const backend = acpOwner(id);
+			if (backend) return backend.activity(id);
+			const gone = findDeparted(id);
+			return gone?.run ? activityOf(gone.run) : gone?.acp?.activity ?? { messages: [], activeTools: new Map() };
 		},
 		subscribe: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
 		steer: async (id, message) => {
-			if (acp.find(id, requireOwner().key)) { await acp.steer(id, { message }); return; }
+			requireOwner();
+			// As a root's settled child is revived by a steer: reopen what held it first, then steer it live.
+			if (!runs.has(id) && !acpOwner(id) && findDeparted(id)) await revive(id);
+			const backend = acpOwner(id);
+			if (backend) {
+				if ((await backend.result(id)).status !== "running") { const full = capacityError(); if (full) throw full; }
+				await backend.steer(id, { message }); return;
+			}
 			const r = runs.get(id);
-			if (!r || r.ownerKey !== requireOwner().key) throw new Error(`${id}: child is not owned by this parent`);
-			await steer(r, message, true); // A message typed directly by the human is an explicit restart request.
+			if (!inTree(r)) throw new Error(`${id}: child is not in this parent's tree`);
+			// A message typed directly by the human is an explicit restart request. A nested run is steered
+			// by the delegating child's binding, which owns its session and its revival.
+			if (r.ownerKey === requireOwner().key) { await steer(r, message, true); return; }
+			const steerer = state.owners.get(r.ownerKey)?.steerFromUser;
+			if (!steerer) throw new Error(`${id}: its delegating child's session is not open; steer that child instead`);
+			await steerer(r, message);
 		},
 		cancel: async (id) => {
-			if (acp.find(id, requireOwner().key)) { await acp.cancel(id, {}); return; }
-			const r = runs.get(id); if (r?.ownerKey === requireOwner().key) await cancelRun(r);
+			requireOwner();
+			const backend = acpOwner(id);
+			if (backend) { await backend.cancel(id, {}); return; }
+			const r = runs.get(id); if (inTree(r)) await cancelRun(r);
 		},
 	};
 	pi.on("message_end", (event) => {
@@ -1867,7 +2104,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			unwrap(requireAction(PI_CAPABILITIES, "wait"));
 			piRuns.set(id, run);
 		}
-		if (!piRuns.size) return acpWaitResult(await acp.wait({ runIds: acpIds, mode, ...(timeoutMs !== undefined ? { timeoutMs } : {}) }, signal, () => ctx.hasPendingMessages()), ids, timeoutMs);
+		if (!piRuns.size) return acpWaitResult(await acp.wait({ runIds: acpIds, mode, ...(timeoutMs !== undefined ? { timeoutMs } : {}) }, signal, () => (ctx.hasPendingMessages() || noticePending())), ids, timeoutMs);
 		if (signal?.aborted) throw new DOMException("Wait cancelled; the runs are unaffected.", "AbortError");
 		const join = acp.join(acpIds);
 		let wake = () => {};
@@ -1892,7 +2129,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 				};
 				if (mode === "any" ? settled.length > 0 : settled.length === rows.length) return await end("settled");
 				if (signal?.aborted) { aborted = true; throw new DOMException("Wait cancelled; the runs are unaffected.", "AbortError"); }
-				if (ctx.hasPendingMessages()) return await end("interrupted");
+				if ((ctx.hasPendingMessages() || noticePending())) return await end("interrupted");
 				if (coordinatorLost) return await end("lost", "the ACP coordinator (it is shutting down, or another process owns these runs); not settled");
 				// A terminal status that never settles is a child that stopped without reporting completion (see waitForChild).
 				for (const [id, run] of piRuns) {
@@ -1927,7 +2164,8 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		}
 	}
 
-	pi.registerTool({
+	// Held by name so /delegate fork:|fresh: starts a run through the very same path as the tool.
+	const delegateTool = {
 		name: "delegate",
 		renderCall: () => empty(),
 		renderResult: resultRenderer("delegate"),
@@ -1938,7 +2176,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			"Delegate only for context isolation, parallelism, or a model-tier switch — if the brief would be longer than the expected diff, do the work yourself. " +
 			"Start the brief with a short task title on its own line, then objective, ownership, interfaces/constraints, verification, return shape. " +
 			'context "fork" (default) hands the child your conversation so far; "fresh" is for adversarial review. ' +
-			"Runs in the background by default \u2014 the call returns a run id at once and you are woken once, when the child finishes. There are no progress pings by design; waiting is not your work. Do other work, or use delegate_ctl wait with that runId to block without polling when nothing else can proceed, or delegate_ctl status for a single progress read when someone asks. A launch never joins the child; use delegate_ctl wait only when dependent work needs its result. A child re-binds the extensions your session loaded and calls your session's MCP tools, and gets their tools (built-ins, extension tools, mcp__<server>__<tool>, delegate and delegate_ctl), limited to its role's tools list; at depth " + MAX_DELEGATION_DEPTH + ", the cap, it gets no delegate or delegate_ctl. Model: run delegate_ctl models first; a role's approved default is used when model: is omitted. Proposing a model that is not the approved default is a conversation with the user, not a tool step: state the offering, price, rating and tradeoff, get their answer, then call delegate; if they want it kept, delegate_ctl action=approve. Use delegate_ctl to list roles, wait, check status, steer, or cancel. " +
+			"Runs in the background by default \u2014 the call returns a run id at once and you are woken once, when the child finishes. There are no progress pings by design; waiting is not your work. Do other work, or use delegate_ctl wait with that runId to block without polling when nothing else can proceed, or delegate_ctl status for a single progress read when someone asks. A launch never joins the child; use delegate_ctl wait only when dependent work needs its result. A child re-binds the extensions your session loaded and calls your session's MCP tools, and gets their tools (built-ins, extension tools, mcp__<server>__<tool>, delegate and delegate_ctl), limited to its role's tools list; at the depth limit (" + MAX_DELEGATION_DEPTH + " unless the user changed it) it gets no delegate or delegate_ctl. Model: run delegate_ctl models first; when model: is omitted a role's approved default is used, else the first usable entry of the role's model list. Starts beyond the user's limit on running children fail with CONCURRENCY_LIMIT: wait for one to finish. Proposing a model that is not the approved default is a conversation with the user, not a tool step: state the offering, price, rating and tradeoff, get their answer, then call delegate; if they want it kept, delegate_ctl action=approve. Use delegate_ctl to list roles, wait, check status, steer, or cancel. " +
 			'backend "acp" runs an external ACP agent session instead (agent required, e.g. "pi", "amp", "codex", "claude"): it creates a session and sends task as its first turn, or with sessionId opens that exact native session (an Amp T-ID, say) without owning it and sends task only when given. ' +
 			"An ACP child never receives your conversation (no context), and an opened session keeps its native role and model. Its report carries the agent's native session ID and each turn's request ID and delivery. Close an ACP run with delegate_ctl close when done.",
 		parameters: Type.Object({
@@ -1956,15 +2194,19 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			executionEnvironment: Type.Optional(Type.String({ description: 'acp only: "local" or "orb". Creating: where the session runs. Opening (Amp only): a verification hint' })),
 			mode: Type.Optional(Type.String({ description: 'acp + amp only, created threads: Amp\'s agent mode (low, medium, high, ultra or a plugin mode), used for every turn. Not with model or sessionId' })),
 		}),
-		async execute(_id, params, signal, onUpdate, ctx) {
+		async execute(_id: string, params: any, signal: AbortSignal | undefined, onUpdate: any, ctx: ExtensionContext): Promise<any> {
 			remember(ctx);
 			const start = validateStartInput(params as Record<string, unknown>);
 			if (!start.ok) return failed(new DelegateError(start.error.code, start.error.message, start.error.field));
 			// A session at the cap is launched without delegation tools. This check is the backstop for any
 			// session that still has them; it covers both backends, since a child here would run at depth + 1.
-			if (depth + 1 > MAX_DELEGATION_DEPTH) {
-				return failed(new DelegateError("DEPTH_EXCEEDED", `delegation depth cap is ${MAX_DELEGATION_DEPTH}: you run at depth ${depth}, so a child would run at depth ${depth + 1}. Do this work yourself with your own tools.`));
+			const cap = maxDepth();
+			if (depth + 1 > cap) {
+				return failed(new DelegateError("DEPTH_EXCEEDED", `delegation depth cap is ${cap}: you run at depth ${depth}, so a child would run at depth ${depth + 1}. Do this work yourself with your own tools.`));
 			}
+			if (!nesting && mode() === "off") return failed(new DelegateError("DELEGATION_OFF", "delegation is turned off in the pi-delegate settings (/delegate settings). Do this work yourself."));
+			const full = capacityError();
+			if (full) return failed(full);
 			if (start.value.backend === "acp") {
 				const input = start.value;
 				try {
@@ -1984,6 +2226,10 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			const { trusted: projectTrusted, source: projectTrustSource } = await decideTrust(cwd, ctx, signal);
 			// Aborted while the trust question was open or queued: start nothing.
 			if (signal?.aborted) return failed(new DelegateError("ABORTED", "the delegate call was aborted before the child started; nothing was started"));
+			// Again, after the trust await: parallel delegate calls each passed the first check before any of
+			// them existed. From here to runs.set nothing awaits, so this count includes every earlier start.
+			const stillFull = capacityError();
+			if (stillFull) return failed(stillFull);
 			const roles = loadRoles(cwd, projectTrusted);
 			const role = roles.get(p.role);
 			if (!role) {
@@ -1992,14 +2238,17 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 					isError: true, details: undefined,
 				};
 			}
-			// Model: explicit param, else the role's approved default, else the role file, else the parent's.
+			// Model: explicit param, else the role's approved default, else the role's model list, else the parent's.
 			const approved = loadDefaults().approved[role.name];
-			const { model, thinking: specThinking } = resolveModel(p.model ?? approved?.spec ?? role.model, ctx);
+			let resolved: { model: any; thinking?: string; pick?: string };
+			try { resolved = p.model ?? approved?.spec ? resolveModel(p.model ?? approved!.spec, ctx) : resolveRoleModels(role.models, ctx); }
+			catch (error) { return failed(new DelegateError("MODEL_UNAVAILABLE", error instanceof Error ? error.message : String(error), "model")); }
+			const { model, thinking: specThinking, pick: modelPick } = resolved;
 			if (!model) return { content: [{ type: "text", text: "no model available for child" }], isError: true, details: undefined };
 			const thinking = String(specThinking ?? (p.model ? undefined : approved?.spec.split(":")[1]) ?? role.thinking ?? ctx.thinkingLevel ?? "");
 			const timeoutMs = p.timeoutMs ?? role.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 			// A child at the cap could only fail its delegate calls, so it gets no delegation tools at all.
-			const atDepthCap = depth + 1 >= MAX_DELEGATION_DEPTH;
+			const atDepthCap = depth + 1 >= cap;
 			const tools = [...(role.tools ?? EVERY_TOOL)];
 			const withheld = atDepthCap ? [...DELEGATION_TOOLS] : undefined;
 			const { allows } = toolAllowlist(tools, withheld);
@@ -2009,8 +2258,8 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			const runtime = (start.value as PiStartInput).runtime ?? role.runtime ?? "in-process";
 			// An oven slice runs outside this process and never receives the conversation, as an ACP child.
 			const context = runtime === "oven" ? "fresh" : p.context ?? role.context ?? "fork";
-			const systemPrompt = role.systemPrompt + (role.systemPrompt.includes("STATUS:") ? "" : contractFooter(delegates, atDepthCap && toolAllowlist(tools).allows("delegate")))
-				+ (delegates ? childrenFooter(depth + 1) : "") + (context === "fork" ? FORK_FOOTER : "");
+			const systemPrompt = role.systemPrompt + (role.systemPrompt.includes("STATUS:") ? "" : contractFooter(delegates, atDepthCap && toolAllowlist(tools).allows("delegate"), cap))
+				+ (delegates ? childrenFooter(depth + 1, cap) : "") + (context === "fork" ? FORK_FOOTER : "");
 			// An oven slice writes in its own copy, never in this tree.
 			if (isWriter && runtime !== "oven") {
 				const clash = [...runs.values()].find((r) => !r.completion.settled && r.writer && r.cwd === cwd);
@@ -2067,6 +2316,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 				...(runtime === "oven" ? { runtime: "oven" as const, extensions: role.extensions ?? [] } : {}),
 				projectTrusted,
 				projectTrustSource,
+				...(modelPick ? { modelPick } : {}),
 			};
 			linkParent(run, ctx);
 			const loader = run.runtime === "oven" ? undefined : childLoader(run, SettingsManager.create(cwd, AGENT_DIR, { projectTrusted }), false);
@@ -2102,7 +2352,8 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			void launch(run, p.task, onUpdate, loader).then(() => publish(completion));
 			return { content: [{ type: "text", text: `${run.id} running (${run.runtime === "oven" ? "oven slice" : run.context}, ${run.model}). Completion will wake you; use delegate_ctl wait with this runId when dependent work needs the result.` }], details: recordedView(run) };
 		},
-	});
+	};
+	pi.registerTool(delegateTool);
 
 const WAIT_POLL_MS = 1000;
 /**
@@ -2141,7 +2392,7 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 		unsubscribe = run.completion.subscribe((value) => finish(() => resolve(value)));
 		if (done) return;
 		poll = setInterval(() => {
-			if (ctx.hasPendingMessages()) { finish(() => resolve(interrupted)); return; }
+			if ((ctx.hasPendingMessages() || noticePending())) { finish(() => resolve(interrupted)); return; }
 			// Terminal status without settle = a failure path that set status but never completed
 			// (see the child-state save catch). Two consecutive polls ride out finishRun's
 			// async persistence gap so a normal completion cannot false-positive.
@@ -2319,7 +2570,7 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 				// The tools a child started from here would be offered: this session's, or, in a delegating child,
 				// what its own session was offered. The todo tool stays with the root parent.
 				const offered = (nesting ? [...(nesting.offered ?? [])] : pi.getAllTools().map((tool) => tool.name)).filter((name) => name !== "todo");
-				const withheld = depth + 1 >= MAX_DELEGATION_DEPTH ? DELEGATION_TOOLS : [];
+				const withheld = depth + 1 >= maxDepth() ? DELEGATION_TOOLS : [];
 				const rows = roles.map((r) => {
 					const tools = r.tools ?? EVERY_TOOL;
 					const { allows } = toolAllowlist(tools, withheld);
@@ -2373,11 +2624,12 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 						}
 						case "result": return acpRunResult(await read(() => acp.result(id)));
 						case "wait": {
-							const outcome = await acp.wait({ runIds: [id], mode: "all", ...(p.timeoutMs !== undefined ? { timeoutMs: p.timeoutMs } : {}) }, signal, () => ctx.hasPendingMessages());
+							const outcome = await acp.wait({ runIds: [id], mode: "all", ...(p.timeoutMs !== undefined ? { timeoutMs: p.timeoutMs } : {}) }, signal, () => (ctx.hasPendingMessages() || noticePending()));
 							return await acpWaitResult(outcome, [id], p.timeoutMs);
 						}
 						case "steer": {
 							const current = await acp.result(id);
+							if (current.status !== "running") { const full = capacityError(); if (full) return failed(full); }
 							const request = unwrap(validateSteer({ backend: "acp", origin: current.session.origin, agent: current.session.agent }, p as Record<string, unknown>));
 							const v = await acp.steer(id, request);
 							const queued = v.session.origin === "opened" && v.session.agent.toLowerCase() === "amp" && v.turns.at(-1)?.status === "running";
@@ -2424,6 +2676,8 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 					}
 					if (p.timeoutMs !== undefined) replacement = { ...replacement, timeoutMs: p.timeoutMs };
 					const previous = `${run.model}${run.thinking ? `:${run.thinking}` : ""}`;
+					// The model steered it: its completion wakes the model, whoever started it.
+					if (run.userStarted) { run.userStarted = undefined; saveRun(run); }
 					await steer(run, p.message, p.restart, replacement);
 					const moved = replacement?.model ? ` Model changed from ${previous} to ${run.model}${run.thinking ? `:${run.thinking}` : ""} for this and later segments; its earlier work keeps the model it ran on.` : "";
 					const retimed = replacement?.timeoutMs !== undefined ? ` Budget now ${Math.round(run.timeoutMs / 60000)} min for this and later segments.` : "";
@@ -2442,8 +2696,86 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 		return framed((width) => resultLines(shown, expanded, theme, width));
 	});
 
+	const PARKED = "pi-delegate.parked";
+	const baseDescription = delegateTool.description;
+	let describedMode: string | undefined;
+	/**
+	 * Apply the root's delegation mode. `off` parks the delegation tools (takes them out of the active
+	 * set); another mode brings back only what was parked, so a tool the person turned off themselves
+	 * stays off. The parked set is a session entry on the branch, so a restart or /tree, which restore
+	 * the active tools from the transcript, still knows what to bring back. The orchestrator
+	 * instruction is the delegate tool's description, re-registered only when the mode changes.
+	 */
+	function syncMode(ctx: ExtensionContext) {
+		const current = mode();
+		const orchestrating = current === "orchestrator";
+		if (describedMode === undefined ? orchestrating : (describedMode === "orchestrator") !== orchestrating) {
+			delegateTool.description = baseDescription + (orchestrating ? ORCHESTRATOR_PROMPT : "");
+			pi.registerTool(delegateTool);
+		}
+		describedMode = current;
+		const entry = ctx.sessionManager.getBranch().findLast((e: any) => e.type === "custom" && e.customType === PARKED) as any;
+		const parked: string[] = Array.isArray(entry?.data?.tools) ? entry.data.tools.filter((name: unknown) => DELEGATION_TOOLS.includes(name as string)) : [];
+		const active = pi.getActiveTools();
+		if (current === "off") {
+			const drop = active.filter((name) => DELEGATION_TOOLS.includes(name));
+			if (!drop.length) return;
+			pi.setActiveTools(active.filter((name) => !drop.includes(name)));
+			pi.appendEntry(PARKED, { tools: [...new Set([...parked, ...drop])] });
+		} else if (parked.length) {
+			pi.setActiveTools([...active, ...parked.filter((name) => !active.includes(name))]);
+			pi.appendEntry(PARKED, { tools: [] });
+		}
+	}
 	let navigationOpen = false;
 	const childDrafts = new Map<string, string>();
+	/** The roles page: what a delegate call without model: would run on now, and where each role comes from. */
+	function roleLines(ctx: ExtensionContext): string[] {
+		const roles = [...loadRoles(ctx.cwd, ctx.isProjectTrusted()).values()].sort((a, b) => a.name.localeCompare(b.name));
+		const approved = loadDefaults().approved;
+		const lines = roles.flatMap((r) => {
+			let now: string;
+			try {
+				const resolved: { model: any; pick?: string } = approved[r.name] ? resolveModel(approved[r.name].spec, ctx) : resolveRoleModels(r.models, ctx);
+				now = `${resolved.model ? modelKey(resolved.model) : "no model"}${approved[r.name] ? " (approved default)" : r.models?.length ? resolved.pick ? ` — ${resolved.pick}` : " (role file)" : " (this session's model)"}`;
+			} catch (error) { now = `unavailable: ${error instanceof Error ? error.message : String(error)}`; }
+			return [`${r.name} — ${r.description}`,
+				`  models: ${r.models?.join(", ") ?? "inherits this session's model"}`,
+				`  runs on now: ${now}`,
+				`  ${r.context ?? "fork"} context${r.thinking ? ` · thinking ${r.thinking}` : ""} · tools: ${r.tools?.join(", ") ?? "every tool"}`,
+				`  ${r.source}`, ""];
+		});
+		return [...lines, "Edit a role's model: line to list models, most preferred first. Roles are read from the package, ~/.pi/agent/agents, ~/.agents/agents and a trusted project's .pi/agents."];
+	}
+	async function openSettings(ctx: ExtensionContext) {
+		if (ctx.mode !== "tui") {
+			const d = readDelegateSettings(SETTINGS_PATH), t = readTodoSettings(SETTINGS_PATH);
+			ctx.ui.notify(`delegate settings: mode ${d.mode} · max depth ${d.maxDepth} · max running ${d.maxConcurrent || "no limit"} · model picking ${d.modelPicking} · todo reminders ${t.reminders ? "on" : "off"} (${SETTINGS_PATH})`, "info");
+			return;
+		}
+		let settings = readDelegateSettings(SETTINGS_PATH);
+		let todoSettings = readTodoSettings(SETTINGS_PATH);
+		await ctx.ui.custom<void>((tui, _theme, _keys, done) => {
+			const rows: SettingsRow[] = [
+				...delegateRows(() => settings, async (change) => { settings = await saveDelegateSettings(change, SETTINGS_PATH); if ("mode" in change) syncMode(ctx); }),
+				...todoRows(() => todoSettings, async (change) => { todoSettings = await saveTodoSettings(change, SETTINGS_PATH); }),
+				{ id: "roles", section: "Agents", label: "Roles", value: () => `${loadRoles(ctx.cwd, ctx.isProjectTrusted()).size} roles`,
+					help: "Each role's model list, the model a delegate call without model: runs on right now, and the file it comes from.",
+					submenu: (close) => textPage("Roles", () => roleLines(ctx), close, Math.max(6, tui.terminal.rows - 12)) },
+				{ id: "mom", section: "Mom", label: "Mom", value: () => activity?.hasMomSettings() ? "settings" : "not connected",
+					help: "Mom's own settings: background tracking, suggestions, continuity, map mode and her models. Esc returns here.",
+					submenu: (close) => activity?.momSettings(ctx, tui, close) ?? textPage("Mom", () => ["Mom is not connected yet. Her settings open here once her saved view has loaded."], close) },
+				{ id: "restore", section: "Reset", label: "Restore defaults", value: () => "",
+					help: "Set delegation and todo settings above back to their defaults. Mom's settings, approved role models and ratings are kept.",
+					action: async () => {
+						settings = await saveDelegateSettings({ ...DEFAULT_DELEGATE_SETTINGS }, SETTINGS_PATH);
+						todoSettings = await saveTodoSettings({ ...DEFAULT_TODO_SETTINGS }, SETTINGS_PATH);
+						syncMode(ctx);
+					} },
+			];
+			return new SettingsPanel("Delegate settings", rows, () => tui.requestRender(), () => done(), Math.max(6, Math.min(16, tui.terminal.rows - 10)));
+		});
+	}
 	async function openChild(ctx: ExtensionContext, id: string) {
 		if (navigationOpen) return;
 		navigationOpen = true;
@@ -2473,11 +2805,32 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 	pi.on("session_start", async (_ev, ctx) => {
 		try { await attach(ctx); }
 		catch (error) { attachError = String(error); ctx.ui.notify(attachError, "error"); return; }
+		if (!nesting) syncMode(ctx);
 		if (ctx.mode !== "tui") return;
 		activity?.install(ctx, liveSource, (id) => openChild(ctx, id));
 	});
 	// A delegating child has no UI: its commands and shortcut stay the root parent's.
 	if (!nesting) {
+		// The mode applies from the next turn the person starts, and at session start: no reload.
+		pi.on("before_agent_start", (_started, ctx) => { syncMode(ctx); });
+		pi.on("tool_call", (event) => {
+			if (mode() === "orchestrator" && WRITE_TOOLS.includes(event.toolName)) {
+				return { block: true, reason: `Delegation mode is orchestrator: the main session does not ${event.toolName} files. Delegate this change to a writer role (delegate), in the background.` };
+			}
+			return undefined;
+		});
+		// A notice is delivered once it is in the conversation. One the run never took in (an abort clears
+		// Pi's queues) is sent again when the run settles: shown without a new turn after an abort.
+		let aborted = false;
+		pi.on("agent_start", () => { aborted = false; });
+		pi.on("message_end", (event) => {
+			const message = event.message as any;
+			if (message.role === "assistant" && message.stopReason === "aborted") aborted = true;
+			if (message.role === "custom" && message.customType === "delegate" && owner) inFlight(owner).delete(noticeKey(message));
+		});
+		pi.on("agent_settled", () => { if (owner?.binding?.pi === pi) redeliver(owner, aborted); });
+		// The person's prompt starts a new stretch of work: the Agents frame stops showing runs that settled before it.
+		pi.on("input", (event) => { if (event.source === "interactive") activity?.markPrompt(); });
 		pi.registerEntryRenderer<DealsDetails>("pi-delegate.deals", (entry, opts, theme) =>
 			framed((width) => resultView("OpenRouter", "deals", "", { content: [], details: entry.data }, opts, theme, width)));
 		pi.registerCommand("deals", {
@@ -2500,6 +2853,33 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 			description: "Open finished delegate history without restarting children",
 			handler: async (_args, ctx) => { await openHistory(ctx); },
 		});
+		pi.registerCommand("delegate", {
+			description: "Delegate settings (mode, limits, model picking, roles, Mom) · fork:<role> <task> · fresh:<role> <task>",
+			getArgumentCompletions: (prefix) => {
+				const ctx = owner?.binding?.ctx;
+				const roles = ctx ? [...loadRoles(ctx.cwd, ctx.isProjectTrusted()).values()].sort((a, b) => a.name.localeCompare(b.name)) : [];
+				const items = [{ value: "settings", label: "settings", description: "Every pi-delegate setting, below the prompt" },
+					...roles.flatMap((r) => (["fork", "fresh"] as const).map((kind) => ({ value: `${kind}:${r.name} `, label: `${kind}:${r.name}`,
+						description: `${kind === "fork" ? "with this conversation" : "no conversation"} · ${r.description}` })))];
+				const matching = items.filter((item) => item.value.startsWith(prefix.trim()));
+				return matching.length ? matching : null;
+			},
+			handler: async (args, ctx) => {
+				const text = args.trim();
+				const launch = /^(fork|fresh):(\S+)\s+([\s\S]+)$/.exec(text);
+				try {
+					if (!text || text === "settings") { await openSettings(ctx); return; }
+					if (!launch) throw new Error("Use /delegate settings, /delegate fork:<role> <task>, or /delegate fresh:<role> <task>.");
+					const [, context, role, task] = launch;
+					// A child calls MCP tools through this session's last tool context; a command has none of its own.
+					if (!toolContext) ctx.ui.notify("This child has no MCP tools: they reach a child through this session's tools, which pi-delegate sees once the model has called delegate or delegate_ctl here.", "warning");
+					const result = await delegateTool.execute("user-command", { role, task, context }, undefined, undefined, ctx);
+					const run = result.details?.id ? runs.get(result.details.id) : undefined;
+					if (run && !result.isError) { run.userStarted = true; saveRun(run); changed(); }
+					ctx.ui.notify(result.content?.[0]?.text ?? "delegate returned nothing", result.isError ? "error" : "info");
+				} catch (error) { ctx.ui.notify(String(error instanceof Error ? error.message : error), "error"); }
+			},
+		});
 		// Ctrl+J is also Pi's default secondary newline (tui.input.newLine), so Pi reports the override
 		// at startup until the user drops ctrl+j from that action in keybindings.json (see README).
 		pi.registerShortcut("ctrl+j", {
@@ -2514,6 +2894,11 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 
 	async function shutdown(reason: string) {
 		activity?.dispose();
+		// A delegating child's ACP runs, as they stand, while its binding can still read them: parking them
+		// waits on the Coordinator, and the root's tree keeps showing them meanwhile.
+		const leaving = reason !== "reload" && owner?.parentRun && owner.binding?.pi === pi
+			? { parentId: owner.parentRun.id, acp: acp.owned(owner.key).map((view) => ({ view, activity: acp.activity(view.id) })) } : undefined;
+		if (leaving) departed.set(leaving.parentId, { pi: departed.get(leaving.parentId)?.pi ?? [], acp: leaving.acp });
 		const previous = owner;
 		owner = undefined;
 		if (!previous || previous.binding?.pi !== pi) return;
@@ -2521,8 +2906,17 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 		// A reload replaces only the binding. Actual exit/session replacement settles and parks children,
 		// and releases this parent's ACP sessions before the Coordinator shuts down.
 		if (reason !== "reload") {
-			await closeOwner(previous);
-			await acp.closeOwner(previous.key);
+			// A revival of this child waits for this close: reopening mid-close would restore ACP runs that
+			// the close then parks out from under the steer.
+			const closed = (async () => {
+				await closeOwner(previous);
+				const parked = await acp.closeOwner(previous.key);
+				// Parked now: show them as they were left.
+				if (leaving && departed.has(leaving.parentId)) departed.set(leaving.parentId, { pi: departed.get(leaving.parentId)!.pi, acp: parked });
+			})();
+			if (leaving) closingChildren.set(leaving.parentId, closed);
+			try { await closed; }
+			finally { if (leaving && closingChildren.get(leaving.parentId) === closed) closingChildren.delete(leaving.parentId); }
 			// The Coordinator is process-wide: it stays while another parent in this process may hold runs on it.
 			if (!state.owners.size) await shutdownAcpCoordinator();
 		}

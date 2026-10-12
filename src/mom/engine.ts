@@ -20,7 +20,7 @@ import { isEndeavor } from "./graph.ts";
 import { Beverly } from "./classify.ts";
 import { COMMIT_GRAPH_MODE, V2_MODE, modeFor } from "./modes.ts";
 import { fromWorkGraph, v2Body, V2_AUDIT_TASK, V2_DIGEST_TASK, V2_UPDATE_TASK, type V2BodyParts } from "./v2.ts";
-import { readSpec } from "./spec.ts";
+import { readSpec, SpecError } from "./spec.ts";
 import { writeMomGlobals } from "./globals.ts";
 import type { SpecOp } from "./v2.ts";
 import { decodeStart, encodeOperation, OPERATION_FAILED, type MomRequest, type OperationHeader, type OperationStart } from "./operation.ts";
@@ -29,6 +29,8 @@ import { currentSession, leadRunning } from "./session-file.ts";
 import { SidecarStore } from "./sidecar.ts";
 import { formatElapsed } from "./status.ts";
 import { collectTurnSignals, lastDirectionOf, MAX_WINDOW_CHECKS, MAX_WINDOW_TURNS, offeredRefs, parseWindowVerdict, renderCorrection, stageOne, windowMessages, windowPurpose } from "./window.ts";
+import { TRAIL_BACKFILL_TASK, TRAIL_DIGEST_TASK, TRAIL_UPDATE_TASK, trailBody } from "../trail/prompt.ts";
+import { TrailStore, trailFor } from "../trail/store.ts";
 
 /** The operation in her slice's current context. */
 export interface OperationState {
@@ -65,6 +67,8 @@ export interface MomStatus {
 	operationTiming?: { startupMs: number; requestMs: number; totalMs: number; oldestEvidenceAgeMs: number };
 	/** Evidence she could not read (a missing worker transcript), and tool calls whose outcome is unknown: for the workspace's Status tab. */
 	unavailable?: string[];
+	/** Why the lead's own transcript cannot be read past some entry: her coverage cannot advance until it is fixed. */
+	blocked?: string;
 	uncertainEffects?: { ref: string; name?: string }[];
 	/** Messages for the user, newest last. */
 	notices: { at: number; text: string; level: "info" | "warning" | "error" }[];
@@ -326,35 +330,49 @@ export async function begin(engine: Engine, api: Durable.ToolExecutionApi, ctx: 
 		}
 		if (request.kind === "resume" && !mom.enabled) { await writeMomGlobals({ enabled: true }); mom = await open(); }
 	}
-	if (!mom.enabled) {
+	if (!mom.enabled && !(start.kind === "request" && start.request.kind === "rebuild")) {
 		await save({ status: "done" });
 		return done("Mom is paused; nothing to do.");
 	}
 	let review: CompactionReview | undefined;
 	try {
+		// The mode in force for this operation. The trail (docs/trail.md) keeps no graph, so the graph-only
+		// requests are refused here, as a recorded fault, before any preparation runs for them.
+		const mode = modeFor(settings.mapMode ?? mom.mode);
+		store.track = mode.name === "trail" ? "trail" : "graph"; // map records this operation writes belong to its mode's coverage track
+		const rebuild = start.kind === "request" && start.request.kind === "rebuild";
+		if (mode.name === "trail" && (relabel || rebuild)) throw new Error("Mom's trail has no work graph to relabel or rebuild; this command applies to the graph modes.");
 		const reviewing = await continuity(mom, start, host(start.session), store, decider);
 		if (reviewing) mom = await open();
-		review = relabel ? undefined : compactionToReview(mom, reader, status);
+		// An explicit update handles the pending evidence now; the post-compaction audit remains queued for background delivery.
+		// The trail audits no compaction: there is no map for a thread-map audit to reconcile against.
+		review = mode.name === "trail" || relabel || (start.kind === "request" && (start.request.kind === "update" || start.request.kind === "rebuild"))
+			? undefined : compactionToReview(mom, reader, status);
 		await writeStatus(engine, api, ctx, current => { current.op = { job, mode: review ? "audit" : "update", startedAt: Date.now(), activity: "reading history" }; });
-		let prepared = await mom.prepare({ refresh: start.kind === "request" && start.request.kind !== "update" && !relabel, review, force: relabel && Boolean(mom.checkpoint), relabel, job, signal: ctx?.abortSignal });
+		let prepared = await mom.prepare({ refresh: start.kind === "request" && start.request.kind !== "update" && !relabel, review, force: relabel && Boolean(mom.checkpoint),
+			forceDigest: start.kind === "request" && start.request.kind === "rebuild", relabel, job, signal: ctx?.abortSignal });
 		while (prepared.kind === "defer") {
 			await writeStatus(engine, api, ctx, current => { current.waitingForWorkers = mom.waitingForWorkers; current.deferredUntil = prepared.kind === "defer" ? prepared.until : undefined; });
 			await sleep(Math.max(250, Math.min(2000, prepared.until - Date.now())), ctx?.abortSignal);
 			lead?.refresh();
-			prepared = await mom.prepare({ refresh: start.kind === "request" && start.request.kind !== "update" && !relabel, review, force: relabel && Boolean(mom.checkpoint), relabel, job, signal: ctx?.abortSignal });
+			prepared = await mom.prepare({ refresh: start.kind === "request" && start.request.kind !== "update" && !relabel, review, force: relabel && Boolean(mom.checkpoint),
+				forceDigest: start.kind === "request" && start.request.kind === "rebuild", relabel, job, signal: ctx?.abortSignal });
 		}
 		status.waitingForWorkers = false; status.deferredUntil = undefined;
 		status.unavailable = [...mom.feed.gaps.values()]; status.uncertainEffects = mom.feed.uncertainEffects();
+		// A worker transcript that went missing is a side note; the lead's own transcript stuck is a stop, said as one.
+		const blocked = mom.feed.gaps.get("parent");
+		if (blocked) status.blocked = `Mom cannot read past an entry of this session: ${blocked}`; else delete status.blocked;
 		if (prepared.kind === "idle") {
 			status.more = false;
 			await save({ status: "done" }, current => { delete current.op; });
 			return done(prepared.reason);
 		}
-		const mode = modeFor(settings.mapMode ?? mom.mode);
 		// Historical catch-up is a chapter-chain thread-map operation. It deliberately uses the
 		// transaction finalizer for this operation, then returns to the saved frontier mode. v2 owns
-		// every write to its map, so it reconciles the digest itself.
-		const operationMode = relabel || (prepared.batch.digest && mode !== V2_MODE) ? COMMIT_GRAPH_MODE : mode;
+		// every write to its map, so it reconciles the digest itself; the trail owns digests and
+		// everything else, since it has no graph for commit_graph to write.
+		const operationMode = mode.name === "trail" ? mode : relabel || (prepared.batch.digest && mode !== V2_MODE) ? COMMIT_GRAPH_MODE : mode;
 		prepared.header.mapMode = operationMode.name;
 		prepared.header.digest = Boolean(prepared.batch.digest);
 		prepared.header.relabel = relabel;
@@ -373,8 +391,15 @@ export async function begin(engine: Engine, api: Durable.ToolExecutionApi, ctx: 
 		if (operationMode === V2_MODE && specSkip) specLog(start.session, { job, ran: true, ops: [], skipped: specSkip });
 		else if (mode.name === "v2" && operationMode !== V2_MODE && start.kind === "delivery")
 			specLog(start.session, { job, ran: true, ops: [], skipped: `mode-${operationMode.name}` });
-		const read = specifiable ? await readSpec(classifier, fromWorkGraph(mom.graph), prepared.batch.events,
-			reason => specLog(start.session, { job, ran: true, ops: [], failOpen: reason })) : undefined;
+		let read;
+		if (specifiable) {
+			try { read = await readSpec(classifier, fromWorkGraph(mom.graph), prepared.batch.events); }
+			catch (error) {
+				const reason = error instanceof SpecError ? error.reason : "classifier-error";
+				specLog(start.session, { job, ran: true, ops: [], failOpen: reason });
+				throw error; // a spec is required: no update runs without one
+			}
+		}
 		if (read) prepared.header.spec = read.ops;
 		let body: Record<string, unknown> = { ...prepared.body, ...(prepared.guidance.trim() ? { guidance: prepared.guidance.trim() } : {}) };
 		if (relabel) body = { task: "Repair the saved work map. Give a decision only for the work that needs one: a concise, meaningful label to keep it, or retired with a short reason. An ID you leave out keeps its saved label. Mom tracks only durable, multi-turn things — retire status questions, one-off meta questions, and instructions the next turn fully satisfied. Keep genuine multi-turn work even when phrased as a question. Never retire settled work or work holding unfinished work. The host preserves sources, structure, notes and obligations.",
@@ -391,12 +416,22 @@ export async function begin(engine: Engine, api: Durable.ToolExecutionApi, ctx: 
 				recovery: prepared.body.recovery as Record<string, unknown> | undefined,
 				guidance: prepared.guidance });
 		}
+		if (operationMode.name === "trail") {
+			// The trail's own body: the evidence and what she already wrote (lines to reuse, ids to link),
+			// read from `session.trail` on the lead's current branch. Nothing of the graph vocabulary.
+			const trail = trailFor(await new TrailStore(() => start.session, reader.getSessionId()).load(), new Set(reader.getBranch().map(entry => entry.id)));
+			body = trailBody({ task: prepared.header.backfilling ? TRAIL_BACKFILL_TASK : prepared.batch.digest ? TRAIL_DIGEST_TASK : TRAIL_UPDATE_TASK,
+				newEvents: prepared.body.newEvents as string,
+				newUserDirections: prepared.body.newUserDirections as { ref: string; text?: string }[] | undefined,
+				trail, recovery: prepared.body.recovery as Record<string, unknown> | undefined, guidance: prepared.guidance });
+		}
 		status.operationTiming = mom.operationTiming;
 		status.more = prepared.header.more;
 		// v2: only a background batch the decision model can read is decided up front. An explicit
 		// request, a correction, a first map, catch-up, an audit, a retry and a recovery all skip the
 		// questions and go straight to her model, which then runs on structural checks alone.
-		const shadow = decider && prepared.kind === "work" && mom.checkpoint && read?.ops.length !== 0 ? await shadowGuesses(decider.client, mom, prepared.batch.events) : undefined;
+		// The trail has no work items to guess about, even when a graph checkpoint survives a mode switch.
+		const shadow = decider && prepared.kind === "work" && mom.checkpoint && read?.ops.length !== 0 && operationMode.name !== "trail" ? await shadowGuesses(decider.client, mom, prepared.batch.events) : undefined;
 		await save({ status: "open", job, header: prepared.header, childUsage: usage.total, baseUsage: mom.usage, ...(shadow ? { shadow } : {}),
 			// Recorded only when her model will run on it: the skip below logs its own `ran: false`, and
 			// one batch must produce exactly one line either way.
@@ -582,7 +617,7 @@ export async function accepted(engine: Engine, api: Durable.ToolExecutionApi, ct
 	const usage = sumUsage(sumUsage(op.baseUsage ?? emptyUsage(), op.childUsage ?? emptyUsage()), { ...turn, elapsedMs: turn.elapsedMs + turnMs });
 	await store.append("usage", { usage, error: null }, `${header.job}:usage`);
 	const reader = currentSession(file);
-	const state = await loadState(store, reader);
+	const state = await loadState(store, reader, { mode: header.mapMode });
 	// The spec read this batch: whether her model then changed the map is what labels the ops.
 	if (op.read) specLog(file, { job: header.job, ran: true, ...op.read, ...(diagnostics?.unmet?.length ? { unmet: diagnostics.unmet } : {}),
 		changed: (await store.load()).some(record => record.id === `${header.job}:map` && record.data.snapshot !== undefined) });

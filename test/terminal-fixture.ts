@@ -1,6 +1,7 @@
 import { appendFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import delegate from "../src/index.ts";
+import { momSettings } from "../src/mom/settings.ts";
 
 /** Commands only control the fixture. All rendering and child work are the actual extension. */
 export default function (pi: any) {
@@ -21,6 +22,12 @@ export default function (pi: any) {
 		writeFileSync(join(root, "parent.json"), JSON.stringify({ file: ctx.sessionManager.getSessionFile() }));
 		ctx.ui.setStatus("fixture", "FIXTURE-READY");
 	});
+	pi.registerCommand("fixture-mom-settings", { handler: async (_args: string, ctx: any) => {
+		await ctx.ui.custom((tui: any, _theme: any, _keys: any, done: () => void) => momSettings(
+			{ enabled: true, inject: false, hush: false, nudgedClasses: [], mode: "", model: "", decider: "" },
+			async () => {}, () => tui.requestRender(), () => done(), 12),
+		{ overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left", margin: 0 } });
+	} });
 	pi.registerCommand("fixture-join", { handler: async (args: string, ctx: any) => {
 		const result = await tools.get("delegate_ctl").execute("fixture", { action: "wait", runId: args.trim() }, undefined, undefined, ctx);
 		trace({ event: "joined", details: result.details });

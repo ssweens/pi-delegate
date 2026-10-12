@@ -4,8 +4,9 @@
  * an operation: `mom_begin` (engine.ts) prepares it and keeps its header in a Durable document; her
  * other tools rebuild the evidence from the lead's session file and her `.mom` file, and keep
  * per-operation progress (pages read, rejections) in a Durable document. Acceptance writes the map record
- * `${job}:map` to the `.mom` file, once. Child steps (audits, checks) carry their header in their first
- * message instead. Only these tools write the `.mom` file.
+ * `${job}:map` to the `.mom` file, once; in trail mode the waypoints go to `session.trail` first and that
+ * record carries only the coverage cursor. Child steps (audits, checks) carry their header in their first
+ * message instead. Only these tools write the `.mom` and `.trail` files on the Oven side.
  *
  * oven calls the default export with its own `@earendil-works/pi-durable`.
  */
@@ -15,18 +16,21 @@ import { Type, type Static } from "typebox";
 import { Check } from "typebox/value";
 import { validateToolArguments } from "@earendil-works/pi-ai/utils/validation";
 import { graphChange, isCheckpoint, loadState, noticeKey, type Checkpoint } from "./checkpoint.ts";
-import { acceptGraph, momTools, validateSearchQuery } from "./contract.ts";
+import { acceptGraph, decodeLists, momTools, validateSearchQuery } from "./contract.ts";
 import { V2_MODE, modeFor } from "./modes.ts";
 import { commitV2Tool } from "./v2.ts";
-import { LiveFeed, type FeedEvent } from "./feed.ts";
+import { isUserDirection, LiveFeed, type FeedEvent } from "./feed.ts";
 import { editGraph, emptyGraph, isEndeavor, sourceSuggestion, Unfinished, type GraphNode } from "./graph.ts";
 import { Beverly, type LabelVerdict } from "./classify.ts";
 import { decodeOperation, decodeStart, OPERATION_FAILED, type OperationHeader } from "./operation.ts";
 import { accepted, begin, docsFor, failed, GIVE_UP, readOperation, readSettings, rejected, type Engine } from "./engine.ts";
 import { sessionFromFile } from "./session-file.ts";
 import { SidecarStore } from "./sidecar.ts";
+import { recordWaypointsTool } from "../trail/prompt.ts";
+import { TrailStore, trailFor } from "../trail/store.ts";
+import { sortTiers, STEP_KINDS, trailEntries, validateWaypointInputs, type Waypoint } from "../trail/types.ts";
 
-const FINALIZERS = new Set(["commit_graph", "commit_v2", "commit_labels", "record_thread_map"]);
+const FINALIZERS = new Set(["commit_graph", "commit_v2", "commit_labels", "record_thread_map", "record_waypoints"]);
 const BEGIN = "mom_begin";
 const SOLE = "Mom finalization requires a sole direct tool call, never a batch or nested call.";
 
@@ -45,7 +49,7 @@ const worlds = new Map<string, Promise<World>>();
 async function rebuild(op: OperationHeader): Promise<World> {
 	const reader = sessionFromFile(op.session.file, op.session.leaf);
 	const store = new SidecarStore(() => op.session.file, op.session.id);
-	const state = await loadState(store, reader);
+	const state = await loadState(store, reader, { mode: op.mapMode });
 	let feed = new LiveFeed(reader);
 	const cut = op.cut ?? state.coverageCut ?? state.checkpoint?.cut;
 	// A worker transcript that disappeared stays unreviewed; readable evidence is still reconciled.
@@ -168,12 +172,37 @@ const labelsDefinition = { name: "commit_labels", description: "Repair saved wor
 		parameters: Type.Object({ labels: Type.Array(Type.Object({ id: Type.String({ minLength: 1 }), label: Type.String({ minLength: 1, maxLength: 160 }),
 			state: Type.Optional(Type.Union([Type.Literal("active"), Type.Literal("parked")])) }, { additionalProperties: false }), { maxItems: 64 }),
 			retired: Type.Optional(Type.Array(Type.Object({ id: Type.String({ minLength: 1 }), reason: Type.String({ minLength: 1, maxLength: 240 }) }, { additionalProperties: false }), { maxItems: 64 })) }, { additionalProperties: false }) };
+	/** Normalize transport-only JSON strings before Pi validates any finalizer's arguments. The trail's
+	 *  `waypoints` list is decoded here because decodeLists belongs to the graph contract. */
+	const listArgs = (args: unknown) => {
+		if (!args || typeof args !== "object" || Array.isArray(args)) return args ?? {};
+		const out = decodeLists(args as Record<string, unknown>);
+		if (typeof out.waypoints === "string") try { const parsed = JSON.parse(out.waypoints); if (Array.isArray(parsed)) out.waypoints = parsed; } catch { /* validation reports it */ }
+		return out;
+	};
+	/** The tool definition pi-ai validates a finalizer's arguments against. */
+	const finalizerDefinition = (name: string) => name === "commit_labels" ? labelsDefinition : name === "commit_v2" ? commitV2Tool() : name === "record_waypoints" ? recordWaypointsTool() : definition(name);
 	/** Arguments as Durable checks and coerces them (pi-ai's validation); throws its "Validation failed" error. */
-	const check = (name: string, args: unknown) => validateToolArguments(name === "commit_labels" ? labelsDefinition as any : { ...definition(name) } as any,
-		{ type: "toolCall", id: "check", name, arguments: JSON.parse(JSON.stringify(args ?? {})) });
+	const check = (name: string, args: unknown) => validateToolArguments({ ...finalizerDefinition(name) } as any,
+		{ type: "toolCall", id: "check", name, arguments: JSON.parse(JSON.stringify(listArgs(args))) });
+	/** A retried skipped range: what its map record says about the gap once this finalizer accepts. Shared
+	 *  by every form so the trail's coverage cursor resolves gaps exactly as the graph forms do. */
+	const gapChange = (op: OperationHeader, state: World["state"], feed: LiveFeed): Record<string, unknown> => {
+		if (!op.retryGap) return {};
+		const retried = state.gaps.find(gap => gap.id === op.retryGap!.id);
+		const range = (refs: string[]) => {
+			const events = refs.map(ref => feed.byRef.get(ref));
+			if (!events.length || events.some(event => !event)) throw new Error("Mom cannot retry a skipped range because its recorded sources are unreadable.");
+			return { firstRef: events[0]!.ref, lastRef: events.at(-1)!.ref, count: events.length };
+		};
+		return op.retryGap.remaining.length && retried ? { gap: { action: "open", ...retried, ...range(op.retryGap.remaining) } } : { gap: { action: "resolved", id: op.retryGap.id } };
+	};
+	type Form = "transaction" | "v2" | "labels" | "trail";
+	const FORM_FINALIZER: Record<Form, string> = { transaction: "commit_graph", v2: "commit_v2", labels: "commit_labels", trail: "record_waypoints" };
 	// Transaction commits a model-authored graph; acts derives work from model-written labels;
 	// relabels apply model-written display labels. All three use the same single-writer commit tail.
-	const finalize = (form: "transaction" | "v2" | "labels" = "transaction") => ({ ...tool(form === "v2" ? commitV2Tool() : form === "labels" ? labelsDefinition : definition("commit_graph"), async (_args, op, api, ctx) => {
+	// Trail appends waypoints to `session.trail` and only its coverage cursor to `.mom`.
+	const finalize = (form: Form = "transaction") => ({ ...tool(finalizerDefinition(FORM_FINALIZER[form]), async (_args, op, api, ctx) => {
 		const { calls } = await operationContext(api, ctx);
 		const call = calls.find(each => each.id === api.callId);
 		const attempts = calls.filter(each => FINALIZERS.has(each.name)).length;
@@ -188,14 +217,76 @@ const labelsDefinition = { name: "commit_labels", description: "Repair saved wor
 		// active mode did not ask it to do — otherwise a small model can reach for commit_graph in v2
 		// and author edits the host is supposed to check against the minimal schema.
 		const active = modeFor(op.mapMode ?? state.mode);
-		if (op.relabel ? form !== "labels" : active.finalizer !== (form === "v2" ? "commit_v2" : "commit_graph"))
+		if (op.relabel ? form !== "labels" : active.finalizer !== FORM_FINALIZER[form])
 			return await reject(`This operation requires ${op.relabel ? "commit_labels" : active.finalizer}.`);
 		// The decider every semantic gate asks, from the same settings line `begin` read.
 		const agent = await api.agent(ctx);
 		const settings = readSettings(agent.instructions);
 		const classifier = settings.classifier ? new Beverly(settings.classifier) : undefined;
 		const records = await new SidecarStore(() => op.session.file, op.session.id).load();
-		if (records.some(record => record.id === `${op.job}:map`)) return { content: text("Map saved."), control: { terminate: true } };
+		if (records.some(record => record.id === `${op.job}:map`)) return { content: text(form === "trail" ? "Trail saved." : "Map saved."), control: { terminate: true } };
+		if (form === "trail") {
+			// The trail keeps no graph: waypoints are appended to `session.trail`, and the `.mom` record
+			// is the coverage-without-a-map cursor, marked `trail: true` by the store. The trail is its own
+			// coverage track: loadState ignores graph checkpoints in trail mode, so there is never one here
+			// (base null) and a session switched from a graph mode indexes its whole history into the trail.
+			const value = listArgs(call?.arguments ?? _args) as Record<string, unknown>;
+			const repairs: string[] = [];
+			// Near-miss refs are canonicalized before validation, as the graph forms do; a ref that matches
+			// nothing is left for validation to name.
+			if (Array.isArray(value.waypoints)) value.waypoints = value.waypoints.map(item => !item || typeof item !== "object" || !Array.isArray((item as any).refs) ? item
+				: { ...item, refs: (item as { refs: unknown[] }).refs.map(ref => {
+					if (typeof ref !== "string" || known.has(ref)) return ref;
+					const to = sourceSuggestion(ref, known.keys());
+					if (to) repairs.push(`${ref}→${to}`);
+					return to ?? ref;
+				}) });
+			const trailStore = new TrailStore(() => op.session.file, op.session.id);
+			const branch = new Set(sessionFromFile(op.session.file, op.session.leaf).getBranch().map(entry => entry.id));
+			const existing = trailFor(await trailStore.load(), branch);
+			const idFor = (index: number) => `${op.job}:w${index}`;
+			const { inputs, defects } = validateWaypointInputs(value, existing.waypoints, new Set(known.keys()), idFor);
+			if (defects.length) {
+				await update(api, ctx, op.job, doc => { doc.rejections++; });
+				return await reject(`Waypoints rejected; nothing was saved. ${defects.join(" ")}`);
+			}
+			// Waypoints are where the user steered; the rest are steps for the detail page (sortTiers). Ids keep the
+			// call index so a retry writes the same ones.
+			const isUserTurn = (ref: string) => { const event = known.get(ref); return Boolean(event && isUserDirection(event)); };
+			const tiers = sortTiers(inputs, idFor, isUserTurn);
+			// Re-indexing the same history (a retried backfill, a session switched between modes) never writes a moment
+			// twice: an item of the same kind citing a source the trail already holds is that entry. Links to it follow.
+			const held = trailEntries(existing), alias = new Map<string, string>();
+			inputs.forEach((input, index) => {
+				const same = held.find(entry => entry.kind === input.kind && entry.refs.some(ref => input.refs.includes(ref)));
+				if (same) alias.set(idFor(index), same.id);
+			});
+			const relink = (id: string | null | undefined) => id == null ? undefined : alias.get(id) ?? id;
+			// Where it sits in the transcript: the user turn it cites, else its first lead source, else the batch's.
+			const lead = `${op.session.id}:`, entryOf = (ref: string) => ref.slice(lead.length).split(":")[0]!;
+			const anchorOf = (refs: readonly string[]) => {
+				const ref = refs.find(isUserTurn) ?? refs.find(r => r.startsWith(lead)) ?? op.refs.find(r => r.startsWith(lead));
+				return ref?.startsWith(lead) ? entryOf(ref) : undefined;
+			};
+			const at = Date.now();
+			const all = [...tiers.waypoints.map(item => ({ ...item, step: false })), ...tiers.steps.map(item => ({ ...item, step: true }))]
+				.filter(item => !alias.has(idFor(item.index))).sort((a, b) => a.index - b.index);
+			for (const { index, input, step } of all) {
+				const closes = relink(input.closes), supersedes = relink(input.supersedes), anchor = anchorOf(input.refs);
+				const waypoint: Waypoint = { id: idFor(index), sessionId: op.session.id, at, kind: input.kind, line: input.line, refs: input.refs, caption: input.caption,
+					...(closes ? { closes } : {}), ...(supersedes ? { supersedes } : {}), ...(anchor ? { anchor } : {}), parent: op.session.leaf, by: "mom",
+					...(step && !STEP_KINDS.has(input.kind) ? { step: true as const } : {}) };
+				await trailStore.appendWaypoint(waypoint);
+			}
+			// Written after the waypoints: a crash between the two leaves the batch uncovered and retried, and
+			// the retry's ids are the same `${job}:w<n>`, so a reader sees the waypoints once.
+			try { await store.append("map", { base: state.checkpointId ?? null, cut: op.cut!, failure: null, ...gapChange(op, state, feed), ...(op.backfill !== undefined ? { backfill: op.backfill } : {}) }, `${op.job}:map`); }
+			catch (error) { throw new Error(`Mom could not advance her trail coverage beside the session: ${String(error)}`); }
+			worlds.delete(`${op.job}:${op.step}`);
+			await accepted(engine, api, ctx, op);
+			const demoted = tiers.steps.filter(item => !STEP_KINDS.has(item.input.kind)).length;
+			return { content: text(`Trail saved.${alias.size ? ` ${alias.size} already on the trail, not repeated.` : ""}${demoted ? ` Filed ${demoted} as step${demoted === 1 ? "" : "s"}: a waypoint must cite the user turn that made it.` : ""}${repairs.length ? ` Repaired refs: ${repairs.join(", ")}.` : ""}`), control: { terminate: true } };
+		}
 		const done = await progress(api, ctx, op.job);
 		const inspected = new Set([...done.inspected, ...[...feed.byRef.keys()].filter(ref => ref.startsWith(`mom-${op.job}:`))]);
 		const graph = state.checkpoint?.graph ?? emptyGraph();
@@ -303,14 +394,7 @@ const labelsDefinition = { name: "commit_labels", description: "Repair saved wor
 		const material = !state.checkpoint || JSON.stringify(next.graph) !== JSON.stringify(graph)
 			|| JSON.stringify(effectiveNote) !== JSON.stringify(state.checkpoint.note ?? null)
 			|| JSON.stringify(next.unfinished) !== JSON.stringify(state.checkpoint.unfinished ?? []);
-		const retried = op.retryGap ? state.gaps.find(gap => gap.id === op.retryGap!.id) : undefined;
-		const range = (refs: string[]) => {
-			const events = refs.map(ref => feed.byRef.get(ref));
-			if (!events.length || events.some(event => !event)) throw new Error("Mom cannot retry a skipped range because its recorded sources are unreadable.");
-			return { firstRef: events[0]!.ref, lastRef: events.at(-1)!.ref, count: events.length };
-		};
-		const gapUpdate = !op.retryGap ? {} : op.retryGap.remaining.length && retried
-			? { gap: { action: "open", ...retried, ...range(op.retryGap.remaining) } } : { gap: { action: "resolved", id: op.retryGap.id } };
+		const gapUpdate = gapChange(op, state, feed);
 		const resolutionUpdate = { ...(resolutionKeys.size ? { resolvedNotices: [...resolutionKeys] } : {}), ...(op.auditedGaps?.length ? { resolvedGaps: op.auditedGaps } : {}) };
 		const cut = op.cut!, at = Date.now();
 		const write = async (data: Record<string, unknown>, failure: string) => {
@@ -321,7 +405,12 @@ const labelsDefinition = { name: "commit_labels", description: "Repair saved wor
 				const checkpoint: Checkpoint = { sessionId: op.session.id, graph: next.graph, change: graphChange(state.checkpoint?.graph ?? emptyGraph(), next.graph),
 					note: effectiveNote, unfinished: next.unfinished, cut, at, model: agent.model ? `${agent.model.provider}/${agent.model.modelId}` : "" };
 				if (!isCheckpoint(checkpoint)) return await reject("Host-derived checkpoint is invalid; last checkpoint unchanged.");
-				await write({ snapshot: checkpoint, failure: null, ...gapUpdate, ...resolutionUpdate, ...(op.screen ? { screen: op.screen } : {}) }, "Mom could not write her state beside the session");
+				// Another finalizer may have saved a map since this one began. Re-read just before appending: a map built
+				// from an older checkpoint would otherwise replace the newer one without a trace. The operation fails and retries.
+				store.invalidate?.();
+				const current = await loadState(store, sessionFromFile(op.session.file, op.session.leaf), { mode: op.mapMode });
+				if ((current.checkpointId ?? null) !== (state.checkpointId ?? null)) throw new Error("Her saved map changed while she worked on this update, so it was not saved; the update is retried from the current map.");
+				await write({ snapshot: checkpoint, base: state.checkpointId ?? null, failure: null, ...gapUpdate, ...resolutionUpdate, ...(op.screen ? { screen: op.screen } : {}) }, "Mom could not write her state beside the session");
 			} else {
 				if (!state.checkpointId) throw new Error("Mom cannot advance evidence coverage without a saved sidecar checkpoint.");
 				await write({ base: state.checkpointId, cut, failure: null, ...gapUpdate, ...resolutionUpdate, ...(op.screen ? { screen: op.screen } : {}) }, "Mom could not advance her state beside the session");
@@ -330,15 +419,24 @@ const labelsDefinition = { name: "commit_labels", description: "Repair saved wor
 		worlds.delete(`${op.job}:${op.step}`);
 		await accepted(engine, api, ctx, op, unmet?.length ? { unmet } : undefined);
 		return { content: text("Map saved."), control: { terminate: true } };
-	}), prepareArguments: (args: unknown) => { try { return validateToolArguments(form === "v2" ? commitV2Tool() as any : form === "labels" ? labelsDefinition as any : { ...definition("commit_graph") } as any,
-		{ type: "toolCall", id: "check", name: form === "v2" ? "commit_v2" : form === "labels" ? "commit_labels" : "commit_graph", arguments: JSON.parse(JSON.stringify(args ?? {})) }) as any; } catch { return {} as any; } } });
+	}), prepareArguments: (args: unknown) => { try { return check(FORM_FINALIZER[form], args) as any; } catch { return {} as any; } } });
 
 	const inspect = tool({ ...definition("inspect_evidence") }, async (args, op, api, ctx) => {
 		const { feed, known, missing, state } = await world(op);
 		if (typeof args.ref !== "string" || !Number.isSafeInteger(args.offset) || args.offset < 0 || !Number.isSafeInteger(args.limit) || args.limit < 1 || args.limit > 24000) throw new Error("Invalid evidence request.");
+		// A trail waypoint id (bare, or written node:<id> as the graph's references are) is Mom's own saved note.
+		if (op.mapMode === "trail" && !known.has(args.ref)) {
+			const id = args.ref.startsWith("node:") ? args.ref.slice(5) : args.ref;
+			const waypoint = (await new TrailStore(() => op.session.file, op.session.id).load()).find(record => record.type === "waypoint" && record.id === id);
+			if (waypoint || args.ref.startsWith("node:")) return { content: text(JSON.stringify(waypoint
+				? { ref: args.ref, authority: "Saved trail entry, not original evidence. Cite its refs, never this id.", waypoint }
+				: { ref: args.ref, error: `No trail entry ${id}.`, instruction: "Trail entries are linked through closes and supersedes by id; they are not evidence. Inspect [src:…] ids only." })),
+				...(waypoint ? {} : { isError: true }) };
+		}
 		if (args.ref.startsWith("node:") && op.mode !== "audit") {
 			const node = state.checkpoint?.graph.nodes.find(node => node.id === args.ref.slice(5));
-			if (!node) throw new Error(`Unknown saved node: ${args.ref}`);
+			// A wrong reference is the model's to correct, not a reason to fail the whole operation.
+			if (!node) return { content: text(JSON.stringify({ ref: args.ref, error: `Unknown saved node: ${args.ref}`, instruction: "Inspect a node id from the map you were shown, or an [src:…] evidence id." })), isError: true };
 			const value = JSON.stringify(node);
 			return { content: text(JSON.stringify({ ref: args.ref, authority: "Saved interpretation, not original evidence. Cite its sources, not this node reference.",
 				offset: args.offset, totalChars: value.length, nextOffset: args.offset + args.limit < value.length ? args.offset + args.limit : null,
@@ -398,7 +496,7 @@ const labelsDefinition = { name: "commit_labels", description: "Repair saved wor
 		if (op.mode !== "audit" || !op.section) throw new Error("record_thread_map belongs to a thread-map audit step.");
 		const { calls } = await operationContext(api, ctx);
 		let args: any;
-		try { args = validateToolArguments(recordDefinition as any, { type: "toolCall", id: "check", name: "record_thread_map", arguments: JSON.parse(JSON.stringify(calls.find(call => call.id === api.callId)?.arguments ?? _args)) }); }
+		try { args = validateToolArguments(recordDefinition as any, { type: "toolCall", id: "check", name: "record_thread_map", arguments: JSON.parse(JSON.stringify(listArgs(calls.find(call => call.id === api.callId)?.arguments ?? _args))) }); }
 		catch (error) {
 			if (calls.filter(call => FINALIZERS.has(call.name)).length >= 2) throw new Error(`Mom could not finalize after one repair. ${error instanceof Error ? error.message : String(error)}`);
 			return { content: text(`${error instanceof Error ? error.message : String(error)} Correct all reported defects and resubmit once.`), isError: true };
@@ -439,7 +537,8 @@ const labelsDefinition = { name: "commit_labels", description: "Repair saved wor
 				.filter(entry => entry.sources.some(ref => known.get(ref)?.kind !== "compaction"));
 		}
 		return { content: text(`Chapter state recorded.\n${JSON.stringify({ actor: op.section.actor, sourceMetadata, ...map })}`), control: { terminate: true } };
-	}), prepareArguments: (args: unknown) => { try { validateToolArguments(recordDefinition as any, { type: "toolCall", id: "check", name: "record_thread_map", arguments: JSON.parse(JSON.stringify(args ?? {})) }); return args as any; } catch { return placeholder as any; } } };
+	}), prepareArguments: (args: unknown) => { try { return validateToolArguments(recordDefinition as any,
+		{ type: "toolCall", id: "check", name: "record_thread_map", arguments: JSON.parse(JSON.stringify(listArgs(args))) }) as any; } catch { return placeholder as any; } } };
 
 	/** `mom_begin`: every operation starts here, as a sole call. */
 	const beginTool = durable.defineTool({ name: BEGIN, replay: "safe", executionMode: "sequential", outputLimits: WHOLE,
@@ -463,7 +562,7 @@ const labelsDefinition = { name: "commit_labels", description: "Repair saved wor
 /** Mom's own tool surface. A stale or foreign slice configuration must never hand her native
  *  filesystem, shell or editor tools: a small model given those leaves the operation and wanders.
  *  The extension enforces its own boundary rather than trusting the allowlist it was given. */
-const MOM_TOOL_NAMES = new Set([BEGIN, "commit_graph", "commit_v2", "commit_labels", "record_thread_map", "inspect_evidence", "search_history"]);
+const MOM_TOOL_NAMES = new Set([BEGIN, "commit_graph", "commit_v2", "commit_labels", "record_thread_map", "record_waypoints", "inspect_evidence", "search_history"]);
 	const RELABEL_PROMPT = "You are Mom repairing her saved work map, not processing new activity or answering the recorded conversation. First call mom_begin alone. Then read its work list and call commit_labels once. Give a decision only for the work that needs one: a concise, meaningful label to keep it, or retired with a short reason. An ID you leave out keeps its saved label.\n\n\n\nMom tracks only durable, multi-turn things. Retire work that is not: a status or progress question (\"where are we?\", \"is it in place now?\", \"were those labels from act mode or commit mode\"), a one-off meta question, or an instruction the next turn fully satisfied. Keep genuine multi-turn work even when it is phrased as a question (\"What else is fucking idiotic in this stack?\" is a real audit request). Never retire settled work, or work that still holds unfinished work — give those a label instead.\n\n\n\nA kept work item may also carry state: active when it is being worked on now, parked when it is deliberately deferred. Set active for work in progress, including an umbrella initiative whose child is current. Never mark work settled here — a completion needs its own evidence. Base every label on that work's intent and observed outcome; do not copy terminal markup or invent new work. Never call other tools, and never alter IDs, sources, or notes.";
 
 	const hooks = [durable.hook(durable.GenerationTask, {
@@ -485,6 +584,10 @@ const MOM_TOOL_NAMES = new Set([BEGIN, "commit_graph", "commit_v2", "commit_labe
 				: header.relabel ? ["commit_labels"]
 				// v2 owns every write, catch-up digests included; commit_graph owns its own digest.
 				: operationMode.name === "v2" ? ["commit_v2", "inspect_evidence", "search_history"]
+				// The trail has no graph: its one finalizer appends waypoints, digests included. It indexes the batch in
+				// front of her and never reconciles older history, so it gets no history search: a small model given
+				// one fishes with it (dozens of one-word queries per catch-up) instead of reading the evidence.
+				: operationMode.name === "trail" ? ["record_waypoints", "inspect_evidence"]
 				: ["commit_graph", "inspect_evidence", "search_history"]);
 			return { messages: messages.map(message => {
 				if (message.role === "system") return { ...message,
@@ -520,7 +623,7 @@ const MOM_TOOL_NAMES = new Set([BEGIN, "commit_graph", "commit_v2", "commit_labe
 
 	return durable.defineExtension({
 		name: "mom",
-		tools: [beginTool, finalize(), finalize("v2"), finalize("labels"), inspect, search, record],
+		tools: [beginTool, finalize(), finalize("v2"), finalize("labels"), finalize("trail"), inspect, search, record],
 		hooks,
 	});
 }

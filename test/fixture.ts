@@ -3,7 +3,7 @@ import { REAL_HOME, TEST_AGENT_DIR, underRealPi } from "./setup.ts";
 import assert from "node:assert/strict";
 import { createServer, type ServerResponse } from "node:http";
 import { createServer as createNetServer } from "node:net";
-import { existsSync, mkdtempSync, mkdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -121,14 +121,13 @@ export async function startOven(root: string, agentDir: string) {
 	const port = await freePort();
 	Object.assign(process.env, {
 		XDG_CONFIG_HOME: join(root, "xdg", "config"), XDG_DATA_HOME: join(root, "xdg", "data"), XDG_STATE_HOME: join(root, "xdg", "state"),
-		XDG_CACHE_HOME: join(root, "xdg", "cache"), OVEN_URL: `http://127.0.0.1:${port}`, OVEN_PI_AGENT_DIR: agentDir,
+		XDG_CACHE_HOME: join(root, "xdg", "cache"), OVEN_URL: `http://127.0.0.1:${port}`, PI_CODING_AGENT_DIR: agentDir,
 		OVEN_ROLES_DIR: join(root, "roles"), OVEN_LAUNCH_AGENTS_DIR: join(root, "LaunchAgents"), OVEN_SERVICE: "off", OVEN_TAILSCALE: "off", OVEN_SETUP: "off",
 	});
-	const config = join(root, "xdg", "config", "oven");
-	mkdirSync(config, { recursive: true });
-	writeFileSync(join(config, "settings.json"), JSON.stringify({ packages: [fileURLToPath(new URL("..", import.meta.url)).replace(/\/$/, "")] }));
-	const later = new Date(Date.now() + 3600_000);
-	utimesSync(join(config, "settings.json"), later, later);
+	// Oven runs on Pi's own folder: its package list is the agent dir's settings.json, which Mom's package joins.
+	const settingsPath = join(agentDir, "settings.json");
+	const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+	writeFileSync(settingsPath, JSON.stringify({ ...settings, packages: [fileURLToPath(new URL("..", import.meta.url)).replace(/\/$/, "")] }));
 	const { startDaemon } = await import(join(OVEN_DIR, "src", "daemon.ts"));
 	const host = { tools: [], dropped: [], errors: [], async promptFor() { return ""; }, close() {} };
 	const start = () => startDaemon({ toolHost: host });
