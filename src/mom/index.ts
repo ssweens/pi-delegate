@@ -1,6 +1,6 @@
 /** Mom runs in oven (her slice follows this session); the lead shows her state, sends the user's requests and adds her hints. */
 import { copyToClipboard, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Text, matchesKey, isKittyProtocolActive } from "@earendil-works/pi-tui";
+import { Text, matchesKey, isKittyProtocolActive, type TUI } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { MomClient, type Command, type Snapshot, type SourcePage } from "./client.ts";
 import { momSettings } from "./settings.ts";
@@ -137,21 +137,27 @@ export function installMom(pi: ExtensionAPI) {
 		} catch (error) { context.ui.notify(`Cannot open Mom: ${String(error)}`, "error"); }
 		finally { if (heldWidget === held) { momView = undefined; viewOpen = false; closeView = undefined; heldWidget = undefined; sync(); } }
 	}
-	async function showSettings(context: ExtensionContext) {
-		if (context.mode !== "tui") throw new Error("Mom settings requires interactive mode.");
-		await ready;
+	/** Mom's settings panel over her saved controls; undefined until she is connected. /delegate settings opens it as a submenu. */
+	function settingsPanel(context: ExtensionContext, tui: TUI, close: () => void) {
 		const controls = client?.snapshot?.controls;
-		if (!controls) throw new Error(readError ?? "Mom is not connected.");
+		if (!controls) return undefined;
 		const fallback = String(pi.getFlag("mom-model") ?? FLAGS["mom-model"][1]);
-		await context.ui.custom<void>((tui, _theme, _keys, done) => momSettings(controls,
-			async change => { await request({ kind: "controls", change }); }, () => tui.requestRender(), () => done(), Math.max(3, Math.min(12, tui.terminal.rows - 9)),
+		return momSettings(controls,
+			async change => { await request({ kind: "controls", change }); }, () => tui.requestRender(), close, Math.max(3, Math.min(12, tui.terminal.rows - 9)),
 			// Model is one of the settings: its row opens the picker as a submenu. The pick is Mom's
 			// alone and never becomes Pi's default.
 			// `done(selected)` is the settings row's own save trigger: hand the pick straight back and
 			// let momSettings persist it. Saving here as well would fire twice, and a throw would leave
 			// the submenu open for good.
 			(current, finished) => momModelSelector(context, tui, current, fallback, finished) as never,
-			(current, finished) => momDeciderSelector(context, tui, current, finished) as never));
+			(current, finished) => momDeciderSelector(context, tui, current, finished) as never);
+	}
+	activity.setMomSettings(settingsPanel);
+	async function showSettings(context: ExtensionContext) {
+		if (context.mode !== "tui") throw new Error("Mom settings requires interactive mode.");
+		await ready;
+		if (!client?.snapshot?.controls) throw new Error(readError ?? "Mom is not connected.");
+		await context.ui.custom<void>((tui, _theme, _keys, done) => settingsPanel(context, tui, () => done())!);
 	}
 	async function checkKeys(context: ExtensionContext) {
 		if (context.mode !== "tui") throw new Error("The key check requires an interactive terminal.");

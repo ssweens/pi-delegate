@@ -33,10 +33,20 @@ function withLegend(lines: string[], legend: string, theme: Theme, width: number
 	return lines;
 }
 
-/** Only live executions stay pinned. Selection stays on its child while that child remains active. */
+/** The main editor, when it is what has focus: Pi's editor exposes its cursor and autocomplete state. */
+type EditorLike = Component & { getCursor(): { line: number; col: number }; getText(): string; isShowingAutocomplete?(): boolean };
+const isEditor = (c: Component | null): c is EditorLike =>
+	Boolean(c) && typeof (c as Partial<EditorLike>).getCursor === "function" && typeof (c as Partial<EditorLike>).getText === "function";
+
+/**
+ * Live executions stay pinned, with the runs they started indented beneath them, and runs that settled
+ * since the person's last prompt stay listed (dimmed) so their reports are one keypress away. ← at the
+ * start of the editor's draft enters the list; ↑↓ select, → or Enter opens a child, ← or Esc returns.
+ */
 export class AgentsPanel implements Component, Focusable {
 	focused = false;
 	private selectedId?: string;
+	private settledBefore = 0;
 	private offset = 0;
 	private previousFocus: Component | null = null;
 	private timer?: ReturnType<typeof setInterval>;
@@ -49,7 +59,17 @@ export class AgentsPanel implements Component, Focusable {
 		// Fullscreen transcript navigation runs before focused-component input. Consume list
 		// navigation here so Home/PageDown cannot move the parent transcript behind the list.
 		this.removeInputListener = tui.addInputListener((data) => {
-			if (!this.focused || tui.hasOverlay()) return;
+			if (tui.hasOverlay()) return;
+			if (!this.focused) {
+				if (!matchesKey(data, "left") || this.opening || !this.rows().length) return;
+				// Only from the very start of the draft, with no completion menu open: anywhere else ← moves the cursor.
+				const editor = (tui as TUI & { getFocusedComponent(): Component | null }).getFocusedComponent();
+				if (!isEditor(editor) || editor.isShowingAutocomplete?.()) return;
+				const { line, col } = editor.getCursor();
+				if (line !== 0 || col !== 0) return;
+				this.focus();
+				return { consume: true };
+			}
 			this.handleInput(data);
 			return { consume: true };
 		});
@@ -57,7 +77,13 @@ export class AgentsPanel implements Component, Focusable {
 	}
 
 	private rows(): RunView[] {
-		return this.src.all().filter((r) => !r.settled);
+		return this.src.all().filter((r) => !r.settled || (r.endedAt ?? 0) >= this.settledBefore);
+	}
+
+	/** Settled runs that ended before this time are no longer listed: the person has moved on. */
+	hideSettledBefore(time: number) {
+		this.settledBefore = time;
+		if (this.focused && !this.rows().length) this.release();
 	}
 
 	focus() {
@@ -80,26 +106,35 @@ export class AgentsPanel implements Component, Focusable {
 		const active = this.src.all().some((v) => !v.settled);
 		if (active && !this.timer) this.timer = setInterval(() => this.tui.requestRender(), TICK_MS);
 		if (!active && this.timer) { clearInterval(this.timer); this.timer = undefined; }
-		if (!active && this.focused && !this.opening) this.release();
+		if (!this.rows().length && this.focused && !this.opening) this.release();
 		this.tui.requestRender();
 	}
 
 	handleInput(data: string) {
 		const rows = this.rows();
 		let index = Math.max(0, rows.findIndex((r) => r.id === this.selectedId));
-		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+j")) { this.release(); return; }
+		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+j") || matchesKey(data, "left")) { this.release(); return; }
+		// Typing is for the editor: a printable key leaves the list and lands in the draft, never lost here.
+		if (!this.opening && data.length > 0 && !/[\x00-\x1f\x7f]/.test(data)) {
+			const editor = this.previousFocus;
+			this.release();
+			editor?.handleInput?.(data);
+			return;
+		}
 		if (matchesKey(data, "up")) index--;
 		else if (matchesKey(data, "down")) index++;
 		else if (matchesKey(data, "pageUp")) index -= LIST_ROWS;
 		else if (matchesKey(data, "pageDown")) index += LIST_ROWS;
 		else if (matchesKey(data, "home")) index = 0;
 		else if (matchesKey(data, "end")) index = rows.length - 1;
-		else if (matchesKey(data, "enter") && rows[index] && !this.opening) {
+		else if ((matchesKey(data, "enter") || matchesKey(data, "right")) && rows[index] && !this.opening) {
 			this.selectedId = rows[index].id;
 			this.opening = true;
 			void this.openChild(this.selectedId).finally(() => {
 				this.opening = false;
-				this.release();
+				// Back from the child: stay in the list, so → and ← walk between children and the editor.
+				if (this.rows().length) { this.tui.setFocus(this.focusTarget ?? this); this.tui.requestRender(); }
+				else this.release();
 			});
 			return;
 		}
@@ -125,9 +160,12 @@ export class AgentsPanel implements Component, Focusable {
 		const modelWidth = inner >= 65 && modelSpare >= 16 && shown.some((v) => v.model) ? Math.min(28, modelSpare) : 0;
 		const body = shown.map((v) => {
 			const selected = this.focused && v.id === this.selectedId;
-			const prefix = `${selected ? this.theme.fg("accent", "›") : " "} ${icon(v, this.theme)} `;
+			// A run started by a delegating child sits under it: one step in per level below the root's children.
+			const level = Math.max(0, Math.min(4, (v.depth ?? 1) - 1));
+			const branch = level ? this.theme.fg("dim", `${"  ".repeat(level - 1)}└ `) : "";
+			const prefix = `${selected ? this.theme.fg("accent", "›") : " "} ${branch}${icon(v, this.theme)} `;
 			const time = elapsed(v.durationMs);
-			const title = this.theme.fg(selected ? "accent" : "text", runTitle(v));
+			const title = this.theme.fg(selected ? "accent" : v.settled ? "muted" : "text", runTitle(v));
 			if (inner < 65) return pad(`${prefix}${title}`, Math.max(1, inner - time.length - 1)) + ` ${time}`;
 			// Reserve the column on every row once it is shown, so a session with no model
 			// stays blank instead of pulling the activity column left.
@@ -138,15 +176,18 @@ export class AgentsPanel implements Component, Focusable {
 				? this.theme.fg("dim", v.status === "running" ? `session ${v.nativeSessionId ?? "pending"}` : v.status)
 				: v.status === "running"
 				? v.activeTool ? formatToolCall(v.activeTool.name, v.activeTool.args, this.theme) : this.theme.fg("dim", "Thinking…")
+				: v.settled ? this.theme.fg(v.status === "complete" ? "dim" : "warning", v.status)
 				: this.theme.fg("warning", "Stopping…");
 			return prefix + pad(title, titleWidth) + " " + pad(this.theme.fg("muted", v.role), roleWidth) + " " + model + pad(activity, activityWidth) + " " + this.theme.fg("dim", time);
 		});
 		const range = rows.length > count ? ` · ${this.offset + 1}–${this.offset + count}/${rows.length}` : "";
 		// A queued prompt in the parent editor is otherwise unexplained: say when its turn is blocked here.
 		const joined = rows.some((v) => v.joinedWaiters);
-		const header = this.theme.bold("Agents") + this.theme.fg("muted", ` · ${rows.length} active${range}`)
+		const active = rows.filter((v) => !v.settled).length, done = rows.length - active;
+		const counts = [active ? `${active} active` : "", done ? `${done} done` : ""].filter(Boolean).join(" · ");
+		const header = this.theme.bold("Agents") + this.theme.fg("muted", ` · ${counts}${range}`)
 			+ (joined ? this.theme.fg("warning", " · parent blocked in wait") : "");
-		return { header, body: body.map((l) => truncateToWidth(l, inner, "…")), hint: this.focused ? "↑↓ select · Enter open · Esc editor" : "Ctrl+J focus agents · /agents history" };
+		return { header, body: body.map((l) => truncateToWidth(l, inner, "…")), hint: this.focused ? "↑↓ select · → open · ← editor" : "← agents · /agents history" };
 	}
 
 	renderSection(width: number): string[] {
@@ -249,7 +290,9 @@ export class ChildView implements Component, Focusable {
 	}
 
 	handleInput(data: string) {
-		if (matchesKey(data, "escape")) { this.done(); return; }
+		// Close after this key's dispatch: fullscreen mode runs input listeners after the focused component,
+		// and the Agents list, focused again once this view closes, would take the same Esc as its own.
+		if (matchesKey(data, "escape")) { setImmediate(this.done); return; }
 		if (this.keybindings.matches(data, "app.tools.expand")) { this.transcript.toggleTools(); this.cache = undefined; }
 		else if (this.keybindings.matches(data, "app.thinking.toggle")) { this.transcript.toggleThinking(); this.cache = undefined; }
 		else if (matchesKey(data, "pageUp")) this.top = Math.max(0, (this.top ?? Math.max(0, (this.cache?.lines.length ?? 0) - this.pageRows)) - this.pageRows);

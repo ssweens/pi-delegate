@@ -84,7 +84,29 @@ test("a child loads its parent's extensions; its role's tools line is a plain al
 				assert(!tools.some((tool: any) => tool.name === "todo"), "the copy's tools are not in the child");
 				assert.equal(child.offered.has("todo"), false, "the copy was left out before its tools were offered");
 				assert.deepEqual(child.extensionErrors, [], "no conflict is reported: the copy is gone");
+				assert(!tools.some((tool: any) => tool.name === "mom") && !child.offered.has("mom"), "Mom stays with the root parent");
 			} finally { rmSync(copy, { force: true }); }
+		});
+
+		await t.test("an extension that brings Mom without delegation (pi-tether, say) is left out of every child", async () => {
+			const momOnly = join(box.agentDir, "extensions", "mom-only.js");
+			writeFileSync(momOnly, `export default function (pi) {
+	pi.registerCommand("mom", { description: "Mom without delegation", handler: async () => {} });
+	for (const name of ["mom", "mom_probe"]) pi.registerTool({ name, label: name, description: "Mom fixture " + name + ".",
+		parameters: { type: "object", properties: {} }, async execute() { return { content: [{ type: "text", text: name }], details: undefined }; } });
+}
+`);
+			try {
+				api.script("Without Mom", { text: "NO-MOM-DONE" });
+				const result = await h.waitLaunch("Without Mom", { role: "everything" });
+				assert.equal(result.details.status, "complete", result.content[0].text);
+				const child = run(result.details.id);
+				const names = child.session.getAllTools().map((tool: any) => tool.name);
+				assert(!names.includes("mom") && !names.includes("mom_probe"), `no Mom tool in the child: ${names}`);
+				assert(!child.offered.has("mom_probe"), "the whole extension was left out before its tools were offered");
+				assert(!toolNames(requestsFor("Without Mom")[0]).some((name: string) => name.startsWith("mom")), "the child's model is offered none");
+				assert(names.includes("fixture_tool"), "other extensions still load");
+			} finally { rmSync(momOnly, { force: true }); }
 		});
 
 		await t.test("tools: read, fixture_tool gets exactly those; no other tool is registered", async () => {

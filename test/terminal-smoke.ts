@@ -69,8 +69,12 @@ try {
 		}
 		key("C-o"); key("PPage"); await expect(/^\s+OUTPUT-(?:1|2)\s*$/m); save(`${mode}-expanded`);
 		key("C-o"); key("C-End");
-		text("CHILD-DRAFT"); key("Escape"); await expect(/PARENT-DRAFT/);
-		key("C-j"); key("Enter"); await expect(/CHILD-DRAFT/); key("C-u");
+		// Esc leaves the child for the Agents list; ← returns to the editor, and ← at the start of the draft re-enters the list.
+		text("CHILD-DRAFT"); key("Escape"); await expect(/PARENT-DRAFT/); await expect(/→ open · ← editor/);
+		key("Left"); await expect(/← agents · /);
+		// Ctrl+A, not Home: fullscreen mode gives Home to the transcript.
+		key("C-a"); key("Left"); await expect(/→ open · ← editor/);
+		key("Right"); await expect(/CHILD-DRAFT/); key("C-u");
 		writeFileSync(release, "release");
 		await expect(/Streaming line 35/); save(`${mode}-streaming-latest`);
 		key("PPage"); await expect(/scroll paused/);
@@ -81,7 +85,9 @@ try {
 		if (mode === "fullscreen") { mouse(64, 6); await expect(/scroll paused/); key("C-End"); }
 		tmux("resize-window", "-t", "pi", "-x", "54", "-y", "20");
 		await expect(/LATEST-END/); save(`${mode}-narrow`);
-		key("Escape"); await expect(/PARENT-DRAFT/); await expect(/Agents.*active/, true);
+		// The settled child stays listed (dimmed) until the next prompt; ← returns to the editor.
+		key("Escape"); await expect(/PARENT-DRAFT/); await expect(/Agents.*active/, true); await expect(/Agents · 1 done/);
+		key("Left"); await expect(/← agents · /); key("C-e");
 		// A launch must hand off before the child finishes; it must never freeze the parent turn.
 		tmux("resize-window", "-t", "pi", "-x", "110", "-y", "36");
 		const joinGate = deferred();
@@ -93,7 +99,8 @@ try {
 		await expect(/Waiting for a new scout/, true);
 		await expect(/parent blocked in wait/, true); save(`${mode}-background`);
 		joinGate.resolve(); await expect(/✓ Joined child/);
-		assert.equal(capture().match(/✓ Joined child/g)?.length, 1, "the outcome is recorded once, not reprinted");
+		// The Agents frame lists the settled run too; the transcript records its outcome once.
+		assert.equal(capture().split("\n").filter((line) => /✓ Joined child/.test(line) && !line.startsWith("│")).length, 1, "the outcome is recorded once, not reprinted");
 		// Control-tool output uses Pi's own tool shape: titled line, clipped preview, expandable.
 		api.script("Show the roles", { tool: { name: "delegate_ctl", arguments: { action: "roles" } } }, { text: "ROLES-SEEN" });
 		key("C-u"); await command("Show the roles");

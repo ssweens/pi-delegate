@@ -1,6 +1,7 @@
 /**
  * Every pi-delegate setting, in one file: `<agentDir>/pi-delegate.json` (mode 0600, written atomically).
  *
+ *   delegate  — delegation's controls: mode, depth and concurrency limits, model picking (delegate-settings.ts)
  *   mom       — Mom's controls: mode, model, decision model, tracking, continuity, suggestion classes
  *   defaults  — the approved default model per role, with the catalog it was approved against
  *   ratings   — researched quality ratings, per exact `provider/id`
@@ -24,6 +25,8 @@ import writeFileAtomic from "write-file-atomic";
 export interface ApprovedDefault { spec: string; reason?: string; approvedAt: number; cost?: { input: number; output: number } }
 export interface RatingEntry { score: number; source: string; note?: string }
 export interface SettingsFile {
+	/** Delegation's controls, validated by delegate-settings.ts. */
+	delegate?: Record<string, unknown>;
 	/** Mom's controls, validated by her own vocabulary (src/mom/globals.ts). */
 	mom?: Record<string, unknown>;
 	defaults?: { approved?: Record<string, ApprovedDefault>; catalogAtApproval?: string[] };
@@ -45,6 +48,7 @@ export function readSettings(file: string = settingsFile()): SettingsFile {
 	try {
 		const value = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
 		return {
+			...(object(value.delegate) ? { delegate: value.delegate } : {}),
 			...(object(value.mom) ? { mom: value.mom } : {}),
 			...(object(value.defaults) ? { defaults: value.defaults as SettingsFile["defaults"] } : {}),
 			...(object(value.ratings) ? { ratings: value.ratings as SettingsFile["ratings"] } : {}),
@@ -63,6 +67,7 @@ export function readLegacySection<K extends "defaults" | "ratings">(section: K, 
  *  writers that never see each other's change (a Mom setting, an approved role) cannot drop it. */
 export function mergeSettings(current: SettingsFile, patch: SettingsFile): SettingsFile {
 	const next: SettingsFile = { ...current };
+	if (patch.delegate) next.delegate = { ...current.delegate, ...patch.delegate };
 	if (patch.mom) next.mom = { ...current.mom, ...patch.mom };
 	if (patch.defaults) next.defaults = { ...current.defaults, ...patch.defaults,
 		approved: { ...current.defaults?.approved, ...patch.defaults.approved },
