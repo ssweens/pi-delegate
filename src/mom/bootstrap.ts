@@ -1,16 +1,17 @@
-// Cold-start bootstrap. A long backlog must not become one Mom proposal per 24,000-character
+// Cold-start bootstrap. A long backlog must not become one Path proposal per 24,000-character
 // capture window: that window is a per-call context guard, not a schedule. Instead, walk the
 // branch locally (no model calls), segment on compaction boundaries into chapters, extract a
-// fixed schema per chapter with source pointers, and hand Mom ONE bounded chapter-chain digest.
+// fixed schema per chapter with source pointers, and hand Path ONE bounded chapter-chain digest.
 //
 // Design follows the thread-map skill: normalize first, segment on compaction, extract state not
 // prose, and treat every compaction summary as a claim rather than truth. The host performs no
-// semantic judgment here — it emits recorded facts with pointers; Mom synthesizes the graph.
+// semantic judgment here — it emits recorded facts with pointers; Path synthesizes the graph.
 //
 // Cut safety: the digest always describes exactly the evidence the feed drained, and the returned
 // cut is the drain's own cut. Coverage is therefore never claimed beyond processed evidence, and
 // worker cursors keep matching the drained end.
 import type { Cut, FeedEvent } from "./feed.ts";
+import { oneLine } from "../util/text.ts";
 
 export interface BootstrapPolicy {
 	/**
@@ -22,7 +23,7 @@ export interface BootstrapPolicy {
 	 */
 	maxChapters: number;
 	/** Hard bound on digest characters, so one model message stays inside the context guard.
-	 *  Must match --mom-bootstrap-chars' default (mom/index.ts); one source of truth for the cap. */
+	 *  Must match --path-bootstrap-chars' default (mom/index.ts); one source of truth for the cap. */
 	maxDigestChars: number;
 	/** Safety net on local drain windows. Each window is one 24,000-character capture. */
 	maxWindows: number;
@@ -74,14 +75,12 @@ const ASSISTANT_CHARS = 1600;
 const isCompaction = (event: FeedEvent) => event.actor === "lead" && event.kind === "compaction";
 const isDirection = (event: FeedEvent) => event.actor === "lead" && (event.kind === "user" || event.kind === "user_answer");
 const isDelegateTool = (event: FeedEvent) => event.actor === "lead" && event.kind === "tool_call" && Boolean(event.name?.includes("delegate"));
-const flat = (text: string) => text.replace(/\s+/g, " ").trim();
 /** The file an edit or write call names. Sessions rarely carry `file_op` entries; the calls themselves do. */
 function writtenPath(event: FeedEvent): string | undefined {
 	if (event.actor !== "lead" || event.kind !== "tool_call" || !/^(edit|write)$/i.test(event.name ?? "") || !event.text) return undefined;
 	const match = /"path":("(?:[^"\\]|\\.)*")/.exec(event.text);
 	try { return match ? JSON.parse(match[1]) as string : undefined; } catch { return undefined; }
 }
-const clamp = (text: string, limit: number) => (text.length <= limit ? text : `${text.slice(0, Math.max(0, limit - 1))}…`);
 
 /** Chapters break on compaction entries; the compaction event closes the chapter it ends. */
 export function segmentChapters(events: readonly FeedEvent[]): Chapter[] {
@@ -139,7 +138,7 @@ interface BlockLine { text: string; cls?: TrimClass; rank: number }
 
 function chapterBlock(chapter: Chapter, budget: number): string {
 	const lines: BlockLine[] = [{ text: `Chapter ${chapter.index} · entries ${chapter.entries} · narrative ${chapter.narrativeChars} chars · workers settled ${chapter.workersSettled} · compactions ${chapter.closingCompactions}`, rank: 0 }];
-	const cite = (label: string, item: ChapterDirection, limit = DIRECTION_CHARS) => `  ${label} [src:${item.ref}] ${clamp(flat(item.text), limit)}`;
+	const cite = (label: string, item: ChapterDirection, limit = DIRECTION_CHARS) => `  ${label} [src:${item.ref}] ${oneLine(item.text, limit)}`;
 	const directions = chapter.beats.filter(beat => beat.kind === "direction"), outcomes = chapter.beats.filter(beat => beat.kind === "outcome");
 	const first = directions[0], last = directions.at(-1), end = outcomes.at(-1);
 	chapter.beats.forEach((beat, i) => lines.push(beat.kind === "direction"
@@ -153,7 +152,7 @@ function chapterBlock(chapter: Chapter, budget: number): string {
 		// The closing claim is the provider's summary: context for the chapter, never citable evidence. A remote
 		// compaction's placeholder says nothing about the chapter, so only its presence is recorded.
 		const placeholder = /remote compaction applied/i.test(chapter.closingClaim.text);
-		lines.push({ text: placeholder ? "  CLAIM(placeholder — no content)" : `  CLAIM ${clamp(flat(chapter.closingClaim.text), CLAIM_CHARS)}`, rank: 0 });
+		lines.push({ text: placeholder ? "  CLAIM(placeholder — no content)" : `  CLAIM ${oneLine(chapter.closingClaim.text, CLAIM_CHARS)}`, rank: 0 });
 	}
 	const omitted: Record<TrimClass, number> = { file: 0, handoff: 0, direction: 0, outcome: 0, end: 0 };
 	const render = (kept: BlockLine[]) => {

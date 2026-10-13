@@ -1,6 +1,9 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth } from "@earendil-works/pi-tui";
-import type { AnnotationView, WorkView } from "./presentation.ts";
+import { navKeys } from "./keys.ts";
+import { keepInView, moveIndex, stepFor } from "./scroll.ts";
+import { fit, indent, selectedRow } from "./text.ts";
+import { kindWord, stateWord } from "./vocabulary.ts";
+import { NO_ACCOUNT, type AnnotationView, type WorkView } from "./presentation.ts";
 
 /** Why a row is shown at the top level although it has a recorded parent. */
 type Detached = "outside" | "loop";
@@ -16,12 +19,10 @@ interface Node {
 }
 interface Row { id: string; depth: number }
 
-const stateName = (state: string): string => ({ active: "in progress", parked: "waiting", settled: "finished", proposed: "proposed" })[state] ?? "not yet known";
-const kindName = (kind: string): string => ({ rule: "Rule", choice: "Choice", observation: "Observation" })[kind] ?? (kind || "Note");
 const label = (item: AnnotationView): string => item.label || item.id;
 const lines = (title: string, value: string): string[] => value.split(/\r?\n/).map((line, i) => i ? `  ${line}` : `${title}: ${line}`);
 
-/** Navigable hierarchy of a Mom work view. Input routing belongs to the parent component. */
+/** Navigable hierarchy of a Path work view. Input routing belongs to the parent component. */
 export class GraphBrowser {
 	private work: WorkView | undefined;
 	private nodes = new Map<string, Node>();
@@ -60,7 +61,21 @@ export class GraphBrowser {
 		const rows = this.rows();
 		if (!rows.length) return;
 		const at = Math.max(0, rows.findIndex(row => row.id === this.selectedId));
-		this.selectedId = rows[Math.min(rows.length - 1, Math.max(0, at + Math.trunc(delta)))].id;
+		this.selectedId = rows[moveIndex(at, delta, rows.length)].id;
+	}
+
+	/**
+	 * The keys every map view shares: ↑↓ and Home/End move, → or Space expands and collapses, ← goes to the parent.
+	 * True when the key was one of them; a caller handles its own extras before or after.
+	 */
+	handleKey(data: string, page?: number): boolean {
+		const nav = navKeys(data);
+		const step = stepFor(nav, page);
+		if (step !== undefined) this.move(step);
+		else if (nav === "right" || data === " ") this.toggle();
+		else if (nav === "left") this.parent();
+		else return false;
+		return true;
 	}
 
 	toggle(): void {
@@ -73,32 +88,23 @@ export class GraphBrowser {
 		if (this.parentId) this.selectedId = this.parentId;
 	}
 
-	first(): void {
-		this.selectedId = this.rows()[0]?.id;
-	}
-
-	last(): void {
-		this.selectedId = this.rows().at(-1)?.id;
-	}
-
 	render(theme: Theme, width: number, height: number): string[] {
 		if (width < 1 || height < 1) return [];
-		const fit = (line: string) => truncateToWidth(line, width, "…");
 		const rows = this.rows();
-		if (!rows.length) return [fit(theme.fg("muted", "Mom has not saved an account of this work yet."))];
+		if (!rows.length) return [fit(theme.fg("muted", NO_ACCOUNT), width)];
 		const at = Math.max(0, rows.findIndex(row => row.id === this.selectedId));
-		this.scroll = Math.min(Math.max(this.scroll, at - height + 1, 0), at, Math.max(0, rows.length - height));
+		this.scroll = keepInView(this.scroll, at, height, rows.length);
 		return rows.slice(this.scroll, this.scroll + height).map(({ id, depth }) => {
 			const node = this.nodes.get(id)!, item = node.item;
 			const selected = id === this.selectedId;
 			const twisty = !node.children.length ? " " : this.expanded.has(id) ? "▾" : "▸";
 			const focus = id === this.work?.focus ? theme.fg("accent", " ◆ focus") : "";
-			const kind = node.endeavor ? "" : theme.fg("dim", `${kindName(item.kind)}: `);
+			const kind = node.endeavor ? "" : theme.fg("dim", `${kindWord(item.kind)}: `);
 			const note = node.detached === "loop" ? " · parent loop" : node.detached === "outside" ? " · parent outside view"
 				: !node.endeavor && !node.parent ? " · no recorded parent" : "";
 			const name = selected ? theme.bold(theme.fg("accent", label(item))) : label(item);
-			const line = `${selected ? "> " : "  "}${"  ".repeat(depth)}${theme.fg("dim", twisty)} ${kind}${name}${theme.fg("muted", ` · ${stateName(item.state)}${note}`)}${focus}`;
-			return selected ? theme.bg("selectedBg", truncateToWidth(line, width, "…", true)) : fit(line);
+			const line = `${selected ? "> " : "  "}${indent(depth)}${theme.fg("dim", twisty)} ${kind}${name}${theme.fg("muted", ` · ${stateWord(item.state)}${note}`)}${focus}`;
+			return selected ? selectedRow(theme, line, width) : fit(line, width);
 		});
 	}
 
@@ -106,7 +112,7 @@ export class GraphBrowser {
 		const node = this.selectedId ? this.nodes.get(this.selectedId) : undefined;
 		if (!node) return [];
 		const item = node.item, out = [label(item), `ID: ${item.id}`];
-		out.push(`Kind: ${item.kind || "unknown"} · State: ${item.state || "unknown"} (${stateName(item.state)})${item.summaryOnly ? " · name/state only" : ""}`);
+		out.push(`Kind: ${item.kind || "unknown"} · State: ${item.state || "unknown"} (${stateWord(item.state)})${item.summaryOnly ? " · name/state only" : ""}`);
 		if (node.parent) out.push(`Within: ${this.named(node.parent)}`);
 		else if (node.recordedParent) out.push(`Within: [${node.recordedParent}] — ${node.detached === "loop" ? "parent links form a loop" : "outside this view"}`);
 		else if (!node.endeavor) out.push("Within: no recorded endeavor parent");

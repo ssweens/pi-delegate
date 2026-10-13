@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { TrailStore, trailFile, trailFor } from "../src/trail/store.ts";
 import { beforeLastDetour, current, depths, evolution, glance, landing, lines, openItems, renderBefore, renderEvolution, renderLanding, renderOpen, renderStanding, renderTrail, renderWaypoint, whereWeAre } from "../src/trail/projection.ts";
-import { sortTiers, trailEntries, validateWaypointInputs, type Strike, type Trail, type TrailRecord, type Waypoint } from "../src/trail/types.ts";
+import { label, sortTiers, trailEntries, validateWaypointInputs, type Strike, type Trail, type TrailRecord, type Waypoint } from "../src/trail/types.ts";
 
 const sessionId = "session-trail";
 let clock = 1_700_000_000_000;
@@ -187,7 +187,25 @@ test("journey: the glance carries the crumbs, the detour we are on, its open ite
 	assert.deepEqual([onA.crumbs, onA.open.map(w => w.id), onA.depth], [["Trail mode", "Lockfile bug"], ["j:w4"], 1]);
 	const home = glance(asTrail(journey.all));
 	assert.deepEqual([home.goal?.id, home.crumbs, home.current, home.depth, home.last?.id], ["j:w11", ["Trail mode"], undefined, 0, "j:w12"]);
-	assert.deepEqual(glance(asTrail([])), { goal: undefined, opening: undefined, changed: false, crumbs: [], current: undefined, open: [], last: undefined, depth: 0 });
+	const shape = (view: ReturnType<typeof glance>) => view.tree && { goal: view.tree.goal.id, before: view.tree.before.map(w => w.id),
+		levels: view.tree.levels.map(level => ({ head: level.head.id, open: level.open.map(w => w.id), ...(level.from ? { from: level.from.id } : {}), ...(level.done ? { done: [level.done.waypoint.id, level.done.kind] } : {}) })) };
+	assert.deepEqual(shape(twoDeep), { goal: "j:w1", before: [], levels: [{ head: "j:w1", open: [] }, { head: "j:w3", open: ["j:w4"] }, { head: "j:w5", open: [] }] },
+		"the tree: the goal, then each open detour nested in the one it left, an open item under the level it was raised in; nothing finished yet");
+	assert.deepEqual(shape(glance(journey.upTo(9))), { goal: "j:w1", before: [], levels: [{ head: "j:w1", open: [] }, { head: "j:w3", open: [], done: ["j:w9", "decided"] }] },
+		"a finished detour and a closed item are gone; only the latest finished thing shows, where it happened");
+	assert.deepEqual(shape(home), { goal: "j:w11", before: ["j:w1"], levels: [{ head: "j:w11", open: [], done: ["j:w3", "returned"] }] },
+		"back home under the changed goal, the old goal as what led there; the latest finished thing reads as the detour it ended");
+	const reframes = asTrail([...journey.all, wp("j:w13", "reframed", "Trail mode", "Ship the trail as the default mode"), wp("j:w14", "reframed", "Trail mode", "Make the trail the only mode")]);
+	assert.deepEqual(shape(glance(reframes))!.before, ["j:w13", "j:w11", "j:w1"], "the goals that led here, newest first");
+	const newThread = asTrail([wp("n:w1", "set_out", "Ledger", "Build the portable ledger"), wp("n:w2", "set_out", "Hop integration", "Run the ledger from Hop")]);
+	assert.deepEqual([shape(glance(newThread))!.goal, shape(glance(newThread))!.before], ["n:w2", ["n:w1"]], "a set_out on a new thread is the current goal, whatever thread it is on");
+	const finding = wp("s:w3", "learned", "Ledger", "OpenCode cannot receive messages");
+	const answered = { waypoints: [wp("s:w1", "set_out", "Ledger", "Build it"), wp("s:w2", "open", "Ledger", "Is MCP elicitation a handoff?"), wp("s:w5", "detour", "receiver", "Build a receiver", { from: "s:w3" })],
+		entries: [] as Waypoint[], struck: [] } as Trail;
+	answered.entries = [answered.waypoints[0]!, answered.waypoints[1]!, finding, wp("s:w4", "closed", "Ledger", "Elicitation cannot target another session", { closes: "s:w2", step: true }), answered.waypoints[2]!];
+	assert.deepEqual(shape(glance(answered)), { goal: "s:w1", before: [], levels: [{ head: "s:w1", open: [], done: ["s:w2", "closed"] }, { head: "s:w5", open: [], from: "s:w3" }] },
+		"a step that closes a parked question closes it; a detour carries the finding that led to it");
+	assert.deepEqual(glance(asTrail([])), { goal: undefined, opening: undefined, changed: false, crumbs: [], current: undefined, open: [], tree: undefined, parked: [], last: undefined, depth: 0 });
 	assert.deepEqual(depths(asTrail(journey.all)), [0, 0, 0, 1, 1, 2, 1, 1, 1, 0, 0, 0], "a detour sits where it left; a returned sits where it resumes");
 });
 
@@ -203,7 +221,7 @@ test("journey: evolution keeps the superseded set_out; current() drops it", () =
 test("journey: standing and trail rendering", () => {
 	const twoDeep = journey.upTo(6);
 	const standing = renderStanding(twoDeep).split("\n");
-	assert.equal(standing[0], "Mom's trail — where we are (descriptive, not direction):");
+	assert.equal(standing[0], "Path's trail — where we are (descriptive, not direction):");
 	assert.equal(standing[1], "Set out: Replace the graph with an append-only trail [src:lead:j:w1]");
 	assert.equal(standing[2], "Detour 2 deep: Sidecar test failed on the way; looking at it first — return to: Lockfile bug [src:lead:j:w5]");
 	assert.equal(standing[3], "Detour 1 deep: Stopped to chase a stale lock left by a crashed oven — return to: Trail mode [src:lead:j:w3]");
@@ -216,7 +234,7 @@ test("journey: standing and trail rendering", () => {
 	const onA = renderStanding(journey.upTo(4));
 	assert.match(onA, /\nOpen on this line: Does proper-lockfile reclaim a stale lock on its own\? \[src:lead:j:w4\]\n/);
 	assert.ok(renderStanding(asTrail(journey.all)).split("\n").length <= 10);
-	assert.match(renderStanding(asTrail(journey.all)), /^Mom's trail .*\nSet out \(reframed\): The trail replaces/);
+	assert.match(renderStanding(asTrail(journey.all)), /^Path's trail .*\nSet out \(reframed\): The trail replaces/);
 
 	const done: Trail = { waypoints: journey.all, struck: [{ waypoint: wp("j:w13", "learned", "Cache idea", "struck and gone"), strike: strike("s", "j:w13") }] };
 	const whole = renderTrail(done);
@@ -360,4 +378,35 @@ test("the glance keeps the opening goal; a reframe is marked, not swapped in", (
 	assert.equal(view.goal?.id, "j:w1", "the current goal is still known to the standing and the Trail tab");
 	assert.equal(view.changed, true);
 	assert.equal(glance(asTrail([start])).changed, false);
+});
+
+test("titles: a waypoint's own title, a later title record that renames it, and a label fallback for the rest", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-delegate-trail-titles-"));
+	const session = join(dir, "session.jsonl");
+	try {
+		await writeFile(session, "{}\n");
+		const store = new TrailStore(() => session, sessionId);
+		await store.appendWaypoint(wp("t:w1", "set_out", "Trail glance", "Make the widget glanceable."));
+		await store.appendWaypoint(wp("t:w2", "decided", "Trail glance", "Show short labels in the widget, never captions.", { title: "Labels, not captions" }));
+		await store.appendWaypoint(wp("t:w3", "decided", "Trail glance", "Spin Path's symbol beside its title; repaint on a clock while it works."));
+		const title = (id: string, target: string, text: string) => ({ id, sessionId, at: (clock += 60_000), target, title: text, parent: null });
+		await store.appendTitle(title("t:t0", "t:w3", "Spinner by title"));
+		await store.appendTitle(title("t:t1", "t:w3", "Spinner beside the title"));
+		await store.appendTitle(title("t:t2", "t:w2", "Overwritten?"));
+		await store.appendTitle(title("t:t3", "nowhere", "Nothing to title"));
+		assert.equal((await readFile(trailFile(session), "utf8")).trim().split("\n").length, 7, "titles are appended records; no waypoint is rewritten");
+		const trail = trailFor(await new TrailStore(() => session, sessionId).load(), new Set());
+		assert.deepEqual(trail.waypoints.map(w => w.title), [undefined, "Overwritten?", "Spinner beside the title"], "the latest title record wins, over a waypoint's own title too (a repair renames)");
+		assert.deepEqual(trail.waypoints.map(label), ["Trail glance", "Overwritten?", "Spinner beside the title"], "an untitled goal reads as its thread name");
+	} finally { await rm(dir, { recursive: true, force: true }); }
+	assert.equal(label(wp("x", "decided", "l", "Drive Amp over stdin: echo the prompt rather than pass it.")), "Drive Amp over stdin", "the first clause");
+	assert.equal(label(wp("x", "decided", "l", "Approve proceeding with the single-PTY plan so Claude Code can be spawned too")), "Approve proceeding with the…", "cut at a word");
+	const { inputs, titles, defects } = validateWaypointInputs({
+		waypoints: [{ kind: "decided", line: "l", refs: ["lead:a"], caption: "c", title: "  " }],
+		titles: [{ id: "known", title: "  Two words " }, { id: "unknown", title: "Dropped" }],
+	}, [{ id: "known", kind: "decided" }], new Set(["lead:a"]), index => `j:w${index}`);
+	assert.deepEqual(defects, []);
+	assert.equal(inputs[0]!.title, undefined, "a blank title is no title");
+	assert.deepEqual(titles, [{ id: "known", title: "Two words" }], "titles for ids the trail does not hold are dropped, not defects");
+	assert.ok(validateWaypointInputs({ waypoints: [{ kind: "decided", line: "l", refs: ["lead:a"], caption: "c", title: "x".repeat(41) }] }, [], new Set(["lead:a"]), i => `${i}`).defects.length, "a title is at most 40 characters");
 });

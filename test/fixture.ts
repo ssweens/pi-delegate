@@ -8,12 +8,10 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { once } from "node:events";
+import { capturePi, deferred } from "./capture.ts";
+export { capturePi, deferred, fakePi, tempDir } from "./capture.ts";
+import { errorMessage, isRecord, textOf } from "../src/util/text.ts";
 
-export function deferred<T = void>() {
-	let resolve!: (value: T | PromiseLike<T>) => void;
-	const promise = new Promise<T>((done) => { resolve = done; });
-	return { promise, resolve };
-}
 export interface Reply {
 	text?: string;
 	after?: string;
@@ -46,13 +44,15 @@ export async function provider() {
 					if (question?.type === "choice") {
 						const told = chosen?.[name];
 						const probabilities: Record<string, number> = { ...Object.fromEntries(Object.keys(question.criteria ?? {}).map(key => [key, 0.01])) };
-						if (told && typeof told === "object") Object.assign(probabilities, told);
+						if (isRecord(told)) Object.assign(probabilities, told);
 						else if (probabilities.none !== undefined) probabilities.none = 0.9;
 						else if (probabilities.nothing !== undefined) probabilities.nothing = 0.9;
 						else { const first = Object.keys(probabilities)[0]; if (first) probabilities[first] = 0.9; }
 						const choice = Object.entries(probabilities).sort((a, b) => b[1] - a[1])[0]?.[0] ?? "none";
 						return [name, { choice, probabilities }];
 					}
+					// A score is the expected level; left alone it is the lowest.
+					if (question?.type === "score") return [name, { type: "score", score: typeof chosen?.[name] === "number" ? chosen[name] : 0, confidence: 0.9 }];
 					return [name, { noul: typeof chosen?.[name] === "number" ? chosen[name] : (name === "durable_work" ? 0.99 : 0.01) }];
 				}));
 				res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ answers })); return;
@@ -60,7 +60,7 @@ export async function provider() {
 			assert.equal(req.url, "/v1/chat/completions");
 			requests.push(request);
 			const user = request.messages.findLast((m: any) => m.role === "user");
-			const text = typeof user?.content === "string" ? user.content : user?.content?.filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n");
+			const text = textOf(user?.content);
 			const reply = scripts.get(text)?.shift() ?? onUnscripted?.(request);
 			assert(reply, `Unscripted model request: ${text}`);
 			arrivals.get(text)?.resolve(request);
@@ -75,7 +75,7 @@ export async function provider() {
 			if (tools.length) chunk({ tool_calls: tools.map((tool, index) => ({ index, id: `call-${requests.length}${index ? `-${index}` : ""}`, type: "function", function: { name: tool.name, arguments: JSON.stringify(tool.arguments) } })) });
 			chunk({}, tools.length ? "tool_calls" : "stop");
 			res.end("data: [DONE]\n\n");
-		} catch (error) { errors.push(String(error)); res.writeHead(500); res.end(String(error)); }
+		} catch (error) { errors.push(errorMessage(error)); res.writeHead(500); res.end(errorMessage(error)); }
 	});
 	server.listen(0, "127.0.0.1"); await once(server, "listening");
 	const address = server.address(); assert(address && typeof address !== "string");
@@ -176,8 +176,7 @@ export async function harness(box: Sandbox, parent?: string, hooks: { beforeNoti
 	// test file that loaded it before test/setup.ts would point it at the real home.
 	if (homedir() === REAL_HOME || underRealPi(AGENT_DIR)) refuse(`harness: pi-delegate's agent directory ${AGENT_DIR} is the real home's ~/.pi; import "./setup.ts" first in the test file. Refusing to run.`);
 	if (AGENT_DIR !== box.agentDir) refuse(`harness: pi-delegate's agent directory is ${AGENT_DIR}, not this sandbox's ${box.agentDir}; its children would read another sandbox's settings.`);
-	const tools = new Map<string, any>();
-	const commands = new Map<string, any>();
+	const tools = new Map<string, any>(), commands = new Map<string, any>();
 	let ctx: any;
 	let extensionApi: any;
 	const notices: any[] = [], errors: any[] = [];
@@ -190,13 +189,10 @@ export async function harness(box: Sandbox, parent?: string, hooks: { beforeNoti
 				input: ["text"], contextWindow: 32768, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
 		});
 		extensionApi = pi;
-		extension(new Proxy(pi, { get(target, key) {
-			if (key === "getFlag") return (name: string) => Object.prototype.hasOwnProperty.call(hooks.flags ?? {}, name) ? hooks.flags![name] : target.getFlag(name);
-			if (key === "registerTool") return (tool: any) => { tools.set(tool.name, tool); target.registerTool(tool); };
-			if (key === "registerCommand") return (name: string, options: any) => { commands.set(name, options); target.registerCommand(name, options); };
-			if (key === "sendMessage") return (message: any, options: any) => { hooks.beforeNotice?.(message); notices.push(message); notice.resolve(message); return target.sendMessage(message, options); };
-			return target[key];
-		} }));
+		extension(capturePi(pi, (target) => ({
+			getFlag: (name: string) => Object.prototype.hasOwnProperty.call(hooks.flags ?? {}, name) ? hooks.flags![name] : target.getFlag(name),
+			sendMessage: (message: any, options: any) => { hooks.beforeNotice?.(message); notices.push(message); notice.resolve(message); return target.sendMessage(message, options); },
+		}), { tools, commands }).pi);
 		pi.on("session_start", (_event: any, context: any) => { ctx = context; });
 		hooks.register?.(pi);
 	};

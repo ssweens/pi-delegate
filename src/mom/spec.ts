@@ -10,6 +10,7 @@
 import { parseDeciderAnswer, type DeciderAnswer, type DeciderQuestion } from "./decider.ts";
 import { renderUpdateEvents, type FeedEvent } from "./feed.ts";
 import type { SpecOp, V2Graph, V2Node } from "./v2.ts";
+import { clipText, errorMessage } from "../util/text.ts";
 
 /** Below this, an answer is not a decision however it ranks. */
 export const SPEC_FLOOR = 0.25;
@@ -44,7 +45,7 @@ export function evidenceState(graph: V2Graph, events: readonly FeedEvent[]): str
 	const lines: string[] = [];
 	const visit = (parent: string | null, depth: number) => {
 		for (const node of children.get(parent) ?? []) {
-			lines.push(`${"  ".repeat(depth)}- ${node.kind}${node.state ? ` [${node.state}]` : ""} ${node.id}: ${node.label.slice(0, 60)}${node.id === graph.focus ? "  <-- current" : ""}`);
+			lines.push(`${"  ".repeat(depth)}- ${node.kind}${node.state ? ` [${node.state}]` : ""} ${node.id}: ${clipText(node.label, 60, { ellipsis: "" })}${node.id === graph.focus ? "  <-- current" : ""}`);
 			visit(node.id, depth + 1);
 		}
 	};
@@ -52,7 +53,7 @@ export function evidenceState(graph: V2Graph, events: readonly FeedEvent[]): str
 	if (!lines.length) lines.push("(empty)");
 	// Trim the activity text: the classifier decides shape, not prose, and every extra character is
 	// prefill the 3B decider pays for on every round.
-	const trimmed = events.map(event => (event.text && event.text.length > 300 ? { ...event, text: `${event.text.slice(0, 300)}\u2026` } : event));
+	const trimmed = events.map(event => (event.text ? { ...event, text: clipText(event.text, 300) } : event));
 	return `CURRENT WORK MAP\n${lines.join("\n")}\n\nNEW ACTIVITY IN THE SESSION\n${renderUpdateEvents(trimmed)}`;
 }
 
@@ -135,20 +136,20 @@ export class SpecError extends Error {
 /**
  * Ask the spec's questions and read the ops off the answers. The spec is required: no client, a failed
  * endpoint, or a round that does not answer every question throws, so no update ever runs without one.
- * The spec can only ever narrow what her model may write — it is never the thing that stops an update.
+ * The spec can only ever narrow what its model may write — it is never the thing that stops an update.
  */
 export async function readSpec(client: SpecClient | undefined, graph: V2Graph, events: readonly FeedEvent[]): Promise<{ ops: SpecOp[]; chosen: Record<string, string> }> {
-	if (!client) throw new SpecError("no-client", "No decision model is configured for Mom's change spec. Choose one in /mom settings.");
+	if (!client) throw new SpecError("no-client", "No decision model is configured for Path's change spec. Choose one in /path settings.");
 	const state = evidenceState(graph, events);
 	const questions = specQuestions(graph);
 	let answers: Record<string, DeciderAnswer>;
 	// One round: the 3B decider answers every question in ~30s, and splitting re-prefills the state per round.
 	try { answers = (await client.ask(state, questions)).answers; }
-	catch (error) { throw new SpecError("classifier-error", `Mom's decision model did not answer: ${error instanceof Error ? error.message : String(error)}`); }
+	catch (error) { throw new SpecError("classifier-error", `Path's decision model did not answer: ${errorMessage(error)}`); }
 	const reading: SpecReading = {};
 	for (const [name, question] of Object.entries(questions)) {
 		const answer = parseDeciderAnswer(question, answers[name]);
-		if (!answer || answer.type !== "choice") throw new SpecError("incomplete", `Mom's decision model did not answer ${name} with a choice on its menu.`);
+		if (!answer || answer.type !== "choice") throw new SpecError("incomplete", `Path's decision model did not answer ${name} with a choice on its menu.`);
 		reading[name] = Object.entries(answer.probabilities).sort((a, b) => b[1] - a[1]);
 	}
 	return specOps(graph, reading);

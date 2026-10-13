@@ -1,30 +1,35 @@
-/** Mom runs in oven (her slice follows this session); the lead shows her state, sends the user's requests and adds her hints. */
+/** Path runs in oven (its slice follows this session); the lead shows its state, sends the user's requests and adds its hints. */
 import { copyToClipboard, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text, matchesKey, isKittyProtocolActive, type TUI } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { MomClient, TRAIL_STANDING, type Command, type Snapshot, type SourcePage, type TrailOptions } from "./client.ts";
 import { WAYPOINT_KINDS, type WaypointKind } from "../trail/types.ts";
-import { momSettings } from "./settings.ts";
-import { ANCHOR, clockTime } from "./anchor.ts";
+import { pathRows } from "./settings.ts";
+import { SettingsPanel } from "../ui/settings-panel.ts";
+import { FULLSCREEN } from "../ui/overlay.ts";
+import { chordLabel } from "../ui/hints.ts";
+import { ANCHOR } from "./anchor.ts";
 import type { FindingRequest } from "./operation.ts";
 import { CORRECTION } from "./feed.ts";
 import { COMPACT_KEY, FOCUS_KEY, MomPanel, MomView, momToolPreview, type PanelDiagnostics, type PanelView } from "../ui/panel.ts";
 import { activityFor } from "../ui/activity.ts";
-import { updateErrorSummary } from "./status.ts";
+import { formatUsage, updateErrorSummary, WAITING_FOR_VIEW } from "./status.ts";
 import { presentGraph, readText, summaryText } from "../ui/presentation.ts";
 import { DEFAULT_MODE, modeNames } from "./modes.ts";
 import { momDeciderSelector, momModelSelector, pickMomModel } from "./model-picker.ts";
 import { MomRebuildPanel } from "../ui/mom-rebuild.ts";
 import type { RebuiltMap } from "./rebuild.ts";
+import { clockTime, formatDuration } from "../util/format.ts";
+import { errorMessage, textOf } from "../util/text.ts";
 
 const FLAGS = {
-	"mom-model": ["Exact provider/model for Mom; never inherits the lead model", "openai-codex/gpt-5.6-sol"],
+	"mom-model": ["Exact provider/model for Path; never inherits the lead model", "openai-codex/gpt-5.6-sol"],
 	"mom-mode": [`Map-maintenance mode (${modeNames().join(", ")}); see docs/map-modes.md`, DEFAULT_MODE],
-	"mom-interval-ms": ["Minimum spacing between background Mom updates in milliseconds", "0"],
-	"mom-max-wait-ms": ["Longest Mom waits for a turn to end before updating anyway, in milliseconds", "1800000"],
+	"mom-interval-ms": ["Minimum spacing between background Path updates in milliseconds", "0"],
+	"mom-max-wait-ms": ["Longest Path waits for a turn to end before updating anyway, in milliseconds", "1800000"],
 	"mom-retry-ms": ["Automatic retry delays after a failed update, comma-separated milliseconds", "5000,60000,300000"],
 	"mom-advisor-url": ["Optional System One endpoint. Empty disables it", ""],
-	"mom-decider": ["Pi classifier model (local System One) for Mom's decisions: the v2 change check before her model reads a batch. Required: with none, every update fails until one is set.", ""],
+	"mom-decider": ["Pi classifier model (local System One) for Path's decisions: the v2 change check before its model reads a batch. Required: with none, every update fails until one is set.", ""],
 	"mom-decider-url": ["Local decider (System One, decider/serve.py) for continuity checks and state-change shadowing. Empty disables it", ""],
 	"mom-decider-clear": ["The decider skips a continuity model check when it is at least this sure the turn continues", "0.9"],
 	"mom-advisor-model": ["Native System One model ID", "beverly-4B"],
@@ -35,13 +40,25 @@ const FLAGS = {
 	"mom-bootstrap-chars": ["Maximum characters of cold-catch-up compression sent in one proposal", "48000"],
 };
 
+/** Resolve one flag from its `path-*` and deprecated `mom-*` registrations: a `path-*` value that differs from the default wins. */
+export function resolveFlag(name: keyof typeof FLAGS, get: (key: string) => unknown): unknown {
+	const fallback = FLAGS[name][1], path = get(name.replace(/^mom-/, "path-"));
+	return path !== undefined && path !== fallback ? path : get(name) ?? fallback;
+}
+
 const installedIn = new WeakSet<object>();
 
 export function installMom(pi: ExtensionAPI) {
 	if (installedIn.has(pi)) return;
 	installedIn.add(pi);
 	if (process.env.PI_STRINGS_WORKER === "1" || process.env.PI_STRINGS_OPENED === "1") return;
-	for (const [name, [description, value]] of Object.entries(FLAGS)) pi.registerFlag(name, { description, type: "string", default: value });
+	// `--path-*` are the documented flags; `--mom-*` keep working as deprecated aliases (internal keys stay `mom-*`).
+	for (const [name, [description, value]] of Object.entries(FLAGS)) {
+		pi.registerFlag(name.replace(/^mom-/, "path-"), { description, type: "string", default: value });
+		pi.registerFlag(name, { description: `Deprecated alias of --${name.replace(/^mom-/, "path-")}. ${description}`, type: "string", default: value });
+	}
+	/** A flag's value: the `path-*` one when it differs from its default, else the deprecated `mom-*` one. */
+	const flag = (name: keyof typeof FLAGS) => resolveFlag(name, key => pi.getFlag(key));
 	let ctx: ExtensionContext | undefined, client: MomClient | undefined;
 	let ready: Promise<void> = Promise.resolve(), epoch = 0, readError: string | undefined;
 	let widgetSignature: string | undefined;
@@ -55,12 +72,12 @@ export function installMom(pi: ExtensionAPI) {
 	function view(explicit = false, elapsed = true): PanelView {
 		const error = client?.error ?? readError;
 		const saved: PanelView = client?.state ? client.view(explicit, elapsed) : {
-			status: client?.error ? "reconnecting" : error && !client ? "needs you" : "connecting", summary: "Waiting for Mom's saved view. Existing notes have not been loaded.",
+			status: client?.error ? "reconnecting" : error && !client ? "needs you" : "connecting", summary: WAITING_FOR_VIEW,
 		};
 		const shown = client?.error ?? (explicit || !client ? readError : undefined);
 		const rebuild = rebuilding?.owner === client ? rebuilding : undefined;
-		const rebuildStatus = rebuild?.candidate ? "Rebuild ready · /mom rebuild to review" : rebuild?.error
-			? `Rebuild failed · ${updateErrorSummary(rebuild.error)} · /mom rebuild to retry` : rebuild?.message;
+		const rebuildStatus = rebuild?.candidate ? "Rebuild ready · /path rebuild to review" : rebuild?.error
+			? `Rebuild failed · ${updateErrorSummary(rebuild.error)} · /path rebuild to retry` : rebuild?.message;
 		return { ...saved, compact: compact(), ...(shown ? { error: updateErrorSummary(shown) } : {}),
 			...(rebuildStatus ? { rebuild: rebuildStatus, rebuildUrl: !rebuild?.candidate && !rebuild?.error ? rebuild?.sliceUrl : undefined } : {}),
 			status: client?.error ? "reconnecting" : saved.status };
@@ -79,14 +96,14 @@ export function installMom(pi: ExtensionAPI) {
 	}
 	function cached(): string {
 		const v = view(true), u = client?.snapshot?.usage;
-		return `${v.summary || "Mom has not saved a view of this work yet."}\n\n${v.status}${v.sliceUrl ? `\nSlice: ${v.sliceUrl}` : ""}${v.rebuild ? `\n${v.rebuild}` : ""}${v.rebuildUrl ? `\nRebuild slice: ${v.rebuildUrl}` : ""}${v.error ? `\n${v.error}` : ""}${v.note ? `\n\nNotice: ${v.note}` : ""}${u ? `\n\nMom (session): ${u.calls} model calls · ${u.input + u.cacheRead + u.cacheWrite} input tokens · ${u.output} output tokens · $${u.nominalCost.toFixed(5)} nominal · ${(u.elapsedMs / 1000).toFixed(1)}s cumulative model/update time` : ""}`;
+		return `${v.summary || "Path has not saved a view of this work yet."}\n\n${v.status}${v.sliceUrl ? `\nSlice: ${v.sliceUrl}` : ""}${v.rebuild ? `\n${v.rebuild}` : ""}${v.rebuildUrl ? `\nRebuild slice: ${v.rebuildUrl}` : ""}${v.error ? `\n${v.error}` : ""}${v.note ? `\n\nNotice: ${v.note}` : ""}${u ? `\n\n${formatUsage(u)}` : ""}`;
 	}
 	function failure(error: unknown) { readError = String(error); sync(); }
 	function reset(context: ExtensionContext) {
-		rebuilding?.abort.abort(new Error("Mom session changed.")); rebuilding = undefined;
+		rebuilding?.abort.abort(new Error("Path session changed.")); rebuilding = undefined;
 		const token = ++epoch; client?.close(); client = undefined; ctx = context; readError = undefined;
 		widgetSignature = undefined; sentAnchors.clear(); sentStandings.clear();
-		const flags = Object.fromEntries(Object.entries(FLAGS).map(([name, [, value]]) => [name, pi.getFlag(name) ?? value]));
+		const flags = Object.fromEntries(Object.keys(FLAGS).map(name => [name, flag(name as keyof typeof FLAGS)])) as Record<string, string | boolean | undefined>;
 		let connection: MomClient;
 		try {
 			connection = new MomClient(context, { flags, changed: () => { if (epoch === token) sync(); },
@@ -100,18 +117,33 @@ export function installMom(pi: ExtensionAPI) {
 	function updateContext(context: ExtensionContext) { ctx = context; client?.updateContext(context); }
 	async function request(command: Command, signal?: AbortSignal): Promise<unknown> {
 		const token = epoch; await ready;
-		if (token !== epoch || !client) throw new Error(readError ?? "Mom session changed or is unavailable.");
+		if (token !== epoch || !client) throw new Error(readError ?? "Path session changed or is unavailable.");
 		return client.request(command, signal);
 	}
 	async function refresh(): Promise<void> { await request({ kind: "refresh" }); }
+	/**
+	 * A command that starts a run says so at once (or what it waits behind), and says how the run ended:
+	 * the widget's spinner is the only other sign, and a run can take minutes.
+	 */
+	async function act(context: ExtensionContext, label: string, command: Command, ended: (added: number) => string): Promise<void> {
+		await ready;
+		const snapshot = client?.snapshot, before = snapshot?.passive.trail?.count ?? 0;
+		const current = snapshot?.startedAt === undefined ? undefined : `${snapshot.passive.trail?.task ?? "updating"}, ${formatDuration(Date.now() - snapshot.startedAt)} in`;
+		context.ui.notify(current ? `Path: ${label} — queued behind the run in progress (${current}).` : `Path: ${label}…`, "info");
+		await request(command);
+		const failed = client?.runError;
+		if (failed) { context.ui.notify(`Path: ${label} failed: ${updateErrorSummary(failed)} /path detail has the full error.`, "error"); return; }
+		context.ui.notify(`Path: ${ended((client?.snapshot?.passive.trail?.count ?? before) - before)}`, "info");
+	}
+	const added = (count: number) => count > 0 ? `${count} new entr${count === 1 ? "y" : "ies"} on the trail` : "nothing new for the trail";
 	async function findingAction(action: FindingRequest, finding: string) { await request({ kind: "finding", action, finding }); }
 	pi.on("session_start", (_event, context) => reset(context));
-	// A new branch: her work on the old one is stopped in oven, and she follows the selected branch.
+	// A new branch: its work on the old one is stopped in oven, and it follows the selected branch.
 	pi.on("session_tree", (_event, context) => { void client?.halt(); reset(context); });
-	pi.on("session_shutdown", () => { rebuilding?.abort.abort(new Error("Mom session ended.")); rebuilding = undefined;
+	pi.on("session_shutdown", () => { rebuilding?.abort.abort(new Error("Path session ended.")); rebuilding = undefined;
 		epoch++; client?.close(); client = undefined; activity.clearMom(); ctx = undefined; });
-	// Her hints: the continuity anchor she prepared after a compaction goes into the lead's context once, and in
-	// trail mode her standing (where we are) follows whenever it changed since the last one sent.
+	// Its hints: the continuity anchor it prepared after a compaction goes into the lead's context once, and in
+	// trail mode its standing (where we are) follows whenever it changed since the last one sent.
 	pi.on("before_agent_start", (started, context) => {
 		updateContext(context);
 		const anchor = client?.pendingAnchor();
@@ -153,62 +185,59 @@ export function installMom(pi: ExtensionAPI) {
 				setEnabled: async enabled => { await request({ kind: "controls", change: { enabled } }); },
 				draftForLead: text => { const draft = context.ui.getEditorText(); context.ui.setEditorText(`${draft}${draft ? "\n\n" : ""}${text}`); },
 				prepareLeadDraft: async finding => { await findingAction("discuss", finding); const draft = context.ui.getEditorText();
-					context.ui.setEditorText(`${draft}${draft ? "\n\n" : ""}Mom suggested: ${finding}\nLet's discuss this before acting.`); },
+					context.ui.setEditorText(`${draft}${draft ? "\n\n" : ""}Path suggested: ${finding}\nLet's discuss this before acting.`); },
 			}, theme, tui, () => done()); },
-			{ overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left", margin: 0 } });
-		} catch (error) { context.ui.notify(`Cannot open Mom: ${String(error)}`, "error"); }
+			FULLSCREEN);
+		} catch (error) { context.ui.notify(`Cannot open Path: ${String(error)}`, "error"); }
 		finally { if (heldWidget === held) { momView = undefined; viewOpen = false; closeView = undefined; heldWidget = undefined; sync(); } }
 	}
-	/** Mom's settings panel over her saved controls; undefined until she is connected. /delegate settings opens it as a submenu. */
-	function settingsPanel(context: ExtensionContext, tui: TUI, close: () => void) {
-		const controls = client?.snapshot?.controls;
-		if (!controls) return undefined;
-		const fallback = String(pi.getFlag("mom-model") ?? FLAGS["mom-model"][1]);
-		return momSettings(controls,
-			async change => { await request({ kind: "controls", change }); }, () => tui.requestRender(), close, Math.max(3, Math.min(12, tui.terminal.rows - 9)),
-			// Model is one of the settings: its row opens the picker as a submenu. The pick is Mom's
-			// alone and never becomes Pi's default.
-			// `done(selected)` is the settings row's own save trigger: hand the pick straight back and
-			// let momSettings persist it. Saving here as well would fire twice, and a throw would leave
-			// the submenu open for good.
+	/** Path's rows of the settings panel over its saved controls, read live; undefined until it is connected. /path
+	 *  settings shows them alone; /delegate settings lists them with the package's other rows. */
+	function settingsRows(context: ExtensionContext, tui: TUI) {
+		if (!client?.snapshot?.controls) return undefined;
+		const fallback = String(flag("mom-model"));
+		return pathRows(() => client!.snapshot!.controls, async change => { await request({ kind: "controls", change }); },
+			// The pickers are Path's alone: a pick never becomes Pi's default. Their `done(selected)` hands the pick
+			// back to the row, which saves it once.
 			(current, finished) => momModelSelector(context, tui, current, fallback, finished) as never,
 			(current, finished) => momDeciderSelector(context, tui, current, finished) as never, fallback);
 	}
-	activity.setMomSettings(settingsPanel);
+	activity.setMomRows(settingsRows);
 	async function rebuild(context: ExtensionContext) {
-		if (context.mode !== "tui") throw new Error("/mom rebuild requires an interactive terminal.");
+		if (context.mode !== "tui") throw new Error("/path rebuild requires an interactive terminal.");
 		await ready;
 		const owner = client, sessionEpoch = epoch;
-		if (!owner || !owner.snapshot) throw new Error(readError ?? "Mom is not connected.");
+		if (!owner || !owner.snapshot) throw new Error(readError ?? "Path is not connected.");
 		if (!rebuilding || rebuilding.owner !== owner || rebuilding.error) {
 			const job = { owner, abort: new AbortController(), message: "Preparing a private copy of this session…" } as NonNullable<typeof rebuilding>;
 			rebuilding = job;
 			sync();
 			void owner.rebuild((message, sliceUrl) => { if (rebuilding === job) { job.message = message; job.sliceUrl = sliceUrl; sync(); } }, job.abort.signal)
 				.then(candidate => { if (rebuilding !== job || job.abort.signal.aborted) return;
-					job.candidate = candidate; sync(); context.ui.notify("Mom's rebuilt map is ready. /mom rebuild opens the review.", "info"); })
+					job.candidate = candidate; sync(); context.ui.notify("Path's rebuilt map is ready. /path rebuild opens the review.", "info"); })
 				.catch(error => { if (rebuilding !== job || job.abort.signal.aborted) return;
-					job.error = error instanceof Error ? error.message : String(error); sync();
-					context.ui.notify(`Mom's rebuild failed: ${job.error}`, "error"); });
+					job.error = errorMessage(error); sync();
+					context.ui.notify(`Path's rebuild failed: ${job.error}`, "error"); });
 			return;
 		}
-		if (!rebuilding.candidate) { context.ui.notify(`${rebuilding.message} · progress is in Mom's widget.`, "info"); return; }
+		if (!rebuilding.candidate) { context.ui.notify(`${rebuilding.message} · progress is in Path's widget.`, "info"); return; }
 		const candidate = rebuilding.candidate;
 		const result = await context.ui.custom<"saved" | "cancelled">((tui, theme, _keys, done) =>
 			new MomRebuildPanel(tui, theme, () => Math.max(8, tui.terminal.rows - 6), candidate,
 				async selected => {
-					if (epoch !== sessionEpoch || client !== owner) throw new Error("The Mom session changed; rebuild again on the selected branch.");
+					if (epoch !== sessionEpoch || client !== owner) throw new Error("The Path session changed; rebuild again on the selected branch.");
 					await owner.acceptRebuild(selected);
 				}, done, owner.state?.checkpoint?.graph.nodes.length ?? 0, owner.snapshot?.explicit.work),
-			{ overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left", margin: 0 } });
+			FULLSCREEN);
 		if (rebuilding?.candidate === candidate) { rebuilding = undefined; sync(); }
-		if (result === "saved") context.ui.notify("Mom's rebuilt map is saved. Earlier checkpoints remain available.", "info");
+		if (result === "saved") context.ui.notify("Path's rebuilt map is saved. Earlier checkpoints remain available.", "info");
 	}
 	async function showSettings(context: ExtensionContext) {
-		if (context.mode !== "tui") throw new Error("Mom settings requires interactive mode.");
+		if (context.mode !== "tui") throw new Error("Path settings requires interactive mode.");
 		await ready;
-		if (!client?.snapshot?.controls) throw new Error(readError ?? "Mom is not connected.");
-		await context.ui.custom<void>((tui, _theme, _keys, done) => settingsPanel(context, tui, () => done())!);
+		if (!client?.snapshot?.controls) throw new Error(readError ?? "Path is not connected.");
+		await context.ui.custom<void>((tui, _theme, _keys, done) =>
+			new SettingsPanel("Path settings", settingsRows(context, tui)!, () => tui.requestRender(), () => done(), Math.max(3, Math.min(12, tui.terminal.rows - 9))));
 	}
 	async function checkKeys(context: ExtensionContext) {
 		if (context.mode !== "tui") throw new Error("The key check requires an interactive terminal.");
@@ -216,22 +245,22 @@ export function installMom(pi: ExtensionAPI) {
 		try { await context.ui.custom<void>((tui, theme, _keys, done) => {
 			const events: string[] = [];
 			unsubscribe = context.ui.onTerminalInput(data => {
-				const key = matchesKey(data, FOCUS_KEY) ? "Ctrl+Shift+J" : matchesKey(data, COMPACT_KEY) ? "Ctrl+Shift+K" : "neither Mom shortcut";
+				const key = matchesKey(data, FOCUS_KEY) ? chordLabel(FOCUS_KEY) : matchesKey(data, COMPACT_KEY) ? chordLabel(COMPACT_KEY) : "neither Path shortcut";
 				const legacy = tui.terminal.kittyProtocolActive && /^\x1b[jk]$/.test(data);
 				events.push(`${JSON.stringify(data).slice(0, 80)} → ${legacy ? "legacy Alt; enhanced host mode rejects this encoding" : key}`);
 				if (events.length > 6) events.shift(); tui.requestRender(); return undefined;
 			});
-			return { render: width => new Text([theme.bold("Mom · key check"), "", "Press Ctrl+Shift+J once, then Ctrl+Shift+K once. Press Enter to close.",
+			return { render: width => new Text([theme.bold("Path · key check"), "", `Press ${chordLabel(FOCUS_KEY)} once, then ${chordLabel(COMPACT_KEY)} once. Press Enter to close.`,
 				"Escape is recorded here so split Alt sequences remain visible.", "Nothing is saved or sent to a model. Only press test keys here.", "",
-				`Enhanced keyboard: host=${tui.terminal.kittyProtocolActive ? "on" : "off"}, Mom parser=${isKittyProtocolActive() ? "on" : "off"}`,
+				`Enhanced keyboard: host=${tui.terminal.kittyProtocolActive ? "on" : "off"}, Path parser=${isKittyProtocolActive() ? "on" : "off"}`,
 				...(events.length ? events : ["Waiting for a key event…"])].join("\n"), 1, 1).render(width),
 				handleInput: data => { if (matchesKey(data, "enter")) done(); }, invalidate() {} };
-		}, { overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left", margin: 0 } }); } finally { unsubscribe?.(); }
+		}, FULLSCREEN); } finally { unsubscribe?.(); }
 	}
-	pi.registerShortcut(FOCUS_KEY, { description: "Open Mom's view (Esc or Ctrl+Shift+J returns)", handler: open });
-	pi.registerShortcut(COMPACT_KEY, { description: "Toggle Mom's widget between full and one line", handler: async context => { ctx = context; toggleCompact(); } });
-	const TRAIL_DESCRIPTION = "Read Mom's trail: where we are and the waypoints into the transcript. query finds where a line landed; before shows what we were doing before the last detour; open lists unfinished steps and questions; evolution shows how the goal changed.";
-	pi.registerTool({ name: "mom", label: "Mom", description: "Read Mom's saved story map, her trail, selected records, or original evidence without a model call. The widget already shows your current place; use this for more detail. Read-only: working agents never maintain Mom's notes. Choose at most one of graph, source, trail.",
+	pi.registerShortcut(FOCUS_KEY, { description: `Open Path's view (Esc or ${chordLabel(FOCUS_KEY)} returns)`, handler: open });
+	pi.registerShortcut(COMPACT_KEY, { description: "Toggle Path's widget between full and one line", handler: async context => { ctx = context; toggleCompact(); } });
+	const TRAIL_DESCRIPTION = "Read Path's trail: where we are and the waypoints into the transcript. query finds where a line landed; before shows what we were doing before the last detour; open lists unfinished steps and questions; evolution shows how the goal changed.";
+	pi.registerTool({ name: "path", label: "Path", description: "Read Path's saved story map, its trail, selected records, or original evidence without a model call. The widget already shows your current place; use this for more detail. Read-only: working agents never maintain Path's notes. Choose at most one of graph, source, trail.",
 		parameters: Type.Object({ graph: Type.Optional(Type.Object({
 				nodes: Type.Optional(Type.Array(Type.String(), { minItems: 1, maxItems: 20, description: "IDs of endeavors or attached notes from a previous read. Omit to see the whole map." })),
 				depth: Type.Optional(Type.Integer({ minimum: 0, maximum: 3, description: "How much surrounding work to include (0–3, default 1). Even 0 explains the goal, your place in it, and what is outside the view." })),
@@ -246,9 +275,9 @@ export function installMom(pi: ExtensionAPI) {
 				evolution: Type.Optional(Type.Boolean({ description: "How the goal changed: set_out, then each reframed." })),
 				limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200, description: "How many of the latest waypoints to list (default 40)." })),
 			}, { additionalProperties: false, description: TRAIL_DESCRIPTION })) }, { additionalProperties: false }),
-		renderCall(args, theme) { return new Text(theme.fg("toolTitle", theme.bold("Mom")) + theme.fg("muted", ` · ${args.source ? "reading original evidence" : args.trail ? "reading the trail" : "finding our place"}`), 0, 0); },
+		renderCall(args, theme) { return new Text(theme.fg("toolTitle", theme.bold("Path")) + theme.fg("muted", ` · ${args.source ? "reading original evidence" : args.trail ? "reading the trail" : "finding our place"}`), 0, 0); },
 		renderResult(result, _options, theme) {
-			const text = result.content.filter(part => part.type === "text").map(part => part.text).join("\n");
+			const text = textOf(result.content);
 			const details = result.details;
 			const overview = details && typeof details === "object" && "overview" in details && typeof details.overview === "string" ? details.overview : text;
 			const preview = details && typeof details === "object" && "preview" in details && typeof details.preview === "string" ? details.preview : overview;
@@ -267,13 +296,13 @@ export function installMom(pi: ExtensionAPI) {
 				return { content: [{ type: "text" as const, text }], details: { overview, preview, expandable, data, at: client?.snapshot?.explicit.work?.at } };
 			} catch (error) {
 				failure(error);
-				throw new Error("Mom couldn't read that saved view or source. Her last saved notes are unchanged. Use an ID from a previous Mom read; /mom detail shows the reason.");
+				throw new Error("Path couldn't read that saved view or source. Its last saved notes are unchanged. Use an ID from a previous Path read; /path detail shows the reason.");
 			}
 		},
 	});
-	/** The trail's projections as text, for the non-TUI and /mom paths alike. */
+	/** The trail's projections as text, for the non-TUI and /path paths alike. */
 	async function trailRead(options: TrailOptions): Promise<string> { return (await request({ kind: "trail", options }) as { text: string }).text; }
-	pi.registerCommand("mom", { description: "Open Mom · rebuild · compact · overview · status · map|graph [endeavor] [depth] · trail [query] · before · open [line] · evolution · mark <kind> <caption> · strike <id> [reason] · detail · keys · correct <text> · source <id> [offset] · log · refresh · relabel · pause · resume · settings · model",
+	pi.registerCommand("path", { description: "Open Path · rebuild · compact · overview · status · map|graph [endeavor] [depth] · trail [query] · before · open [line] · evolution · mark <kind> <caption> · strike <id> [reason] · reindex [full] (fix the trail's entries) · detail · keys · correct <text> · source <id> [offset] · log · refresh (catch up now) · relabel · pause · resume · settings · model",
 		handler: async (args, context) => {
 			ctx = context;
 			const commandEpoch = epoch;
@@ -281,30 +310,30 @@ export function installMom(pi: ExtensionAPI) {
 			try {
 				if (!command || command === "detail") return await open(context);
 				if (command === "overview") return await show(context);
-				if (command === "rebuild") { if (parts.length) throw new Error("Use /mom rebuild; everything happens in its modal."); return await rebuild(context); }
+				if (command === "rebuild") { if (parts.length) throw new Error("Use /path rebuild; everything happens in its modal."); return await rebuild(context); }
 				if (command === "compact") { toggleCompact(); return; }
 				if (command === "status") { context.ui.notify(cached(), "info"); return; }
 				if (command === "keys") return await checkKeys(context);
-				if (command === "settings") { if (parts.length) throw new Error("Use /mom settings to open the interactive controls."); return await showSettings(context); }
+				if (command === "settings") { if (parts.length) throw new Error("Use /path settings to open the interactive controls."); return await showSettings(context); }
 				if (command === "model") {
-					if (context.mode !== "tui") throw new Error("Mom's model switcher requires interactive mode.");
+					if (context.mode !== "tui") throw new Error("Path's model switcher requires interactive mode.");
 					await ready;
 					const controls = client?.snapshot?.controls;
-					if (!controls) throw new Error(readError ?? "Mom is not connected.");
-					// The pick is scoped to Mom: it never becomes Pi's default model.
-					const picked = await pickMomModel(context, controls.model, String(pi.getFlag("mom-model") ?? FLAGS["mom-model"][1]));
+					if (!controls) throw new Error(readError ?? "Path is not connected.");
+					// The pick is scoped to Path: it never becomes Pi's default model.
+					const picked = await pickMomModel(context, controls.model, String(flag("mom-model")));
 					if (!picked) return;
 					await request({ kind: "controls", change: { model: picked } });
-					context.ui.notify(`Mom will use ${picked}. Saved; her slice reconfigures when idle.`, "info");
+					context.ui.notify(`Path will use ${picked}. Saved; its slice reconfigures when idle.`, "info");
 					return;
 				}
 				if (command === "pause" || command === "resume") {
 					await request({ kind: "controls", change: { enabled: command === "resume" } });
-					context.ui.notify(`Mom ${command === "pause" ? "paused" : "resumed"}.`, "info"); return;
+					context.ui.notify(`Path ${command === "pause" ? "paused" : "resumed"}.`, "info"); return;
 				}
 				if (command === "correct") {
-					if (!text) throw new Error("Use /mom correct <your correction>.");
-					// The correction is in the lead's session: oven delivers it to her like any new entry.
+					if (!text) throw new Error("Use /path correct <your correction>.");
+					// The correction is in the lead's session: oven delivers it to Path like any new entry.
 					pi.sendMessage({ customType: CORRECTION, content: args.slice(args.indexOf(command) + command.length).trim(), display: true, details: { origin: "user-command" } }, { triggerTurn: false });
 					return;
 				}
@@ -318,18 +347,26 @@ export function installMom(pi: ExtensionAPI) {
 				if (command === "evolution") { context.ui.notify(await trailRead({ evolution: true }), "info"); return; }
 				if (command === "mark") {
 					const [kind, ...rest] = parts;
-					if (!kind || !(WAYPOINT_KINDS as readonly string[]).includes(kind) || !rest.length) throw new Error(`Use /mom mark <kind> <caption>, where kind is one of ${WAYPOINT_KINDS.join(", ")}.`);
+					if (!kind || !(WAYPOINT_KINDS as readonly string[]).includes(kind) || !rest.length) throw new Error(`Use /path mark <kind> <caption>, where kind is one of ${WAYPOINT_KINDS.join(", ")}.`);
 					const waypoint = await request({ kind: "mark", waypoint: { kind: kind as WaypointKind, caption: rest.join(" ") } }) as { id: string; line: string };
-					context.ui.notify(`Marked ${kind} on “${waypoint.line}” as ${waypoint.id}. /mom strike ${waypoint.id} removes it from the trail.`, "info"); return;
+					context.ui.notify(`Marked ${kind} on “${waypoint.line}” as ${waypoint.id}. /path strike ${waypoint.id} removes it from the trail.`, "info"); return;
 				}
 				if (command === "strike") {
 					const [target, ...rest] = parts;
-					if (!target) throw new Error("Use /mom strike <waypoint-id> [reason].");
+					if (!target) throw new Error("Use /path strike <waypoint-id> [reason].");
 					await request({ kind: "strike", target, ...(rest.length ? { reason: rest.join(" ") } : {}) });
 					context.ui.notify(`Struck ${target}. The record stays in the file; the trail no longer shows it.`, "info"); return;
 				}
+				if ((command === "reindex" && parts[0] !== "full") || (command === "relabel" && client?.snapshot?.passive.trail)) {
+					await act(context, "repairing the trail's titles, links and kinds from its own entries", { kind: "reindex" },
+						() => "trail repaired. /path reindex full re-reads the whole transcript instead (slow)."); return;
+				}
+				if (command === "reindex") {
+					const { struck } = await request({ kind: "reindex", full: true }) as { struck: number };
+					context.ui.notify(`Re-indexing the trail from the start: ${struck} entr${struck === 1 ? "y" : "ies"} Path wrote are struck (your marks are kept). Where you are now shows first; history fills in behind it.`, "info"); return;
+				}
 				if (command === "source") {
-					if (!parts[0]) throw new Error("Use /mom source <source-id> [offset].");
+					if (!parts[0]) throw new Error("Use /path source <source-id> [offset].");
 					context.ui.notify(`Original recorded evidence, not new work:\n${JSON.stringify(await request({ kind: "source", ref: parts[0], offset: Number(parts[1] ?? 0) }), null, 2)}`, "info"); return;
 				}
 				if (command === "log") {
@@ -351,15 +388,15 @@ export function installMom(pi: ExtensionAPI) {
 						if (d.action === "reserved") return `${time} anchor after compact ${d.compaction} — prepared (delivery not confirmed)`;
 						return `${time} anchor after compact ${d.compaction} — skipped: ${d.reason}`;
 					});
-					context.ui.notify(lines.length ? `Mom findings and continuity events (oldest first):\n${lines.join("\n")}` : "Mom has not recorded findings or continuity events yet.", "info"); return;
+					context.ui.notify(lines.length ? `Path findings and continuity events (oldest first):\n${lines.join("\n")}` : "Path has not recorded findings or continuity events yet.", "info"); return;
 				}
-				if (command === "refresh") { await refresh(); return; }
-				if (command === "relabel") { await request({ kind: "relabel" }); return; }
-				throw new Error("Use /mom, rebuild, overview, status, map, graph, trail, before, open, evolution, mark, strike, detail, correct, source, log, refresh, relabel, pause, or resume.");
+				if (command === "refresh") { await act(context, "catching up on new activity", { kind: "refresh" }, count => client?.snapshot?.passive.trail ? `caught up — ${added(count)}.` : "caught up."); return; }
+				if (command === "relabel") { await act(context, "relabelling the work map", { kind: "relabel" }, () => "work map relabelled."); return; }
+				throw new Error("Use /path, rebuild, overview, status, map, graph, trail, before, open, evolution, mark, strike, reindex, detail, correct, source, log, refresh, relabel, pause, or resume.");
 			} catch (error) {
 				if (commandEpoch === epoch) {
 					failure(error);
-					context.ui.notify(`Mom request failed: ${updateErrorSummary(String(error))}. The saved map is unchanged; /mom detail has full diagnostics.`, "error");
+					context.ui.notify(`Path request failed: ${updateErrorSummary(String(error))}. The saved map is unchanged; /path detail has full diagnostics.`, "error");
 				}
 			}
 		},

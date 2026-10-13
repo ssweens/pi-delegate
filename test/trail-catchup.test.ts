@@ -13,7 +13,7 @@ const toolText = (request: any): string => {
 };
 const until = async <T>(what: string, read: () => Promise<T | undefined> | T | undefined, context: () => unknown, ms = 40000) => {
 	for (const deadline = Date.now() + ms; Date.now() < deadline; await new Promise(resolve => setTimeout(resolve, 25))) { const value = await read(); if (value) return value; }
-	throw new Error(`Timed out waiting for ${what}: ${JSON.stringify(context())}`);
+	throw new Error(`Timed out waiting for ${what}: ${JSON.stringify(await context())}`);
 };
 
 const USAGE = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
@@ -48,7 +48,7 @@ async function catchUp(globalMode: boolean) {
 		api.script(live, { text: "Shipping the labels." });
 		// A waypoint the trail already holds for a chapter-two turn: the backfill that meets it must not repeat it.
 		const { TrailStore: Store } = await import("../src/trail/store.ts");
-		await new Store(() => h!.parent, sessionId).appendWaypoint({ id: "pre:w0", sessionId, at: Date.now(), kind: "decided", line: "Edge renderer", refs: [`${sessionId}:${ids.C2U2}`], caption: "Existing decision.", parent: null, by: "mom" } as any);
+		await new Store(() => h!.parent, sessionId).appendWaypoint({ id: "pre:w0", sessionId, at: Date.now(), kind: "decided", line: "Edge renderer", refs: [`${sessionId}:${ids.C2U2}`], title: "Existing decision", caption: "Existing decision.", parent: null, by: "mom" } as any);
 
 		const ref = (tag: string) => `${sessionId}:${ids[tag]}`;
 		const nodeRefs = ["node:pre:w0", "pre:w0", "node:no-such-waypoint"];
@@ -67,14 +67,14 @@ async function catchUp(globalMode: boolean) {
 					return { tool: { name: "inspect_evidence", arguments: { ref: nodeRefs[tools.length - 1], offset: 0, limit: 2000 } } };
 				}
 				if (tools.length === nodeRefs.length + 1) { const last = tools[tools.length - 1]; inspects.push({ ref: nodeRefs[2], text: typeof last.content === "string" ? last.content : last.content.map((p: any) => p.text).join(""), isError: Boolean(last.isError) }); }
-				return { tool: { name: "record_waypoints", arguments: { waypoints: [{ kind: "set_out", line: "Label derivation", refs: [ref("C3U1")], caption: "Derive map labels from node kinds." }] } } };
+				return { tool: { name: "record_waypoints", arguments: { waypoints: [{ kind: "set_out", line: "Label derivation", refs: [ref("C3U1")], title: "Labels from node kinds", caption: "Derive map labels from node kinds." }] } } };
 			}
 			if (events.includes("C1U1:"))
-				return { tool: { name: "record_waypoints", arguments: { waypoints: [{ kind: "set_out", line: "Map labels", refs: [ref("C1U1")], caption: "Implement semantic map labels." }] } } };
+				return { tool: { name: "record_waypoints", arguments: { waypoints: [{ kind: "set_out", line: "Map labels", refs: [ref("C1U1")], title: "Semantic map labels", caption: "Implement semantic map labels." }] } } };
 			// Chapter two: one new detour, and a decision the trail already holds (same kind, shared ref).
 			return { tool: { name: "record_waypoints", arguments: { waypoints: [
-				{ kind: "detour", line: "Edge renderer work", refs: [ref("C2U1")], caption: "Switch to the edge renderer." },
-				{ kind: "decided", line: "Edge renderer", refs: [ref("C2U2")], caption: "Repeats the decision already on the trail." }] } } };
+				{ kind: "detour", line: "Edge renderer work", refs: [ref("C2U1")], title: "Edge renderer", caption: "Switch to the edge renderer." },
+				{ kind: "decided", line: "Edge renderer", refs: [ref("C2U2")], title: "Repeated decision", caption: "Repeats the decision already on the trail." }] } } };
 		});
 		await h.runtime.session.prompt(live);
 		const context = () => ({ errors: api.errors, bodies: bodies.length, extensionErrors: h!.errors });
@@ -135,6 +135,27 @@ async function catchUp(globalMode: boolean) {
 		const inspected = inspectRows.flatMap(row => (JSON.parse(row.record).model ?? []) as any[]).filter(m => m.role === "toolResult" && m.toolName === "inspect_evidence");
 		assert.deepEqual(inspected.map(m => Boolean(m.isError)), [false, false, true], "an unknown node ref is an error tool result; the operation still completed");
 		assert.match(inspects[2].text, /No trail entry no-such-waypoint/);
+
+		// 5. /path reindex: Path's entries are struck and the trail is indexed again from the start, live first.
+		if (globalMode) {
+			const notifications: string[] = [];
+			const interactive = { ...h.ctx(), ui: { ...h.ctx().ui, notify: (text: string) => { notifications.push(text); } } };
+			const old = trail.waypoints.map(w => w.id), operations = bodies.length;
+			await h.commands.get("path").handler("reindex full", interactive);
+			assert.match(notifications.join("\n"), /4 entries Path wrote are struck/);
+			const reset = (await maps()).find(record => String(record.id).startsWith("reindex:"));
+			assert.deepEqual([reset?.data.cut, reset?.data.trail], [{ parent: null, workers: [] }, true], "coverage restarts from the session's start on the trail track");
+			await until("the re-index to backfill", async () => { const all = await maps(), at = all.indexOf(all.find(record => String(record.id).startsWith("reindex:"))!);
+				return all.slice(at + 1).some(record => record.data.backfill === null) ? true : undefined; },
+				async () => ({ ...context(), maps: (await maps()).slice(-4).map(record => ({ id: record.id, backfill: record.data.backfill, cut: record.data.cut?.parent })) }), 90000);
+			assert.ok(!String(bodies[operations].task).startsWith("Backfill:") && /C3U1:/.test(bodies[operations].newEvents), "the re-index shows where we are first");
+			assert.deepEqual(bodies[operations].trail, { lines: [], recent: [], open: [] }, "the re-index starts from an empty trail");
+			const again = trailFor((await new TrailStore(() => h!.parent, sessionId).load()) as any, new Set(manager.getBranch().map((entry: any) => entry.id)));
+			assert.deepEqual(again.waypoints.map(w => w.caption), ["Implement semantic map labels.", "Switch to the edge renderer.", "Repeats the decision already on the trail.", "Derive map labels from node kinds."],
+				"indexed afresh: nothing aliases to a struck entry");
+			assert.ok(again.waypoints.every(w => !old.includes(w.id)), "every entry is new");
+			assert.deepEqual(again.struck.map(item => item.waypoint.id).sort(), [...old].sort(), "the old entries stay in the file, struck");
+		}
 		assert.deepEqual(h.errors, []);
 		assert.deepEqual(api.errors, []);
 	} finally {
@@ -142,7 +163,7 @@ async function catchUp(globalMode: boolean) {
 	}
 }
 
-test("trail catch-up indexes the latest chapter first, then the client drains older chapters behind it", { timeout: 120000, skip }, () => catchUp(true));
+test("trail catch-up indexes the latest chapter first, then the client drains older chapters behind it; /path reindex full does it again from the start", { timeout: 240000, skip }, () => catchUp(true));
 
 // Known gap: with --mom-mode alone (nothing saved), MomClient.reload() calls loadState(store, manager) without the flag's mode,
 // reads the graph track, never sees `backfill`/`coverageCut`, and drain() stops after the first round (src/mom/client.ts:229, 287).

@@ -1,12 +1,12 @@
 # Map modes
 
-`commit_graph` remains the default. `v2` is the opt-in minimal map. `trail` is the append-only waypoint index that is replacing both; it is documented in [`trail.md`](trail.md) and shares only the operation seam described here (`mom_begin`, batches, digests, retries). The work-graph code as it stood before the trail is archived on branch `archive/mom-graph` (tag `mom-graph-archive`). On eligible background batches, a decision model writes a per-node change spec; an empty spec skips Mom's model. When no usable spec is available, v2 fails open to Mom's model and checks structure only. (`act_labels` was deleted; see **Current evidence**.)
+`commit_graph` remains the default. `v2` is the opt-in minimal map. `trail` is the append-only waypoint index that is replacing both; it is documented in [`trail.md`](trail.md) and shares only the operation seam described here (`mom_begin`, batches, digests, retries). The work-graph code as it stood before the trail is archived on branch `archive/mom-graph` (tag `mom-graph-archive`). On eligible background batches, a decision model writes a per-node change spec; an empty spec skips Path's model. When no usable spec is available, v2 fails open to Path's model and checks structure only. (`act_labels` was deleted; see **Current evidence**.)
 
 ## Purpose
 
 A mode defines the split between model judgment and host code:
 
-| Mode | Mom model decides | Decision model classifies | Host decides |
+| Mode | Path model decides | Decision model classifies | Host decides |
 |---|---|---|---|
 | `commit_graph` | Graph changes, targets, states, and focus | Whether parked work is retired | Validation, source repair, and single-writer acceptance |
 | `v2` | The contents of each accepted map edit | Per-node state, attachment and new-work ops for eligible background batches | Structural invariants, plus state/removal compliance with a non-empty spec |
@@ -15,31 +15,34 @@ A mode defines the split between model judgment and host code:
 ## Selection and persistence
 
 Select **Tracking**, **Suggestions**, **Automatic continuity**, **Map mode**, **Model**, and **Decision
-model** in `/mom settings`. The client stores them in `<agentDir>/pi-delegate.json`, in the `mom`
-section beside `defaults` and `ratings`. It writes the file atomically with mode `0600` before the
-slice hears about a change, so the save succeeds when Oven is down. New or reconfigured Mom slices
+model** in `/path settings`. The client stores them in `<agentDir>/pi-delegate.json`, in the `path`
+section (the older `mom` section is still read) beside `defaults` and `ratings`. It writes the file atomically with mode `0600` before the
+slice hears about a change, so the save succeeds when Oven is down. New or reconfigured Path slices
 read the saved value. Saving a control in one Pi session does not reconfigure slices in other running
 sessions. Those slices keep the configuration they last received. `Quiet this session` is the one
 exception. It is a session toggle and is never persisted.
 
-`--mom-mode <name>` and `--mom-decider <provider/id>` supply the initial values. A saved setting takes
+`--path-mode <name>` and `--path-decider <provider/id>` supply the initial values. The old `--mom-*` flags still work as deprecated aliases. A saved setting takes
 precedence over them, and older session control records remain as a fallback. The loader drops malformed
-fields instead of throwing, so one bad value does not prevent a Mom slice from loading. The former
+fields instead of throwing, so one bad value does not prevent a Path slice from loading. The former
 settings files (`delegate-models.json`, `delegate-ratings.json`) are folded in on the first write.
 
-The decision-model picker lists Pi's registered private-IPv4 System One classifiers and resolves their
-endpoint from the registry. With no usable decision model, `v2` sends every update to Mom without a
+The decision-model picker is Pi's own model selector, the same component as Path's model picker (type to search,
+Tab for all of Pi's models). It opens on Pi's registered private-IPv4 System One classifiers, then every other model
+Pi knows whose endpoint is on a loopback or private IPv4 host (named "not tagged as a decision model"), for an
+inference server that does not tag its decision models, then "no decider". Either kind resolves its
+endpoint from the registry (`<baseUrl>/v1/systemone`); a model tagged as a classifier must speak System One. With no usable decision model, `v2` sends every update to Path without a
 change spec; the host then checks structure only. A missing classifier, failed/slow endpoint, oversized
 batch or incomplete answer fails open the same way. The client warns once per session when a chosen
 reference does not resolve to a registered local System One classifier. Unknown modes are refused rather
 than replaced with defaults.
 
-After the save acknowledgment, the client reconfigures Mom's slice. A busy slice takes the
+After the save acknowledgment, the client reconfigures Path's slice. A busy slice takes the
 new configuration for its next operation. Each operation pins its mode and its evidence,
 so a settings change cannot alter an update already in progress.
 
 Pi `/reload` reloads the client, not the shared Oven daemon's cached extension modules.
-After changing the Mom extension source, restart Oven to load that code:
+After changing the Path extension source, restart Oven to load that code:
 
 ```sh
 node ../oven/bin/oven.mjs stop
@@ -58,7 +61,7 @@ Restarting Oven is not required for an ordinary mode or model settings change.
    so oven retries it.
 
 The tool list is phase-specific: `mom_begin` alone before preparation, then the finalizer and the
-evidence tools. Each operation starts a fresh context; earlier operations stay in her slice's
+evidence tools. Each operation starts a fresh context; earlier operations stay in its slice's
 storage and out of the model's input.
 
 Large historical catch-up is never raw evidence. The host compresses the backlog locally into a
@@ -71,27 +74,27 @@ inspection; a summary-only section establishes no new raw facts. Historical gaps
 audited merely because current evidence was reconciled. Recovery processes bounded prefixes and
 preserves the unattempted suffix and the coverage cursor.
 
-`/mom rebuild` starts reconstruction in the background and returns to the editor immediately. Mom's
+`/path rebuild` starts reconstruction in the background and returns to the editor immediately. Path's
 widget shows each pass, the current tool or model activity, streamed character count, elapsed time,
-and the rebuild's Oven slice URL. When complete, it prompts you to run `/mom rebuild` again to open
+and the rebuild's Oven slice URL. When complete, it prompts you to run `/path rebuild` again to open
 the review modal. The temporary slice retires when reconstruction ends, so its URL appears only
-while it is running. Normal Mom's slice URL appears separately in the widget, `/mom status`, and
-the Status tab. Rebuild activity stays live while the map view is held steady. Mom copies the selected branch into a private, unfollowed Oven slice and reconstructs
+while it is running. Normal Path's slice URL appears separately in the widget, `/path status`, and
+the Status tab. Rebuild activity stays live while the map view is held steady. Path copies the selected branch into a private, unfollowed Oven slice and reconstructs
 its map from bounded thread-map chapter digests, including a short, single-window history. Rebuild
-honors `--mom-bootstrap-chapters` (default 24) and `--mom-bootstrap-chars` (default 48000), rather
+honors `--path-bootstrap-chapters` (default 24) and `--path-bootstrap-chars` (default 48000), rather
 than forcing a chapter per pass. If the next capture window would omit directions, it saves the
 complete prefix in the private map and resumes from that evidence cut; it never accepts an incomplete digest. The live
 `.mom` file is not an input or changed during reconstruction. Arrow keys browse the
 candidate tree; left at its root shows the current map, and right returns to the rebuild. Down past
 the last candidate item selects **Use rebuilt map**; Enter on that action replaces the
 saved graph. Escape discards the candidate without replacing the map. A failed rebuild appears in the
-widget; `/mom rebuild` retries it. Changing sessions cancels an in-progress rebuild.
+widget; `/path rebuild` retries it. Changing sessions cancels an in-progress rebuild.
 Incomplete/unreadable evidence or a changed branch or checkpoint blocks replacement. Accepted replacements append a new checkpoint based on the current one,
 so earlier maps remain in the sidecar and global settings are untouched. The command requires an
 interactive TUI and can run while background tracking is paused without resuming it; it does not
 create start/preview/apply subcommands.
 
-`/mom relabel` repairs saved labels without consuming the live backlog. The model supplies IDs and
+`/path relabel` repairs saved labels without consuming the live backlog. The model supplies IDs and
 labels through `commit_labels`; the host applies them using the saved sources, and the decision
 model guards the rewrite — it refuses a label that describes the conversation rather than the work,
 and a replacement that names nothing in that work's intent. IDs, structure, evidence, notes, and
@@ -106,7 +109,7 @@ type V2Graph = { focus: ID | null; nodes: V2Node[] };
 type V2Node = { id; parent: ID | null; kind: "work" | "rule" | "note"; state?: "active" | "parked" | "settled"; label; sources };
 ```
 
-Mom commits with `commit_v2 { put, remove, focus }`. A `put` replaces the whole node, except that
+Path commits with `commit_v2 { put, remove, focus }`. A `put` replaces the whole node, except that
 `sources` accumulate. `commit_v2 {}` records that nothing durable changed. The host always checks
 structure and reports every defect at once:
 
@@ -128,19 +131,19 @@ map without sources.
 
 For an eligible background delivery with an existing map and a usable decision model, `readSpec`
 (`src/mom/spec.ts`) asks one choice question per work node for state and attachment, plus one question
-for new work. The answers become `SpecOp`s and are included as `changes` in Mom's request. `applySpec`
-checks her commit against that spec: state changes and removals are constrained; additions are
+for new work. The answers become `SpecOp`s and are included as `changes` in Path's request. `applySpec`
+checks its commit against that spec: state changes and removals are constrained; additions are
 permitted, not required, because the attachment classifier has known holdout misses. An existing
 rule or note may be rewritten only under work the spec touched; its kind and parent cannot change.
-Focus is derived from the accepted ops, not chosen by Mom.
+Focus is derived from the accepted ops, not chosen by Path.
 
 If the decision model returns a complete set of answers but no ops, the host saves evidence coverage
-and skips Mom's model. A spec never writes edits itself: it enforces state/drop decisions and permits
+and skips Path's model. A spec never writes edits itself: it enforces state/drop decisions and permits
 some additions. It does not validate labels or other prose.
 
 The decision path is fail-open. A first map, explicit request, correction, review, catch-up, retry or
 recovery does not get a spec. Nor does a batch if the classifier is absent, fails, times out, exceeds
-`SPEC_CHARS`, or omits an answer. Mom then runs with structural checks only, including the non-empty
+`SPEC_CHARS`, or omits an answer. Path then runs with structural checks only, including the non-empty
 map guard. This preserves progress but means the per-node protection is not active on those paths.
 V2 decision records are logged beside the session as `v2-spec`. Eligible fail-open reads include `no-client`, `oversized`, `incomplete`, or `classifier-error`; ineligible operations record their skip reason (for example `no-checkpoint`, `retry-gap`, or `correction`).
 

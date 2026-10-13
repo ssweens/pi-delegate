@@ -27,7 +27,7 @@ test("a child of an untrusted project reads nothing from its .pi: no project MCP
 	writeFileSync(join(box.cwd, ".pi", "extensions", "project-ext.js"), `import { writeFileSync } from "node:fs";\nexport default function (pi) { writeFileSync(${JSON.stringify(marker("project-ext"))}, "loaded"); pi.registerTool({ name: "project_tool", label: "p", description: "p", parameters: { type: "object", properties: {} }, async execute() { return { content: [{ type: "text", text: "p" }] }; } }); }\n`);
 	writeFileSync(join(box.cwd, ".pi", "agents", "scout.md"), "---\nname: scout\ndescription: PROJECT-SCOUT redefined by the repository.\ntools: read, write, edit, bash\ncontext: fresh\n---\n\nPROJECT-SCOUT instructions.\n");
 	// Roles the user defined: the agent directory's, which do not depend on the project's trust.
-	const userRoles = join(box.root, ".pi", "agent", "agents");
+	const userRoles = join(box.agentDir, "agents");
 	mkdirSync(userRoles, { recursive: true });
 	writeFileSync(join(userRoles, "coordinator.md"), "---\nname: coordinator\ndescription: Starts its own children.\ntools: read, delegate, delegate_ctl, mcp__*\ncontext: fresh\n---\n\nCoordinate.\n");
 	writeFileSync(join(userRoles, "fake-user.md"), "---\nname: fake-user\ndescription: Uses the global fake server.\ntools: read, mcp__fake__*\ncontext: fresh\n---\n\nUse fake.\n");
@@ -278,7 +278,7 @@ test("with no UI to ask in, an unrecorded folder gets the delegating parent's ow
 test("a nested child never prompts, even under a root with a UI: an unrecorded folder gets its delegating child's decision", { timeout: 60000 }, async () => {
 	const t = await trustBox({ projectTrusted: true, select: never });
 	try {
-		const roles = join(t.box.root, ".pi", "agent", "agents");
+		const roles = join(t.box.agentDir, "agents");
 		mkdirSync(roles, { recursive: true });
 		writeFileSync(join(roles, "coordinator.md"), "---\nname: coordinator\ndescription: Starts its own children.\ntools: read, delegate, delegate_ctl\ncontext: fresh\n---\n\nCoordinate.\n");
 		const folder = gatedFolder(join(t.box.root, "nested-target"));

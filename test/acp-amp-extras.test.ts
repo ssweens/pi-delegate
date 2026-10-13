@@ -14,8 +14,7 @@ import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { provider, sandbox, harness } from "./fixture.ts";
 import { configureAcpCoordinator } from "../src/acp/instance.ts";
-import { AMP_DELEGATE_LABEL, ampRunLabel, ampThreadTitle } from "../src/acp-backend.ts";
-import { AMP_LABEL, parseAmpCost } from "../src/acp/runtime/amp-cli.ts";
+import { AMP_DELEGATE_LABEL, AMP_LABEL, ampRunLabel, ampThreadTitle, parseAmpCost } from "../src/acp/runtime/amp-cli.ts";
 import { asRunView } from "../src/render.ts";
 
 const fakeAcpAgent = new URL("./acp/fixtures/fake-acp-agent.ts", import.meta.url).pathname;

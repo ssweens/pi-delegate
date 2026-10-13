@@ -130,16 +130,16 @@ test("an unfollowed Oven slice rebuilds the transcript independently, then accep
 		const interactive = { ...live, mode: "tui", ui: { ...live.ui, custom, notify(text: string) { notifications.push(text); } } };
 		const tracking = (await daemon.oven.list()).find((slice: any) => slice.key === ownerKey(identity));
 		assert.ok(tracking, "the tracking slice uses the canonical session identity");
-		await h.commands.get("mom").handler("status", interactive);
+		await h.commands.get("path").handler("status", interactive);
 		assert.ok(notifications.some(text => text.includes(`${process.env.OVEN_URL}/slice/${tracking.id}`)), "general Mom status links to the tracking slice, not the rebuild");
-		await h.commands.get("mom").handler("rebuild", interactive);
+		await h.commands.get("path").handler("rebuild", interactive);
 		assert.equal(opened, 0, "starting the rebuild returns without opening a modal");
 		for (const deadline = Date.now() + 12000; Date.now() < deadline && !notifications.some(text => text.includes("ready"));)
 			await new Promise(resolve => setTimeout(resolve, 20));
 		assert.match(notifications.join("\n"), /ready/, "background reconstruction reports when review is available");
-		await h.commands.get("mom").handler("rebuild", interactive);
+		await h.commands.get("path").handler("rebuild", interactive);
 		assert.ok(modalSaved, "review saves only after its action received Enter");
-		await h.commands.get("mom").handler("graph", interactive);
+		await h.commands.get("path").handler("graph", interactive);
 		assert.match(notifications.join("\n"), /Build a durable map/, "Mom's public graph view reloads after acceptance");
 		const saved = await loadState(new SidecarStore(() => file, identity.sessionId), manager);
 		assert.notEqual(saved.checkpointId, original.checkpointId);
@@ -185,7 +185,7 @@ test("Mom's widget shows background rebuild progress and the review action in bo
 		assert.ok(screen.includes(`Slice: ${base.sliceUrl}`));
 		assert.ok(screen.includes(`Rebuild slice: ${base.rebuildUrl}`));
 		assert.match(momSectionLines({ ...base, rebuild: "Rebuilding from the selected branch · pass 3" }, theme, 90).join("\n"), /pass 3/);
-		assert.match(momSectionLines({ ...base, rebuild: "Rebuild ready · \/mom rebuild to review" }, theme, 90).join("\n"), /rebuild to review/);
+		assert.match(momSectionLines({ ...base, rebuild: "Rebuild ready · \/path rebuild to review" }, theme, 90).join("\n"), /rebuild to review/);
 	}
 });
 

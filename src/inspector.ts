@@ -1,8 +1,15 @@
 /** Live work stays pinned; history is on demand. Both open the same child conversation. */
-import { CustomEditor, getSelectListTheme, keyHint, type KeybindingsManager, type SettingsManager, type Theme } from "@earendil-works/pi-coding-agent";
-import { type Component, type Focusable, matchesKey, SelectList, type TUI, type TuiMouseEvent, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { CustomEditor, getSelectListTheme, keyHint, type KeybindingsManager, type SettingsManager, type Theme, type ThemeColor } from "@earendil-works/pi-coding-agent";
+import { type Component, type Focusable, matchesKey, SelectList, type TUI, type TuiMouseEvent, visibleWidth } from "@earendil-works/pi-tui";
 import { ChildTranscript, type ChildActivity } from "./transcript.js";
-import { elapsed, formatToolCall, frame, runTitle, statusMark, type RunView } from "./render.js";
+import { formatDuration } from "./util/format.ts";
+import { errorMessage } from "./util/text.ts";
+import { FilterInput, filterBy } from "./ui/filter.ts";
+import { agentListHint, chordLabel, hint, joinHints, keyLabel } from "./ui/hints.ts";
+import { navKeys } from "./ui/keys.ts";
+import { keepInView, moveIndex, stepFor } from "./ui/scroll.ts";
+import { fit, fitPad, indent, padTo } from "./ui/text.ts";
+import { formatToolCall, frame, runTitle, statusMark, withLegend, type RunView } from "./render.js";
 
 export interface LiveSource {
 	all(): RunView[];
@@ -14,23 +21,11 @@ export interface LiveSource {
 
 const TICK_MS = 250;
 const LIST_ROWS = 4;
+const STOP_KEY = "ctrl+x", LATEST_KEY = "ctrl+end";
 
 function icon(v: RunView, theme: Theme): string {
 	const { color, glyph } = statusMark(v);
 	return theme.fg(color, glyph);
-}
-
-function pad(text: string, width: number): string {
-	const clipped = truncateToWidth(text, Math.max(0, width), "…");
-	return clipped + " ".repeat(Math.max(0, width - visibleWidth(clipped)));
-}
-
-/** Replace the frame's bottom border with its navigation legend. */
-function withLegend(lines: string[], legend: string, theme: Theme, width: number): string[] {
-	if (width < 8) return lines;
-	const label = truncateToWidth(` ${legend} `, width - 3, "…");
-	lines[lines.length - 1] = theme.fg("borderMuted", "╰─") + theme.fg("dim", label) + theme.fg("borderMuted", "─".repeat(Math.max(0, width - 3 - visibleWidth(label))) + "╯");
-	return lines;
 }
 
 /** The main editor, when it is what has focus: Pi's editor exposes its cursor and autocomplete state. */
@@ -61,7 +56,7 @@ export class AgentsPanel implements Component, Focusable {
 		this.removeInputListener = tui.addInputListener((data) => {
 			if (tui.hasOverlay()) return;
 			if (!this.focused) {
-				if (!matchesKey(data, "left") || this.opening || !this.rows().length) return;
+				if (navKeys(data) !== "left" || this.opening || !this.rows().length) return;
 				// Only from the very start of the draft, with no completion menu open: anywhere else ← moves the cursor.
 				const editor = (tui as TUI & { getFocusedComponent(): Component | null }).getFocusedComponent();
 				if (!isEditor(editor) || editor.isShowingAutocomplete?.()) return;
@@ -113,7 +108,8 @@ export class AgentsPanel implements Component, Focusable {
 	handleInput(data: string) {
 		const rows = this.rows();
 		let index = Math.max(0, rows.findIndex((r) => r.id === this.selectedId));
-		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+j") || matchesKey(data, "left")) { this.release(); return; }
+		const nav = navKeys(data);
+		if (nav === "cancel" || nav === "left" || matchesKey(data, "ctrl+j")) { this.release(); return; }
 		// Typing is for the editor: a printable key leaves the list and lands in the draft, never lost here.
 		if (!this.opening && data.length > 0 && !/[\x00-\x1f\x7f]/.test(data)) {
 			const editor = this.previousFocus;
@@ -121,13 +117,9 @@ export class AgentsPanel implements Component, Focusable {
 			editor?.handleInput?.(data);
 			return;
 		}
-		if (matchesKey(data, "up")) index--;
-		else if (matchesKey(data, "down")) index++;
-		else if (matchesKey(data, "pageUp")) index -= LIST_ROWS;
-		else if (matchesKey(data, "pageDown")) index += LIST_ROWS;
-		else if (matchesKey(data, "home")) index = 0;
-		else if (matchesKey(data, "end")) index = rows.length - 1;
-		else if ((matchesKey(data, "enter") || matchesKey(data, "right")) && rows[index] && !this.opening) {
+		const step = stepFor(nav, LIST_ROWS);
+		if (step !== undefined) index = moveIndex(index, step, rows.length);
+		else if ((nav === "confirm" || nav === "right") && rows[index] && !this.opening) {
 			this.selectedId = rows[index].id;
 			this.opening = true;
 			void this.openChild(this.selectedId).finally(() => {
@@ -138,7 +130,7 @@ export class AgentsPanel implements Component, Focusable {
 			});
 			return;
 		}
-		this.selectedId = rows[Math.max(0, Math.min(rows.length - 1, index))]?.id;
+		this.selectedId = rows[index]?.id;
 		this.tui.requestRender();
 	}
 
@@ -148,8 +140,7 @@ export class AgentsPanel implements Component, Focusable {
 		const index = Math.max(0, rows.findIndex((r) => r.id === this.selectedId));
 		this.selectedId = rows[index].id;
 		const count = Math.min(LIST_ROWS, Math.max(1, this.tui.terminal.rows - 10), rows.length);
-		this.offset = Math.max(0, Math.min(this.offset, index, rows.length - count));
-		if (index >= this.offset + count) this.offset = index - count + 1;
+		this.offset = keepInView(this.offset, index, count, rows.length);
 		const inner = Math.max(1, width - 4);
 		// One width for every row, so the column lines up. It only appears where the activity
 		// column keeps at least 16 columns after it; narrower terminals drop it entirely.
@@ -162,14 +153,14 @@ export class AgentsPanel implements Component, Focusable {
 			const selected = this.focused && v.id === this.selectedId;
 			// A run started by a delegating child sits under it: one step in per level below the root's children.
 			const level = Math.max(0, Math.min(4, (v.depth ?? 1) - 1));
-			const branch = level ? this.theme.fg("dim", `${"  ".repeat(level - 1)}└ `) : "";
+			const branch = level ? this.theme.fg("dim", `${indent(level - 1)}└ `) : "";
 			const prefix = `${selected ? this.theme.fg("accent", "›") : " "} ${branch}${icon(v, this.theme)} `;
-			const time = elapsed(v.durationMs);
+			const time = formatDuration(v.durationMs);
 			const title = this.theme.fg(selected ? "accent" : v.settled ? "muted" : "text", runTitle(v));
-			if (inner < 65) return pad(`${prefix}${title}`, Math.max(1, inner - time.length - 1)) + ` ${time}`;
+			if (inner < 65) return fitPad(`${prefix}${title}`, Math.max(1, inner - time.length - 1)) + ` ${time}`;
 			// Reserve the column on every row once it is shown, so a session with no model
 			// stays blank instead of pulling the activity column left.
-			const model = modelWidth ? pad(this.theme.fg("muted", v.model), modelWidth) + " " : "";
+			const model = modelWidth ? fitPad(this.theme.fg("muted", v.model), modelWidth) + " " : "";
 			const activityWidth = Math.max(1, inner - 4 - titleWidth - roleWidth - visibleWidth(model) - time.length - 3);
 			// An ACP agent streams no tool calls here: its session is the fact worth the column.
 			const activity = v.backend === "acp"
@@ -178,7 +169,7 @@ export class AgentsPanel implements Component, Focusable {
 				? v.activeTool ? formatToolCall(v.activeTool.name, v.activeTool.args, this.theme) : this.theme.fg("dim", "Thinking…")
 				: v.settled ? this.theme.fg(v.status === "complete" ? "dim" : "warning", v.status)
 				: this.theme.fg("warning", "Stopping…");
-			return prefix + pad(title, titleWidth) + " " + pad(this.theme.fg("muted", v.role), roleWidth) + " " + model + pad(activity, activityWidth) + " " + this.theme.fg("dim", time);
+			return prefix + fitPad(title, titleWidth) + " " + fitPad(this.theme.fg("muted", v.role), roleWidth) + " " + model + fitPad(activity, activityWidth) + " " + this.theme.fg("dim", time);
 		});
 		const range = rows.length > count ? ` · ${this.offset + 1}–${this.offset + count}/${rows.length}` : "";
 		// A queued prompt in the parent editor is otherwise unexplained: say when its turn is blocked here.
@@ -187,7 +178,7 @@ export class AgentsPanel implements Component, Focusable {
 		const counts = [active ? `${active} active` : "", done ? `${done} done` : ""].filter(Boolean).join(" · ");
 		const header = this.theme.bold("Agents") + this.theme.fg("muted", ` · ${counts}${range}`)
 			+ (joined ? this.theme.fg("warning", " · parent blocked in wait") : "");
-		return { header, body: body.map((l) => truncateToWidth(l, inner, "…")), hint: this.focused ? "↑↓ select · → open · ← editor" : "← agents · /agents history" };
+		return { header, body: body.map((l) => fit(l, inner)), hint: this.focused ? agentListHint() : joinHints(hint.left("agents"), "/agents history") };
 	}
 
 	renderSection(width: number): string[] {
@@ -198,7 +189,8 @@ export class AgentsPanel implements Component, Focusable {
 	render(width: number): string[] {
 		const section = this.section(width);
 		if (!section) return [];
-		return withLegend(frame(section.header, section.body, this.focused ? "borderAccent" : "borderMuted", this.theme, width), section.hint, this.theme, width);
+		const border = this.focused ? "borderAccent" : "borderMuted";
+		return withLegend(frame(section.header, section.body, border, this.theme, width), section.hint, border, this.theme, width);
 	}
 
 	invalidate() {}
@@ -210,29 +202,45 @@ export class AgentsPanel implements Component, Focusable {
 	}
 }
 
-/** A snapshot picker, not another persistent dashboard. Selecting a row only opens its transcript. */
+/** A snapshot picker, not another persistent dashboard. Selecting a row only opens its transcript; typing filters it. */
 export class AgentHistory implements Component {
-	private list: SelectList;
+	private list!: SelectList;
+	private readonly filter: FilterInput;
 
-	constructor(runs: RunView[], private theme: Theme, private tui: TUI, done: (id?: string) => void) {
-		this.list = new SelectList(runs.map((v) => ({
-			value: v.id,
-			label: `${icon(v, theme)} ${runTitle(v)}`,
-			description: `${v.role}${v.backend === "acp" && v.nativeSessionId ? ` ${v.nativeSessionId}` : ""} · ${v.status} · ${elapsed(v.durationMs)}`,
-		})), Math.max(1, Math.min(8, tui.terminal.rows - 6)), {
-			selectedPrefix: (s) => theme.fg("accent", s),
-			selectedText: (s) => theme.fg("accent", s),
-			description: (s) => theme.fg("muted", s),
-			scrollInfo: (s) => theme.fg("dim", s),
-			noMatch: (s) => theme.fg("dim", s),
-		});
-		this.list.onSelect = (item) => done(item.value);
-		this.list.onCancel = () => done();
+	constructor(private runs: RunView[], private theme: Theme, private tui: TUI, private done: (id?: string) => void) {
+		this.filter = new FilterInput({ prompt: "Filter: ", placeholder: "title, role or status", typeToSearch: true, enterSelects: true, onChange: query => this.show(query) });
+		this.filter.focused = true;
+		this.show("");
 	}
 
-	handleInput(data: string) { this.list.handleInput(data); this.tui.requestRender(); }
+	/** The list again with only the runs matching `query`. */
+	private show(query: string) {
+		const runs = filterBy(this.runs, query, v => `${runTitle(v)} ${v.role} ${v.status} ${v.nativeSessionId ?? ""}`);
+		this.list = new SelectList(runs.map((v) => ({
+			value: v.id,
+			label: `${icon(v, this.theme)} ${runTitle(v)}`,
+			description: `${v.role}${v.backend === "acp" && v.nativeSessionId ? ` ${v.nativeSessionId}` : ""} · ${v.status} · ${formatDuration(v.durationMs)}`,
+		})), Math.max(1, Math.min(8, this.tui.terminal.rows - 6)), {
+			selectedPrefix: (s) => this.theme.fg("accent", s),
+			selectedText: (s) => this.theme.fg("accent", s),
+			description: (s) => this.theme.fg("muted", s),
+			scrollInfo: (s) => this.theme.fg("dim", s),
+			noMatch: (s) => this.theme.fg("dim", s),
+		});
+		this.list.onSelect = (item) => this.done(item.value);
+		this.list.onCancel = () => this.done();
+	}
+
+	handleInput(data: string) {
+		// Esc closes the filter first, then the picker; Enter and the list keys always reach the list.
+		if (!this.filter.handle(data)) this.list.handleInput(data);
+		this.tui.requestRender();
+	}
+
 	render(width: number): string[] {
-		return withLegend(frame(this.theme.bold("Finished agents"), this.list.render(Math.max(1, width - 4)), "borderAccent", this.theme, width), "↑↓ select · Enter open · Esc back", this.theme, width);
+		const inner = Math.max(1, width - 4);
+		const body = [...(this.filter.active || this.filter.query ? [this.filter.render(inner)] : []), ...this.list.render(inner)];
+		return withLegend(frame(this.theme.bold("Finished agents"), body, "borderAccent", this.theme, width), joinHints(hint.move("select"), hint.enter("open"), "type to filter", hint.cancel("back")), "borderAccent", this.theme, width);
 	}
 	invalidate() { this.list.invalidate(); }
 }
@@ -281,7 +289,7 @@ export class ChildView implements Component, Focusable {
 			this.top = undefined;
 		} catch (e) {
 			this.editor.setText(text);
-			this.notice = `Message not sent: ${e instanceof Error ? e.message : String(e)}`;
+			this.notice = `Message not sent: ${errorMessage(e)}`;
 		} finally {
 			this.sending = false;
 			this.editor.disableSubmit = false;
@@ -292,17 +300,18 @@ export class ChildView implements Component, Focusable {
 	handleInput(data: string) {
 		// Close after this key's dispatch: fullscreen mode runs input listeners after the focused component,
 		// and the Agents list, focused again once this view closes, would take the same Esc as its own.
-		if (matchesKey(data, "escape")) { setImmediate(this.done); return; }
+		const nav = navKeys(data);
+		if (this.keybindings.matches(data, "app.interrupt")) { setImmediate(this.done); return; }
 		if (this.keybindings.matches(data, "app.tools.expand")) { this.transcript.toggleTools(); this.cache = undefined; }
 		else if (this.keybindings.matches(data, "app.thinking.toggle")) { this.transcript.toggleThinking(); this.cache = undefined; }
-		else if (matchesKey(data, "pageUp")) this.top = Math.max(0, (this.top ?? Math.max(0, (this.cache?.lines.length ?? 0) - this.pageRows)) - this.pageRows);
-		else if (matchesKey(data, "pageDown")) {
+		else if (nav === "pageUp") this.top = Math.max(0, (this.top ?? Math.max(0, (this.cache?.lines.length ?? 0) - this.pageRows)) - this.pageRows);
+		else if (nav === "pageDown") {
 			if (this.top !== undefined) {
 				const next = this.top + this.pageRows;
 				this.top = next >= (this.cache?.lines.length ?? 0) - this.pageRows ? undefined : next;
 			}
-		} else if (matchesKey(data, "ctrl+end")) this.top = undefined;
-		else if (matchesKey(data, "ctrl+x")) {
+		} else if (matchesKey(data, LATEST_KEY)) this.top = undefined;
+		else if (matchesKey(data, STOP_KEY)) {
 			if (this.current()?.status === "running") {
 				this.notice = "Stopping this child…";
 				void this.src.cancel(this.id).then(() => { this.notice = "Child stopped."; this.tui.requestRender(); }).catch((e) => { this.notice = String(e); this.tui.requestRender(); });
@@ -344,19 +353,19 @@ export class ChildView implements Component, Focusable {
 	render(width: number): string[] {
 		const height = Math.max(1, this.tui.terminal.rows);
 		const v = this.current();
-		if (!v) return [pad("Child unavailable · Esc parent", width), ...Array(Math.max(0, height - 1)).fill(" ".repeat(width))];
+		if (!v) return [fitPad(`Child unavailable · ${keyLabel("app.interrupt")} parent`, width), ...Array(Math.max(0, height - 1)).fill(padTo("", width))];
 		const inner = Math.max(1, width - 4);
 		const header = `${icon(v, this.theme)} ${this.theme.bold(runTitle(v))}${this.theme.fg("muted", ` · ${v.role}`)}`;
 		const meta = v.backend === "acp"
-			? [v.status, elapsed(v.durationMs), `acp ${v.agent ?? ""}`, `${v.origin === "opened" ? "opened session" : "session"} ${v.nativeSessionId ?? "pending"}${v.executionEnvironment ? ` (${v.executionEnvironment})` : ""}`, v.model].filter(Boolean).join(" · ")
-			: `${v.status} · ${elapsed(v.durationMs)} · ${v.model}${v.thinking ? `:${v.thinking}` : ""}`;
-		const head = frame(header, [truncateToWidth(meta, inner, "…")], "borderMuted", this.theme, width);
+			? [v.status, formatDuration(v.durationMs), `acp ${v.agent ?? ""}`, `${v.origin === "opened" ? "opened session" : "session"} ${v.nativeSessionId ?? "pending"}${v.executionEnvironment ? ` (${v.executionEnvironment})` : ""}`, v.model].filter(Boolean).join(" · ")
+			: `${v.status} · ${formatDuration(v.durationMs)} · ${v.model}${v.thinking ? `:${v.thinking}` : ""}`;
+		const head = frame(header, [fit(meta, inner)], "borderMuted", this.theme, width);
 		const editor = this.editor.render(width);
 		const footer = [
 			...(this.notice ? [this.theme.fg("dim", this.notice)] : []),
 			...editor,
-			this.theme.fg("dim", `Esc parent · ${v.stopped ? "Enter restart" : v.settled ? "Enter resume" : "Enter steer"} · ${keyHint("app.tools.expand", "tools")} · Ctrl+X stop`),
-			this.theme.fg("dim", `PgUp/PgDn scroll · Ctrl+End latest${this.top === undefined ? " · following" : " · scroll paused"}`),
+			this.theme.fg("dim", `${joinHints(`${keyLabel("app.interrupt")} parent`, `${keyLabel("tui.input.submit")} ${v.stopped ? "restart" : v.settled ? "resume" : "steer"}`, keyHint("app.tools.expand", "tools"), `${chordLabel(STOP_KEY)} stop`)}`),
+			this.theme.fg("dim", joinHints(hint.scroll(), `${chordLabel(LATEST_KEY)} latest`, this.top === undefined ? "following" : "scroll paused")),
 		];
 		this.pageRows = Math.max(1, height - head.length - footer.length);
 		const lines = this.activityLines(v, width);
@@ -365,7 +374,7 @@ export class ChildView implements Component, Focusable {
 		const visible = lines.slice(start, start + this.pageRows);
 		while (visible.length < this.pageRows) visible.push("");
 		// Every cell is covered: neither the parent transcript nor its agents frame shows through.
-		return [...head, ...visible, ...footer].slice(-height).map((l) => pad(l, width));
+		return [...head, ...visible, ...footer].slice(-height).map((l) => fitPad(l, width));
 	}
 
 	invalidate() { this.cache = undefined; this.transcript.invalidate(); this.editor.invalidate(); }

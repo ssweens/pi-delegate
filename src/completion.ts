@@ -1,3 +1,5 @@
+import { waitCancelled } from "./wait.ts";
+
 /** One execution segment: joiners receive its result, or the parent gets a completion wake-up. */
 export class RunCompletion<T> {
 	private completed = false;
@@ -26,7 +28,7 @@ export class RunCompletion<T> {
 	}
 
 	wait(signal?: AbortSignal): Promise<T> {
-		const cancelled = () => new DOMException("Wait cancelled; the child is unaffected.", "AbortError");
+		const cancelled = () => waitCancelled("child");
 		if (signal?.aborted) return Promise.reject(cancelled());
 		if (this.completed) {
 			this.claimed = true;

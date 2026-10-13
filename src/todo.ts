@@ -7,6 +7,8 @@
  * their content string (omp convention).
  */
 
+import { isRecord } from "./util/text.ts";
+
 export type TodoStatus = "pending" | "in_progress" | "completed" | "abandoned" | "blocked";
 
 export interface TodoItem {
@@ -53,17 +55,17 @@ export function markToStatus(mark: string): TodoStatus | undefined {
  * instead of crashing the widget, the tool, or branch restore.
  */
 export function parseTodoState(value: unknown): TodoState | undefined {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	if (!isRecord(value)) return undefined;
 	const phases = (value as { phases?: unknown }).phases;
 	if (!Array.isArray(phases)) return undefined;
 	const out: TodoPhase[] = [];
 	for (const rawPhase of phases) {
-		if (!rawPhase || typeof rawPhase !== "object" || Array.isArray(rawPhase)) return undefined;
+		if (!isRecord(rawPhase)) return undefined;
 		const { name, tasks } = rawPhase as { name?: unknown; tasks?: unknown };
 		if (typeof name !== "string" || !Array.isArray(tasks)) return undefined;
 		const parsedTasks: TodoItem[] = [];
 		for (const rawTask of tasks) {
-			if (!rawTask || typeof rawTask !== "object" || Array.isArray(rawTask)) return undefined;
+			if (!isRecord(rawTask)) return undefined;
 			const { content, status, blocker } = rawTask as { content?: unknown; status?: unknown; blocker?: unknown };
 			if (typeof content !== "string" || typeof status !== "string" || !STATUSES.includes(status as TodoStatus)) {
 				return undefined;

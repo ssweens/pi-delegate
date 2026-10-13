@@ -1,8 +1,8 @@
 /**
- * Mom's tools, as the Durable extension oven installs by name: `mom` (her operation, evidence and
- * finalizers). Each message her slice gets starts
- * an operation: `mom_begin` (engine.ts) prepares it and keeps its header in a Durable document; her
- * other tools rebuild the evidence from the lead's session file and her `.mom` file, and keep
+ * Path's tools, as the Durable extension oven installs by name: `mom` (its operation, evidence and
+ * finalizers). Each message its slice gets starts
+ * an operation: `mom_begin` (engine.ts) prepares it and keeps its header in a Durable document; its
+ * other tools rebuild the evidence from the lead's session file and its `.mom` file, and keep
  * per-operation progress (pages read, rejections) in a Durable document. Acceptance writes the map record
  * `${job}:map` to the `.mom` file, once; in trail mode the waypoints go to `session.trail` first and that
  * record carries only the coverage cursor. Child steps (audits, checks) carry their header in their first
@@ -16,23 +16,27 @@ import { Type, type Static } from "typebox";
 import { Check } from "typebox/value";
 import { validateToolArguments } from "@earendil-works/pi-ai/utils/validation";
 import { graphChange, isCheckpoint, loadState, noticeKey, type Checkpoint } from "./checkpoint.ts";
-import { acceptGraph, decodeLists, momTools, validateSearchQuery } from "./contract.ts";
+import { acceptGraph, decodeJsonList, decodeLists, momTools, validateSearchQuery } from "./contract.ts";
 import { V2_MODE, modeFor } from "./modes.ts";
 import { commitV2Tool } from "./v2.ts";
-import { isUserDirection, LiveFeed, type FeedEvent } from "./feed.ts";
+import { branchIds, isUserDirection, LiveFeed, type FeedEvent } from "./feed.ts";
 import { editGraph, emptyGraph, isEndeavor, sourceSuggestion, Unfinished, type GraphNode } from "./graph.ts";
 import { Beverly, type LabelVerdict } from "./classify.ts";
 import { decodeOperation, decodeStart, OPERATION_FAILED, type OperationHeader } from "./operation.ts";
-import { accepted, begin, docsFor, failed, GIVE_UP, readOperation, readSettings, rejected, type Engine } from "./engine.ts";
+import { accepted, begin, docsFor, failed, GIVE_UP, readOperation, readInstructionSettings, rejected, type Engine } from "./engine.ts";
 import { sessionFromFile } from "./session-file.ts";
 import { SidecarStore } from "./sidecar.ts";
 import { recordWaypointsTool } from "../trail/prompt.ts";
 import { TrailStore, trailFor } from "../trail/store.ts";
-import { sortTiers, STEP_KINDS, trailEntries, validateWaypointInputs, type Waypoint } from "../trail/types.ts";
+import { sortTiers, STEP_KINDS, trailEntries, validateWaypointInputs, type Revision, type Waypoint } from "../trail/types.ts";
+import { planRepair } from "../trail/repair.ts";
+import { clipText, errorMessage, isRecord, textOf } from "../util/text.ts";
+import { parseRef } from "../util/ref.ts";
+import { UNREADABLE_SOURCES } from "./status.ts";
 
 const FINALIZERS = new Set(["commit_graph", "commit_v2", "commit_labels", "record_thread_map", "record_waypoints"]);
 const BEGIN = "mom_begin";
-const SOLE = "Mom finalization requires a sole direct tool call, never a batch or nested call.";
+const SOLE = "Path finalization requires a sole direct tool call, never a batch or nested call.";
 
 const item = Type.Object({ text: Type.String({ minLength: 1 }), sources: Type.Array(Type.String(), { minItems: 1 }) }, { additionalProperties: false });
 const items = Type.Array(item);
@@ -79,7 +83,7 @@ function world(op: OperationHeader): Promise<World> {
 	return found;
 }
 
-/** Her results are evidence she must read whole: Durable's 50 KB default would cut a digest (a JSON document) mid-string. */
+/** Its results are evidence it must read whole: Durable's 50 KB default would cut a digest (a JSON document) mid-string. */
 const WHOLE = { maxBytes: 16 * 1024 * 1024, maxLines: 1_000_000 };
 const text = (value: string) => [{ type: "text" as const, text: value }];
 
@@ -91,7 +95,7 @@ export default function mom(durable: typeof Durable): Durable.Extension {
 
 	const engine: Engine = { durable, docs: docsFor(durable) };
 	/**
-	 * The operation this call belongs to and its tool calls: her slice's open operation (from its document,
+	 * The operation this call belongs to and its tool calls: its slice's open operation (from its document,
 	 * calls since it started), or a child step's (the header of its context's first message).
 	 */
 	type Call = { id: string; name: string; arguments: unknown; round: string };
@@ -106,7 +110,7 @@ export default function mom(durable: typeof Durable): Durable.Extension {
 			do {
 				const page = await tx.scanEntries({ conversationId: api.conversationId, ...(min !== undefined ? { minEntryId: min as any } : {}) }, 200, cursor);
 				for (const entry of page.items) for (const message of entry.model ?? []) {
-					if (message.role === "user") oldest = typeof message.content === "string" ? message.content : message.content.filter((part: any) => part.type === "text").map((part: any) => part.text).join("");
+					if (message.role === "user") oldest = textOf(message.content, "");
 					if (message.role === "assistant") for (const block of [...message.content].reverse()) if (block.type === "toolCall") calls.unshift({ id: block.id, name: block.name, arguments: block.arguments, round: String(entry.id) });
 				}
 				cursor = page.next;
@@ -114,7 +118,7 @@ export default function mom(durable: typeof Durable): Durable.Extension {
 			return { oldest, calls };
 		}, ctx);
 		const header = own?.header ?? (found.oldest ? decodeOperation(found.oldest).header : undefined);
-		if (!header) throw new Error("No Mom operation is open: call mom_begin first.");
+		if (!header) throw new Error("No Path operation is open: call mom_begin first.");
 		return { header, calls: found.calls, slice: Boolean(own) };
 	}
 	const operation = async (api: Durable.ToolExecutionApi, ctx: any) => (await operationContext(api, ctx)).header;
@@ -128,7 +132,7 @@ export default function mom(durable: typeof Durable): Durable.Extension {
 	const update = (api: Durable.ToolExecutionApi, ctx: any, job: string, change: (doc: Progress) => void) =>
 		api.commit(async tx => { change(await tx.doc(Progress, api.conversationId, job, null)); }, ctx);
 
-	/** A private tool: errors of Mom's own tooling end the operation with a marked result the lead reads. */
+	/** A private tool: errors of Path's own tooling end the operation with a marked result the lead reads. */
 	const tool = (definition: { name: string; description: string; parameters: any; constrainedSampling?: any },
 		run: (args: any, op: OperationHeader, api: Durable.ToolExecutionApi, ctx: any) => Promise<Durable.ToolExecutionResult>) => durable.defineTool({
 		...definition, replay: "safe", executionMode: "sequential", outputLimits: WHOLE,
@@ -139,7 +143,7 @@ export default function mom(durable: typeof Durable): Durable.Extension {
 				if (batched(calls, api.callId)) throw new Error(SOLE);
 				return await run(args, header, api, ctx);
 			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
+				const message = errorMessage(error);
 				await failed(engine, api, ctx, message).catch(() => {});
 				return { content: text(`${OPERATION_FAILED}${message}`), isError: true, control: { terminate: true } };
 			}
@@ -161,7 +165,7 @@ export default function mom(durable: typeof Durable): Durable.Extension {
 	 * Finalizers check their own arguments, so a malformed call counts as an attempt: Durable would answer it
 	 * without running the tool. After one repair (a second failed finalization) the operation ends.
 	 */
-const clip = (text: string, max: number): string => text.length <= max ? text : text.slice(0, max);
+const clip = (text: string, max: number): string => clipText(text, max, { ellipsis: "" });
 /** Newest evidence a node cites, so focus lands on the work the user asked for most recently. */
 const sourceAt = (node: GraphNode, known: ReadonlyMap<string, FeedEvent>): number => Math.max(...node.sources.map(ref => {
 	const at = known.get(ref)?.at;
@@ -173,11 +177,11 @@ const labelsDefinition = { name: "commit_labels", description: "Repair saved wor
 			state: Type.Optional(Type.Union([Type.Literal("active"), Type.Literal("parked")])) }, { additionalProperties: false }), { maxItems: 64 }),
 			retired: Type.Optional(Type.Array(Type.Object({ id: Type.String({ minLength: 1 }), reason: Type.String({ minLength: 1, maxLength: 240 }) }, { additionalProperties: false }), { maxItems: 64 })) }, { additionalProperties: false }) };
 	/** Normalize transport-only JSON strings before Pi validates any finalizer's arguments. The trail's
-	 *  `waypoints` list is decoded here because decodeLists belongs to the graph contract. */
+	 *  lists are decoded here because decodeLists belongs to the graph contract. */
 	const listArgs = (args: unknown) => {
-		if (!args || typeof args !== "object" || Array.isArray(args)) return args ?? {};
-		const out = decodeLists(args as Record<string, unknown>);
-		if (typeof out.waypoints === "string") try { const parsed = JSON.parse(out.waypoints); if (Array.isArray(parsed)) out.waypoints = parsed; } catch { /* validation reports it */ }
+		if (!isRecord(args)) return args ?? {};
+		const out = decodeLists(args);
+		for (const field of ["waypoints", "titles", "revise"]) out[field] = decodeJsonList(out[field], { allowNull: false });
 		return out;
 	};
 	/** The tool definition pi-ai validates a finalizer's arguments against. */
@@ -192,7 +196,7 @@ const labelsDefinition = { name: "commit_labels", description: "Repair saved wor
 		const retried = state.gaps.find(gap => gap.id === op.retryGap!.id);
 		const range = (refs: string[]) => {
 			const events = refs.map(ref => feed.byRef.get(ref));
-			if (!events.length || events.some(event => !event)) throw new Error("Mom cannot retry a skipped range because its recorded sources are unreadable.");
+			if (!events.length || events.some(event => !event)) throw new Error(UNREADABLE_SOURCES);
 			return { firstRef: events[0]!.ref, lastRef: events.at(-1)!.ref, count: events.length };
 		};
 		return op.retryGap.remaining.length && retried ? { gap: { action: "open", ...retried, ...range(op.retryGap.remaining) } } : { gap: { action: "resolved", id: op.retryGap.id } };
@@ -207,8 +211,8 @@ const labelsDefinition = { name: "commit_labels", description: "Repair saved wor
 		const call = calls.find(each => each.id === api.callId);
 		const attempts = calls.filter(each => FINALIZERS.has(each.name)).length;
 		const reject = async (reason: string) => {
-			if (attempts >= 2) await rejected(engine, api, ctx, op, `Mom could not finalize after one repair. ${reason}`);
-			return { content: text(attempts >= 2 ? `Mom could not finalize after one repair. ${reason} No map was accepted.` : `${reason} Correct all reported defects and resubmit once.`),
+			if (attempts >= 2) await rejected(engine, api, ctx, op, `Path could not finalize after one repair. ${reason}`);
+			return { content: text(attempts >= 2 ? `Path could not finalize after one repair. ${reason} No map was accepted.` : `${reason} Correct all reported defects and resubmit once.`),
 				isError: true, ...(attempts >= 2 ? { control: { terminate: true as const } } : {}) };
 		};
 		const { store, state, known, newRefs, feed } = await world(op);
@@ -217,11 +221,13 @@ const labelsDefinition = { name: "commit_labels", description: "Repair saved wor
 		// active mode did not ask it to do — otherwise a small model can reach for commit_graph in v2
 		// and author edits the host is supposed to check against the minimal schema.
 		const active = modeFor(op.mapMode ?? state.mode);
-		if (op.relabel ? form !== "labels" : active.finalizer !== FORM_FINALIZER[form])
-			return await reject(`This operation requires ${op.relabel ? "commit_labels" : active.finalizer}.`);
+		// A trail relabel is a titling pass: it finishes with record_waypoints like any trail operation.
+		const labels = op.relabel && active.name !== "trail";
+		if (labels ? form !== "labels" : active.finalizer !== FORM_FINALIZER[form])
+			return await reject(`This operation requires ${labels ? "commit_labels" : active.finalizer}.`);
 		// The decider every semantic gate asks, from the same settings line `begin` read.
 		const agent = await api.agent(ctx);
-		const settings = readSettings(agent.instructions);
+		const settings = readInstructionSettings(agent.instructions);
 		const classifier = settings.classifier ? new Beverly(settings.classifier) : undefined;
 		const records = await new SidecarStore(() => op.session.file, op.session.id).load();
 		if (records.some(record => record.id === `${op.job}:map`)) return { content: text(form === "trail" ? "Trail saved." : "Map saved."), control: { terminate: true } };
@@ -242,10 +248,15 @@ const labelsDefinition = { name: "commit_labels", description: "Repair saved wor
 					return to ?? ref;
 				}) });
 			const trailStore = new TrailStore(() => op.session.file, op.session.id);
-			const branch = new Set(sessionFromFile(op.session.file, op.session.leaf).getBranch().map(entry => entry.id));
+			const branch = branchIds(sessionFromFile(op.session.file, op.session.leaf));
 			const existing = trailFor(await trailStore.load(), branch);
 			const idFor = (index: number) => `${op.job}:w${index}`;
-			const { inputs, defects } = validateWaypointInputs(value, existing.waypoints, new Set(known.keys()), idFor);
+			const { inputs, titles, defects } = validateWaypointInputs(value, trailEntries(existing), new Set(known.keys()), idFor);
+			// A repair pass revises the trail it was shown (src/trail/repair.ts); no other operation may.
+			const revisions = Array.isArray(value.revise) ? value.revise as Revision[] : [];
+			if (revisions.length && !op.repair) defects.push("revise is only for a repair pass; leave it out.");
+			const repair = op.repair ? planRepair(existing, revisions, index => `${op.job}:r${index}`) : undefined;
+			if (repair) defects.push(...repair.defects);
 			if (defects.length) {
 				await update(api, ctx, op.job, doc => { doc.rejections++; });
 				return await reject(`Waypoints rejected; nothing was saved. ${defects.join(" ")}`);
@@ -263,25 +274,37 @@ const labelsDefinition = { name: "commit_labels", description: "Repair saved wor
 			});
 			const relink = (id: string | null | undefined) => id == null ? undefined : alias.get(id) ?? id;
 			// Where it sits in the transcript: the user turn it cites, else its first lead source, else the batch's.
-			const lead = `${op.session.id}:`, entryOf = (ref: string) => ref.slice(lead.length).split(":")[0]!;
+			const leadEntry = (ref: string) => { const parsed = parseRef(ref); return parsed?.stream === op.session.id ? parsed.entryId : undefined; };
 			const anchorOf = (refs: readonly string[]) => {
-				const ref = refs.find(isUserTurn) ?? refs.find(r => r.startsWith(lead)) ?? op.refs.find(r => r.startsWith(lead));
-				return ref?.startsWith(lead) ? entryOf(ref) : undefined;
+				const ref = refs.find(isUserTurn) ?? refs.find(r => leadEntry(r)) ?? op.refs.find(r => leadEntry(r));
+				return ref ? leadEntry(ref) : undefined;
 			};
-			const at = Date.now();
+			// When it happened, not when it was indexed: backfilled history keeps its own times.
+			const recorded = Date.now(), atOf = (refs: readonly string[]) => {
+				const time = Date.parse(known.get(refs.find(isUserTurn) ?? refs[0]!)?.at ?? "");
+				return Number.isFinite(time) ? time : recorded;
+			};
 			const all = [...tiers.waypoints.map(item => ({ ...item, step: false })), ...tiers.steps.map(item => ({ ...item, step: true }))]
 				.filter(item => !alias.has(idFor(item.index))).sort((a, b) => a.index - b.index);
 			for (const { index, input, step } of all) {
-				const closes = relink(input.closes), supersedes = relink(input.supersedes), anchor = anchorOf(input.refs);
-				const waypoint: Waypoint = { id: idFor(index), sessionId: op.session.id, at, kind: input.kind, line: input.line, refs: input.refs, caption: input.caption,
+				const closes = relink(input.closes), supersedes = relink(input.supersedes), from = relink(input.from), anchor = anchorOf(input.refs);
+				const waypoint: Waypoint = { id: idFor(index), sessionId: op.session.id, at: atOf(input.refs), kind: input.kind, line: input.line, refs: input.refs, caption: input.caption,
+					...(input.title ? { title: input.title } : {}), ...(from ? { from } : {}),
 					...(closes ? { closes } : {}), ...(supersedes ? { supersedes } : {}), ...(anchor ? { anchor } : {}), parent: op.session.leaf, by: "mom",
 					...(step && !STEP_KINDS.has(input.kind) ? { step: true as const } : {}) };
 				await trailStore.appendWaypoint(waypoint);
 			}
+			// Titles for waypoints recorded before titles existed; ids keep the call index, so a retry writes them once.
+			for (const [index, item] of [...titles, ...(repair?.titles ?? [])].entries())
+				await trailStore.appendTitle({ id: `${op.job}:t${index}`, sessionId: op.session.id, at: recorded, target: item.id, title: item.title, parent: op.session.leaf });
+			// A repair's revised copies first, then the strikes of what they replace: a crash between leaves both, never neither.
+			for (const copy of repair?.copies ?? []) await trailStore.appendWaypoint({ ...copy, parent: copy.parent ?? op.session.leaf });
+			for (const [index, item] of (repair?.strikes ?? []).entries())
+				await trailStore.appendStrike({ id: `${op.job}:s${index}`, sessionId: op.session.id, at: recorded, target: item.target, reason: item.reason, parent: op.session.leaf });
 			// Written after the waypoints: a crash between the two leaves the batch uncovered and retried, and
 			// the retry's ids are the same `${job}:w<n>`, so a reader sees the waypoints once.
 			try { await store.append("map", { base: state.checkpointId ?? null, cut: op.cut!, failure: null, ...gapChange(op, state, feed), ...(op.backfill !== undefined ? { backfill: op.backfill } : {}) }, `${op.job}:map`); }
-			catch (error) { throw new Error(`Mom could not advance her trail coverage beside the session: ${String(error)}`); }
+			catch (error) { throw new Error(`Path could not advance its trail coverage beside the session: ${String(error)}`); }
 			worlds.delete(`${op.job}:${op.step}`);
 			await accepted(engine, api, ctx, op);
 			const demoted = tiers.steps.filter(item => !STEP_KINDS.has(item.input.kind)).length;
@@ -311,7 +334,7 @@ const labelsDefinition = { name: "commit_labels", description: "Repair saved wor
 				const settled = work.filter(node => dropped.has(node.id) && node.state === "settled").map(node => node.id);
 				if (settled.length) throw new Error(`Finished records are not retirable: ${settled.join(", ")}. Give each a label instead.`);
 				if (!classifier && work.some(node => { const wanted = byId.get(node.id); return wanted && wanted.label !== node.label; }))
-					throw new Error("The Mom decider (decision model) is not configured; labels cannot be repaired without it.");
+					throw new Error("The Path decider (decision model) is not configured; labels cannot be repaired without it.");
 				for (const node of work) {
 					const wanted = byId.get(node.id);
 					if (!wanted || wanted.label === node.label) continue;
@@ -389,7 +412,7 @@ const labelsDefinition = { name: "commit_labels", description: "Repair saved wor
 		// A graph-identical acceptance still advances durable evidence coverage: a cursor record over the latest full checkpoint.
 		const resolutionKeys = new Set(next.resolutions.map(item => `${item.riskClass}:${item.target}`));
 		const pendingNotice = state.checkpoint?.note && !resolutionKeys.has(noticeKey(state.checkpoint.note)) ? state.checkpoint.note : null;
-		// Advice stays on Mom's surface. Delivery never adds it to lead context.
+		// Advice stays on Path's surface. Delivery never adds it to lead context.
 		const effectiveNote = next.note ? { ...next.note, nextRequest: true } : pendingNotice;
 		const material = !state.checkpoint || JSON.stringify(next.graph) !== JSON.stringify(graph)
 			|| JSON.stringify(effectiveNote) !== JSON.stringify(state.checkpoint.note ?? null)
@@ -409,11 +432,11 @@ const labelsDefinition = { name: "commit_labels", description: "Repair saved wor
 				// from an older checkpoint would otherwise replace the newer one without a trace. The operation fails and retries.
 				store.invalidate?.();
 				const current = await loadState(store, sessionFromFile(op.session.file, op.session.leaf), { mode: op.mapMode });
-				if ((current.checkpointId ?? null) !== (state.checkpointId ?? null)) throw new Error("Her saved map changed while she worked on this update, so it was not saved; the update is retried from the current map.");
-				await write({ snapshot: checkpoint, base: state.checkpointId ?? null, failure: null, ...gapUpdate, ...resolutionUpdate, ...(op.screen ? { screen: op.screen } : {}) }, "Mom could not write her state beside the session");
+				if ((current.checkpointId ?? null) !== (state.checkpointId ?? null)) throw new Error("Its saved map changed while it worked on this update, so it was not saved; the update is retried from the current map.");
+				await write({ snapshot: checkpoint, base: state.checkpointId ?? null, failure: null, ...gapUpdate, ...resolutionUpdate, ...(op.screen ? { screen: op.screen } : {}) }, "Path could not write its state beside the session");
 			} else {
-				if (!state.checkpointId) throw new Error("Mom cannot advance evidence coverage without a saved sidecar checkpoint.");
-				await write({ base: state.checkpointId, cut, failure: null, ...gapUpdate, ...resolutionUpdate, ...(op.screen ? { screen: op.screen } : {}) }, "Mom could not advance her state beside the session");
+				if (!state.checkpointId) throw new Error("Path cannot advance evidence coverage without a saved sidecar checkpoint.");
+				await write({ base: state.checkpointId, cut, failure: null, ...gapUpdate, ...resolutionUpdate, ...(op.screen ? { screen: op.screen } : {}) }, "Path could not advance its state beside the session");
 			}
 		}
 		worlds.delete(`${op.job}:${op.step}`);
@@ -424,7 +447,7 @@ const labelsDefinition = { name: "commit_labels", description: "Repair saved wor
 	const inspect = tool({ ...definition("inspect_evidence") }, async (args, op, api, ctx) => {
 		const { feed, known, missing, state } = await world(op);
 		if (typeof args.ref !== "string" || !Number.isSafeInteger(args.offset) || args.offset < 0 || !Number.isSafeInteger(args.limit) || args.limit < 1 || args.limit > 24000) throw new Error("Invalid evidence request.");
-		// A trail waypoint id (bare, or written node:<id> as the graph's references are) is Mom's own saved note.
+		// A trail waypoint id (bare, or written node:<id> as the graph's references are) is Path's own saved note.
 		if (op.mapMode === "trail" && !known.has(args.ref)) {
 			const id = args.ref.startsWith("node:") ? args.ref.slice(5) : args.ref;
 			const waypoint = (await new TrailStore(() => op.session.file, op.session.id).load()).find(record => record.type === "waypoint" && record.id === id);
@@ -443,7 +466,7 @@ const labelsDefinition = { name: "commit_labels", description: "Repair saved wor
 				text: value.slice(args.offset, args.offset + args.limit) })) };
 		}
 		if (op.section?.sources?.[args.ref]) args = { ...args, ref: op.section.sources[args.ref] };
-		const gone = typeof args.ref === "string" && !known.has(args.ref) ? missing.get(args.ref.slice(0, args.ref.indexOf(":"))) : undefined;
+		const gone = typeof args.ref === "string" && !known.has(args.ref) ? missing.get(parseRef(args.ref)?.stream ?? "") : undefined;
 		if (gone) return { content: text(JSON.stringify({ ref: args.ref, error: `Error: ENOENT: no such file or directory, open '${gone}'`,
 			instruction: "The original file is unavailable. Continue with supplied evidence; do not infer unseen contents or repeat this read." })), isError: op.mode === "audit" };
 		const done = await progress(api, ctx, op.job);
@@ -498,8 +521,8 @@ const labelsDefinition = { name: "commit_labels", description: "Repair saved wor
 		let args: any;
 		try { args = validateToolArguments(recordDefinition as any, { type: "toolCall", id: "check", name: "record_thread_map", arguments: JSON.parse(JSON.stringify(listArgs(calls.find(call => call.id === api.callId)?.arguments ?? _args))) }); }
 		catch (error) {
-			if (calls.filter(call => FINALIZERS.has(call.name)).length >= 2) throw new Error(`Mom could not finalize after one repair. ${error instanceof Error ? error.message : String(error)}`);
-			return { content: text(`${error instanceof Error ? error.message : String(error)} Correct all reported defects and resubmit once.`), isError: true };
+			if (calls.filter(call => FINALIZERS.has(call.name)).length >= 2) throw new Error(`Path could not finalize after one repair. ${errorMessage(error)}`);
+			return { content: text(`${errorMessage(error)} Correct all reported defects and resubmit once.`), isError: true };
 		}
 		const { known, feed } = await world(op);
 		const canonical = (ref: string) => {
@@ -547,7 +570,7 @@ const labelsDefinition = { name: "commit_labels", description: "Repair saved wor
 		execute: (_args: unknown, api: Durable.ToolExecutionApi, ctx: any) => begin(engine, api, ctx) });
 
 	/**
-	 * The model sees only the current operation: messages from its start (her slice keeps earlier ones in
+	 * The model sees only the current operation: messages from its start (its slice keeps earlier ones in
 	 * storage), with a delivery or request shown as a short prompt and a step's header removed.
 	 */
 	const prompt = (text: string) => {
@@ -556,43 +579,44 @@ const labelsDefinition = { name: "commit_labels", description: "Repair saved wor
 		if (start?.kind === "request") return start.request.kind === "relabel" ? "The user requested a repair of saved work labels. Call mom_begin." : "The user's session sent a request. Call mom_begin.";
 		return decodeOperation(text).text;
 	};
-	const textOf = (message: any) => typeof message.content === "string" ? message.content : message.content.filter((part: any) => part.type === "text").map((part: any) => part.text).join("");
 	const REPAIR_PREFIX = "No finalizer was executed.";
-	const repair = (header: OperationHeader) => `${REPAIR_PREFIX} Review the supplied evidence and finish with ${header.relabel ? "commit_labels" : modeFor(header.mapMode).finalizer} as a sole direct call. Your previous text did not save any changes.`;
-/** Mom's own tool surface. A stale or foreign slice configuration must never hand her native
+	const repair = (header: OperationHeader) => `${REPAIR_PREFIX} Review the supplied evidence and finish with ${header.relabel && modeFor(header.mapMode).name !== "trail" ? "commit_labels" : modeFor(header.mapMode).finalizer} as a sole direct call. Your previous text did not save any changes.`;
+/** Path's own tool surface. A stale or foreign slice configuration must never hand it native
  *  filesystem, shell or editor tools: a small model given those leaves the operation and wanders.
  *  The extension enforces its own boundary rather than trusting the allowlist it was given. */
 const MOM_TOOL_NAMES = new Set([BEGIN, "commit_graph", "commit_v2", "commit_labels", "record_thread_map", "record_waypoints", "inspect_evidence", "search_history"]);
-	const RELABEL_PROMPT = "You are Mom repairing her saved work map, not processing new activity or answering the recorded conversation. First call mom_begin alone. Then read its work list and call commit_labels once. Give a decision only for the work that needs one: a concise, meaningful label to keep it, or retired with a short reason. An ID you leave out keeps its saved label.\n\n\n\nMom tracks only durable, multi-turn things. Retire work that is not: a status or progress question (\"where are we?\", \"is it in place now?\", \"were those labels from act mode or commit mode\"), a one-off meta question, or an instruction the next turn fully satisfied. Keep genuine multi-turn work even when it is phrased as a question (\"What else is fucking idiotic in this stack?\" is a real audit request). Never retire settled work, or work that still holds unfinished work — give those a label instead.\n\n\n\nA kept work item may also carry state: active when it is being worked on now, parked when it is deliberately deferred. Set active for work in progress, including an umbrella initiative whose child is current. Never mark work settled here — a completion needs its own evidence. Base every label on that work's intent and observed outcome; do not copy terminal markup or invent new work. Never call other tools, and never alter IDs, sources, or notes.";
+	const RELABEL_PROMPT = "You are Path repairing its saved work map, not processing new activity or answering the recorded conversation. First call mom_begin alone. Then read its work list and call commit_labels once. Give a decision only for the work that needs one: a concise, meaningful label to keep it, or retired with a short reason. An ID you leave out keeps its saved label.\n\n\n\nMom tracks only durable, multi-turn things. Retire work that is not: a status or progress question (\"where are we?\", \"is it in place now?\", \"were those labels from act mode or commit mode\"), a one-off meta question, or an instruction the next turn fully satisfied. Keep genuine multi-turn work even when it is phrased as a question (\"What else is fucking idiotic in this stack?\" is a real audit request). Never retire settled work, or work that still holds unfinished work — give those a label instead.\n\n\n\nA kept work item may also carry state: active when it is being worked on now, parked when it is deliberately deferred. Set active for work in progress, including an umbrella initiative whose child is current. Never mark work settled here — a completion needs its own evidence. Base every label on that work's intent and observed outcome; do not copy terminal markup or invent new work. Never call other tools, and never alter IDs, sources, or notes.";
 
 	const hooks = [durable.hook(durable.GenerationTask, {
 		async beforeRequest(request, api, ctx) {
-			const startAt = request.messages.findLastIndex(message => message.role === "user" && decodeStart(textOf(message)) !== undefined);
+			const startAt = request.messages.findLastIndex(message => message.role === "user" && decodeStart(textOf(message.content, "")) !== undefined);
 			// System entries (the prompt and the tool list) are positional: keep every one, drop earlier operations.
 			const messages = request.messages.filter((message, index) => index >= startAt || !["user", "assistant", "toolResult"].includes(message.role));
 			// Whether this operation already had its repair prompt: onYield, in this same generation, reads it.
-			await api.memo("mom-repaired", messages.some(message => message.role === "user" && textOf(message).startsWith(REPAIR_PREFIX)), ctx);
-			await api.memo("mom-gave-up", messages.some(message => message.role === "user" && textOf(message).startsWith(GIVE_UP)), ctx);
-			const start = startAt >= 0 ? decodeStart(textOf(request.messages[startAt]!)) : undefined;
+			await api.memo("mom-repaired", messages.some(message => message.role === "user" && textOf(message.content, "").startsWith(REPAIR_PREFIX)), ctx);
+			await api.memo("mom-gave-up", messages.some(message => message.role === "user" && textOf(message.content, "").startsWith(GIVE_UP)), ctx);
+			const start = startAt >= 0 ? decodeStart(textOf(request.messages[startAt]!.content, "")) : undefined;
 			const operation = await readOperation(engine, api as any, ctx);
 			const begun = messages.some(message => message.role === "toolResult" && message.toolName === BEGIN && !message.isError);
 			const header = start?.kind === "step" ? start.header : begun && operation.status === "open" ? operation.header : undefined;
-			const settings = readSettings(messages.filter(message => message.role === "system").map(textOf).join("\n"));
+			const settings = readInstructionSettings(messages.filter(message => message.role === "system").map(message => textOf(message.content, "")).join("\n"));
 			const operationMode = modeFor(header?.mapMode ?? settings.mapMode);
-			const givingUp = messages.some(message => message.role === "user" && textOf(message).startsWith(GIVE_UP));
+			const givingUp = messages.some(message => message.role === "user" && textOf(message.content, "").startsWith(GIVE_UP));
 			const allowed = new Set(!header || givingUp ? [BEGIN] : header.mode === "audit" ? ["record_thread_map", ...(header.section?.needsInspection ? ["inspect_evidence"] : [])]
-				: header.relabel ? ["commit_labels"]
+				// A trail relabel is a titling pass: it finishes with record_waypoints like every trail operation.
+				: header.relabel && operationMode.name !== "trail" ? ["commit_labels"]
 				// v2 owns every write, catch-up digests included; commit_graph owns its own digest.
 				: operationMode.name === "v2" ? ["commit_v2", "inspect_evidence", "search_history"]
 				// The trail has no graph: its one finalizer appends waypoints, digests included. It indexes the batch in
-				// front of her and never reconciles older history, so it gets no history search: a small model given
+				// front of its and never reconciles older history, so it gets no history search: a small model given
 				// one fishes with it (dozens of one-word queries per catch-up) instead of reading the evidence.
 				: operationMode.name === "trail" ? ["record_waypoints", "inspect_evidence"]
 				: ["commit_graph", "inspect_evidence", "search_history"]);
 			return { messages: messages.map(message => {
 				if (message.role === "system") return { ...message,
-					...(header?.relabel && message.sections?.instructions ? { sections: { ...message.sections, instructions: RELABEL_PROMPT } } : {}),
-					// Mom's tools only. A stale slice configuration that carried native read/bash/codemode
+					// A graph relabel gets its own instructions; a trail relabel keeps the trail's (it finishes with record_waypoints).
+					...(header?.relabel && operationMode.name !== "trail" && message.sections?.instructions ? { sections: { ...message.sections, instructions: RELABEL_PROMPT } } : {}),
+					// Path's tools only. A stale slice configuration that carried native read/bash/codemode
 					// is corrected here, at the one place every request passes through.
 					...(message.toolsAdded ? { toolsAdded: message.toolsAdded.filter(tool => allowed.has(tool.name) && MOM_TOOL_NAMES.has(tool.name)) } : {}) };
 				if (message.role !== "user") return message;
@@ -611,14 +635,14 @@ const MOM_TOOL_NAMES = new Set([BEGIN, "commit_graph", "commit_v2", "commit_labe
 			// Ended again without a finalizer: a hook cannot fail the turn, a tool result can. mom_begin fails the operation.
 			return await api.memo<boolean>("mom-gave-up", ctx) ? undefined : { continue: GIVE_UP };
 		},
-		/** An operation her tools ended as failed (a rejection after repair, or her own tooling) fails the turn. */
+		/** An operation its tools ended as failed (a rejection after repair, or its own tooling) fails the turn. */
 		async afterTools(_assistant, _results, api, ctx) {
 			const op = await readOperation(engine, api as any, ctx);
 			if (op.fault) throw new Error(op.fault);
 		},
 	})];
 
-	// Her operations each start a fresh context (the hook above): summarizing the stored history would only spend model calls.
+	// Its operations each start a fresh context (the hook above): summarizing the stored history would only spend model calls.
 	hooks.push(durable.hook(durable.CompactionTask, { beforeCompact: () => ({ decline: true as const }) }));
 
 	return durable.defineExtension({

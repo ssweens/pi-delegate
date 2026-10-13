@@ -46,7 +46,7 @@ test("trail Mom records a waypoint through Oven, repairs a rejected call once, a
 			const result = lastToolText(request);
 			if (!begun) begun = JSON.parse(result);
 			const ref = begun.newUserDirections[0].ref;
-			const waypoint = { kind: "set_out", line: "Semantic labels", caption: "The user asked for semantic labels on the map; work on them begins here." };
+			const waypoint = { kind: "set_out", line: "Semantic labels", title: " Semantic map labels ", caption: "The user asked for semantic labels on the map; work on them begins here." };
 			// First call cites an invented source; the host must reject it naming the defect, and the repair must land.
 			if (calls.length) { assert.match(result, /cites unobserved source invented:1/); assert.match(result, /resubmit once/); }
 			const call = calls.length ? { waypoints: [{ ...waypoint, refs: [ref] }] } : { waypoints: [{ ...waypoint, refs: ["invented:1"] }] };
@@ -79,7 +79,8 @@ test("trail Mom records a waypoint through Oven, repairs a rejected call once, a
 		assert.match(recorded.id, /^[0-9a-f-]+:w0$/);
 		assert.equal(typeof recorded.parent, "string");
 		assert.equal(recorded.sessionId, sessionId);
-		assert.equal(typeof recorded.at, "number");
+		assert.equal(recorded.title, "Semantic map labels", "the title is kept, trimmed");
+		assert.equal(recorded.at, Date.parse((user as any).timestamp), "a waypoint is timed by the user turn it cites, not by when it was indexed");
 		assert.ok(existsSync(trailFile(h.parent)), "the trail lives beside the session file");
 
 		// Coverage advanced in `.mom` as the graph-less cursor: a cut, no failure, and no snapshot.
@@ -195,6 +196,158 @@ test("a second trail batch is shown the first waypoint and links a learned to it
 		assert.match(both[1].id, /^[0-9a-f-]+:w0$/);
 		assert.notEqual(both[1].id.split(":")[0], firstId!.split(":")[0], "each batch's ids carry its own job");
 		assert.ok(bodies.some(body => body.trail.recent[0]?.id === firstId), "a later batch was shown the first waypoint");
+		assert.deepEqual(h.errors, []);
+		assert.deepEqual(api.errors, []);
+	} finally {
+		await h?.runtime.dispose(); await daemon.stop(); await api.close(); rmSync(box.root, { recursive: true, force: true });
+	}
+});
+
+test("caught up, untitled entries get a titling pass of their own; a detour carries what led to it", { timeout: 45000, skip }, async () => {
+	const api = await provider(), box = sandbox(api.url);
+	const daemon = await startOven(box.root, box.agentDir);
+	const { TrailStore, trailFor } = await import("../src/trail/store.ts");
+	const { glance } = await import("../src/trail/projection.ts");
+	const { trailRows } = await import("../src/ui/trail-view.ts");
+	let h: Awaited<ReturnType<typeof harness>> | undefined;
+	const bodies: any[] = [];
+	try {
+		h = await harness(box, undefined, { flags: FLAGS });
+		const prompt = "Convert Hop to Werkit; OpenCode needs a receiver first.";
+		api.script(prompt, { text: "Starting on the OpenCode receiver." });
+		api.onUnscripted(request => {
+			const names: string[] = (request.tools ?? []).map((tool: any) => tool.function?.name);
+			if (names.includes("mom_begin")) return { tool: { name: "mom_begin", arguments: {} } };
+			const body = JSON.parse(lastToolText(request));
+			bodies.push(body);
+			if (String(body.task).startsWith("Titling pass")) {
+				assert.deepEqual(names.sort(), ["inspect_evidence", "record_waypoints"], "a titling pass finishes like any trail operation");
+				assert.doesNotMatch(JSON.stringify((request.messages ?? []).filter((message: any) => message.role === "system")), /commit_labels/, "a titling pass keeps the trail's instructions, not the graph relabel's");
+				// Sent as a JSON string, as mimo sends nested lists; the host decodes it like waypoints.
+				return { tool: { name: "record_waypoints", arguments: { waypoints: [], titles: JSON.stringify(body.trail.untitled.map((entry: any) => ({ id: entry.id, title: entry.kind === "detour" ? "OpenCode receiver" : "Convert Hop to Werkit" }))) } } };
+			}
+			const ref = body.newUserDirections[0].ref;
+			// Recorded the old way, with no titles; the detour names the finding that led to it by its index in this call.
+			return { tool: { name: "record_waypoints", arguments: { waypoints: [
+				{ kind: "set_out", line: "Werkit conversion", refs: [ref], caption: "Use Werkit as Hop's workflow, converting the repo to it." },
+				{ kind: "learned", line: "Werkit conversion", refs: [ref], title: "OpenCode can't receive", caption: "OpenCode has no inbound delivery for message_thread." },
+				{ kind: "detour", line: "opencode receiver", refs: [ref], from: "#1", caption: "Build an OpenCode receiver before the conversion goes on." },
+			] } } };
+		});
+		await h.runtime.session.prompt(prompt);
+		const manager = h.runtime.session.sessionManager, sessionId = manager.getSessionId();
+		const context = () => ({ errors: api.errors, bodies: bodies.map(body => body.task), extensionErrors: h!.errors });
+		const read = async () => trailFor(await new TrailStore(() => h!.parent, sessionId).load(), new Set(manager.getBranch().map((entry: any) => entry.id)));
+		const trail = await until("the titling pass", async () => { const t = await read(); return t.waypoints.length === 2 && t.waypoints.every(w => w.title) ? t : undefined; }, context, 30000);
+		const titling = bodies.find(body => String(body.task).startsWith("Titling pass"));
+		assert.equal(titling.newEvents, "", "a titling pass reads no evidence");
+		assert.deepEqual(titling.trail.untitled.map((entry: any) => entry.kind).sort(), ["detour", "set_out"], "the widget's untitled entries are offered; the titled finding is not");
+		const [goal, detour] = trail.waypoints;
+		const finding = (trail.entries ?? []).find(entry => entry.kind === "learned")!;
+		assert.equal(detour!.from, finding.id, "#1 named the finding written in the same call");
+		assert.deepEqual(trail.waypoints.map(w => w.title), ["Convert Hop to Werkit", "OpenCode receiver"]);
+		assert.equal(goal!.caption, "Use Werkit as Hop's workflow, converting the repo to it.", "titling leaves the record itself unchanged");
+		const plain = { fg: (_c: string, text: string) => text, bold: (text: string) => `*${text}*` } as any;
+		assert.deepEqual(trailRows(glance(trail), plain, 100), ["◎ Convert Hop to Werkit", "  ↳ *OpenCode receiver*  ‹ OpenCode can't receive"], "tasks, and what led to the detour");
+		assert.deepEqual(h.errors, []);
+		assert.deepEqual(api.errors, []);
+	} finally {
+		await h?.runtime.dispose(); await daemon.stop(); await api.close(); rmSync(box.root, { recursive: true, force: true });
+	}
+});
+
+test("/path reindex repairs the trail in one operation from its own entries, without re-reading the transcript", { timeout: 45000, skip }, async () => {
+	const api = await provider(), box = sandbox(api.url);
+	const daemon = await startOven(box.root, box.agentDir);
+	const { TrailStore, trailFor } = await import("../src/trail/store.ts");
+	const { glance } = await import("../src/trail/projection.ts");
+	let h: Awaited<ReturnType<typeof harness>> | undefined;
+	const bodies: any[] = [];
+	try {
+		h = await harness(box, undefined, { flags: FLAGS });
+		const prompt = "Run Werkit from Hop. Also agent rows must keep spawn order.";
+		api.script(prompt, { text: "On it." });
+		api.onUnscripted(request => {
+			const names: string[] = (request.tools ?? []).map((tool: any) => tool.function?.name);
+			if (names.includes("mom_begin")) return { tool: { name: "mom_begin", arguments: {} } };
+			const body = JSON.parse(lastToolText(request));
+			bodies.push(body);
+			if (String(body.task).startsWith("Repair pass")) {
+				const goalChange = body.trail.entries.find((entry: any) => entry.kind === "reframed");
+				return { tool: { name: "record_waypoints", arguments: { waypoints: [], revise: JSON.stringify([{ id: goalChange.id, kind: "decided", title: "Spawn-order agent rows" }]) } } };
+			}
+			const ref = body.newUserDirections[0].ref;
+			// Recorded under the old rules: a feature request filed as a goal change.
+			return { tool: { name: "record_waypoints", arguments: { waypoints: [
+				{ kind: "set_out", line: "Hop integration", refs: [ref], title: "Run Werkit from Hop", caption: "Run Werkit from Hop." },
+				{ kind: "reframed", line: "Hop integration", refs: [ref], title: "Agent rows keep spawn order", caption: "Agent rows must keep spawn order." },
+			] } } };
+		});
+		await h.runtime.session.prompt(prompt);
+		const manager = h.runtime.session.sessionManager, sessionId = manager.getSessionId();
+		const context = () => ({ errors: api.errors, bodies: bodies.map(body => body.task), extensionErrors: h!.errors });
+		const read = async () => trailFor(await new TrailStore(() => h!.parent, sessionId).load(), new Set(manager.getBranch().map((entry: any) => entry.id)));
+		await until("the first index", async () => (await read()).waypoints.length === 2 ? true : undefined, context, 20000);
+		let notifications: string[] = [];
+		const interactive = { ...h.ctx(), ui: { ...h.ctx().ui, notify: (text: string) => { notifications.push(text); } } };
+		// Path may still be finishing the first index: the repair waits behind it rather than being refused.
+		await h.commands.get("path").handler("reindex", interactive);
+		assert.match(notifications[0]!, /^Path: repairing the trail/, "the command says at once that it started");
+		assert.match(notifications.at(-1)!, /^Path: trail repaired/, "and how its run ended");
+		notifications = [];
+		await h.commands.get("path").handler("refresh", interactive);
+		assert.deepEqual(notifications, ["Path: catching up on new activity…", "Path: caught up — nothing new for the trail."], "a refresh acknowledges and reports too");
+		const repairs = bodies.filter(body => String(body.task).startsWith("Repair pass"));
+		assert.equal(repairs.length, 1, "one operation");
+		assert.equal(repairs[0].newEvents, "", "no transcript is read");
+		assert.deepEqual(repairs[0].trail.entries.map((entry: any) => entry.kind), ["set_out", "reframed"], "the whole trail is shown");
+		const trail = await read();
+		assert.deepEqual(trail.waypoints.map(w => [w.kind, w.title]), [["set_out", "Run Werkit from Hop"], ["decided", "Spawn-order agent rows"]]);
+		assert.equal(trail.struck.length, 1, "the replaced entry stays in the file, struck");
+		assert.equal(glance(trail).tree!.goal.title, "Run Werkit from Hop", "the real goal is current again");
+		assert.deepEqual(h.errors, []);
+		assert.deepEqual(api.errors, []);
+	} finally {
+		await h?.runtime.dispose(); await daemon.stop(); await api.close(); rmSync(box.root, { recursive: true, force: true });
+	}
+});
+
+test("with a decision model, a batch whose user turns do not steer skips the update model; one that steers runs it", { timeout: 60000, skip }, async () => {
+	const api = await provider(), box = sandbox(api.url);
+	const daemon = await startOven(box.root, box.agentDir);
+	const { SidecarStore } = await import("../src/mom/sidecar.ts");
+	let h: Awaited<ReturnType<typeof harness>> | undefined;
+	const bodies: any[] = [], asked: string[] = [];
+	try {
+		h = await harness(box, undefined, { flags: { ...FLAGS, "mom-decider": "fixture-classifier/fixture-decider" } });
+		api.classify(request => {
+			if (!request.questions?.steers) return undefined;
+			const sent = String(request.state).split("The user then sent: ")[1] ?? "";
+			asked.push(sent);
+			return { steers: /switch to/i.test(sent) ? 2.7 : 0.1 };
+		});
+		const status = "How is it going so far?", steer = "Switch to the edge renderer now.";
+		api.script(status, { text: "Going well." });
+		api.script(steer, { text: "Switching." });
+		api.onUnscripted(request => {
+			const names: string[] = (request.tools ?? []).map((tool: any) => tool.function?.name);
+			if (names.includes("mom_begin")) return { tool: { name: "mom_begin", arguments: {} } };
+			const body = JSON.parse(lastToolText(request));
+			bodies.push(body);
+			const ref = body.newUserDirections.at(-1).ref;
+			return { tool: { name: "record_waypoints", arguments: { waypoints: [{ kind: "set_out", line: "Edge renderer", refs: [ref], title: "Edge renderer", caption: "Switch to the edge renderer." }] } } };
+		});
+		const manager = h.runtime.session.sessionManager, sessionId = manager.getSessionId();
+		const context = () => ({ errors: api.errors, asked, bodies: bodies.length, extensionErrors: h!.errors });
+		const maps = async () => (await new SidecarStore(() => h!.parent, sessionId).load()).filter(record => record.type === "map" && record.data.cut);
+		await h.runtime.session.prompt(status);
+		await until("coverage of the routine turn", async () => (await maps()).length ? true : undefined, context, 20000);
+		assert.equal(bodies.length, 0, "the update model was not asked about a status question");
+		assert.deepEqual(asked, [status], "the decision model read the one user turn");
+		await h.runtime.session.prompt(steer);
+		await until("the steering turn's waypoint", async () => bodies.length ? true : undefined, context, 20000);
+		assert.match(bodies[0].newEvents, /edge renderer/i);
+		assert.ok(asked.includes(steer));
 		assert.deepEqual(h.errors, []);
 		assert.deepEqual(api.errors, []);
 	} finally {

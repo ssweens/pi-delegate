@@ -1,4 +1,9 @@
 /** Read-only, English-first projection. No inference, storage writes, or model calls. */
+import { clipText, flatten } from "../util/text.ts";
+import { isFinished, isWaiting, kindWord, stateWord } from "./vocabulary.ts";
+
+/** What every surface says when Path has saved nothing. */
+export const NO_ACCOUNT = "Path has not saved an account of this work yet.";
 export interface AnnotationView {
 	id: string;
 	kind: string;
@@ -69,12 +74,10 @@ const strings = (value: unknown): string[] => Array.isArray(value) ? value.filte
 const records = (value: unknown): RecordData[] => Array.isArray(value) ? value.filter(v => v && typeof v === "object" && typeof v.id === "string") : [];
 const copy = <T>(value: T): T => structuredClone(value);
 const name = (item: Pick<AnnotationView, "label" | "id">): string => item.label || item.id;
-const stateName = (state: string): string => ({ active: "in progress", parked: "waiting", settled: "finished", proposed: "proposed", unknown: "not yet known" })[state] ?? "not yet known";
-const annotationName = (kind: string): string => ({ rule: "Rule", choice: "Open choice", observation: "Observation" })[kind] ?? "Attached note";
 const sentence = (value: string): string => /[.!?]$/.test(value.trim()) ? value.trim() : `${value.trim()}.`;
 const excerpt = (value: string, limit = 280): string => {
-	const single = value.replace(/\s+/g, " ").trim();
-	return single.length > limit ? `${single.slice(0, limit).trimEnd()}… (excerpt)` : single;
+	const single = flatten(value);
+	return single.length > limit ? `${clipText(single, limit)} (excerpt)` : single;
 };
 const list = (items: string[], limit = 5): string => items.slice(0, limit).join("; ") + (items.length > limit ? `; and ${items.length - limit} more` : "");
 
@@ -150,9 +153,9 @@ function orientation(view: WorkView, raw: Map<string, RecordData>): string {
 	const pieces: string[] = [];
 	const coverageComplete = view.coverageComplete !== false && !view.error;
 	if (view.historical) pieces.push("You are reading an earlier saved account, not current work.");
-	else if (!coverageComplete) pieces.push("Mom has not read the latest activity yet. This is her last-saved snapshot, not current orientation.");
+	else if (!coverageComplete) pieces.push("Path has not read the latest activity yet. This is its last-saved snapshot, not current orientation.");
 	if (!view.endeavors.length && !view.unattachedAnnotations.length) {
-		pieces.push("Mom has not saved an account of this work yet.");
+		pieces.push(NO_ACCOUNT);
 	} else if (purpose) {
 		pieces.push(`The mother thread ${view.historical ? "was" : "is"} “${name(purpose)}”.`);
 		pieces.push(purpose.intent ? `Its purpose: ${sentence(excerpt(purpose.intent))}` : "Its full purpose is not included in this selected view.");
@@ -175,8 +178,8 @@ function orientation(view: WorkView, raw: Map<string, RecordData>): string {
 	if (view.focusPath.length) {
 		pieces.push(`${view.historical ? "Where work was" : coverageComplete ? "Where you are" : "Last saved focus"}: ${view.focusPath.map(id => byId.get(id)?.label || id).join(" → ")}.`);
 		const focused = view.focus ? raw.get(view.focus) : undefined;
-		if (focused && view.focus !== view.focusEndeavor) pieces.push(`The ${view.historical ? "recorded" : coverageComplete ? "current" : "last saved"} point of attention in that endeavor is the attached ${annotationName(text(focused.kind)).toLowerCase()} “${text(focused.label) || focused.id}” (${focused.kind === "rule" && focused.state === "active" ? "in force" : stateName(text(focused.state))}), not a separate endeavor.`);
-		else if (focused) pieces.push(`That endeavor is ${stateName(text(focused.state))}.`);
+		if (focused && view.focus !== view.focusEndeavor) pieces.push(`The ${view.historical ? "recorded" : coverageComplete ? "current" : "last saved"} point of attention in that endeavor is the attached ${kindWord(text(focused.kind)).toLowerCase()} “${text(focused.label) || focused.id}” (${focused.kind === "rule" && focused.state === "active" ? "in force" : stateWord(text(focused.state))}), not a separate endeavor.`);
+		else if (focused) pieces.push(`That endeavor is ${stateWord(text(focused.state))}.`);
 	} else if (view.focus) pieces.push("The current point of attention is outside the loaded hierarchy.");
 	const selectedWork = view.endeavors.filter(e => !e.summaryOnly);
 	for (const [state, label] of [["active", "Work in progress"], ["parked", "Waiting work"], ["settled", "Finished work"], ["proposed", "Proposed work"]]) {
@@ -186,14 +189,14 @@ function orientation(view: WorkView, raw: Map<string, RecordData>): string {
 	const notes = view.endeavors.flatMap(e => e.annotations.filter(a => !a.summaryOnly).map(a => ({ item: a, owner: name(e) })));
 	const rules = notes.filter(({ item }) => item.kind === "rule" && item.state === "active");
 	if (rules.length) pieces.push(sentence(`Rules still in force: ${list(rules.map(({ item, owner }) => `${owner} — ${excerpt(item.intent || item.label, 220)}`))}`));
-	const waiting = notes.filter(({ item }) => item.state === "parked");
+	const waiting = notes.filter(({ item }) => isWaiting(item.state));
 	if (waiting.length) pieces.push(`Waiting within this work: ${list(waiting.map(({ item, owner }) => `${owner} — ${name(item)}`))}.`);
-	const outcomes = notes.filter(({ item }) => item.kind === "observation" && item.state === "settled");
+	const outcomes = notes.filter(({ item }) => item.kind === "observation" && isFinished(item.state));
 	if (outcomes.length) pieces.push(`Recorded outcomes: ${list(outcomes.map(({ item, owner }) => `${owner} — ${name(item)}`))}.`);
 	if (view.roots.length > 1) pieces.push(`Other top-level endeavors are also shown: ${list(view.roots.filter(id => id !== view.purpose).map(id => name(byId.get(id)!)))}.`);
 	if (view.outside.length) pieces.push(`Outside this view: ${view.outside.join(" ")}`);
 	else if (raw.size) pieces.push("This read includes the whole saved account; no other work is hidden by the selection.");
-	if (view.error) pieces.unshift("Mom could not update this account. This is the last saved view, not confirmation that recent activity has been incorporated.");
+	if (view.error) pieces.unshift("Path could not update this account. This is the last saved view, not confirmation that recent activity has been incorporated.");
 	return pieces.join(" ");
 }
 
@@ -208,10 +211,8 @@ export function readText(view: WorkView, details = false): string {
  * the overview; the exact wording (including punctuation) remains in detail. */
 const compact = (value: string, limit = 90): string => {
 	const plain = value.replace(/["“”«»„‟「」『』]/g, "")
-		.replace(/(?<!\p{L})['‘’]|['‘’](?!\p{L})/gu, "").replace(/\s+/g, " ").trim();
-	if (plain.length <= limit) return plain;
-	const head = plain.slice(0, limit), boundary = head.lastIndexOf(" ");
-	return `${(boundary > limit / 2 ? head.slice(0, boundary) : head).trimEnd()}…`;
+		.replace(/(?<!\p{L})['‘’]|['‘’](?!\p{L})/gu, "");
+	return clipText(flatten(plain), limit, { words: true });
 };
 const GROUP_LIMIT = 2;
 const ENDEAVOR_LIMIT = 2;
@@ -221,7 +222,7 @@ const grouped = (items: string[]): string => items.slice(0, GROUP_LIMIT).join(";
 /** Bounded story groups under their recorded endeavor, never inferred membership. */
 export interface ProgressView { coverage?: { consumed: number; total: number } }
 /**
- * How much recorded evidence Mom has durably consumed. Honest coverage, not effort: entries differ
+ * How much recorded evidence Path has durably consumed. Honest coverage, not effort: entries differ
  * in size, so the percentage is a monotone progress signal, not an estimate of remaining time.
  * Returns undefined rather than guessing when the branch no longer contains the consumed leaf.
  */
@@ -248,7 +249,7 @@ export function summaryText(view: WorkView): string {
 	const items = [...view.endeavors, ...view.endeavors.flatMap(e => e.annotations), ...view.unattachedAnnotations];
 	const byId = new Map(items.map(item => [item.id, item]));
 	const selected = new Set(view.omittedRecords ? view.selected : []);
-	const state = (item: AnnotationView) => item.kind === "rule" && item.state === "active" ? "in force" : stateName(item.state);
+	const state = (item: AnnotationView) => item.kind === "rule" && item.state === "active" ? "in force" : stateWord(item.state);
 	const coverageComplete = view.coverageComplete !== false && !view.error;
 	const current = view.historical ? "Recorded focus" : coverageComplete ? "Current" : "Last saved focus";
 	const rule = (item: AnnotationView) => item.kind === "rule" && item.state === "active";
@@ -270,15 +271,15 @@ export function summaryText(view: WorkView): string {
 	const note = (item: AnnotationView, owner: string | null, indent: string, label = "") => {
 		const identified = item.id === view.focus || selected.has(item.id);
 		const prefix = `${label}${identified ? `[${item.id}] ` : ""}`;
-		const phrase = item.state === "settled" ? name(item) : item.intent || `${name(item)} (intent not loaded)`;
+		const phrase = isFinished(item.state) ? name(item) : item.intent || `${name(item)} (intent not loaded)`;
 		if (!(item.kind === "rule" && why(item, indent, prefix))) {
-			lines.push(`${indent}${prefix}${compact(phrase, item.id === view.focus || item.state === "parked" ? 100 : 90)}${item.summaryOnly ? " · name/state only" : ""}`);
+			lines.push(`${indent}${prefix}${compact(phrase, item.id === view.focus || isWaiting(item.state) ? 100 : 90)}${item.summaryOnly ? " · name/state only" : ""}`);
 		}
 		// Keep exact attached-record scope. Labels are only previews; no endpoint
 		// is widened to its containing endeavor. Omitted targets are counted.
 		const targets = [...new Set(view.connections.filter(c => c.relation === "governs" && (c.fromAnnotation ?? c.from) === item.id)
 			.map(c => c.toAnnotation ?? c.to))];
-		if (item.state !== "settled" && targets.length && !(targets.length === 1 && targets[0] === owner)) {
+		if (!isFinished(item.state) && targets.length && !(targets.length === 1 && targets[0] === owner)) {
 			lines.push(`${indent}  Applies to: ${grouped(targets.map(id => compact(byId.get(id)?.label || id, 70)))}`);
 		}
 		history(item, `${indent}  `);
@@ -289,10 +290,10 @@ export function summaryText(view: WorkView): string {
 		const rest = notes.filter(item => item !== focus);
 		const groups: [string, AnnotationView[]][] = [
 			["Rules in force", rest.filter(rule)],
-			["Waiting on you", rest.filter(item => item.state === "parked" && item.kind === "choice")],
-			["Waiting", rest.filter(item => item.state === "parked" && item.kind !== "choice")],
-			["Recorded outcomes", rest.filter(item => item.state === "settled")],
-			["Other notes", rest.filter(item => !rule(item) && !["parked", "settled"].includes(item.state))],
+			["Waiting on you", rest.filter(item => isWaiting(item.state) && item.kind === "choice")],
+			["Waiting", rest.filter(item => isWaiting(item.state) && item.kind !== "choice")],
+			["Recorded outcomes", rest.filter(item => isFinished(item.state))],
+			["Other notes", rest.filter(item => !rule(item) && !isWaiting(item.state) && !isFinished(item.state))],
 		];
 		for (const [label, members] of groups) {
 			if (!members.length) continue;
@@ -304,10 +305,10 @@ export function summaryText(view: WorkView): string {
 		}
 	};
 
-	if (view.error) lines.push("Mom could not update this account; last saved view only, not confirmation of recent activity.");
-	else if (!view.historical && !coverageComplete) lines.push(`Mom has not read the latest activity yet; this is her last-saved snapshot, not current orientation.${coverageSentence(view) ? ` ${coverageSentence(view)}` : ""}`);
+	if (view.error) lines.push("Path could not update this account; last saved view only, not confirmation of recent activity.");
+	else if (!view.historical && !coverageComplete) lines.push(`Path has not read the latest activity yet; this is its last-saved snapshot, not current orientation.${coverageSentence(view) ? ` ${coverageSentence(view)}` : ""}`);
 	if (view.historical) lines.push(`History${view.checkpoint ? ` · checkpoint=${view.checkpoint}` : ""} — earlier saved account, not current work.`);
-	if (!items.length) lines.push(view.omittedRecords ? "No records loaded in this selection." : "Mom has not saved an account of this work yet.");
+	if (!items.length) lines.push(view.omittedRecords ? "No records loaded in this selection." : NO_ACCOUNT);
 	else if (!view.purpose || !endeavors.has(view.purpose)) lines.push(`Endeavor: account outside this view${view.purpose ? ` [${view.purpose}]` : ""}.`);
 
 	const pinned = [view.motherThread, view.focusEndeavor, view.purpose]
@@ -318,7 +319,7 @@ export function summaryText(view: WorkView): string {
 		.flatMap(connection => [connection.from, connection.to]));
 	const rest = view.endeavors.filter(e => !important.has(e.id)).sort((a, b) => {
 		const rank = (e: EndeavorView) => selected.has(e.id) || e.annotations.some(a => selected.has(a.id)) ? 0
-			: alternativeIds.has(e.id) ? 1 : e.state === "parked" ? 2 : e.state === "active" ? 3 : 4;
+			: alternativeIds.has(e.id) ? 1 : isWaiting(e.state) ? 2 : e.state === "active" ? 3 : 4;
 		return rank(a) - rank(b);
 	});
 	const shown = pinned.map(id => endeavors.get(id)!).concat(rest.slice(0, ENDEAVOR_LIMIT));

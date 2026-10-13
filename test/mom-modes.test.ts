@@ -4,7 +4,7 @@ import { test } from "node:test";
 import { Check } from "typebox/value";
 import { MOM_PROMPT, acceptGraph, momTools } from "../src/mom/contract.ts";
 import momExtension from "../src/mom/mom-tools.ts";
-import { readSettings, settingsLine, type MomSettings } from "../src/mom/engine.ts";
+import { readInstructionSettings, settingsLine, type MomSettings } from "../src/mom/engine.ts";
 import { readMomGlobals, writeMomGlobals } from "../src/mom/globals.ts";
 import { settingsFile } from "../src/settings-file.ts";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -43,7 +43,7 @@ test("M1: choosing no mode, an empty mode, or the current mode changes nothing t
 });
 
 test("command errors retain their concise cause", () => {
-	assert.equal(updateErrorSummary('Error: Unknown Mom mode "act_labels"; --mom-mode accepts commit_graph, v2, trail.'), 'Unknown Mom mode "act_labels"; --mom-mode accepts commit_graph, v2, trail.');
+	assert.equal(updateErrorSummary('Error: Unknown Path mode "act_labels"; --path-mode accepts commit_graph, v2, trail.'), 'Unknown Path mode "act_labels"; --path-mode accepts commit_graph, v2, trail.');
 });
 
 test("retired mode history is replayed without rejecting the current saved mode", async () => {
@@ -52,7 +52,7 @@ test("retired mode history is replayed without rejecting the current saved mode"
 		{ getBranch: () => [] } as never);
 	assert.equal((await read("act_labels", "commit_graph")).mode, "commit_graph", "superseded mode history is not validated as current state");
 	assert.equal((await read("act_labels")).mode, DEFAULT_MODE, "a removed last-selected mode migrates to the safe default");
-	await assert.rejects(read("unknown_mode"), /Unknown Mom mode "unknown_mode"/);
+	await assert.rejects(read("unknown_mode"), /Unknown Path mode "unknown_mode"/);
 });
 
 test("a stale Oven extension fails clearly when it lacks the selected mode's finalizer", () => {
@@ -63,10 +63,10 @@ test("a stale Oven extension fails clearly when it lacks the selected mode's fin
 });
 
 test("M2: an unknown mode is refused loudly and never falls back to the default", () => {
-	assert.throws(() => modeFor("freeform"), /Unknown Mom mode "freeform"/);
+	assert.throws(() => modeFor("freeform"), /Unknown Path mode "freeform"/);
 	// The message names the flag and the declared names so a typo is fixable from the error alone.
-	assert.throws(() => modeFor("nonsense"), /--mom-mode accepts commit_graph, v2, trail/);
-	assert.throws(() => momConfiguration(identity, { ...flags, "mom-mode": "nonsense" }), /Unknown Mom mode/);
+	assert.throws(() => modeFor("nonsense"), /--path-mode accepts commit_graph, v2, trail/);
+	assert.throws(() => momConfiguration(identity, { ...flags, "mom-mode": "nonsense" }), /Unknown Path mode/);
 });
 
 test("M2: the registry is well formed — unique lowercase_underscore names, each with a prompt and finalizer", () => {
@@ -178,6 +178,7 @@ test("local settings save returns while Mom's runtime reconfiguration is still p
 });
 
 test("mode is a durable setting: listed, cycled to a declared name, and carried in the sidecar", async () => {
+	const { PROCESS_RISK_CLASSES } = await import("../src/mom/process-health.ts");
 	const { initTheme } = await import("@earendil-works/pi-coding-agent");
 	const { momSettings } = await import("../src/mom/settings.ts");
 	const { CONTROL_KEYS } = await import("../src/mom/sidecar.ts");
@@ -188,13 +189,20 @@ test("mode is a durable setting: listed, cycled to a declared name, and carried 
 	const rendered = component.render(120).join("\n").replace(/\x1b\[[0-9;]*m/g, "");
 	assert.match(rendered, /Map mode/);
 	assert.match(rendered, /Decision model/);
-	assert.match(rendered, /SETTING HELP/);
 	assert.match(rendered, /Background tracking/);
-	assert.match(rendered, /work map in the background/);
+	assert.match(rendered, /work map in the background/, "the selected row's help is under the list");
+	assert.match(rendered, /Type to search/, "Pi's SettingsList, the same panel as /delegate settings");
 	component.handleInput?.("\u001b[B");
 	const next = component.render(120).join("\n").replace(/\x1b\[[0-9;]*m/g, "");
-	assert.match(next, /SETTING HELP/);
-	assert.match(next, /eligible findings from Mom's map/);
+	assert.match(next, /eligible findings from Path's map/);
+	// An on/off row cycles on Enter and saves.
+	component.handleInput?.("\r");
+	await new Promise(resolve => setImmediate(resolve));
+	assert.deepEqual(saved, [{ nudgedClasses: [...PROCESS_RISK_CLASSES] }]);
+	// The mode opens its options, each with its own help.
+	for (let i = 0; i < 3; i++) component.handleInput?.("\u001b[B");
+	component.handleInput?.("\r");
+	assert.match(component.render(120).join("\n").replace(/\x1b\[[0-9;]*m/g, ""), /Append-only trail of waypoints|Free-form commit_graph/);
 	// The decision-model row never shows a flag default as if the user saved it: unset is not a setting.
 	const shown = (decider: string | undefined) => momSettings({ enabled: true, inject: false, hush: false, nudgedClasses: [], mode: "", model: "", decider },
 		async () => {}, () => {}, () => {}).render(120).join("\n").replace(/\x1b\[[0-9;]*m/g, "");
@@ -207,9 +215,6 @@ test("mode is a durable setting: listed, cycled to a declared name, and carried 
 	assert.match(modeled("", "openai-codex/gpt-5.6-sol"), /Model\s+openai-codex\/gpt-5\.6-sol/, "the default she runs is named");
 	assert.match(modeled("local-dgx/beverly-4B", "openai-codex/gpt-5.6-sol"), /Model\s+local-dgx\/beverly-4B/, "a saved model is named");
 	assert.match(modeled("", ""), /Model\s+\(not set\)/);
-	const narrow = component.render(54).join("\n").replace(/\x1b\[[0-9;]*m/g, "");
-	assert.ok(narrow.indexOf("SETTING HELP") > narrow.indexOf("Enter/Space to change"), "narrow terminals stack the help below the list");
-	assert.match(narrow, /eligible findings from Mom's map/);
 	// The sidecar accepts mode and decision-model control records alongside the existing ones.
 	assert.deepEqual([...CONTROL_KEYS], ["enabled", "inject", "nudgedClasses", "mode", "model", "decider"]);
 	assert.equal(modeFor("v2").name, "v2");
@@ -365,18 +370,23 @@ test("the decision model resolves through Pi's classifier registry; an empty or 
 	const registry = { findOfType: (_type: "classifier", provider: string, id: string) =>
 		provider === "local-llm" && id === "beverly-4B" ? { id, api: "typesafe-system-one", baseUrl: "http://127.0.0.1:8000/v1/" } : undefined };
 	const configured = momConfiguration(identity, { ...flags, "mom-decider": "local-llm/beverly-4B" }, registry);
-	assert.deepEqual(readSettings(configured.instructions).classifier, { url: "http://127.0.0.1:8000/v1/systemone", model: "beverly-4B", timeoutMs: 120000 });
+	assert.deepEqual(readInstructionSettings(configured.instructions).classifier, { url: "http://127.0.0.1:8000/v1/systemone", model: "beverly-4B", timeoutMs: 120000 });
 	assert.deepEqual(deciderFor({ "mom-decider": " local-llm/beverly-4B " }, registry), { ref: "local-llm/beverly-4B", classifier: { url: "http://127.0.0.1:8000/v1/systemone", model: "beverly-4B" } });
 	// Unregistered, not System One, or not local: Mom still starts, with no decision model, and the ref is
 	// reported unresolved so the client can say so.
 	const incompatible = { findOfType: () => ({ id: "model", api: "openai-chat-completions", baseUrl: "https://example.test/v1" }) };
 	const remote = { findOfType: () => ({ id: "model", api: "typesafe-system-one", baseUrl: "https://example.test/v1" }) };
 	for (const [ref, from] of [["missing/model", registry], ["provider/model", incompatible], ["provider/model", remote], ["local-llm/beverly-4B", undefined]] as const) {
-		assert.equal(readSettings(momConfiguration(identity, { ...flags, "mom-decider": ref }, from).instructions).classifier, undefined);
+		assert.equal(readInstructionSettings(momConfiguration(identity, { ...flags, "mom-decider": ref }, from).instructions).classifier, undefined);
 		assert.deepEqual(deciderFor({ "mom-decider": ref }, from), { ref, classifier: undefined });
 	}
+	// A server that does not tag its decision model: the model is still taken at its address, when that is local.
+	const untagged = { findOfType: () => undefined, find: (provider: string, id: string) => provider === "lan" && id === "beverly" ? { id, api: "openai-completions", baseUrl: "http://192.168.1.51:9999/v1" } : undefined };
+	assert.deepEqual(deciderFor({ "mom-decider": "lan/beverly" }, untagged), { ref: "lan/beverly", classifier: { url: "http://192.168.1.51:9999/v1/systemone", model: "beverly" } });
+	const untaggedRemote = { findOfType: () => undefined, find: () => ({ id: "model", api: "openai-completions", baseUrl: "https://example.test/v1" }) };
+	assert.deepEqual(deciderFor({ "mom-decider": "cloud/model" }, untaggedRemote), { ref: "cloud/model", classifier: undefined });
 	const disabled = momConfiguration(identity, { ...flags, "mom-decider": "" }, registry);
-	assert.equal(readSettings(disabled.instructions).classifier, undefined);
+	assert.equal(readInstructionSettings(disabled.instructions).classifier, undefined);
 	assert.deepEqual(deciderFor({ "mom-decider": "" }, registry), { ref: "" });
 });
 
@@ -387,16 +397,46 @@ test("the decision-model picker excludes classifier models Mom cannot call", asy
 		{ provider: "remote", id: "classifier", name: "Remote", api: "typesafe-system-one", baseUrl: "https://example.test/v1" },
 		{ provider: "chat", id: "chat", name: "Chat", api: "openai-completions", baseUrl: "http://127.0.0.1:8000/v1" },
 	];
-	const registry = { getModelsOfType: () => models, findOfType: (_type: "classifier", provider: string, id: string) => models.find(model => model.provider === provider && model.id === id) };
+	// Pi's chat models: one on the LAN server that did not tag it, one in the cloud, and the tagged one again.
+	const all = [
+		{ provider: "lan", id: "beverly-untagged", name: "Beverly (untagged)", api: "openai-completions", baseUrl: "http://192.168.1.51:9999/v1" },
+		{ provider: "openrouter", id: "some-model", name: "Cloud", api: "openai-completions", baseUrl: "https://openrouter.ai/api/v1" },
+		{ provider: "local-llm", id: "beverly-4B", name: "Beverly", api: "openai-completions", baseUrl: "http://127.0.0.1:8000/v1" },
+	];
+	const find = (provider: string, id: string) => all.find(model => model.provider === provider && model.id === id);
+	// Pi >= 0.8x: the selector reads models through the registry's runtime.
+	const runtime = { getAvailableSnapshot: () => all, getModel: find, getError: () => undefined, refresh: async () => {} };
+	const registry = { getModelsOfType: () => models, getAll: () => all, find, runtime,
+		findOfType: (_type: "classifier", provider: string, id: string) => models.find(model => model.provider === provider && model.id === id) };
 	const context = { modelRegistry: registry } as never;
-	assert.deepEqual(deciderModels(context), [{ value: "local-llm/beverly-4B", label: "local-llm/beverly-4B", description: "Beverly" }]);
+	assert.deepEqual(deciderModels(context), [{ provider: "local-llm", id: "beverly-4B", name: "Beverly" }]);
+	const { untaggedDeciderModels } = await import("../src/mom/model-picker.ts");
+	assert.deepEqual(untaggedDeciderModels(context, deciderModels(context)),
+		[{ provider: "lan", id: "beverly-untagged", name: "Beverly (untagged) · not tagged as a decision model" }],
+		"every other model Path can reach is offered under the decision models; a cloud one is not");
 	const { initTheme } = await import("@earendil-works/pi-coding-agent");
 	const { momDeciderSelector } = await import("../src/mom/model-picker.ts");
 	initTheme("dark");
-	let selected: string | undefined;
-	const picker = momDeciderSelector(context, undefined, "local-llm/beverly-4B", value => { selected = value; });
-	picker.handleInput?.("\r");
-	assert.equal(selected, "local-llm/beverly-4B");
+	const tui = { requestRender() {} };
+	const pick = (current: string, ...keys: string[]) => {
+		let selected: string | undefined = "unset";
+		const picker = momDeciderSelector(context, tui, current, value => { selected = value; });
+		for (const key of keys) picker.handleInput?.(key);
+		return { selected, screen: picker.render(100).join("\n") };
+	};
+	// It is Pi's own model selector, the same one as Path's model picker: a search box and Pi's model rows.
+	const opened = pick("local-llm/beverly-4B");
+	assert.match(opened.screen, /Scope: .*all.* \| .*scoped/, "Pi's selector, with its scope switch");
+	assert.match(opened.screen, /✓ .*beverly-4B/, "the current decider is marked");
+	assert.equal(pick("local-llm/beverly-4B", "\r").selected, "local-llm/beverly-4B");
+	assert.equal(pick("local-llm/beverly-4B", "\x1b[B", "\r").selected, "lan/beverly-untagged", "the untagged models come after the decision models");
+	assert.equal(pick("local-llm/beverly-4B", ..."untag", "\r").selected, "lan/beverly-untagged", "typing searches, as in Pi's model chooser");
+	assert.equal(pick("local-llm/beverly-4B", "\x1b[B", "\x1b[B", "\r").selected, "", "no decider is the last row, saved as empty");
+	assert.equal(pick("local-llm/beverly-4B", "\t", ..."some-model", "\r").selected, "openrouter/some-model", "Tab shows all of Pi's models");
+	assert.equal(pick("", "\x1b").selected, undefined, "Escape cancels");
+	// Path's model picker is the same selector; a saved `provider/id` is marked current there too.
+	const { momModelSelector } = await import("../src/mom/model-picker.ts");
+	assert.match(momModelSelector(context, tui, "lan/beverly-untagged", "lan/beverly-untagged", () => {}).render(100).join("\n"), /✓ .*beverly-untagged/);
 });
 
 test("continuity injection is enabled by default, and a missing global setting means inject: true", async () => {

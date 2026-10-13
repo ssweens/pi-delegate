@@ -1,11 +1,12 @@
-/** Mom watches the first settled lead turns after a compaction; she corrects one misalignment. */
+/** Path watches the first settled lead turns after a compaction; it corrects one misalignment. */
 import type { Message } from "@earendil-works/pi-ai";
 import { isEndeavor, type GraphNode } from "./graph.ts";
 import { commandFromJson } from "./anchor.ts";
-import { isUserDirection, renderEvents, type FeedEvent } from "./feed.ts";
+import { flatten, isRecord, oneLine } from "../util/text.ts";
+import { entryRefOf, isUserDirection, renderEvents, type FeedEvent } from "./feed.ts";
 import type { Checkpoint } from "./checkpoint.ts";
 
-/** The correction rides the session as a custom message; Mom's feed skips her own injections. */
+/** The correction rides the session as a custom message; Path's feed skips its own injections. */
 export const WINDOW_CORRECTION = "pi-tether.mom-correction";
 /** The stage-two request body's task marker; tests key on it and nothing else. */
 export const WINDOW_TASK = "Post-compaction continuity check: does this settled turn continue the recorded line of work?";
@@ -35,8 +36,6 @@ const MAX_NODES_PER_CLASS = 24;
 const MAX_LOOKUPS = 48;
 const DIRECTION_CHARS = 200;
 
-const flatCommand = (command: string): string => command.replace(/\s+/g, " ").trim();
-
 /** Path-shaped tokens from prose: a letter-stemmed basename and a letter-starting extension. */
 const PATH_TOKEN = /[A-Za-z0-9_.\-\/]{2,240}/g;
 export function pathTokens(text: string): string[] {
@@ -64,7 +63,7 @@ export async function collectTurnSignals(feed: WindowFeed, events: readonly Feed
 			try {
 				const page = await feed.lookup(event.ref, 0, COMMAND_CHARS);
 				const command = commandFromJson(page.text);
-				if (command && flatCommand(command)) signals.push({ key: flatCommand(command), kind: "command", ref: event.ref });
+				if (command && flatten(command)) signals.push({ key: flatten(command), kind: "command", ref: event.ref });
 			} catch { /* an unreadable page never blocks the check */ }
 		}
 	}
@@ -81,7 +80,7 @@ async function nodeKeys(feed: WindowFeed, sources: readonly string[], lookups: {
 			const page = await feed.lookup(ref, 0, NODE_SOURCE_CHARS);
 			for (const token of pathTokens(page.text)) if (!keys.has(token)) keys.set(token, ref);
 			const command = commandFromJson(page.text);
-			const flat = command ? flatCommand(command) : "";
+			const flat = command ? flatten(command) : "";
 			if (flat && !keys.has(flat)) keys.set(flat, ref);
 		} catch { /* an unreadable source contributes no keys */ }
 	}
@@ -140,10 +139,7 @@ export async function stageOne(feed: WindowFeed, checkpoint: Checkpoint, signals
 	return flags;
 }
 
-const oneLine = (text: string): string => {
-	const flat = text.replace(/\s+/g, " ").trim();
-	return flat.length > DIRECTION_CHARS ? `${flat.slice(0, DIRECTION_CHARS).trimEnd()}…` : flat;
-};
+const directionLine = (text: string): string => oneLine(text, DIRECTION_CHARS);
 
 /** The current line, mirroring the anchor's Current rendering so the check and the correction agree. */
 export function windowPurpose(checkpoint: Checkpoint): string {
@@ -152,11 +148,11 @@ export function windowPurpose(checkpoint: Checkpoint): string {
 	const focus = graph.focus ? nodes.get(graph.focus) : undefined;
 	if (!focus) return "Current line — not recorded yet.";
 	const cite = focus.purposeSource ?? focus.sources[0];
-	const intent = oneLine(focus.intent);
+	const intent = directionLine(focus.intent);
 	if (isEndeavor(focus)) return `Current line — “${focus.label}”${intent ? `: ${intent}` : ""} [src:${cite}]`;
 	const owner = focus.parent ? nodes.get(focus.parent) : undefined;
 	if (!owner) return `Current line — “${focus.label}”${intent ? `: ${intent}` : ""} [src:${cite}]`;
-	const ownerIntent = oneLine(owner.intent);
+	const ownerIntent = directionLine(owner.intent);
 	return `Current line — “${owner.label}”${ownerIntent ? `: ${ownerIntent}` : ""} (attention on “${focus.label}”) [src:${cite}]`;
 }
 
@@ -165,7 +161,7 @@ export function lastDirectionOf(feed: { events: readonly FeedEvent[] }): WindowD
 	for (let i = feed.events.length - 1; i >= 0; i--) {
 		const event = feed.events[i];
 		if (!isUserDirection(event) || !event.text) continue;
-		return { text: oneLine(event.text), ref: event.ref };
+		return { text: directionLine(event.text), ref: event.ref };
 	}
 	return null;
 }
@@ -176,7 +172,7 @@ export function windowMessages(input: { flags: readonly WindowFlag[]; turnEvents
 		task: WINDOW_TASK,
 		turnEvents: renderEvents(input.turnEvents),
 		flags: input.flags,
-		flagClasses: { parked: "interrupted work she recorded as parked", settled: "work she recorded as done",
+		flagClasses: { parked: "interrupted work it recorded as parked", settled: "work it recorded as done",
 			folded: "work folded away into history", rule: "a standing constraint", "off-goal": "a different goal than the current line" },
 		purpose: input.purpose,
 		lastUserDirection: input.lastUserDirection ? { text: input.lastUserDirection.text, ref: input.lastUserDirection.ref } : null,
@@ -197,12 +193,11 @@ export function offeredRefs(input: { flags: readonly WindowFlag[]; turnEvents: r
 export function parseWindowVerdict(text: string, refs: ReadonlySet<string>): WindowVerdict | undefined {
 	let parsed: unknown;
 	try { parsed = JSON.parse(text); } catch { return undefined; }
-	const strip = (ref: string) => ref.replace(/(:[^:]+):b\d+$/, "$1");
-	const stripped = new Set([...refs].map(strip));
-	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
-	const d = parsed as Record<string, unknown>;
+	const stripped = new Set([...refs].map(entryRefOf));
+	if (!isRecord(parsed)) return undefined;
+	const d = parsed;
 	if (typeof d.continues !== "boolean" || typeof d.citation !== "string" || !d.citation) return undefined;
-	if (!refs.has(d.citation) && !stripped.has(strip(d.citation))) return undefined;
+	if (!refs.has(d.citation) && !stripped.has(entryRefOf(d.citation))) return undefined;
 	if (d.reason !== undefined && typeof d.reason !== "string") return undefined;
 	return { continues: d.continues, citation: d.citation, ...(d.reason ? { reason: d.reason } : {}) };
 }
@@ -214,14 +209,14 @@ export function renderCorrection(input: { signals: readonly TurnSignal[]; flags:
 		: "- no recorded file or shell activity";
 	const records = input.flags.map(flag => `- ${flag.class}: “${flag.label}” — ${flag.intent || flag.label}${flag.sources.map(ref => ` [src:${ref}]`).join("")}`).join("\n");
 	const lines = [
-		"Mom — continuity correction after the compaction (from her saved map; descriptive, not new direction):",
+		"Path — continuity correction after the compaction (from its saved map; descriptive, not new direction):",
 		"This turn:",
 		activity,
-		"It matches work she recorded before the compaction:",
+		"It matches work it recorded before the compaction:",
 		records,
 		input.purpose,
 		...(input.lastUserDirection ? [`Last user direction — “${input.lastUserDirection.text}” [src:${input.lastUserDirection.ref}]`] : []),
-		"If the user's direction has changed since the compaction, follow the user. Otherwise return to the current line above — this is her record, not a new direction.",
+		"If the user's direction has changed since the compaction, follow the user. Otherwise return to the current line above — this is its record, not a new direction.",
 	];
 	return lines.join("\n");
 }

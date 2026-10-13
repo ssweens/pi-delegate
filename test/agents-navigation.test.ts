@@ -4,7 +4,8 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 import { AgentsPanel, type LiveSource } from "../src/inspector.ts";
 import type { RunView } from "../src/render.ts";
-import { SettingsPanel, delegateRows, todoRows } from "../src/ui/delegate-settings.ts";
+import { delegateRows, todoRows } from "../src/ui/delegate-settings.ts";
+import { SettingsPanel } from "../src/ui/settings-panel.ts";
 import { DEFAULT_DELEGATE_SETTINGS, type DelegateSettings } from "../src/delegate-settings.ts";
 import { DEFAULT_TODO_SETTINGS, type TodoSettings } from "../src/todo-settings.ts";
 
@@ -101,16 +102,18 @@ test("the settings panel opens a row's choices in place and saves the chosen one
 	let closed = false;
 	const panel = new SettingsPanel("Delegate settings", delegateRows(() => settings, async (change) => { saved.push(change); settings = { ...settings, ...change }; }), () => {}, () => { closed = true; });
 	const first = plain(panel.render(120));
-	assert.match(first, /DELEGATION/);
-	assert.match(first, /Mode\s+Opportunistic/);
-	assert.match(first, /HELP/);
+	assert.match(first, /Mode\s+Opportunistic ›/);
+	assert.match(first, /How the main session uses children/, "the selected row's help is under the list, as in Pi's /settings");
+	assert.match(first, /Type to search/, "Pi's SettingsList, with its search");
 	panel.handleInput(ENTER);
 	const open = plain(panel.render(120));
 	assert.match(open, /Orchestrator\s+root delegates every task/, "each choice shows what it means");
-	panel.handleInput(DOWN); panel.handleInput(ENTER);
+	panel.handleInput(DOWN);
+	assert.match(plain(panel.render(120)), /It never waits on a/, "and the highlighted choice's help");
+	panel.handleInput(ENTER);
 	await new Promise((resolve) => setImmediate(resolve));
 	assert.deepEqual(saved, [{ mode: "orchestrator" }]);
-	assert.match(plain(panel.render(120)), /Mode\s+● Orchestrator/, "a changed row is marked");
+	assert.match(plain(panel.render(120)), /Mode\s+Orchestrator ● ›/, "a changed row is marked");
 	panel.handleInput(ESC);
 	assert.equal(closed, true);
 });
@@ -122,10 +125,9 @@ test("todo reminder settings are off by default and save On", async () => {
 	const saved: Partial<TodoSettings>[] = [];
 	const panel = new SettingsPanel("Delegate settings", todoRows(() => settings, async (change) => { saved.push(change); settings = { ...settings, ...change }; }), () => {}, () => {});
 	assert.match(plain(panel.render(120)), /Reminders\s+Off/);
+	// A two-way setting cycles on Enter, as Pi's toggles do.
 	panel.handleInput(ENTER);
-	assert.match(plain(panel.render(120)), /On\s+follow up on open todos/);
-	panel.handleInput(DOWN); panel.handleInput(ENTER);
 	await new Promise((resolve) => setImmediate(resolve));
 	assert.deepEqual(saved, [{ reminders: true }]);
-	assert.match(plain(panel.render(120)), /Reminders\s+● On/);
+	assert.match(plain(panel.render(120)), /Reminders\s+On ●/);
 });

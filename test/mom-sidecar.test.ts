@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { SidecarStore, sidecarFile } from "../src/mom/sidecar.ts";
 import { mergeGlobals, readMomGlobals, writeMomGlobals } from "../src/mom/globals.ts";
+import { resolveFlag } from "../src/mom/index.ts";
 import { writeSettings } from "../src/settings-file.ts";
 
 test("loads an existing .mom record without rewriting it", async () => {
@@ -32,6 +33,18 @@ test("Mom's controls are global: they live in one file in the agent dir, not in 
 		// A second save merges over the first, so one setting never wipes another.
 		assert.deepEqual(await writeMomGlobals({ mode: "v2" }, file), { decider: "local-llm/beverly-4B", mode: "v2" });
 		assert.deepEqual(readMomGlobals(file), { decider: "local-llm/beverly-4B", mode: "v2" });
+		const written = JSON.parse(await readFile(file, "utf8"));
+		assert.deepEqual(Object.keys(written), ["path"], "new writes land in the path section");
+
+		// A former `mom` section is still read; a `path` value wins over it.
+		await writeFile(file, JSON.stringify({ mom: { mode: "v2", decider: "old/one" } }));
+		assert.deepEqual(readMomGlobals(file), { mode: "v2", decider: "old/one" });
+		assert.deepEqual(await writeMomGlobals({ decider: "new/one" }, file), { mode: "v2", decider: "new/one" });
+		const both = JSON.parse(await readFile(file, "utf8"));
+		assert.deepEqual(both.mom, { mode: "v2", decider: "old/one" }, "the old section is left alone");
+		assert.deepEqual(both.path, { decider: "new/one" });
+		await rm(file, { force: true });
+		await writeMomGlobals({ decider: "local-llm/beverly-4B", mode: "v2" }, file);
 		assert.equal(statSync(file).mode & 0o777, 0o600, "saved private");
 		// Garbage is dropped field by field: one bad value must not stop Mom in every session.
 		await writeFile(file, JSON.stringify({ mom: { mode: "nonsense", model: "not-a-provider-id", decider: "local-llm/beverly-4B", enabled: "yes", extra: 1 } }));
@@ -99,7 +112,7 @@ test("a corrupt complete line is skipped and reported; every other record still 
 		assert.deepEqual((await reopened.load()).map(record => record.type), ["usage", "map"]);
 		assert.equal(reopened.skipped.length, 2);
 		assert.match(reopened.skipped[0]!, /^line 2: /);
-		assert.equal(reopened.skipped[1], "line 3: not a Mom record");
+		assert.equal(reopened.skipped[1], "line 3: not a Path record");
 	} finally { await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -150,6 +163,14 @@ test("an unreadable record in her saved notes is skipped and reported, and the l
 	const state = await loadState({ load: async () => records, skipped: ["line 9: Unexpected token"] } as never, { getBranch: () => [] } as never);
 	assert.equal(state.mode, "v2", "the records after a bad one still apply");
 	assert.equal(state.skipped!.length, 3);
-	assert.match(state.skipped![1]!, /^map record m1: Invalid Mom model/);
-	assert.match(state.skipped![2]!, /^map record m2: Invalid Mom map snapshot/);
+	assert.match(state.skipped![1]!, /^map record m1: Invalid Path model/);
+	assert.match(state.skipped![2]!, /^map record m2: Invalid Path map snapshot/);
+});
+
+test("a --path-* flag that differs from its default wins over the deprecated --mom-* alias", () => {
+	const get = (values: Record<string, string>) => (key: string) => values[key];
+	assert.equal(resolveFlag("mom-mode", get({ "mom-mode": "v2" })), "v2", "the alias still works alone");
+	assert.equal(resolveFlag("mom-mode", get({ "path-mode": "trail", "mom-mode": "v2" })), "trail", "path wins");
+	assert.equal(resolveFlag("mom-interval-ms", get({ "path-interval-ms": "0", "mom-interval-ms": "50" })), "50", "a path default does not mask an explicit alias");
+	assert.equal(resolveFlag("mom-interval-ms", get({})), "0");
 });

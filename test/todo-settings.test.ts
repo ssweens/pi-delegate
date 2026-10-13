@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
+import { tempDir } from "./capture.ts";
 import { DEFAULT_TODO_SETTINGS, normalizeTodoSettings, readTodoSettings, saveTodoSettings } from "../src/todo-settings.ts";
 
 test("todo reminders default to disabled and malformed values use the default", () => {
@@ -12,8 +12,7 @@ test("todo reminders default to disabled and malformed values use the default", 
 });
 
 test("saving todo settings preserves other settings and writes only the chosen todo field", async (t) => {
-	const dir = mkdtempSync(join(tmpdir(), "pi-delegate-todo-settings-"));
-	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	const dir = tempDir("pi-delegate-todo-settings-", t);
 	const file = join(dir, "pi-delegate.json");
 	writeFileSync(file, JSON.stringify({ delegate: { maxDepth: 4 }, mom: { mode: "trail" } }));
 

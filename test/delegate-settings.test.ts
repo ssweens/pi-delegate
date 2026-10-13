@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
+import { tempDir } from "./capture.ts";
 import { DEFAULT_DELEGATE_SETTINGS, normalizeDelegateSettings, pickModel, readDelegateSettings, saveDelegateSettings } from "../src/delegate-settings.ts";
 import { modelList } from "../src/roles.ts";
 
@@ -15,8 +15,7 @@ test("a missing or malformed delegate section reads as its defaults, field by fi
 });
 
 test("saving a delegate setting merges into the one settings file and keeps the other sections", async (t) => {
-	const dir = mkdtempSync(join(tmpdir(), "pi-delegate-settings-"));
-	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	const dir = tempDir("pi-delegate-settings-", t);
 	const file = join(dir, "pi-delegate.json");
 	writeFileSync(file, JSON.stringify({ mom: { mode: "v2" }, defaults: { approved: { scout: { spec: "a/b", approvedAt: 1 } } } }));
 	assert.deepEqual(await saveDelegateSettings({ maxConcurrent: 4 }, file), { ...DEFAULT_DELEGATE_SETTINGS, maxConcurrent: 4 });

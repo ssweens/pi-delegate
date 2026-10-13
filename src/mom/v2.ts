@@ -9,6 +9,8 @@ import { Check, Errors } from "typebox/value";
 import type { Tool } from "@earendil-works/pi-ai";
 import type { DeciderQuestion } from "./decider.ts";
 import { isEndeavor, sourceSuggestion, type WorkGraph } from "./graph.ts";
+import { clipText, isRecord } from "../util/text.ts";
+import { decodeJsonList } from "./contract.ts";
 
 const id = Type.String({ pattern: "^[A-Za-z][A-Za-z0-9_-]{0,63}$" });
 const LABEL_CHARS = 160;
@@ -111,18 +113,14 @@ export function v2Defects(graph: V2Graph, options: { focus?: boolean } = {}): st
  *  A label over the display limit is shortened, not a reason to throw away the whole transaction (a catch-up
  *  can carry dozens of items). */
 function normalize(value: unknown): unknown {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return value;
-	const decode = (field: unknown) => {
-		if (typeof field !== "string") return field;
-		try { const parsed = JSON.parse(field); return parsed === null || Array.isArray(parsed) ? parsed : field; } catch { return field; }
-	};
-	const { put: rawPut, remove: rawRemove, focus: rawFocus, ...rest } = value as Record<string, unknown>;
-	const put = decode(rawPut), remove = decode(rawRemove), focus = rawFocus === "null" ? null : rawFocus;
+	if (!isRecord(value)) return value;
+	const { put: rawPut, remove: rawRemove, focus: rawFocus, ...rest } = value;
+	const put = decodeJsonList(rawPut), remove = decodeJsonList(rawRemove), focus = rawFocus === "null" ? null : rawFocus;
 	const item = (entry: unknown) => {
-		if (!entry || typeof entry !== "object") return entry;
-		const { state, label, ...keep } = entry as Record<string, unknown>;
+		if (!isRecord(entry)) return entry;
+		const { state, label, ...keep } = entry;
 		return { ...keep, ...(state !== null && state !== undefined ? { state } : {}),
-			...(label !== undefined ? { label: typeof label === "string" && label.length > LABEL_CHARS ? `${label.slice(0, LABEL_CHARS - 1).trimEnd()}\u2026` : label } : {}) };
+			...(label !== undefined ? { label: typeof label === "string" ? clipText(label, LABEL_CHARS) : label } : {}) };
 	};
 	return { ...rest, ...(put != null ? { put: Array.isArray(put) ? put.map(item) : put } : {}),
 		...(remove != null ? { remove } : {}), ...(focus != null ? { focus } : {}) };
@@ -193,12 +191,12 @@ export const V2_UPDATE_TASK = "Update the map from newEvents with one commit_v2 
 export const V2_AUDIT_TASK = "Compare independentThreadMap with the map above, then reconcile material differences with one commit_v2 call. Neither map is authoritative, and a final compaction summary is a claim about its chapter, not evidence. Preserve node identities and work already finished; do not reopen work merely because the audit mentions it.";
 
 /**
- * What her model reads for one v2 update: the evidence, the map, and only the parts v2 acts on.
+ * What its model reads for one v2 update: the evidence, the map, and only the parts v2 acts on.
  * Built here rather than inherited from commit_graph's body, which carries that mode's vocabulary —
  * chapter state, process risks, finding feedback, folds — that v2's instructions never mention.
  */
 export interface V2BodyParts {
-	/** The evidence as her model reads it: chapter-grouped rendering, or a catch-up digest. */
+	/** The evidence as its model reads it: chapter-grouped rendering, or a catch-up digest. */
 	newEvents: string;
 	/** The ops the decision model decided for this batch, when it read one. State transitions and drops
 	 *  are enforced; work ops permit additions, while rule/note additions under touched work are optional. */

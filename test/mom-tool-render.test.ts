@@ -12,27 +12,27 @@ function momTool(): any {
 		events: { emit() {} }, sendMessage() {},
 	};
 	installMom(pi);
-	return tools.find(tool => tool.name === "mom");
+	return tools.find(tool => tool.name === "path");
 }
 
 test("collapsed Mom tool results use the activity preview instead of dumping the saved map", () => {
-	const output = "Mom has not read the latest activity yet; this is her last-saved snapshot, not current orientation.\nMother thread: Review pi-delegate [review] — finished\nRules in force (2):\n    Why: Keep the map readable [src:session:rule]";
-	const rendered = momTool().renderResult({ content: [{ type: "text", text: output }], details: { overview: output, preview: "Mom · updating · Review pi-delegate" } }, { expanded: false }, theme);
+	const output = "Path has not read the latest activity yet; this is its last-saved snapshot, not current orientation.\nMother thread: Review pi-delegate [review] — finished\nRules in force (2):\n    Why: Keep the map readable [src:session:rule]";
+	const rendered = momTool().renderResult({ content: [{ type: "text", text: output }], details: { overview: output, preview: "Path · updating · Review pi-delegate" } }, { expanded: false }, theme);
 	const screen = rendered.render(120, 10).map((line: string) => line.trimEnd()).join("\n");
-	assert.equal(screen, "Mom · updating · Review pi-delegate");
+	assert.equal(screen, "Path · updating · Review pi-delegate");
 	assert.doesNotMatch(screen, /last-saved snapshot|Rules in force|\[src:/);
 });
 
 test("expanded Mom tool results never print the saved map or source details", () => {
 	const output = "Mother thread: Review pi-delegate [review] — finished\nRules in force (2):\n    Why: Keep the map readable [src:session:rule]";
-	const rendered = momTool().renderResult({ content: [{ type: "text", text: output }], details: { overview: "Mom · up to date", preview: "Mom · up to date", expandable: true } }, { expanded: true }, theme);
+	const rendered = momTool().renderResult({ content: [{ type: "text", text: output }], details: { overview: "Path · up to date", preview: "Path · up to date", expandable: true } }, { expanded: true }, theme);
 	const screen = rendered.render(120, 10).map((line: string) => line.trimEnd()).join("\n");
-	assert.equal(screen, "Mom · up to date\nSelected records and sources are available to the model, not displayed here.");
+	assert.equal(screen, "Path · up to date\nSelected records and sources are available to the model, not displayed here.");
 	assert.doesNotMatch(screen, /Mother thread|Rules in force|\[src:/);
 });
 
-/** Mom's view: what she saved, with no way to ask her a question from it. */
-test("Mom's view shows her saved map and status, and typing asks her nothing", async () => {
+/** Path's view: what she saved, with no way to ask her a question from it. */
+test("Path's view shows her saved map and status, and typing asks her nothing", async () => {
 	let refreshes = 0, renders = 0, progress = "Rebuilding · pass 1 · reasoning · 100 chars streamed";
 	const sliceUrl = "http://127.0.0.1:6836/slice/s-tracking", rebuildUrl = "http://127.0.0.1:6836/slice/s-rebuild";
 	const source: any = {

@@ -7,6 +7,7 @@
  * AMP_CLI_PATH selects the binary; a .js/.cjs/.mjs path runs under this Node.
  */
 import { spawn } from "node:child_process";
+import { flatten, oneLine } from "../../util/text.ts";
 
 export function ampCommand(): { command: string; prefix: string[] } {
   const configured = process.env.AMP_CLI_PATH?.trim() || "amp";
@@ -80,3 +81,36 @@ export const AMP_THREAD_ID = /^T-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}
  * alphanumeric, at most 32 characters.
  */
 export const AMP_LABEL = /^[a-z0-9][a-z0-9-]{0,31}$/;
+
+/** Every thread delegate creates carries this label, so leftover threads are easy to find. */
+export const AMP_DELEGATE_LABEL = "pi-delegate";
+
+/** Bound on the Amp CLI calls besides a run's turns (label, usage): a slow Amp delays, never blocks, a status or a wake. */
+export const AMP_CLI_TIMEOUT_MS = 15_000;
+
+/** Amp's own limit is 256 characters; a title is the brief's first line, not the brief. */
+const AMP_TITLE_MAX = 120;
+
+/**
+ * The label that names a run in Amp. Amp labels are at most 32 lowercase alphanumerics and hyphens,
+ * so the 40-character run ID cannot be one: its UUID without hyphens (32 hex digits) names it exactly.
+ */
+export function ampRunLabel(runId: string): string {
+  const uuid = /([0-9a-f]{8})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{12})$/i.exec(runId);
+  const label = (uuid ? uuid.slice(1).join("") : runId).toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+/, "").slice(0, 32);
+  return AMP_LABEL.test(label) ? label : AMP_DELEGATE_LABEL;
+}
+
+/** The title of a thread delegate creates: the brief's first line, as the delegate tool asks briefs to start. */
+export function ampThreadTitle(task: string): string | undefined {
+  // Markdown markers go, so a title never reads as a CLI option (`--title -x`).
+  const line = task.split("\n").map((text) => flatten(text.replace(/[\u0000-\u001f\u007f]+/g, " ")).replace(/^[\s#>*\-–—]+/, "").trim()).find(Boolean);
+  return line ? oneLine(line, AMP_TITLE_MAX) : undefined;
+}
+
+/** Why an Amp CLI call failed, in one line: the command, how it ended and the first line of its stderr. */
+export function describeAmpRun(command: string, run: AmpRun | Error): string {
+  if (run instanceof Error) return `${command} could not start: ${run.message}`;
+  if (run.timedOut) return `${command} timed out`;
+  return `${command} exited ${run.code ?? "by signal"}${run.stderr ? `: ${run.stderr.split("\n")[0]}` : ""}`;
+}

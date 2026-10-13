@@ -64,14 +64,14 @@ try {
 	assert.equal(tools.filter((name) => name === "delegate").length, 1);
 	assert.equal(tools.filter((name) => name === "delegate_ctl").length, 1);
 	assert.equal(tools.filter((name) => name === "todo").length, 1);
-	assert.equal(tools.filter((name) => name === "mom").length, 1);
+	assert.equal(tools.filter((name) => name === "path").length, 1);
 	const skill = loader.getSkills().skills.find((skill) => skill.name === "delegation"); assert(skill);
 	assert.match(readFileSync(skill.filePath, "utf8"), /Model per role/);
 	const definition = result.extensions.flatMap((extension) => [...extension.tools.values()]).find((tool) => tool.definition.name === "delegate");
 	assert(definition); assert.match(definition.definition.description, /delegation skill/);
 	const installed = result.extensions.find((extension) => extension.tools.has("delegate")); assert(installed);
 	const { loadRoles } = await import(pathToFileURL(join(dirname(installed.path), "roles.ts")).href);
-	const roles = loadRoles(cwd, false);
+	const roles = loadRoles(cwd, false, env.PI_CODING_AGENT_DIR);
 	assert.deepEqual([...roles.keys()].sort(), ["reviewer", "scout", "worker"]);
 
 	// ACP runtime: everything resolves from the installed package, never from this checkout.

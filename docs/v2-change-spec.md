@@ -106,7 +106,7 @@ has measured holdout misses.
 | `attach: note` | may add/rewrite notes under touched work; optional, and not limited to one | `sso-login: the commit adds a note under work the spec never touched` |
 | `attach: child` | may add one work item under the named parent; optional | `lint: the commit adds work under this node, but the spec adds nothing there` |
 | `new_work` | may add one work item under the purpose (the root on a cold start) | — |
-| *(nothing)* | Mom's model is skipped; the host saves coverage only | `nothing in the spec changes the map` |
+| *(nothing)* | Path's model is skipped; the host saves coverage only | `nothing in the spec changes the map` |
 
 Three deliberate asymmetries, each from a measured failure:
 
@@ -135,14 +135,14 @@ semantic names above). If tuning renames a criteria name, only the thin adapter 
 ## What the decision model is told
 
 The same classifier answers one call of questions per background batch (`readSpec` in `src/mom/spec.ts`),
-and its answers become the ops her model must write. There is no separate "gate" call any more: a batch
-whose answers decode to no ops is the case where nothing is recorded, and her model is skipped. Every
+and its answers become the ops its model must write. There is no separate "gate" call any more: a batch
+whose answers decode to no ops is the case where nothing is recorded, and its model is skipped. Every
 other path — no decision model, a failed or slow endpoint, a batch past `SPEC_CHARS`, an unanswered
-question, a first map, a correction, catch-up, an audit, a retry — runs her model on the structural
+question, a first map, a correction, catch-up, an audit, a retry — runs its model on the structural
 checks alone. The spec never writes edits itself; it enforces state/drop decisions and permits some
 additions, but does not validate labels or other prose. It is never what stops an update. Each v2
-decision is logged beside her `.mom` file as `v2-spec`: ops, chosen names, any permitted operations
-her model omitted (`unmet`), whether her model ran, and whether the map changed. Eligible fail-open reads
+decision is logged beside its `.mom` file as `v2-spec`: ops, chosen names, any permitted operations
+its model omitted (`unmet`), whether its model ran, and whether the map changed. Eligible fail-open reads
 record `no-client`, `oversized`, `incomplete`, or
 `classifier-error`; ineligible operations record their skip reason, such as `no-checkpoint`, `retry-gap`,
 or `correction`.
@@ -222,7 +222,7 @@ they are the whole remaining margin: any future change to this family is judged 
 ## Implementation and validation evidence
 
 The spec path is wired: `engine.ts` calls `readSpec` for eligible v2 deliveries, attaches its ops to
-the operation, and saves coverage without calling Mom when the complete spec has no ops. The v2
+the operation, and saves coverage without calling Path when the complete spec has no ops. The v2
 finalizer passes non-empty specs through `V2_MODE.apply` to `applySpec`; `specFocus` derives focus.
 New work without a named parent goes under the purpose. Fixture-backed end-to-end coverage lives in
 `test/mom-v2-live.test.ts`, while unit tests pin spec mapping, state/removal enforcement, root promotion,
@@ -232,5 +232,5 @@ On October 10, 2026, `test/mom-v2-semantic.test.ts` passed with the local Qwen3.
 33/33 checks without a decision model, plus 6/6 checks for the no-empty-map drop guard. With Beverly
 4B registered as the real System One classifier, the end-to-end scenario passed 16/16 checks for new
 work, completion, drop, and no-op coverage skip. The no-classifier path remains intentionally
-fail-open: if the classifier is absent, incomplete, too slow, or the batch is ineligible, Mom runs
+fail-open: if the classifier is absent, incomplete, too slow, or the batch is ineligible, Path runs
 with structural checks only. Those fallback semantics are not a classifier-backed guarantee.

@@ -111,8 +111,10 @@ test("v2's decision-model gate skips her model for a batch that changes nothing,
 		await covered();
 		const map = (await records()).findLast(record => record.type === "map" && record.data.snapshot)!.data.snapshot.graph;
 		assert.deepEqual(map.nodes.map((node: any) => node.label), ["Implement semantic map labels", "Add a dark mode toggle"]);
-		const ran = specLog().filter(entry => entry.ran);
-		assert.ok(ran.some(entry => entry.changed === true && entry.ops.some((op: { kind: string }) => op.kind === "new_work")), JSON.stringify(ran));
+		// The spec log line is written as the commit is finalized, after the map record that `covered` sees.
+		const ranNew = () => specLog().filter(entry => entry.ran).some(entry => entry.changed === true && entry.ops.some((op: { kind: string }) => op.kind === "new_work"));
+		await until("the spec read's log line", async () => ranNew() || undefined).catch(() => undefined);
+		assert.ok(ranNew(), JSON.stringify(specLog().filter(entry => entry.ran)));
 
 		// A permitted note that Mom's model omits must remain visible in the decision log.
 		api.classify(request => ({
@@ -121,6 +123,7 @@ test("v2's decision-model gate skips her model for a batch that changes nothing,
 		}));
 		await h.runtime.session.prompt(fourth);
 		await covered();
+		await until("the unmet note in the spec log", async () => specLog().at(-1)?.unmet || undefined).catch(() => undefined);
 		assert.deepEqual(specLog().at(-1)?.unmet, ["labels: the spec asks for a note here, but the commit adds none"]);
 		assert.deepEqual(h.errors, []);
 		assert.deepEqual(api.errors, []);

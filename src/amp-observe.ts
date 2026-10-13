@@ -9,8 +9,9 @@
  * skipped: a message larger than the bound is returned in parts, the cursor keeping how much of it
  * was shown. A failed or unreadable export is reported as unknown and moves nothing.
  */
-import { ampThreadExport } from "./acp/runtime/amp-cli.js";
+import { ampThreadExport, describeAmpRun } from "./acp/runtime/amp-cli.js";
 import type { AmpObservation, ObservedMessage } from "./backend.js";
+import { errorMessage, isRecord } from "./util/text.ts";
 
 /** Where the last observation left off. */
 export interface ObserveCursor {
@@ -82,7 +83,7 @@ export function selectObserved(threadId: string, exported: ThreadExport, cursor:
 	if (sameThread && cursor.remaining === 0 && !cursor.offset) {
 		return { observation: { ...base, state: "unchanged", messages: [], remaining: 0, truncated: false }, cursor: { ...cursor, at } };
 	}
-	const all = (exported.messages as ExportedMessage[]).filter((m) => m && typeof m === "object");
+	const all = (exported.messages as ExportedMessage[]).filter((m) => isRecord(m));
 	let start = 0;
 	let cursorReset = false;
 	if (cursor?.messageId !== undefined) {
@@ -140,11 +141,10 @@ export async function observeAmpThread(input: { threadId: string; cwd: string; c
 	let exported: unknown;
 	try {
 		const run = await ampThreadExport(input.threadId, input.cwd, { timeoutMs: input.timeoutMs ?? OBSERVE_TIMEOUT_MS });
-		if (run.timedOut) return unknown(`amp threads export did not finish within ${input.timeoutMs ?? OBSERVE_TIMEOUT_MS} ms`);
-		if (run.code !== 0) return unknown(`amp threads export exited ${run.code ?? "by signal"}${run.stderr ? `: ${run.stderr}` : ""}`);
+		if (run.timedOut || run.code !== 0) return unknown(describeAmpRun("amp threads export", run));
 		exported = JSON.parse(run.stdout.toString("utf8"));
 	} catch (error) {
-		return unknown(error instanceof SyntaxError ? "amp threads export returned invalid JSON" : `amp threads export could not run: ${error instanceof Error ? error.message : String(error)}`);
+		return unknown(error instanceof SyntaxError ? "amp threads export returned invalid JSON" : `amp threads export could not run: ${errorMessage(error)}`);
 	}
 	if (!exported || typeof exported !== "object" || Array.isArray(exported)) return unknown("amp threads export returned no thread object");
 	const thread = exported as ThreadExport;

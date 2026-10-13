@@ -14,7 +14,7 @@ export interface ProcessNotice {
 }
 export interface ProcessResolution { riskClass: ProcessRiskClass; target: string; resolutionRefs: string[] }
 export interface FindingFeedback { action: "understood" | "dismiss" | "incorrect" | "ignored" | "backoff"; riskRefs: string[] }
-// `explained` and `asked` are legacy record values: her sidecar keeps reading them, nothing writes them now.
+// `explained` and `asked` are legacy record values: its sidecar keeps reading them, nothing writes them now.
 export const FINDING_ACTIONS = ["delivered", "understood", "dismiss", "incorrect", "discuss", "explained", "asked", "ignored", "backoff"] as const;
 export type FindingAction = typeof FINDING_ACTIONS[number];
 export interface Engagement {
@@ -61,7 +61,7 @@ const userAuthority = (event: FeedEvent | undefined) => Boolean(event?.actor ===
 /**
  * Enforce only host-provable protocol facts: identity, target ownership, visible and
  * fresh evidence, class-specific source shape, authority presence, and plain output.
- * Mom remains responsible for judging whether prose actually proves a consequential
+ * Path remains responsible for judging whether prose actually proves a consequential
  * risk and supports the proposed action; keyword matching cannot establish that.
  */
 export function validateProcessNotice(note: ProcessNotice, graph: WorkGraph, known: ReadonlyMap<string, FeedEvent>, fresh: ReadonlySet<string>, compactionReview: boolean): void {
@@ -89,7 +89,7 @@ export function validateProcessNotice(note: ProcessNotice, graph: WorkGraph, kno
 	}
 }
 
-/** Resolution is explicit, identity-matched, visible, and fresh; Mom judges whether it semantically ended the risk. */
+/** Resolution is explicit, identity-matched, visible, and fresh; Path judges whether it semantically ended the risk. */
 export function validateProcessResolution(resolution: ProcessResolution, unresolved: ReadonlySet<string>, known: ReadonlyMap<string, FeedEvent>, fresh: ReadonlySet<string>): void {
 	const key = processNoticeKey(resolution);
 	if (!unresolved.has(key)) throw new Error("Only an unresolved process risk can be resolved.");

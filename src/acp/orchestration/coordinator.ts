@@ -4,7 +4,9 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { join, resolve } from "node:path";
 import type { Profile, RequestRecord, RuntimeHandle, RuntimePort, RuntimeStatus, RuntimeTerminal, RuntimeTurn, StringsResponse, TurnUsage, UsageBreakdown, UsageCost, WorkerKind, WorkerRecord, WorktreeIdentity, NativeSessionDescription, SessionOrigin } from "../domain/types.js";
 import { failure, StringsError } from "../domain/errors.js";
-import { loadProfiles } from "../domain/config.js";
+import { ACP_DEFAULTS, defaultProfile, loadProfiles } from "../domain/config.js";
+import { withTimeout } from "../../util/async.ts";
+import { errorMessage } from "../../util/text.ts";
 import { requireCwdUnowned, requireIsolatedWriter, requireWriterUnowned } from "../domain/worktree.js";
 import { acceptanceContract, parseAcceptanceReport, roleContract, WORKER_CONTRACT } from "../domain/roles.js";
 import { AcpxRuntimePort } from "../runtime/acpx-runtime.js";
@@ -166,7 +168,7 @@ export class Coordinator {
       const opened = stored.origin === "opened";
       const configuredProfile = opened ? undefined : profiles[stored.profileName];
       const direct = stored.profileName.startsWith("direct:") && stored.handle.agent ? directProfile(stored.handle.agent, stored.role, stored.tools) : undefined;
-      const baseProfile = configuredProfile ?? direct ?? { agent: stored.handle.agent ?? "unavailable", role: stored.role, tools: [], timeoutMs: 900_000, cancellationGraceMs: 5_000, maxOutputBytes: 256_000 };
+      const baseProfile = configuredProfile ?? direct ?? defaultProfile(stored.handle.agent ?? "unavailable", stored.role);
       const restoredProfile: Profile = stored.handle.agent && stored.handle.agent !== baseProfile.agent ? { ...baseProfile, agent: stored.handle.agent } : baseProfile;
       const profile: Profile = stored.model ? { ...restoredProfile, model: stored.model } : restoredProfile;
       const wasActive = stored.status === "running" || stored.status === "spawning" || stored.status === "closing" || stored.activeRequestId !== undefined;
@@ -563,7 +565,7 @@ export class Coordinator {
     } catch (error) {
       record.status = "failed";
       record.finishedAt = new Date().toISOString();
-      record.failure = { code: "TURN_START_FAILED", message: error instanceof Error ? error.message : String(error), retryable: false };
+      record.failure = { code: "TURN_START_FAILED", message: errorMessage(error), retryable: false };
       worker.record.status = "idle";
       delete worker.record.activeRequestId;
       await this.persist();
@@ -657,7 +659,7 @@ export class Coordinator {
     if (request.status !== "running") return;
     request.status = "failed";
     request.finishedAt = new Date().toISOString();
-    request.failure = { code: "TURN_START_FAILED", message: error instanceof Error ? error.message : String(error), retryable: false };
+    request.failure = { code: "TURN_START_FAILED", message: errorMessage(error), retryable: false };
     if (worker.record.status !== "closing" && worker.record.status !== "closed") worker.record.status = "idle";
     delete worker.record.activeRequestId;
     worker.record.updatedAt = new Date().toISOString();
@@ -712,7 +714,7 @@ export class Coordinator {
       if (turn) {
         const grace = worker.record.profile.cancellationGraceMs;
         await settlesWithin(turn.cancel("coordinator deadline"), grace).catch(() => false);
-        await resultWithin(Promise.allSettled([
+        await withTimeout(Promise.allSettled([
           turn.closeStream("coordinator deadline exceeded"),
           worker.runtime.close(worker.record.handle, "coordinator deadline exceeded", false),
         ]), grace);
@@ -751,7 +753,7 @@ export class Coordinator {
             if (request.status === "running") {
               request.status = "failed";
               request.finishedAt = new Date().toISOString();
-              request.failure = { code: error instanceof StringsError ? error.code : "MODEL_SELECTION_FAILED", message: error instanceof Error ? error.message : String(error), retryable: false };
+              request.failure = { code: error instanceof StringsError ? error.code : "MODEL_SELECTION_FAILED", message: errorMessage(error), retryable: false };
               worker.record.status = "failed";
             }
             break;
@@ -782,7 +784,7 @@ export class Coordinator {
           if (request.status === "running") {
             request.status = "failed";
             request.finishedAt = new Date().toISOString();
-            request.failure = { code: "TURN_START_FAILED", message: error instanceof Error ? error.message : String(error), retryable: false };
+            request.failure = { code: "TURN_START_FAILED", message: errorMessage(error), retryable: false };
             worker.record.status = "failed";
           }
           break;
@@ -897,7 +899,7 @@ export class Coordinator {
       if (request.status === "running") {
         request.status = "failed";
         request.finishedAt = new Date().toISOString();
-        request.failure = { code: "TRANSPORT_FAILED", message: error instanceof Error ? error.message : String(error), retryable: worker.record.origin === "created" };
+        request.failure = { code: "TRANSPORT_FAILED", message: errorMessage(error), retryable: worker.record.origin === "created" };
         worker.record.status = "failed";
       }
       return undefined;
@@ -1012,7 +1014,7 @@ export class Coordinator {
       };
     } catch (error) {
       if (error instanceof StringsError) throw error;
-      throw new StringsError("MODEL_DISCOVERY_FAILED", `Model discovery failed: ${error instanceof Error ? error.message : String(error)}`);
+      throw new StringsError("MODEL_DISCOVERY_FAILED", `Model discovery failed: ${errorMessage(error)}`);
     }
   }
 
@@ -1029,7 +1031,7 @@ export class Coordinator {
       status = await this.readModelStatus(runtime, handle, agent);
     } catch (error) {
       if (error instanceof StringsError) throw error;
-      throw new StringsError("MODEL_SELECTION_FAILED", `Model selection failed for ${model}: ${error instanceof Error ? error.message : String(error)}`);
+      throw new StringsError("MODEL_SELECTION_FAILED", `Model selection failed for ${model}: ${errorMessage(error)}`);
     }
     if (status.currentModelId !== model) throw new StringsError("MODEL_SELECTION_FAILED", `The worker runtime did not select requested model ${model}.`);
   }
@@ -1039,7 +1041,7 @@ export class Coordinator {
     const mode = input.mode === undefined ? "all" : input.mode;
     if (mode !== "any" && mode !== "all") throw new StringsError("INPUT_INVALID", "wait mode must be any or all.");
     const pending = ids.map((id) => this.completions.get(id)).filter((p): p is Promise<void> => p !== undefined);
-    const timeoutMs = optionalPositive(input.waitTimeoutMs, 300_000);
+    const timeoutMs = optionalPositive(input.waitTimeoutMs, ACP_DEFAULTS.shortTimeoutMs);
     const target = mode === "any" ? Promise.race(pending) : Promise.allSettled(pending).then(() => undefined);
     const timedOut = pending.length > 0 && !(await settlesWithin(target, timeoutMs));
     const selected = ids.map((id) => this.requests.get(id)).filter((request): request is RequestRecord => request !== undefined);
@@ -1104,7 +1106,7 @@ export class Coordinator {
       delete worker.turn;
       this.completions.delete(requestId);
       await this.persist();
-      const cleanup = await resultWithin(Promise.allSettled([
+      const cleanup = await withTimeout(Promise.allSettled([
         turn.closeStream("cancellation grace expired"),
         worker.runtime.close(worker.record.handle, "cancellation grace expired", discardPersistentState),
       ]), worker.record.profile.cancellationGraceMs);
@@ -1117,7 +1119,7 @@ export class Coordinator {
       worker.record.status = cleanupFailure ? "failed" : "closed";
       await this.persist();
       if (cleanupFailure?.status === "rejected") {
-        throw new StringsError("CANCEL_CLEANUP_FAILED", `Request ${requestId} was cancelled, but runtime cleanup failed: ${cleanupFailure.reason instanceof Error ? cleanupFailure.reason.message : String(cleanupFailure.reason)}`, true);
+        throw new StringsError("CANCEL_CLEANUP_FAILED", `Request ${requestId} was cancelled, but runtime cleanup failed: ${errorMessage(cleanupFailure.reason)}`, true);
       }
       return { requestId, escalated: true };
     }
@@ -1173,7 +1175,7 @@ export class Coordinator {
       worker.record.status = "failed";
       worker.record.updatedAt = new Date().toISOString();
       await this.persist();
-      throw new StringsError("CLOSE_FAILED", `Worker ${worker.record.name} cleanup failed: ${error instanceof Error ? error.message : String(error)}`, true);
+      throw new StringsError("CLOSE_FAILED", `Worker ${worker.record.name} cleanup failed: ${errorMessage(error)}`, true);
     }
     worker.record.status = "closed";
     worker.record.updatedAt = new Date().toISOString();
@@ -1223,11 +1225,11 @@ function directProfile(agent: string, rawRole: unknown, rawTools: unknown): Prof
   if (role === "read-only" && tools.some(tool => !DIRECT_READ_TOOLS.includes(tool))) {
     throw new StringsError("POLICY_UNENFORCEABLE", "Read-only workers may only use read, grep, find, and ls.");
   }
-  return { agent, role, tools: [...tools], timeoutMs: 900_000, cancellationGraceMs: 5_000, maxOutputBytes: 256_000 };
+  return defaultProfile(agent, role, tools);
 }
-function optionalString(value: unknown): string | undefined {
+function optionalString(value: unknown, name?: string): string | undefined {
   if (value === undefined) return undefined;
-  if (typeof value !== "string" || value.trim() === "") throw new StringsError("INPUT_INVALID", "String values must be non-empty when provided.");
+  if (typeof value !== "string" || value.trim() === "") throw new StringsError("INPUT_INVALID", name ? `${name} must be a non-empty string when provided.` : "String values must be non-empty when provided.");
   return value.trim();
 }
 
@@ -1256,11 +1258,7 @@ function isRequestedModelUnsupported(error: unknown): boolean {
   const code = (error as { code?: unknown }).code;
   return code === "ACP_MODEL_UNSUPPORTED" || code === "MODEL_UNAVAILABLE";
 }
-function optionalModel(value: unknown): string | undefined {
-  if (value === undefined) return undefined;
-  if (typeof value !== "string" || value.trim() === "") throw new StringsError("INPUT_INVALID", "model must be a non-empty string when provided.");
-  return value.trim();
-}
+const optionalModel = (value: unknown): string | undefined => optionalString(value, "model");
 
 const USAGE_TOKEN_KEYS = ["inputTokens", "outputTokens", "cachedReadTokens", "cachedWriteTokens", "thoughtTokens", "totalTokens"] as const;
 function mergeUsage(prev: TurnUsage | undefined, next: TurnUsage | undefined): TurnUsage | undefined {
@@ -1284,26 +1282,5 @@ function mergeUsage(prev: TurnUsage | undefined, next: TurnUsage | undefined): T
   return { breakdown, ...(cost ? { cost } : {}) };
 }
 
-async function resultWithin<T>(promise: Promise<T>, timeoutMs: number): Promise<T | undefined> {
-  let timer: NodeJS.Timeout | undefined;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), timeoutMs); }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
-
-async function settlesWithin(promise: Promise<void>, timeoutMs: number): Promise<boolean> {
-  let timer: NodeJS.Timeout | undefined;
-  try {
-    return await Promise.race([
-      promise.then(() => true),
-      new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
+/** Whether the promise fulfills within the bound; a rejection still rejects. */
+const settlesWithin = async (promise: Promise<void>, timeoutMs: number): Promise<boolean> => await withTimeout(promise.then(() => true), timeoutMs) ?? false;

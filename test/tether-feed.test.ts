@@ -39,9 +39,9 @@ test("Mom batches settled worker evidence until lead cadence is due, without ext
 			const input = JSON.parse(textOf(begun ?? user));
 			motherRequests.push(input);
 			const ref = /\[src:([^\]]+)\]/.exec(input.newEvents)?.[1] ?? input.original.ref;
-			return { tool: { name: "commit_graph", arguments: { revision: input.graph.revision, purpose: "main", focus: "main", note: null,
-				upsertNodes: [{ id: "main", kind: "try", parent: null, state: "active", label: "Main purpose", intent: input.original.text, observed: "Scout progress received.", actor: "lead", sources: [ref] }],
-				unfinished: [], upsertEdges: [], removeEdges: [], merges: [], folds: [], removeNodes: [], supersessions: [] } } };
+			// commit_graph's current contract: a short `work` list (the legacy upsertNodes/folds groups are internal now).
+			return { tool: { name: "commit_graph", arguments: { focus: "main",
+				work: [{ id: "main", parent: null, state: "active", label: "Main purpose", why: input.original.text ?? prompt, status: "Scout progress received.", sources: [ref] }] } } };
 		});
 		await h.runtime.session.prompt(prompt);
 		await arrived;

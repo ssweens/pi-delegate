@@ -521,6 +521,20 @@ export function validateStartInput(raw: Record<string, unknown>): Validated<Star
 	return { ok: true, value };
 }
 
+/** A failure the tool layer reports by code: a contract violation, or a Coordinator error passed through. */
+export class DelegateError extends Error {
+	constructor(readonly code: string, message: string, readonly field?: string, readonly runId?: string) {
+		super(message);
+		this.name = "DelegateError";
+	}
+}
+
+/** The validated value, or its contract error thrown as a DelegateError. */
+export function unwrap<T>(validated: Validated<T>): T {
+	if (!validated.ok) throw new DelegateError(validated.error.code, validated.error.message, validated.error.field);
+	return validated.value;
+}
+
 /** Fail explicitly when the backend cannot do `action` for this run. */
 export function requireAction(capabilities: BackendCapabilities, action: LifecycleAction): Validated<Capability> {
 	const capability: Capability = capabilities[action];

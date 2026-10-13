@@ -1,7 +1,8 @@
-// Mom's decision model: Beverly over a System One endpoint. It decides two narrow things and invents
+// Path's decision model: Beverly over a System One endpoint. It decides two narrow things and invents
 // nothing — the v2 gate's change questions (asked from v2.ts) and the two guards on a repair of saved
-// labels. Both callers fall back to her model on any doubt, so a failure here is never a verdict.
-import { Decider, type DeciderQuestion } from "./decider.ts";
+// labels. Both callers fall back to its model on any doubt, so a failure here is never a verdict.
+import { Decider, type DeciderAnswer, type DeciderQuestion } from "./decider.ts";
+import { clipText, errorMessage } from "../util/text.ts";
 
 const ask = (question: string, definition: string, yes: string, no: string): DeciderQuestion =>
 	({ type: "noul", instructions: `${question} ${definition}`, criteria: { true: yes, false: no } });
@@ -24,9 +25,8 @@ const LABEL_CUTOFF: Record<string, number> = { wrapper_label: 0.5, names_work: 0
 export type LabelVerdict = Record<keyof typeof LABEL_QUESTIONS, boolean> & { names_work?: boolean };
 
 const TEXT_LIMIT = 2000;
-const clip = (text: string, max: number) => text.length <= max ? text : `${text.slice(0, max)}…`;
 export const workState = (s: WorkSubject): string => [`Work item (${s.state})`, `Label: ${JSON.stringify(s.label)}`,
-	...(s.intent ? [`Intent: ${JSON.stringify(clip(s.intent, TEXT_LIMIT))}`] : []), ...(s.observed ? [`Observed: ${JSON.stringify(clip(s.observed, TEXT_LIMIT))}`] : []),
+	...(s.intent ? [`Intent: ${JSON.stringify(clipText(s.intent, TEXT_LIMIT))}`] : []), ...(s.observed ? [`Observed: ${JSON.stringify(clipText(s.observed, TEXT_LIMIT))}`] : []),
 	...(s.proposed ? [`Proposed label: ${JSON.stringify(s.proposed)}`] : [])].join("\n");
 
 const MAX_IN_FLIGHT = 8;
@@ -40,6 +40,7 @@ async function slot<T>(run: () => Promise<T>): Promise<T> {
 	try { return await run(); } finally { active--; waiting.shift()?.(); }
 }
 const cache = new Map<string, Promise<Record<string, number>>>();
+const answerCache = new Map<string, Promise<Record<string, DeciderAnswer>>>();
 
 /** Beverly over System One: `{ url, model }` resolved from the chosen decision model, never a default.
  *  Any failure throws naming the endpoint — no verdict is ever invented. */
@@ -51,6 +52,20 @@ export class Beverly {
 		this.client = new Decider(options.url, options.timeoutMs ?? 15000, options.model);
 		this.key = `${options.url}\n${options.model}\n`;
 		this.endpoint = `${options.url} (${options.model})`;
+	}
+
+	/** Answers of any kind, per question (cached and paced like every question here). */
+	async answers(state: string, questions: Record<string, DeciderQuestion>): Promise<Record<string, DeciderAnswer>> {
+		const key = `${this.key}answers:${JSON.stringify(questions)}\n${state}`;
+		let pending = answerCache.get(key);
+		if (!pending) {
+			pending = slot(() => this.client.ask(state, questions)).then(({ answers }) => answers as Record<string, DeciderAnswer>);
+			pending.catch(() => answerCache.delete(key));
+			if (answerCache.size >= CACHE_LIMIT) answerCache.delete(answerCache.keys().next().value!);
+			answerCache.set(key, pending);
+		}
+		try { return await pending; }
+		catch (error) { throw new Error(`Beverly ${this.endpoint} could not classify: ${errorMessage(error)}`); }
 	}
 
 	/** Raw nouls — the probability of true, per question. The v2 gate asks its own questions here. */
@@ -65,7 +80,7 @@ export class Beverly {
 			cache.set(key, pending);
 		}
 		try { return await pending; }
-		catch (error) { throw new Error(`Beverly ${this.endpoint} could not classify: ${error instanceof Error ? error.message : String(error)}`); }
+		catch (error) { throw new Error(`Beverly ${this.endpoint} could not classify: ${errorMessage(error)}`); }
 	}
 
 	/** The label guards. `names_work` is asked only when a replacement label is proposed. */

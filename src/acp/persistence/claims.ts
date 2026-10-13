@@ -18,15 +18,15 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import lockfile from "proper-lockfile";
+import { SHORT_LOCK } from "../../util/jsonl.ts";
+import { errorMessage } from "../../util/text.ts";
 import writeFileAtomic from "write-file-atomic";
 import type { WorktreeIdentity } from "../domain/types.js";
 import { StringsError } from "../domain/errors.js";
-import { ownerAlive, processIdentity, stateDirLocked, type ProcessIdentity } from "./home.js";
+import { stateDirLocked } from "./home.js";
+import { ownerAlive, processIdentity, type ProcessIdentity } from "../../util/process.ts";
 
 export interface Claim { key: string; code: string; subject: string }
-
-/** The claim mutex's staleness: its critical section takes milliseconds, and its holder refreshes it every second. */
-const MUTEX_STALE_MS = 2_000;
 
 interface ClaimFile { version: 1; key: string; holder: string; pid: number; host: string; token: string; stateDir: string; subject: string; at: string }
 
@@ -56,10 +56,10 @@ export class Claims {
     await mkdir(this.dir, { recursive: true, mode: 0o700 });
     let release: () => Promise<void>;
     try {
-      // Stale after 2 s (proper-lockfile's minimum); about 5.6 s of retries outlast a dead holder's lock.
-      release = await lockfile.lock(path, { realpath: false, stale: MUTEX_STALE_MS, retries: { retries: 60, minTimeout: 5, maxTimeout: 100 }, onCompromised: () => undefined });
+      // SHORT_LOCK: stale after 2 s (the critical section takes milliseconds); its retries outlast a dead holder's lock.
+      release = await lockfile.lock(path, { ...SHORT_LOCK, onCompromised: () => undefined });
     } catch (error) {
-      throw new StringsError("CLAIM_BUSY", `Cannot take the machine-wide claim ${path}: ${error instanceof Error ? error.message : String(error)}`, true);
+      throw new StringsError("CLAIM_BUSY", `Cannot take the machine-wide claim ${path}: ${errorMessage(error)}`, true);
     }
     try { return await work(); } finally { await release().catch(() => undefined); }
   }

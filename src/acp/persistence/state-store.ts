@@ -5,7 +5,9 @@ import writeFileAtomic from "write-file-atomic";
 import { z } from "zod";
 import type { RequestRecord, RuntimeHandle, WorkerRole, WorkerStatus, WorktreeIdentity } from "../domain/types.js";
 import { StringsError } from "../domain/errors.js";
-import { describeOwner, OWNER_FILE, processIdentity, readOwner } from "./home.js";
+import { describeOwner, OWNER_FILE, readOwner, STATE_LOCK_STALE_MS } from "./home.js";
+import { processIdentity } from "../../util/process.ts";
+import { errorMessage } from "../../util/text.ts";
 import { NativeSessionDescriptionSchema, type NativeSessionDescription } from "../../../dist/acpx-runtime/runtime.js";
 
 export interface SessionProvenance {
@@ -88,14 +90,14 @@ export class StateStore {
     try {
       this.releaseLease = await lockfile.lock(this.root, {
         realpath: false,
-        stale: 30_000,
+        stale: STATE_LOCK_STALE_MS,
         update: 10_000,
         retries: 0,
         onCompromised: (error) => { throw error; },
       });
     } catch (error) {
       const owner = await readOwner(this.root);
-      throw new StringsError("COORDINATOR_OWNED", `${describeOwner(owner)} owns ${this.root}: ${error instanceof Error ? error.message : String(error)}`, true);
+      throw new StringsError("COORDINATOR_OWNED", `${describeOwner(owner)} owns ${this.root}: ${errorMessage(error)}`, true);
     }
     // Who holds the dir, so a claim, an adoption or this error elsewhere can name the process.
     await writeFileAtomic(join(this.root, OWNER_FILE), `${JSON.stringify(processIdentity())}\n`, { encoding: "utf8", mode: 0o600 });
@@ -110,7 +112,7 @@ export class StateStore {
     try { raw = JSON.parse(await readFile(join(root, "state.json"), "utf8")); }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-      throw new StringsError("STATE_CORRUPT", `Cannot read ${join(root, "state.json")}: ${error instanceof Error ? error.message : String(error)}`);
+      throw new StringsError("STATE_CORRUPT", `Cannot read ${join(root, "state.json")}: ${errorMessage(error)}`);
     }
     const parsed = z.union([StateSchema, LegacyStateSchema]).safeParse(raw);
     if (!parsed.success) throw new StringsError("STATE_CORRUPT", `Cannot read ${join(root, "state.json")}: ${parsed.error.message}`);
@@ -140,7 +142,7 @@ export class StateStore {
       return { version: 2, workers: parsed.workers.map(worker => ({ ...worker, origin: "origin" in worker ? worker.origin : "created" })) as StoredWorker[], requests, sessions: parsed.sessions ?? [] };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return { version: 2, workers: [], requests: [], sessions: [] };
-      throw new StringsError("STATE_CORRUPT", `Cannot load ${this.statePath}: ${error instanceof Error ? error.message : String(error)}`);
+      throw new StringsError("STATE_CORRUPT", `Cannot load ${this.statePath}: ${errorMessage(error)}`);
     }
   }
 

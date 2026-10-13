@@ -1,65 +1,60 @@
-import { execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { realpathSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
 	type ExtensionAPI,
 	type ExtensionContext,
-	type ExtensionFactory,
 	type InlineExtension,
 	type LoadExtensionsResult,
 	type RegisteredTool,
 	buildSessionContext,
 	convertToLlm,
-	createAgentSession,
 	DefaultResourceLoader,
-	getAgentDir,
 	loadProjectContextFiles,
-	ModelRuntime,
-	SessionManager,
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
-import { keyHint } from "@earendil-works/pi-coding-agent";
-import { readLegacySection, readSettings, settingsFile, writeSettings } from "./settings-file.ts";
+import { truncateToWidth } from "@earendil-works/pi-tui";
+import { modelKey, parseModelSpec, matchesSpec } from "./model-ref.ts";
+import { allModels, availableModels, findModel, scopedModels } from "./registry.ts";
+import { clipText, errorMessage, textOf } from "./util/text.ts";
+import { ageDays, formatDuration } from "./util/format.ts";
+import { tildify } from "./util/path.ts";
+import { readLegacySection, readSettings, writeSettings } from "./settings-file.ts";
 import { AgentHistory, ChildView, type LiveSource } from "./inspector.js";
-import type { ActiveTool, ChildActivity } from "./transcript.js";
-import { type AAIndices, acpRowView, asRunView, elapsed, empty, framed, type LiveFacts, type ModelRow, type ModelsDetails, resultLines, resultView, type RunView } from "./render.js";
-import { type AcpRunView, type LifecycleAction, type PiStartInput, type WaitOutcome, PI_CAPABILITIES, requireAction, validateStartInput, validateSteer } from "./backend.js";
-import { ovenCall, OvenUnreachable, type Settled, type SliceView } from "./oven.js";
-import { AcpBackend, runningAcpRuns, acpModelsText, acpResultText, acpStatusText, acpSummary, DelegateError, sessionLabel, unwrap } from "./acp-backend.js";
+import { type AAIndices, acpRowView, asRunView, empty, framed, type LiveFacts, type ModelRow, type ModelsDetails, resultLines, resultView, type RunView } from "./render.js";
+import { type AcpRunView, type LifecycleAction, type PiStartInput, PI_CAPABILITIES, requireAction, validateStartInput, validateSteer } from "./backend.js";
+import { ACP_JOIN_LOST, AcpBackend, acpModelsText, acpResultText, acpStatusText, acpSummary, DelegateError, sessionLabel, unwrap } from "./acp-backend.js";
+import { type Join, type JoinOutcome, joinRuns, waitCancelled } from "./wait.ts";
 import { shutdownAcpCoordinator } from "./acp/instance.js";
-import { DELEGATION_TOOLS, droppedTools, EVERY_TOOL, loadRoles, toolAllowlist, WRITE_TOOLS } from "./roles.js";
+import { DELEGATION_TOOLS, droppedTools, EVERY_TOOL, loadRoles, roleSourcesText, toolAllowlist, WRITE_TOOLS } from "./roles.js";
 import { installTodo } from "./todo-ext.js";
 import { dealEligible, formatPercent, selectDeals, type DealsDetails } from "./deals.js";
 import { DealSheet } from "./deals-sheet.js";
-import { RunCompletion } from "./completion.js";
-import { resolveChildTrust, type ChildTrust, type TrustSource } from "./project-trust.js";
-import { ownedElsewhere, processOwner, readRecord, storageDir, writeRecord } from "./storage.js";
+import { resolveChildTrust, type ChildTrust } from "./project-trust.js";
+import { processOwner } from "./storage.js";
 import { installMom } from "./mom/index.js";
 import { activityFor } from "./ui/activity.js";
 import { DEFAULT_DELEGATE_SETTINGS, pickModel, readDelegateSettings, saveDelegateSettings } from "./delegate-settings.ts";
 import { DEFAULT_TODO_SETTINGS, readTodoSettings, saveTodoSettings } from "./todo-settings.ts";
-import { delegateRows, todoRows, SettingsPanel, textPage, type SettingsRow } from "./ui/delegate-settings.ts";
+import { delegateRows, todoRows } from "./ui/delegate-settings.ts";
+import { SettingsPanel, textPage, type SettingsRow } from "./ui/settings-panel.ts";
+import { FULLSCREEN } from "./ui/overlay.ts";
+import { AGENT_DIR, SETTINGS_PATH } from "./agent-dir.ts";
+import {
+	acknowledge, activeWriter, activityOf, admit, allowlist, finishedNotice, PI_BUILTIN_TOOLS, notify, PiBackend, type PiCall, type PiRunSpec, cancelRun, capacityError, changed, CHILD_SETTLED_PROMPT, childOwner, closeOwner, closingChildren, DEFAULT_TIMEOUT_MS, departed, finalResult, findDeparted, FORK_BRIDGE, harvest, inFlight, listeners, maxDepth, noticeKey, ownedRuns, type Owner, ownerPath, pointerDir, publish, recordedView, redeliver, restoreRun, resultText, type Run, runRecordPaths, runs, saveRun, state, summary, TRUST_UNKNOWN, view, type WaitRow,
+} from "./pi-backend.ts";
 
-/** Resolved once, at load, by Pi's own rule (PI_CODING_AGENT_DIR with `~` expanded, else ~/.pi/agent), so this file and Pi read the same mcp.json and settings. */
-export const AGENT_DIR = getAgentDir();
-const LOG_FILE = join(AGENT_DIR, "delegate-runs.jsonl");
-const SETTINGS_PATH = settingsFile(AGENT_DIR);
+export { AGENT_DIR };
+export { CHILD_SETTLED_PROMPT, DELEGATE_MILESTONE_EVENT, type DelegateMilestone, FORK_BRIDGE, TRUST_UNKNOWN } from "./pi-backend.ts";
 const STALE_DAYS = 30;
 const RATINGS_STALE_DAYS = 14;
 const OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models";
 const OPENROUTER_TTL_MS = 10 * 60 * 1000;
 const OPENROUTER_TIMEOUT_MS = 8000;
-const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 /** The shipped depth limit. The root parent is depth 0 and its children depth 1; `maxDepth` in the settings replaces it. */
 export const MAX_DELEGATION_DEPTH = 3;
-/** The depth limit now: read at each delegate call, so a settings change applies to the next child. */
-const maxDepth = () => readDelegateSettings(SETTINGS_PATH).maxDepth;
 /** The root session's delegation mode now (opportunistic, orchestrator, off). Children never get a mode. */
 const mode = () => readDelegateSettings(SETTINGS_PATH).mode;
 /**
@@ -69,27 +64,6 @@ const mode = () => readDelegateSettings(SETTINGS_PATH).mode;
  */
 const ORCHESTRATOR_PROMPT = ` Delegation mode: orchestrator (the user's setting). You coordinate; children execute. Hand every task the user gives you to a child with delegate, in the background, and stay free to keep talking with the user while children run. Do not block on delegate_ctl wait unless the user asks for a result now or your reply cannot be written without it. Read only what you need to write a good brief, and report each child's result when its completion arrives. You cannot edit or write files yourself in this mode: those calls are refused. This overrides the delegate tool's own advice on when to delegate.`;
 const SKILL_PATH = join(dirname(fileURLToPath(import.meta.url)), "..", "skills", "delegation", "SKILL.md");
-const MAX_RETAINED_SESSIONS = 8;
-const OUTPUT_CAP = 40_000;
-// Provider retries are not task work. Keep Pi's automatic retry loop from consuming an entire
-// delegate segment before the child gets a chance to use its tools.
-const MAX_PROVIDER_RETRIES = 3;
-const MAX_PROVIDER_RETRY_MS = 120_000;
-/** Parent-session event bus only. No model turn or worker tool is created by a milestone. */
-export const DELEGATE_MILESTONE_EVENT = "pi-delegate:milestone.v1";
-export interface DelegateMilestone {
-	version: 1;
-	runId: string;
-	segment: number;
-	role: string;
-	kind: "started" | "note" | "settled";
-	at: number;
-	task?: string;
-	text?: string;
-	status?: Status;
-	changedFiles?: string[];
-}
-
 const contractFooter = (delegates: boolean, atDepthCap = false, cap = MAX_DELEGATION_DEPTH) => `
 
 ## Delegated worker contract
@@ -114,276 +88,12 @@ const FORK_FOOTER = `
 ## The conversation before your assignment
 It belongs to the agent that delegated to you \u2014 its plans, its investigation, its supervision of workers. Read it as background only. You are not that agent and you are not observing anyone: you are the worker it hired, and the assignment that follows is yours to carry out with your own tools.`;
 
-type Status = RunView["status"];
-type RunResult = { content: { type: "text"; text: string }[]; details: RunView; isError: boolean };
-
-interface Run {
-	id: string;
-	ownerKey: string;
-	recordPath: string;
-	segment: number;
-	stopped: boolean;
-	acknowledged: boolean;
-	systemPrompt: string;
-	contextFiles: { path: string; content: string }[];
-	appendSystemPrompt: string[];
-	/** The role's `tools` line, names and `*` patterns; EVERY_TOOL when it has none. */
-	tools: string[];
-	/** Names it may not have whatever its list says: the delegation pair at the depth cap. */
-	withheld?: string[];
-	timeoutMs: number;
-	sessionId: string;
-	completion: RunCompletion<RunResult>;
-	role: string;
-	model: string;
-	thinking: string;
-	context: "fork" | "fresh";
-	cwd: string;
-	task: string;
-	status: Status;
-	startedAt: number;
-	endedAt?: number;
-	turns: number;
-	tokens: { input: number; output: number; cacheRead: number; cacheWrite: number };
-	cost: number;
-	changedFiles: string[];
-	droppedTools: string[];
-	output: string;
-	failedAttempts: number;
-	/** Failed attempts in the current segment, for causal timeout reporting. */
-	segmentFailedAttempts: number;
-	segmentFailedAttemptsBase: number;
-	lastAttemptError?: string;
-	providerRetryMs: number;
-	providerRetry?: { attempt: number; maxAttempts: number; delayMs: number; errorMessage: string; startedAt: number };
-	error?: string;
-	lastTool?: string;
-	toolCalls: { name: string; args: Record<string, unknown>; at: number }[];
-	activeTools: Map<string, ActiveTool>;
-	revision: number;
-	streamingMessage?: any;
-	activityCache?: { revision: number; items: ChildActivity };
-	contextWindow?: number;
-	session?: any;
-	ready?: Promise<void>;
-	/** Resource preparation is part of the background launch, not the parent tool call. */
-	preparing?: Promise<void>;
-	startIdx: number;
-	/** Transcript index at which the current segment began; lifetime counters still use startIdx. */
-	segmentStartIdx: number;
-	/** Start of the current execution segment; unlike startedAt, this resets on every resume. */
-	segmentStartedAt: number;
-	forkedMessages?: number;
-	writer: boolean;
-	dirtyBefore?: Map<string, number>;
-	timer?: ReturnType<typeof setTimeout>;
-	sessionFile?: string;
-	// Per-run ownership (see storage.ts). A run owned by another live process is read-only here.
-	ownerPid?: number;
-	ownerHost?: string;
-	ownerToken?: string;
-	foreign?: boolean;
-	/** 1 for a child of the root parent; one more for each delegating child above it. */
-	depth: number;
-	/** Set when the child runs as an oven slice instead of in this process (role `runtime: oven`, or the call's `runtime`). */
-	runtime?: "oven";
-	/** oven: the extensions the slice selects, from the role. */
-	extensions?: string[];
-	/** oven: the slice this run drives; set once oven created it. */
-	sliceId?: string;
-	/** Set when a delegating child started this run. */
-	parentRunId?: string;
-	/** Which entry of the role's model list the run got, and why earlier entries were skipped. */
-	modelPick?: string;
-	/** Started by the person with /delegate: its completion is shown without starting a model turn. */
-	userStarted?: true;
-	/** Every tool name the child's current session was offered, allowed or not; droppedTools is read from it. */
-	offered?: Set<string>;
-	/** Extensions that failed to load, or failed in a handler, in the child's current session. It ran without them. */
-	extensionErrors?: string[];
-	/**
-	 * Whether the child's project is trusted, decided by its parent at delegate time (childTrust). It
-	 * governs everything the child reads from `<cwd>/.pi`: settings, mcp.json, and a delegating child's roles.
-	 */
-	projectTrusted: boolean;
-	/** Why the child has that trust (see TrustSource); `unknown` for a record from before 0.2.0. */
-	projectTrustSource: TrustSource;
-	/** A record from before trust was recorded (pi-delegate < 0.2.0): it runs untrusted, and says so. */
-	projectTrustUnknown?: true;
-	/** Set by stopTree: once this segment settles its session closes, since its children's owner is gone. */
-	closeOnSettle?: boolean;
-}
-
-/** A parent's in-process binding. There is no parent-level lock: runs carry their own ownership. */
-interface Owner {
-	key: string;
-	// One pointer file per run: concurrent processes on the same parent never clobber a shared list.
-	dir: string;
-	queued: Set<string>;
-	closed: boolean;
-	binding?: { pi: ExtensionAPI; ctx: ExtensionContext };
-	/**
-	 * Set when this owner is a delegating child's own session: its children's completions go to
-	 * that child (wakeChild), never straight into its session as a parent turn.
-	 */
-	parentRun?: Run;
-	/** The attached binding's steer, so a completion can revive one of this owner's settled runs. */
-	resume?: (run: Run, message: string) => Promise<void>;
-	/** The same steer for a message the person typed in the root's UI: an explicit restart request. */
-	steerFromUser?: (run: Run, message: string) => Promise<void>;
-	/** The attached binding's ACP backend: the one that reads, steers and cancels this owner's ACP runs. */
-	acp?: AcpBackend;
-	/** A root parent's view of its whole tree, as the Agents frame reads and acts on it. */
-	live?: LiveSource;
-	/** Open one of this owner's settled runs' sessions without starting a turn: a delegating run's own children reattach with it. */
-	reopen?: (run: Run) => Promise<void>;
-	/** True while one of this owner's runs, pi or ACP, has not settled. */
-	busy?: () => boolean;
-	/**
-	 * Closes this owner and its ACP runs, as session_shutdown does. A nested owner also gets that
-	 * event when its delegating child's session closes (closeSession); detach closes it while the session stays.
-	 */
-	detach?: () => Promise<void>;
-	/** Late-report notices that arrived while this owner had no binding (a reload); attach delivers them. */
-	pendingNotices?: Notice[];
-}
-interface RuntimeState {
-	runs: Map<string, Run>;
-	owners: Map<string, Owner>;
-	listeners: Set<() => void>;
-}
-// This is the process-owned execution layer. Extension instances are replaceable UI/tool bindings.
-// Never persist live session objects; a fresh process reconstructs only inert records from disk.
-const runtimeKey = Symbol.for("@ssweens/pi-delegate/runtime/1");
-const processState = globalThis as typeof globalThis & { [key: symbol]: RuntimeState };
-const state = processState[runtimeKey] ??= { runs: new Map(), owners: new Map(), listeners: new Set() };
-const { runs, listeners } = state;
-function changed() { for (const listener of listeners) listener(); }
-function milestone(run: Run, event: Omit<DelegateMilestone, "version" | "runId" | "segment" | "role" | "at">) {
-	const owner = state.owners.get(run.ownerKey);
-	if (!owner?.binding || owner.closed || run.foreign) return;
-	owner.binding.pi.events.emit(DELEGATE_MILESTONE_EVENT, {
-		version: 1, runId: run.id, segment: run.segment, role: run.role, at: Date.now(), ...event,
-	} satisfies DelegateMilestone);
-}
-function newId(role: string): string { return `${role}-${randomUUID()}`; }
-function ownerPath(ctx: ExtensionContext): string {
-	return join(storageDir(ctx.sessionManager.getCwd()), "owners", `${ctx.sessionManager.getSessionId()}.json`);
-}
-function ownedRuns(owner: Owner): Run[] { return [...runs.values()].filter((r) => r.ownerKey === owner.key); }
-function pointerDir(key: string): string { return key.replace(/\.json$/, ""); }
-function foreignError(run: Run): Error {
-	return new Error(`${run.id} is owned by another live Pi process (pid ${run.ownerPid} on ${run.ownerHost}); it is read-only here. Use that session, or wait for it to exit.`);
-}
-/** Legacy single-file index (read only) plus one pointer file per run. */
-function runRecordPaths(owner: Owner): string[] {
-	const paths: string[] = [];
-	const legacy = readRecord<{ version: number; runs: string[] }>(owner.key);
-	if (legacy && (legacy.version !== 1 || !Array.isArray(legacy.runs) || legacy.runs.some((p) => typeof p !== "string"))) throw new Error(`Invalid delegate index: ${owner.key}`);
-	paths.push(...(legacy?.runs ?? []));
-	const names = existsSync(owner.dir) ? readdirSync(owner.dir).filter((n) => n.endsWith(".json")).sort() : [];
-	for (const name of names) {
-		const pointer = readRecord<{ version: number; recordPath: string }>(join(owner.dir, name));
-		if (!pointer || pointer.version !== 1 || typeof pointer.recordPath !== "string") throw new Error(`Invalid delegate pointer: ${join(owner.dir, name)}`);
-		paths.push(pointer.recordPath);
-	}
-	return [...new Set(paths)];
-}
-
-/**
- * The runs a delegating child started, kept when its session closes (retired, cancelled, reopened on a
- * new model): the root lists, reads and revives them as it does its own settled children, until the next
- * prompt hides them. Keyed by the delegating run's id; its revival restores them live and drops the entry.
- */
-interface Departed { pi: Run[]; acp: { view: AcpRunView; activity: ChildActivity }[] }
-const departed = new Map<string, Departed>();
-/** A delegating child's close still in progress (parking its ACP runs), by its run id. A revival waits for it. */
-const closingChildren = new Map<string, Promise<void>>();
-/** A departed run, and the delegating run whose session held it. */
-function findDeparted(id: string): { parentId: string; run?: Run; acp?: Departed["acp"][number] } | undefined {
-	for (const [parentId, gone] of departed) {
-		const run = gone.pi.find((r) => r.id === id);
-		if (run) return { parentId, run };
-		const acpRun = gone.acp.find((a) => a.view.id === id);
-		if (acpRun) return { parentId, acp: acpRun };
-	}
-	return undefined;
-}
-/** Forget a run's departed descendants: its root parent closed, so nothing shows or revives them any more. */
-function forgetDeparted(runId: string) {
-	const gone = departed.get(runId);
-	departed.delete(runId);
-	for (const run of gone?.pi ?? []) forgetDeparted(run.id);
-}
-
-/** The owner of the children a delegating run started, once its session's delegation tools attached. */
-function childOwner(run: Run): Owner | undefined {
-	for (const owner of state.owners.values()) if (owner.parentRun === run) return owner;
-	return undefined;
-}
-/** A delegating child's own children end with its session, as a root parent's end with its own. */
-async function closeChildOwner(run: Run) {
-	const nested = childOwner(run);
-	if (!nested) return;
-	if (nested.detach) await nested.detach();
-	else await closeOwner(nested);
-}
-
-/**
- * Cancel and timeout end a delegating run's whole subtree. Its unsettled descendants are cancelled,
- * not parked, so none of them runs on or revives it; then its children's owner closes. Its session,
- * whose delegation tools that owner served, closes once the run settles, and a restart reopens it
- * from the records.
- */
-async function stopTree(run: Run) {
-	const nested = childOwner(run);
-	if (!nested) return;
-	const mark = (owner: Owner) => {
-		for (const child of ownedRuns(owner)) {
-			if (child.foreign || child.completion.settled) continue;
-			child.stopped = true;
-			if (child.status === "running") child.status = "cancelled";
-			try { saveRun(child); } catch { /* closing still stops it */ }
-			const deeper = childOwner(child);
-			if (deeper) mark(deeper);
-		}
-	};
-	mark(nested);
-	if (run.completion.settled) dropSession(run);
-	else run.closeOnSettle = true;
-	await closeChildOwner(run);
-}
-
-/** Close a settled run's session, keeping its activity readable. Revival opens a new one from the transcript. */
-function dropSession(run: Run) {
-	const session = run.session;
-	if (!session) return;
-	run.activityCache = { revision: run.revision, items: activityOf(run) };
-	run.session = undefined;
-	void closeSession(session);
-}
-
-/**
- * End a child's session. dispose() emits no session_shutdown, so without this its extensions never
- * learn it ended: MCP servers keep running, and a delegating child's own children stay bound to it.
- */
-async function closeSession(session: any) {
-	if (!session) return;
-	try { await session.extensionRunner?.emit({ type: "session_shutdown", reason: "quit" }); }
-	catch { /* the session is disposed regardless */ }
-	try { session.dispose(); } catch { /* ignore */ }
-}
-
 // --- A child's extensions. A child loads what Pi loads for a session in its folder, with its own trust
 // deciding the project's part, so it has the extensions its parent has, Pi's built-ins included. Its role's
 // `tools` line then decides which of their tools it gets.
 
-/** Pi's built-in tools. Each one a child may not have is left out of its session before any tool registers. */
-const PI_BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls", "powershell"];
 /** The child's own pi-delegate, as Pi names an inline extension. */
 const NESTED_PATH = "<inline:pi-delegate>";
-
-const allowlist = (run: Run) => toolAllowlist(run.tools, run.withheld);
 
 /**
  * An extension's tool table that keeps only the tools a child may have. Pi registers a tool by setting it
@@ -399,13 +109,13 @@ class GatedTools extends Map<string, RegisteredTool> {
 	}
 }
 
-/** Mom follows the root parent's session only. An extension that brings her is known by her tool or command. */
-const bringsMom = (extension: LoadExtensionsResult["extensions"][number]) => extension.tools.has("mom") || extension.commands.has("mom");
+/** Path follows the root parent's session only. An extension that brings it is known by its tool or command (`mom` is the former name, still met in older installs). */
+const bringsMom = (extension: LoadExtensionsResult["extensions"][number]) => ["path", "mom"].some(name => extension.tools.has(name) || extension.commands.has(name));
 
 /**
  * The extensions a child's session runs. An installed pi-delegate would add the root parent's
  * `delegate`, `delegate_ctl` and `todo`, so it is left out: the child's own nested instance is its only
- * one. Mom is the root parent's alone: any extension that brings her (an installed pi-delegate, or
+ * one. Path is the root parent's alone: any extension that brings it (an installed pi-delegate, or
  * pi-tether) is left out too, so a child never follows, maps or advises on its own session. Every
  * other extension keeps only the tools the child may have.
  */
@@ -442,209 +152,15 @@ function childTrust(cwd: string, ctx: ExtensionContext, depth: number, session: 
 	return resolveChildTrust({ cwd, parentTrusted: ctx.isProjectTrusted(), agentDir: AGENT_DIR, select, session, signal });
 }
 
-type Notice = { customType: "delegate"; content: string; display: boolean; details: unknown };
-/** The user turn that stands in for removed delegation turns between two assistant messages in a fork. */
-export const FORK_BRIDGE = "Continue.";
-/** Shown on a run whose record predates trust recording. */
-export const TRUST_UNKNOWN = "project trust unknown for this record; treated as untrusted";
-/** The prompt that revives a delegating child after it reported, when one of its own children settles. */
-export const CHILD_SETTLED_PROMPT = "A child you delegated has settled; its report is above. Continue your assignment from there, then end with your own final report.";
-
-/**
- * Wake an owner with a completion. The root parent gets a follow-up that starts its turn. A
- * delegating child gets it through wakeChild, so it never starts a turn that its run does not track.
- */
-function deliver(owner: Owner, message: Notice, retry: () => void) {
-	if (!owner.binding || owner.closed) return;
-	if (owner.parentRun) { wakeChild(owner.parentRun, message, retry); return; }
-	// A run the person started with /delegate reports to them: shown, and in context for the next turn,
-	// without spending a model turn on it.
-	if ((message.details as any)?.userStarted) { owner.binding.pi.sendMessage(message, { triggerTurn: false }); return; }
-	// A steer reaches the parent at once: an idle one starts a turn, and a busy one reads it at its next
-	// model request, inside the run it is in. A follow-up would wait for that run to end, however long it runs.
-	inFlight(owner).set(noticeKey(message), message);
-	owner.binding.pi.sendMessage(message, { deliverAs: "steer", triggerTurn: true });
-}
-
-/** A notice's identity: its run and segment (an ACP run's turn count stands in for a segment). */
-const noticeKey = (message: Notice) => { const d = message.details as any; return `${d?.id}:${d?.segment ?? d?.turns?.length ?? ""}`; };
-/**
- * Completion notices sent to the root parent and not yet in its conversation. Pi drops queued extension
- * messages when the person aborts the run (it clears its queues), so whatever is still here when the
- * run settles is sent again: see redeliver.
- */
-const inFlightNotices = new WeakMap<Owner, Map<string, Notice>>();
-function inFlight(owner: Owner): Map<string, Notice> {
-	let map = inFlightNotices.get(owner);
-	if (!map) inFlightNotices.set(owner, map = new Map());
-	return map;
-}
-/**
- * The parent's run settled with notices that never reached its conversation. After an abort they are
- * appended without a turn, shown and in context for the next prompt, as the person stopped the run;
- * otherwise they start the turn they were sent to start.
- */
-function redeliver(owner: Owner, aborted: boolean) {
-	if (!inFlight(owner).size) return;
-	// The conversation is the record: a notice it holds was delivered, whichever way it got there (a
-	// directly appended message raises no extension event).
-	const recorded = new Set((owner.binding?.ctx.sessionManager.getEntries() ?? [])
-		.filter((entry: any) => entry.type === "custom_message" && entry.customType === "delegate")
-		.map((entry: any) => noticeKey({ details: entry.details } as Notice)));
-	const lost = [...inFlight(owner).values()].filter((message) => !recorded.has(noticeKey(message)));
-	inFlight(owner).clear();
-	if (!lost.length || !owner.binding || owner.closed) return;
-	const { pi } = owner.binding;
-	for (const message of lost) {
-		if (!aborted) inFlight(owner).set(noticeKey(message), message);
-		pi.sendMessage(message, aborted ? { triggerTurn: false } : { deliverAs: "steer", triggerTurn: true });
-	}
-}
-
-const takesFollowUp = (run: Run) => run.status === "running" && !run.completion.settled && Boolean(run.session?.isStreaming);
-/**
- * A completion for one of a delegating child's own children. Mid-turn, the child gets a follow-up,
- * as a root parent does. Opening or between turns, delivery waits until it streams or settles.
- * After it reported, the completion is kept in its transcript and the child is revived to act on
- * it, as an unjoined completion wakes a root parent. Its settled segment reports first.
- */
-function wakeChild(run: Run, message: Notice, retry: () => void) {
-	const session = run.session;
-	if (!session || run.foreign) return; // Its session is gone; its children's owner closed with it.
-	if (takesFollowUp(run)) { void session.sendCustomMessage(message, { deliverAs: "followUp", triggerTurn: true }); return; }
-	if (!run.completion.settled) {
-		const listener = () => {
-			if (!run.completion.settled && !takesFollowUp(run)) return;
-			listeners.delete(listener);
-			retry();
-		};
-		listeners.add(listener);
-		return;
-	}
-	setImmediate(() => {
-		if (!run.completion.settled || run.session !== session) { retry(); return; }
-		void session.sendCustomMessage(message, { triggerTurn: false });
-		// A run stopped, cancelled or timed out is not revived with a fresh budget by its own children.
-		const blocked = run.stopped ? "it was explicitly stopped" : run.status === "cancelled" ? "it was cancelled"
-			: run.status === "timeout" ? "its last segment ran out of its time budget" : undefined;
-		if (blocked) { lateReport(run, message, blocked); return; }
-		const resume = state.owners.get(run.ownerKey)?.resume;
-		if (!resume) { lateReport(run, message, "its parent's delegate runtime is not attached"); return; }
-		resume(run, CHILD_SETTLED_PROMPT).catch((error) => lateReport(run, message, error instanceof Error ? error.message : String(error)));
-	});
-}
-
-/**
- * A child's report reached a delegating child that was not revived to act on it. The report is in
- * that child's transcript, but nothing would read it there, so its own owner is told which run, which
- * report, and why, with the report. An owner between bindings (a reload) gets it when it attaches.
- */
-function lateReport(run: Run, message: Notice, why: string) {
-	const owner = state.owners.get(run.ownerKey);
-	if (!owner || owner.closed) return;
-	const childRunId = (message.details as any)?.id;
-	const notice: Notice = {
-		customType: "delegate", display: true,
-		content: `delegate late report: ${childRunId ?? "a child"} of ${run.id} settled after ${run.id} reported, and ${run.id} was not revived to act on it: ${why}. Its report is in ${run.id}'s transcript and below. Steer ${run.id} to act on it, or act on it yourself.\n\n${message.content}`,
-		details: { kind: "late-report", runId: run.id, ...(childRunId ? { childRunId } : {}), reason: why },
-	};
-	if (!owner.binding) { (owner.pendingNotices ??= []).push(notice); return; }
-	const send = () => deliver(owner, notice, send);
-	send();
-}
-
-type RunRecord = Omit<Run, "completion" | "session" | "timer" | "streamingMessage" | "activeTools" | "activityCache" | "dirtyBefore" | "ready" | "preparing" | "acknowledged" | "foreign" | "offered" | "closeOnSettle"> & { version: 1; savedAt: number };
-function saveRun(run: Run): void {
-	if (run.foreign) throw foreignError(run);
-	const { completion, session, timer, streamingMessage, activeTools, activityCache, dirtyBefore, ready, preparing, acknowledged, foreign, offered, closeOnSettle, ...record } = run;
-	writeRecord(run.recordPath, { ...record, version: 1, savedAt: Date.now() });
-}
-function messagesOf(run: Run): any[] {
-	if (!run.sessionFile) return [];
-	const manager = run.session?.sessionManager ?? openTranscript(run);
-	return manager.getEntries().filter((e: any) => e.type === "message").map((e: any) => e.message);
-}
-function openTranscript(run: Run): SessionManager {
-	if (!run.sessionFile || !existsSync(run.sessionFile)) throw new Error(`${run.id}: saved transcript is missing; refusing to start a replacement.`);
-	const manager = SessionManager.open(run.sessionFile);
-	if (manager.getSessionId() !== run.sessionId) throw new Error(`${run.id}: transcript identity does not match its saved configuration.`);
-	return manager;
-}
-function finalResult(run: Run): RunResult {
-	const details = { ...recordedView(run), settled: true as const, completionReceipt: true as const };
-	// The result is the settlement record, not a snapshot of the waiter that received it.
-	details.joinedWaiters = 0;
-	return { content: [{ type: "text", text: resultText(run) }], details, isError: run.status !== "complete" };
-}
-function restoreRun(path: string, owner: Owner): Run {
-	const record = readRecord<RunRecord>(path);
-	if (!record || record.version !== 1 || record.ownerKey !== owner.key || typeof record.id !== "string" ||
-		typeof record.systemPrompt !== "string" || !Array.isArray(record.contextFiles) || !Array.isArray(record.appendSystemPrompt) || !Array.isArray(record.tools) || typeof record.sessionId !== "string" ||
-		!Number.isInteger(record.segment) || typeof record.cwd !== "string" || !Array.isArray(record.toolCalls)) {
-		throw new Error(`Cannot restore delegate metadata: ${path}`);
-	}
-	// Parent message_end hooks run before Pi appends the message. Only its transcript
-	// can establish durable delivery after a crash; never trust a saved in-memory acknowledgement.
-	const run: Run = { ...record, recordPath: path, acknowledged: false, completion: new RunCompletion(), activeTools: new Map() };
-	// Older records used the lifetime start as the implicit segment start. Keep them readable;
-	// a subsequent resume below always establishes a fresh segment start.
-	run.segmentStartedAt ??= run.startedAt;
-	run.segmentStartIdx ??= run.startIdx;
-	run.segmentFailedAttempts ??= 0;
-	run.segmentFailedAttemptsBase ??= Math.max(0, run.failedAttempts - run.segmentFailedAttempts);
-	run.providerRetryMs ??= 0;
-	run.depth ??= 1; // Records from before nesting are children of a root parent.
-	// 0.2.0 kept a role's MCP opt-in apart from its tools: as tool patterns, every server's tools or the named servers'.
-	const legacyMcp = (record as { mcp?: true | string[] }).mcp;
-	if (legacyMcp) {
-		run.tools = [...run.tools, ...(legacyMcp === true ? ["mcp__*"] : legacyMcp.flatMap((server) => [...new Set([`mcp__${server}__*`, `mcp__${server.replace(/-/g, "_")}__*`])]))];
-		delete (run as { mcp?: unknown }).mcp;
-	}
-	// Records from before trust was recorded: nothing of the project is read, and the run says why.
-	if (typeof run.projectTrusted !== "boolean") { run.projectTrusted = false; run.projectTrustUnknown = true; }
-	run.projectTrustSource ??= "unknown";
-	if (ownedElsewhere(record)) {
-		// Its live owner is still running or delivering it: show a snapshot, never write or re-deliver it.
-		run.foreign = true;
-		run.completion.settle(finalResult(run));
-		return run;
-	}
-	// Unowned, ours from before a reload, or its owner died: this process adopts it.
-	Object.assign(run, processOwner());
-	if (run.status === "running") {
-		run.status = "interrupted";
-		run.endedAt = record.savedAt;
-		run.error = run.runtime === "oven"
-			? `The previous process ended before this execution settled. Its oven slice ${run.sliceId ?? "(not created yet)"} keeps running in oven; steer to rejoin it.`
-			: "The previous process ended before this execution settled. Inspect its saved work; send a message to continue.";
-	}
-	try { harvest(run); }
-	catch (error) { run.status = "error"; run.error = String(error); }
-	saveRun(run);
-	run.completion.settle(finalResult(run));
-	return run;
-}
-
-function parseModelSpec(spec: string): { provider?: string; id: string; thinking?: string } {
-	let thinking: string | undefined;
-	let rest = spec;
-	const colon = rest.lastIndexOf(":");
-	if (colon > 0 && !rest.slice(colon + 1).includes("/")) {
-		thinking = rest.slice(colon + 1);
-		rest = rest.slice(0, colon);
-	}
-	const slash = rest.indexOf("/");
-	return slash > 0 ? { provider: rest.slice(0, slash), id: rest.slice(slash + 1), thinking } : { id: rest, thinking };
-}
+const sortedRoles = (ctx: ExtensionContext) => [...loadRoles(ctx.cwd, ctx.isProjectTrusted(), AGENT_DIR).values()].sort((a, b) => a.name.localeCompare(b.name));
 
 function resolveModel(spec: string | undefined, ctx: ExtensionContext) {
 	if (!spec) return { model: ctx.model, thinking: undefined as string | undefined };
 	const p = parseModelSpec(spec);
-	const reg: any = ctx.modelRegistry;
 	// A named provider is a choice between offerings of the same weights, not a search key:
 	// resolving it to another provider would silently change cost, limits, and serving.
 	// A bare id is any provider's offering of it: prefer one the session has credentials for.
-	const model = p.provider ? reg.find(p.provider, p.id) : (reg.getAvailable?.() ?? []).find((m: any) => m.id === p.id) ?? reg.getAll().find((m: any) => m.id === p.id);
+	const model = p.provider ? findModel(ctx, p.provider, p.id) : availableModels(ctx).find((m) => matchesSpec(m, p)) ?? allModels(ctx).find((m) => matchesSpec(m, p));
 	if (!model) throw new Error(`model not found: ${spec}`);
 	return { model, thinking: p.thinking };
 }
@@ -659,49 +175,13 @@ function resolveModel(spec: string | undefined, ctx: ExtensionContext) {
 function resolveRoleModels(models: readonly string[] | undefined, ctx: ExtensionContext): { model: any; thinking?: string; pick?: string } {
 	if (!models?.length) return { model: ctx.model };
 	if (models.length === 1) return resolveModel(models[0], ctx);
-	const reg: any = ctx.modelRegistry;
-	const scoped = ((ctx as ExtensionContext & { scopedModels?: readonly { model: any }[] }).scopedModels ?? []).map((s) => s.model);
-	const picked = pickModel(models, reg.getAvailable?.() ?? [], scoped, readDelegateSettings(SETTINGS_PATH).modelPicking);
-	if (!picked.model) throw new Error(`none of the role's models can be used: ${picked.skipped.join("; ")}`);
+	const picked = pickModel(models, availableModels(ctx), scopedModels(ctx), readDelegateSettings(SETTINGS_PATH).modelPicking);
+	if (!("entry" in picked)) throw new Error(`none of the role's models can be used: ${picked.skipped.join("; ")}`);
 	const pick = picked.skipped.length ? `${picked.entry} (role list; skipped ${picked.skipped.join("; ")})` : `${picked.entry} (first of the role list)`;
 	return { model: picked.model, thinking: picked.thinking, pick };
 }
 
-/** Dirty paths (tracked+untracked) → mtime, or undefined when cwd is not a git work tree. */
-function snapshotDirty(cwd: string): Map<string, number> | undefined {
-	let out: string;
-	try {
-		out = execFileSync("git", ["status", "--porcelain", "-uall", "-z"], { cwd, encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "ignore"] });
-	} catch {
-		return undefined;
-	}
-	const m = new Map<string, number>();
-	for (const rec of out.split("\0")) {
-		if (rec.length < 4) continue;
-		const p = rec.slice(3);
-		let mtime = 0;
-		try {
-			mtime = statSync(join(cwd, p)).mtimeMs;
-		} catch {
-			/* deleted */
-		}
-		m.set(p, mtime);
-	}
-	return m;
-}
-
-function dirtyDelta(before: Map<string, number> | undefined, cwd: string): string[] | undefined {
-	if (!before) return undefined;
-	const after = snapshotDirty(cwd);
-	if (!after) return undefined;
-	const changed: string[] = [];
-	for (const [p, mt] of after) if (!before.has(p) || before.get(p) !== mt) changed.push(p);
-	for (const p of before.keys()) if (!after.has(p)) changed.push(p);
-	return changed;
-}
-
-const userText = (message: any) => typeof message.content === "string" ? message.content
-	: Array.isArray(message.content) ? message.content.filter((b: any) => b?.type === "text").map((b: any) => b.text).join("") : undefined;
+const userText = (message: any) => typeof message.content === "string" || Array.isArray(message.content) ? textOf(message.content, "") : undefined;
 /**
  * A delegation call, direct or from a codemode script. A script calls a tool as `tools.<name>(` or
  * `tools["<name>"]`, so those shapes mark it as delegating; a script that only mentions the word, such
@@ -781,55 +261,6 @@ function trimDangling(messages: any[]): any[] {
 	return out;
 }
 
-function harvest(run: Run) {
-	// An oven run has no transcript here: its output and turns come from oven (launchOven).
-	if (run.runtime === "oven") return;
-	const msgs = messagesOf(run);
-	let turns = 0;
-	const tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-	let cost = 0;
-	const changed = new Set<string>(dirtyDelta(run.dirtyBefore, run.cwd) ?? []);
-	const gitBacked = run.dirtyBefore !== undefined;
-	let output = "";
-	let failedAttempts = 0;
-	let lastAttemptError: string | undefined;
-	for (let i = run.startIdx; i < msgs.length; i++) {
-		const m = msgs[i];
-		if (m?.role !== "assistant") continue;
-		// A failed request and its retries are attempts, not turns of work. Counting them as turns
-		// made a provider stalling twice for five minutes look like a slow model thinking hard.
-		if (m.stopReason === "error") { failedAttempts += 1; lastAttemptError = m.errorMessage || "unknown provider error"; }
-		else if (m.stopReason !== "aborted") turns += 1;
-		const u = m.usage;
-		if (u) {
-			tokens.input += u.input ?? 0;
-			tokens.output += u.output ?? 0;
-			tokens.cacheRead += u.cacheRead ?? 0;
-			tokens.cacheWrite += u.cacheWrite ?? 0;
-			cost += u.cost?.total ?? 0;
-		}
-		let text = "";
-		for (const b of m.content ?? []) {
-			if (b?.type === "text") text += b.text;
-			if (!gitBacked && b?.type === "toolCall" && (b.name === "edit" || b.name === "write")) {
-				const p = b.arguments?.path ?? b.arguments?.file_path;
-				if (typeof p === "string") changed.add(p);
-			}
-		}
-		// A resumed segment may fail before producing text. Do not re-report the last
-		// completed segment as if it were the current attempt's report.
-		if (i >= run.segmentStartIdx && text.trim()) output = text;
-	}
-	run.turns = turns;
-	run.failedAttempts = failedAttempts;
-	run.segmentFailedAttempts = Math.max(run.segmentFailedAttempts, Math.max(0, failedAttempts - run.segmentFailedAttemptsBase));
-	run.lastAttemptError = lastAttemptError;
-	run.tokens = tokens;
-	run.cost = cost;
-	run.changedFiles = [...changed].sort();
-	run.output = output.length > OUTPUT_CAP ? `${output.slice(0, OUTPUT_CAP)}\n…[truncated ${output.length - OUTPUT_CAP} chars]` : output;
-}
-
 interface ApprovedModel {
 	spec: string; // provider/id:thinking
 	reason?: string;
@@ -850,10 +281,6 @@ function loadDefaults(): Defaults {
 /** Written by delegate_ctl approve after the user agreed in conversation, or by the user's editor. Snapshot is the full catalog. */
 async function saveDefault(role: string, entry: ApprovedModel, available: any[]) {
 	await writeSettings({ defaults: { approved: { [role]: entry }, catalogAtApproval: available.map(modelKey).sort() } }, SETTINGS_PATH);
-}
-
-function modelKey(m: any): string {
-	return `${m.provider}/${m.id}`;
 }
 
 interface Rating {
@@ -885,16 +312,24 @@ interface LiveOR {
 }
 let liveOR: LiveOR | undefined;
 
+/**
+ * One OpenRouter read. The request itself is aborted at the timeout (a race that only stops waiting, as withTimeout
+ * does, would leave the fetch running).
+ */
+async function openRouterJson(url: string): Promise<any> {
+	const res = await fetch(url, { signal: AbortSignal.timeout(OPENROUTER_TIMEOUT_MS) });
+	if (!res.ok) throw new Error(`HTTP ${res.status}`);
+	return res.json();
+}
+
 async function fetchOpenRouter(force = false): Promise<LiveOR> {
 	if (!force && liveOR && !liveOR.error && Date.now() - liveOR.at < OPENROUTER_TTL_MS) return liveOR;
 	try {
-		const res = await fetch(OPENROUTER_MODELS_URL, { signal: AbortSignal.timeout(OPENROUTER_TIMEOUT_MS) });
-		if (!res.ok) throw new Error(`HTTP ${res.status}`);
-		const data = (await res.json())?.data;
+		const data = (await openRouterJson(OPENROUTER_MODELS_URL))?.data;
 		if (!Array.isArray(data)) throw new Error("unexpected payload");
 		liveOR = { at: Date.now(), byId: new Map(data.map((m: any) => [m.id, m])) };
 	} catch (e: any) {
-		liveOR = { at: Date.now(), byId: liveOR?.byId ?? new Map(), error: String(e?.message ?? e) };
+		liveOR = { at: Date.now(), byId: liveOR?.byId ?? new Map(), error: errorMessage(e) };
 	}
 	return liveOR;
 }
@@ -971,13 +406,11 @@ async function fetchEndpoints(id: string, force = false): Promise<LiveEndpoints>
 	if (!force && c && !c.error && Date.now() - c.at < OPENROUTER_TTL_MS) return c;
 	let r: LiveEndpoints;
 	try {
-		const res = await fetch(`https://openrouter.ai/api/v1/models/${id}/endpoints`, { signal: AbortSignal.timeout(OPENROUTER_TIMEOUT_MS) });
-		if (!res.ok) throw new Error(`HTTP ${res.status}`);
-		const eps = (await res.json())?.data?.endpoints;
+		const eps = (await openRouterJson(`https://openrouter.ai/api/v1/models/${id}/endpoints`))?.data?.endpoints;
 		if (!Array.isArray(eps)) throw new Error("unexpected payload");
 		r = { at: Date.now(), endpoints: eps };
 	} catch (e: any) {
-		r = { at: Date.now(), endpoints: c?.endpoints ?? [], error: String(e?.message ?? e) };
+		r = { at: Date.now(), endpoints: c?.endpoints ?? [], error: errorMessage(e) };
 	}
 	liveEP.set(id, r);
 	return r;
@@ -997,7 +430,7 @@ async function discoverDeals(ctx: ExtensionContext, filter = "", signal?: AbortS
 		const batch = await Promise.all(catalog.slice(i, i + 8).map((m) => fetchEndpoints(m.id, force)));
 		batch.forEach((result, j) => endpoints.set(catalog[i + j].id, result));
 	}
-	const configured = new Set<string>((ctx.modelRegistry as any).getAvailable().filter((m: any) => m.provider === "openrouter").map((m: any) => m.id));
+	const configured = new Set<string>(availableModels(ctx).filter((m) => m.provider === "openrouter").map((m: any) => m.id));
 	return selectDeals(catalog, endpoints, configured, new Date(), term ? universe : catalog);
 }
 
@@ -1091,17 +524,17 @@ function liveStr(f: LiveFacts | undefined): string {
 
 function liveSummary(live: LiveOR | undefined): string {
 	if (!live) return "not fetched";
-	const age = Math.round((Date.now() - live.at) / 1000);
+	const age = formatDuration(Date.now() - live.at);
 	const aaCount = [...live.byId.values()].filter((l) => l.benchmarks?.artificial_analysis).length;
-	if (live.error) return `fetch failed (${live.error})${live.byId.size ? `, data from ${age}s ago` : ""}`;
-	return `${live.byId.size} live, ${aaCount} with AA, fetched ${age}s ago (${new Date().toISOString().slice(11, 16)}Z)`;
+	if (live.error) return `fetch failed (${live.error})${live.byId.size ? `, data from ${age} ago` : ""}`;
+	return `${live.byId.size} live, ${aaCount} with AA, fetched ${age} ago (${new Date().toISOString().slice(11, 16)}Z)`;
 }
 
 function ratingStr(r: Ratings, name: string): string {
 	const e = r.entries[name];
 	if (!e) return "";
-	const note = e.note ? ` ${e.note.length > 60 ? `${e.note.slice(0, 60)}\u2026` : e.note}` : "";
-	return `  rated ${e.score} (${e.source.length > 40 ? `${e.source.slice(0, 40)}\u2026` : e.source})${note}`;
+	const note = e.note ? ` ${clipText(e.note, 61)}` : "";
+	return `  rated ${e.score} (${clipText(e.source, 41)})${note}`;
 }
 
 function ratingsSummary(r: Ratings): string {
@@ -1115,20 +548,16 @@ function costStr(m: any): string {
 	return m?.cost ? `$${m.cost.input ?? 0}/${m.cost.output ?? 0}/M` : "$?";
 }
 
-function ageDays(ts: number): number {
-	return Math.floor((Date.now() - ts) / 86_400_000);
-}
-
 /** Approved defaults + drift against the live catalog. */
 function defaultsFacts(ctx: ExtensionContext): ModelsDetails["defaults"] {
 	const d = loadDefaults();
-	const reg: any = ctx.modelRegistry;
-	const avail: any[] = reg.getAvailable();
+	const avail = availableModels(ctx);
 	const byKey = new Map(avail.map((m) => [modelKey(m), m]));
 	const approved: ModelsDetails["defaults"]["approved"] = [];
 	const drift: string[] = [];
 	for (const [role, a] of Object.entries(d.approved)) {
-		const base = a.spec.split(":")[0];
+		const { provider, id } = parseModelSpec(a.spec);
+		const base = provider ? modelKey({ provider, id }) : id;
 		const m = byKey.get(base);
 		approved.push({ role, spec: a.spec, ageDays: ageDays(a.approvedAt), reason: a.reason });
 		if (!m) drift.push(`${role}: ${base} is no longer available`);
@@ -1161,299 +590,6 @@ function defaultsReport({ approved, drift }: ModelsDetails["defaults"]): string 
 	let out = `DEFAULTS (approved by user)\n${approved.map((a) => `  ${a.role}: ${a.spec}  approved ${a.ageDays}d ago${a.reason ? ` \u2014 ${a.reason}` : ""}`).join("\n")}`;
 	if (drift.length) out += `\nDRIFT:\n  ${drift.join("\n  ")}`;
 	return out;
-}
-
-function fmtTokens(n: number): string {
-	return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
-}
-
-const MAX_TOOL_CALLS = 200;
-
-function view(run: Run): RunView {
-	const taskDurationMs = (run.status === "running" ? Date.now() : (run.endedAt ?? Date.now())) - run.segmentStartedAt;
-	return {
-		id: run.id,
-		segment: run.segment,
-		stopped: run.stopped,
-		settled: run.completion.settled,
-		role: run.role,
-		model: run.model,
-		cwd: run.cwd,
-		thinking: run.thinking,
-		context: run.context,
-		forkedMessages: run.forkedMessages,
-		contextWindow: run.contextWindow,
-		status: run.status,
-		task: run.task,
-		output: run.output,
-		turns: run.turns,
-		tokens: run.tokens,
-		cost: run.cost,
-		// The UI and tool details describe the current task, not the persistent run lifetime.
-		// `segmentDurationMs` remains as a compatibility alias for consumers of older details.
-		durationMs: taskDurationMs,
-		segmentDurationMs: taskDurationMs,
-		changedFiles: run.changedFiles,
-		droppedTools: run.droppedTools,
-		failedAttempts: run.failedAttempts,
-		lastAttemptError: run.lastAttemptError,
-		providerRetryMs: run.providerRetryMs,
-		...(run.providerRetry ? { providerRetry: run.providerRetry } : {}),
-		toolCalls: run.toolCalls,
-		activeTool: run.activeTools.values().next().value,
-		joinedWaiters: run.completion.waiting,
-		revision: run.revision,
-		lastTool: run.lastTool,
-		error: run.error,
-		sessionFile: run.sessionFile,
-		depth: run.depth,
-		...(run.parentRunId ? { parentRunId: run.parentRunId } : {}),
-		...(run.endedAt ? { endedAt: run.endedAt } : {}),
-		...(run.userStarted ? { userStarted: true as const } : {}),
-	};
-}
-
-// The SDK retains result objects in its session tree. Published facts must not
-// share mutable arrays/objects with a child that is still running or later resumed.
-function recordedView(run: Run): RunView {
-	return structuredClone(view(run));
-}
-
-function summary(run: Run): string {
-	const dur = ((run.status === "running" ? Date.now() : (run.endedAt ?? Date.now())) - run.segmentStartedAt) / 1000;
-	const parts = [
-		`${run.status} · ${run.id}`,
-		`role ${run.role}`,
-		`model ${run.model}${run.thinking ? `:${run.thinking}` : ""}`,
-		run.context === "fork" ? `context forked from ${run.forkedMessages ?? 0} parent messages` : "context fresh",
-		`${run.turns} turn${run.turns === 1 ? "" : "s"} · ${dur.toFixed(0)}s current task`,
-		`tokens in ${fmtTokens(run.tokens.input)}, out ${fmtTokens(run.tokens.output)}` +
-			(run.tokens.cacheRead ? `, cached ${fmtTokens(run.tokens.cacheRead)}` : ""),
-		run.cost ? `$${run.cost.toFixed(4)}` : "",
-	].filter(Boolean);
-	let s = parts.join(" · ");
-	if (run.providerRetry) {
-		const elapsed = Math.max(0, Date.now() - run.providerRetry.startedAt);
-		s += `\nprovider retrying · retry ${run.providerRetry.attempt}/${run.providerRetry.maxAttempts} · backoff ${run.providerRetry.delayMs}ms · ${Math.round(elapsed / 1000)}s elapsed (last: ${run.providerRetry.errorMessage})`;
-	}
-	if (run.providerRetryMs) s += `\nprovider retry wall ${Math.round(run.providerRetryMs / 1000)}s; separate from task and tool time.`;
-	if (run.failedAttempts) s += `\n${run.failedAttempts} provider attempt${run.failedAttempts === 1 ? "" : "s"} failed and were retried before this (last: ${run.lastAttemptError}) — that wall clock and any tokens are included above.`;
-	if (run.modelPick) s += `\nmodel picked: ${run.modelPick}`;
-	if (run.sessionFile) s += `\nsession: ${run.sessionFile}`;
-	s += `\nproject ${run.projectTrusted ? "trusted" : "untrusted"} (trust source: ${run.projectTrustSource})`;
-	if (run.projectTrustUnknown) s += `\n${TRUST_UNKNOWN}`;
-	if (run.parentRunId) s += `\nstarted by ${run.parentRunId} · depth ${run.depth} of ${maxDepth()}`;
-	if (run.extensionErrors?.length) s += `\nextensions that failed in the child (it ran without them):\n  ${run.extensionErrors.join("\n  ")}`;
-	if (run.droppedTools.length) s += `\ntools the child could not have (a child gets the tools its parent's extensions and MCP tools provide, limited to its role's tools; no delegate or delegate_ctl at the depth limit, ${maxDepth()}; no todo): ${run.droppedTools.join(", ")}`;
-	if (run.changedFiles.length) s += `\nchanged: ${run.changedFiles.join(", ")}`;
-	if (run.error) s += `\nerror: ${run.error}`;
-	return s;
-}
-
-/** The child's words are quoted, never blended into this tool's own reporting. */
-function resultText(run: Run): string {
-	const report = run.output || `(no final report was produced in segment ${run.segment}; an earlier segment's report is not repeated)`;
-	return `${summary(run)}\n\n----- ${run.id} reported for segment ${run.segment}, verbatim -----\n${report}\n----- end of report -----`;
-}
-
-function log(run: Run) {
-	try {
-		mkdirSync(dirname(LOG_FILE), { recursive: true });
-		const { session: _s, timer: _t, activityCache: _a, streamingMessage: _m, activeTools: _tools, completion: _completion, ready: _ready, systemPrompt: _prompt, contextFiles: _context, appendSystemPrompt: _append, offered: _offered, closeOnSettle: _close, ...rest } = run;
-		appendFileSync(LOG_FILE, `${JSON.stringify({ ...rest, output: run.output.slice(0, 2000), ts: Date.now() })}\n`);
-	} catch {
-		/* logging must never fail the run */
-	}
-}
-
-function retire(keep: Run) {
-	// A delegating child's children report into its session. It is retired only once they are all
-	// settled and delivered; its children's owner closes first, and a revival restores them from records.
-	const idle = (r: Run) => { const nested = childOwner(r); return !nested || (!nested.busy?.() && !nested.queued.size && !nested.pendingNotices?.length); };
-	const finished = [...runs.values()].filter((r) => r.ownerKey === keep.ownerKey && r !== keep && r.session && r.completion.settled && idle(r));
-	finished.sort((a, b) => (a.endedAt ?? 0) - (b.endedAt ?? 0));
-	while (finished.length > MAX_RETAINED_SESSIONS - 1) {
-		const r = finished.shift()!;
-		if (childOwner(r)) void closeChildOwner(r).finally(() => dropSession(r));
-		else dropSession(r);
-	}
-}
-
-function finish(run: Run, status: Status, error?: string) {
-	if (run.completion.settled) return;
-	if (run.timer) clearTimeout(run.timer);
-	if (run.providerRetry) {
-		run.providerRetryMs += Math.max(0, Date.now() - run.providerRetry.startedAt);
-		run.providerRetry = undefined;
-	}
-	run.timer = undefined;
-	run.endedAt = Date.now();
-	run.status = status;
-	if (error) run.error = error;
-	try { if (run.session) harvest(run); }
-	catch (e) { run.status = "error"; run.error = `Cannot read child transcript: ${String(e)}`; }
-	if (run.status === "timeout" && !run.error) {
-		run.error = `Stopped after its ${Math.round(run.timeoutMs / 60000)} min budget (timeoutMs, default ${DEFAULT_TIMEOUT_MS / 60000} min). Its work up to that point stands and is not rolled back.`
-			+ (run.segmentFailedAttempts
-				? ` Most of this segment's budget went to ${run.segmentFailedAttempts} failed provider attempt${run.segmentFailedAttempts === 1 ? "" : "s"} and retries (last: ${run.lastAttemptError}), not to the work \u2014 investigate that provider or choose another offering before granting more time.`
-				: ` Give it a larger timeoutMs only if the work genuinely needs longer.`);
-	}
-	run.activeTools.clear();
-	run.streamingMessage = undefined;
-	// What the role listed that its session never offered. MCP tools register as their servers connect, so this waits for the settle.
-	if (run.offered) run.droppedTools = droppedTools(run.tools, run.offered, run.withheld);
-	run.revision++;
-	try { saveRun(run); }
-	catch (e) { run.status = "error"; run.error = `Could not persist completion: ${String(e)}`; }
-	log(run);
-	retire(run);
-	if (run.closeOnSettle) { run.closeOnSettle = false; dropSession(run); }
-	run.completion.settle(finalResult(run));
-	milestone(run, { kind: "settled", status: run.status, changedFiles: run.changedFiles.slice(0, 20) });
-	changed();
-}
-
-async function cancelRun(run: Run) {
-	if (run.foreign) throw foreignError(run);
-	run.stopped = true;
-	if (run.status === "running") run.status = "cancelled";
-	try { saveRun(run); }
-	// The subtree is marked stopped before the abort can settle this run, so nothing below revives it.
-	finally { changed(); await Promise.all([stopTree(run), run.session?.abort(), haltSlice(run)]); }
-}
-
-/** End an oven run's slice's work (oven_halt); its conversation and copy stay in oven. */
-async function haltSlice(run: Run) {
-	ovenWatches.get(run.id)?.abort();
-	if (run.runtime === "oven" && run.sliceId) await ovenCall("halt", { slice: run.sliceId }).catch(() => {});
-}
-
-/** The watch call each oven run is following, so a cancel ends it. */
-const ovenWatches = new Map<string, AbortController>();
-
-/**
- * Follow an oven run's slice until it settles: oven_watch, whose result is the settled event the moment the
- * slice is done. When the call drops (oven restarted, network), it is made again after a short pause, for as
- * long as the run is running; a cancel or the run's timeout (armTimeout) ends it.
- */
-async function settleOven(run: Run): Promise<SliceView> {
-	for (let attempt = 0; ; attempt++) {
-		const abort = new AbortController();
-		ovenWatches.set(run.id, abort);
-		try {
-			const settled = await ovenCall<Settled>("watch", { slice: run.sliceId! }, { signal: abort.signal });
-			return { ...settled.slice, output: settled.output };
-		} catch (error) {
-			if (run.status !== "running") throw error;
-			await new Promise((resolve) => setTimeout(resolve, Math.min(1000 * (attempt + 1), 5000)));
-		} finally { ovenWatches.delete(run.id); }
-	}
-}
-
-const failure = (slice: SliceView) => `oven slice ${slice.id} ${slice.state}${slice.reason ? ` (${slice.reason})` : ""}${slice.detail ? `: ${slice.detail}` : ""}`;
-
-/**
- * One segment of an oven run: the first creates the slice from the run's role configuration in a copy of its
- * cwd, a later one sends the message to it, each with a requestId stable for the run and segment so a retry
- * never starts a second slice or turn. Then it follows the slice until it settles and settles the run like
- * an in-process child's.
- */
-async function launchOven(run: Run, task: string) {
-	try {
-		milestone(run, { kind: "started", task: task.slice(0, 600) });
-		run.segmentStartedAt = Date.now();
-		armTimeout(run);
-		if (!run.sliceId) {
-			const config = { name: run.role, instructions: run.systemPrompt, model: run.model, ...(run.thinking ? { thinking: run.thinking } : {}),
-				...(run.extensions?.length ? { extensions: run.extensions } : {}), ...(run.tools.includes("*") ? {} : { tools: run.tools }) };
-			const created = await ovenCall<SliceView>("create", { config, task, cwd: run.cwd, requestId: `pi-delegate:${run.id}` });
-			run.sliceId = created.id;
-			saveRun(run);
-			if (created.state === "failed") { finish(run, "error", failure(created)); return; }
-		} else await ovenCall("send", { slice: run.sliceId, text: task, requestId: `pi-delegate:${run.id}:${run.segment}` });
-		const slice = await settleOven(run);
-		if (run.status !== "running") { await haltSlice(run); finish(run, run.status); return; }
-		run.turns = slice.turns;
-		run.output = `${slice.output ?? ""}\n\n(oven slice ${run.sliceId}; its changes are in its copy, ${slice.cwd})`;
-		finish(run, slice.state === "idle" ? "complete" : "error", slice.state === "idle" ? undefined : failure(slice));
-	} catch (e: any) {
-		finish(run, run.status === "running" ? "error" : run.status, run.error ?? (e instanceof OvenUnreachable ? e.message : String(e?.message ?? e)));
-	}
-}
-
-function publish(completion: RunCompletion<RunResult>) {
-	if (completion.claimed) return;
-	const result = completion.result;
-	const run = runs.get(result.details.id);
-	if (!run || run.segment !== result.details.segment || run.acknowledged) return;
-	if (run.foreign) return; // Its owner delivers it.
-	const owner = state.owners.get(run.ownerKey);
-	if (!owner?.binding || owner.closed) return;
-	const key = `${run.id}:${run.segment}`;
-	if (owner.queued.has(key)) return;
-	owner.queued.add(key);
-	try {
-		deliver(owner, { customType: "delegate", content: `delegate finished\n${result.content[0].text}`, display: true, details: result.details },
-			() => { owner.queued.delete(key); publish(completion); });
-	} catch (error) { owner.queued.delete(key); throw error; }
-}
-
-function acknowledge(owner: Owner, details: any) {
-	// A several-run wait delivers each settled pi run it reports, with that run's own receipt.
-	if (details?.kind === "runs" && Array.isArray(details.rows)) { for (const row of details.rows) acknowledge(owner, row); return; }
-	const run = details?.id ? runs.get(details.id) : undefined;
-	if (!run || !details.completionReceipt || run.ownerKey !== owner.key || details.status === "running" || details.segment !== run.segment || run.acknowledged) return;
-	run.acknowledged = true;
-	owner.queued.delete(`${run.id}:${run.segment}`);
-}
-
-async function closeOwner(owner: Owner) {
-	owner.binding = undefined;
-	owner.closed = true;
-	// A delegating child's runs outlive its session in the root's view; a root's take its whole tree along.
-	const closing = ownedRuns(owner);
-	if (owner.parentRun) departed.set(owner.parentRun.id, { pi: closing.filter((run) => !run.foreign), acp: departed.get(owner.parentRun.id)?.acp ?? [] });
-	await Promise.all(ownedRuns(owner).map(async (run) => {
-		if (!run.foreign) {
-			await closeChildOwner(run);
-			if (!run.completion.settled) {
-				if (run.status === "running") run.status = "interrupted";
-				await run.session?.abort();
-				await run.completion.wait();
-			}
-			await closeSession(run.session);
-			// Release ownership so the next process to open this parent adopts it.
-			run.ownerPid = run.ownerHost = run.ownerToken = undefined;
-			try { saveRun(run); } catch { /* the record stays with its last owner; a dead owner is adopted anyway */ }
-		}
-		runs.delete(run.id);
-	}));
-	state.owners.delete(owner.key);
-	// After its children's sessions closed (each kept its runs above): a root's tree goes with it.
-	if (!owner.parentRun) for (const run of closing) forgetDeparted(run.id);
-}
-
-/**
- * The user's limit on runs running at once (`maxConcurrent`), across every parent in this process and
- * both backends, grandchildren included. Over it, a start or revival is refused, never queued: a queued
- * child would make a background launch's "running" untrue, and the caller can wait for one to finish.
- */
-function capacityError(): DelegateError | undefined {
-	const limit = readDelegateSettings(SETTINGS_PATH).maxConcurrent;
-	if (!limit) return undefined;
-	const pi = [...runs.values()].filter((r) => !r.foreign && !r.completion.settled).length;
-	const running = pi + runningAcpRuns();
-	if (running < limit) return undefined;
-	return new DelegateError("CONCURRENCY_LIMIT", `${running} runs are already running, the limit set in /delegate settings is ${limit}. Wait for one to finish (delegate_ctl wait), then start this one; nothing was started.`);
-}
-
-/** Reserve a segment before awaiting setup: concurrent steers cannot create duplicate sessions. */
-function armTimeout(run: Run) {
-	if (run.timer) clearTimeout(run.timer);
-	const spent = Date.now() - run.segmentStartedAt;
-	if (spent >= run.timeoutMs) throw new Error(`${run.id} has already run ${Math.round(spent / 60000)} min of this segment; a ${Math.round(run.timeoutMs / 60000)} min budget is already spent. Pass a larger timeoutMs.`);
-	// The explanation is composed in finish(), after harvesting can say where the budget went.
-	run.timer = setTimeout(() => { run.status = "timeout"; void stopTree(run); void run.session?.abort(); }, run.timeoutMs - spent);
 }
 
 /** A child whose tools allow either delegation tool runs its own pi-delegate. Revival reads that from the run. */
@@ -1527,60 +663,6 @@ function childLoader(run: Run, settingsManager: SettingsManager, reopen: boolean
 			: { agentsFilesOverride: () => ({ agentsFiles: loadProjectContextFiles({ cwd: run.cwd, agentDir: AGENT_DIR }) }) }),
 	});
 }
-const MAX_EXTENSION_ERRORS = 20;
-/** An extension failure in a child, kept on the run once. The child runs on without that extension. */
-function extensionError(run: Run, message: string) {
-	const errors = run.extensionErrors ??= [];
-	if (!errors.includes(message) && errors.length < MAX_EXTENSION_ERRORS) errors.push(message);
-}
-
-type Replacement = { model?: string; thinking?: string; contextWindow?: number; timeoutMs?: number };
-const rebinds = (run: Run, replacement?: Replacement) =>
-	Boolean(replacement) && ((replacement!.model ?? run.model) !== run.model || (replacement!.thinking ?? run.thinking) !== run.thinking);
-
-function beginResume(run: Run, restart: boolean, replacement?: Replacement) {
-	if (!run.completion.settled) throw new Error(`${run.id} is still stopping; wait for completion before resuming.`);
-	if (run.stopped && !restart) throw new Error(`${run.id} was explicitly stopped. Restart only at the user's request (steer with restart: true).`);
-	const full = capacityError();
-	if (full) throw full;
-	if (run.writer) {
-		const clash = [...runs.values()].find((r) => r !== run && !r.completion.settled && r.writer && r.cwd === run.cwd);
-		if (clash) throw new Error(`${clash.id} is already writing in ${run.cwd}; wait before resuming this child.`);
-	}
-	openTranscript(run); // Missing history is an error, never permission to start over.
-	// A retained session stays bound to the offering it was opened with. Changing the record alone
-	// sends the next segment to the old provider, so a new offering reopens from the transcript.
-	const rebind = rebinds(run, replacement);
-	const next: Run = { ...run, ...replacement, segment: run.segment + 1, stopped: false, acknowledged: false,
-		// A new segment must not publish the prior segment's report while it is still running.
-		output: "",
-		status: "running", endedAt: undefined, error: undefined, revision: run.revision + 1,
-		// A resume starts a fresh budget and report scope; persist both with the segment.
-		segmentStartIdx: messagesOf(run).length,
-		segmentFailedAttemptsBase: run.failedAttempts,
-		segmentFailedAttempts: 0,
-		segmentStartedAt: Date.now(),
-		session: rebind ? undefined : run.session,
-		completion: new RunCompletion<RunResult>() };
-	saveRun(next);
-	// A stale session must not block its replacement.
-	if (rebind) void closeSession(run.session);
-	Object.assign(run, next);
-	changed();
-}
-
-/** Actual conversation after the inherited prefix, including streamed text and tool results. */
-function activityOf(run: Run): ChildActivity {
-	if (run.activityCache?.revision === run.revision) return run.activityCache.items;
-	let messages: any[];
-	try { messages = messagesOf(run).slice(run.startIdx).filter((m) => m.role === "user" || m.role === "assistant" || m.role === "toolResult"); }
-	catch (error) { return { messages: [], activeTools: run.activeTools, error: String(error) }; }
-	const items = { messages, activeTools: run.activeTools,
-		streaming: run.streamingMessage && !messages.includes(run.streamingMessage) ? run.streamingMessage : undefined };
-	run.activityCache = { revision: run.revision, items };
-	return items;
-}
-
 export default function (pi: ExtensionAPI) { installDelegate(pi); installMom(pi); }
 
 /**
@@ -1595,9 +677,6 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 	// ACP Pi workers (pi-acp) are full Pi processes that load installed extensions. They must not
 	// receive `delegate`, or a worker could start its own orchestration and recurse.
 	if (process.env.PI_STRINGS_WORKER === "1" || process.env.PI_STRINGS_OPENED === "1") return;
-	// Reload refreshes configuration for future session opens. Live children retain the
-	// runtime they already own; replacing a binding must not mutate their provider state.
-	let modelRuntime: Promise<ModelRuntime> | undefined;
 	// Trust answers given "for this session only" and dismissals, and one trust question at a time: a
 	// second child bound for the same folder waits for the first answer instead of asking again. An
 	// aborted delegate call closes its question, which releases the queue.
@@ -1625,28 +704,6 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		trustQueue = decided.catch(() => undefined);
 		return decided;
 	};
-	const getRuntime = () => modelRuntime ??= ModelRuntime.create();
-	// Account and provider extensions register offerings in the parent's live catalog rather
-	// than models.json, and they register them whenever they please \u2014 at startup, on reload, or
-	// when the user switches accounts. Mirror that catalog into this runtime at every child
-	// session open, so a child is limited by the parent's providers, not by launch order.
-	const mirrored = new Set<string>();
-	function mirrorProviders(runtime: ModelRuntime) {
-		const registry: any = requireOwner().binding!.ctx.modelRegistry;
-		const present = new Set<string>(registry.getRegisteredProviderIds());
-		for (const id of present) {
-			const native = registry.getRegisteredNativeProvider(id);
-			if (native) runtime.registerNativeProvider(native);
-			const config = registry.getRegisteredProviderConfig(id);
-			if (config) runtime.registerProvider(id, config);
-			mirrored.add(id);
-		}
-		for (const id of mirrored) {
-			if (present.has(id)) continue;
-			runtime.unregisterProvider(id); // The parent dropped it; a child must not keep serving it.
-			mirrored.delete(id);
-		}
-	}
 	let owner: Owner | undefined;
 	let attachError: string | undefined;
 	// The acp backend (acp-backend.ts) over the process's one Coordinator. Its runs belong to a
@@ -1656,13 +713,21 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		changed,
 		settled: (v, ownerKey) => {
 			const target = state.owners.get(ownerKey);
-			if (!target?.binding || target.closed) return;
-			const message: Notice = { customType: "delegate", content: `delegate finished\n${acpResultText(v)}`, display: true, details: v };
-			const send = () => deliver(target, message, send);
-			send();
+			if (target?.binding && !target.closed) notify(target, finishedNotice(acpResultText(v), v));
 		},
 		// Next to this parent's pi run pointers, under the subsession directory.
 		runDir: (ownerKey) => join(state.owners.get(ownerKey)?.dir ?? pointerDir(ownerKey), "acp"),
+		admit,
+	});
+	// The pi backend (pi-backend.ts): this binding opens its runs' sessions, from its own model runtime.
+	const piBackend = new PiBackend({
+		owner: requireOwner,
+		modelRegistry: () => requireOwner().binding!.ctx.modelRegistry,
+		serves: (run) => state.owners.get(run.ownerKey)?.binding?.pi === pi,
+		link: (run, ctx) => { if (ctx || !parentLinks.has(run)) linkParent(run, ctx); },
+		loader: childLoader,
+		resolve: resolvePi,
+		resolveModel,
 	});
 	// Canonical phased todo (transferred from pi-omp; see todo-ext.ts). The reminder reads this
 	// parent's live children: while one is unsettled its completion message re-wakes the loop,
@@ -1721,10 +786,10 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		owner.binding = { pi, ctx };
 		const bound = owner;
 		if (nesting) bound.parentRun = nesting;
-		bound.resume = (run, message) => steer(run, message);
-		bound.steerFromUser = (run, message) => steer(run, message, true);
+		bound.resume = (run, message) => piBackend.steerRun(run, message);
+		bound.steerFromUser = (run, message) => piBackend.steerRun(run, message, true);
 		bound.acp = acp;
-		bound.reopen = (run) => openSession(run);
+		bound.reopen = (run) => piBackend.openSession(run);
 		if (!nesting) bound.live = liveSource;
 		// This delegating child's runs are live again, restored from their records.
 		else departed.delete(nesting.id);
@@ -1737,40 +802,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			if (entry.type === "message" && entry.message.role === "toolResult") acknowledge(owner, entry.message.details);
 		}
 		for (const run of ownedRuns(owner)) if (run.completion.settled) publish(run.completion);
-		for (const notice of owner.pendingNotices?.splice(0) ?? []) { const send = () => deliver(bound, notice, send); send(); }
-	}
-	async function steer(run: Run, message: string, restart = false, replacement?: { model?: string; thinking?: string; contextWindow?: number; timeoutMs?: number }) {
-		requireOwner();
-		if (run.foreign) throw foreignError(run);
-		// A running oven slice takes the message into its running work, as a live session's steer does.
-		if (run.runtime === "oven" && run.status === "running" && run.sliceId) { await ovenCall("send", { slice: run.sliceId, text: message, steer: true, requestId: `pi-delegate:${run.id}:steer:${randomUUID()}` }); return; }
-		if (run.status === "running") {
-			await run.preparing;
-			await run.ready;
-			if (run.status === "running" && run.session) {
-				// A live turn is already bound to its model. Never swap it underneath running work.
-				if (replacement?.model) throw new Error(`${run.id} is running on ${run.model}; a different offering applies to its next segment. Wait for it or cancel it, then steer with model.`);
-				if (replacement?.timeoutMs !== undefined) {
-					// More time is the one change a live segment can take: re-arm its own budget.
-					const previous = run.timeoutMs;
-					run.timeoutMs = replacement.timeoutMs;
-					try { armTimeout(run); }
-					catch (error) { run.timeoutMs = previous; armTimeout(run); throw error; }
-					saveRun(run);
-					changed();
-				}
-				await run.session.steer(message); return;
-			}
-		}
-		const nested = childOwner(run);
-		if (nested && rebinds(run, replacement)) {
-			// A new offering reopens the session its own children report into.
-			if (nested.busy?.()) throw new Error(`${run.id} has children of its own that have not settled; a different offering reopens its session and would interrupt them. Wait for them, then steer with model.`);
-			await closeChildOwner(run);
-		}
-		beginResume(run, restart, replacement);
-		const completion = run.completion;
-		void launch(run, message).then(() => publish(completion));
+		for (const notice of owner.pendingNotices?.splice(0) ?? []) notify(bound, notice);
 	}
 	/**
 	 * This parent's whole tree, in tree order: each run, then the runs it started, while its children's
@@ -1857,14 +889,13 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			if (!runs.has(id) && !acpOwner(id) && findDeparted(id)) await revive(id);
 			const backend = acpOwner(id);
 			if (backend) {
-				if ((await backend.result(id)).status !== "running") { const full = capacityError(); if (full) throw full; }
 				await backend.steer(id, { message }); return;
 			}
 			const r = runs.get(id);
 			if (!inTree(r)) throw new Error(`${id}: child is not in this parent's tree`);
 			// A message typed directly by the human is an explicit restart request. A nested run is steered
 			// by the delegating child's binding, which owns its session and its revival.
-			if (r.ownerKey === requireOwner().key) { await steer(r, message, true); return; }
+			if (r.ownerKey === requireOwner().key) { await piBackend.steerRun(r, message, true); return; }
 			const steerer = state.owners.get(r.ownerKey)?.steerFromUser;
 			if (!steerer) throw new Error(`${id}: its delegating child's session is not open; steer that child instead`);
 			await steerer(r, message);
@@ -1881,139 +912,6 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		const message = event.message;
 		if ((message.role === "custom" && message.customType === "delegate") || message.role === "toolResult") acknowledge(owner, message.details);
 	});
-
-	async function openSession(run: Run, onUpdate?: (u: any) => void, preparedLoader?: DefaultResourceLoader) {
-		if (run.session) return;
-		if (!statSync(run.cwd).isDirectory()) throw new Error(`Saved working directory is unavailable: ${run.cwd}`);
-		const runtime = await getRuntime();
-		mirrorProviders(runtime);
-		const slash = run.model.indexOf("/");
-		const model = runtime.getModel(run.model.slice(0, slash), run.model.slice(slash + 1));
-		if (!model) throw new Error(`Saved model is unavailable: ${run.model}. No fallback was selected \u2014 choose a replacement: delegate_ctl steer runId=${run.id} model=<provider/id[:thinking]>.`);
-		// Without its own settings manager Pi trusts every project (SettingsManager.create defaults to trusted).
-		const settingsManager = SettingsManager.create(run.cwd, AGENT_DIR, { projectTrusted: run.projectTrusted });
-		if (!parentLinks.has(run)) linkParent(run);
-		const loader = preparedLoader ?? childLoader(run, settingsManager, true);
-		if (!preparedLoader) await loader.reload();
-		// An extension that failed to load is left out by Pi; the child runs without it, and its run says so.
-		run.extensionErrors = [];
-		for (const error of loader.getExtensions().errors) extensionError(run, `${error.path}: ${error.error}`);
-		const manager = openTranscript(run);
-		// A crash may have happened before the first prompt was appended. Preserve the original
-		// brief before the explicit revival message rather than silently discarding the task.
-		if (run.segment > 1 && !messagesOf(run).some((message, index) => index >= run.startIdx && message.role === "user")) {
-			manager.appendMessage({ role: "user", content: [{ type: "text", text: run.task }], timestamp: run.startedAt });
-		}
-		// Extension tools the child may not have never register (gateExtensions). Pi's built-in tools are
-		// not an extension's, so each one it may not have is excluded here, before any tool registers.
-		const { allows } = allowlist(run);
-		const { session } = await createAgentSession({
-			cwd: run.cwd, agentDir: AGENT_DIR, settingsManager, model, thinkingLevel: run.thinking as any,
-			excludeTools: PI_BUILTIN_TOOLS.filter((name) => !allows(name)), resourceLoader: loader,
-			sessionManager: manager, modelRuntime: runtime,
-		} as any);
-		// A tool that reached the registry anyway, such as a built-in this Pi has and the list above does not know, is refused, never handed over.
-		const leaked = session.getAllTools().filter((tool: any) => !allows(tool.name));
-		if (leaked.length) {
-			await closeSession(session);
-			throw new Error(`This Pi gives a child tools pi-delegate cannot withhold: ${leaked.map((tool: any) => tool.name).join(", ")}.`);
-		}
-		run.session = session;
-		saveRun(run);
-
-		session.subscribe((ev: any) => {
-			if (ev.type === "message_start" || ev.type === "message_update") {
-				if (ev.message?.role === "assistant") run.streamingMessage = ev.message;
-			}
-			if (ev.type === "message_end") run.streamingMessage = undefined;
-			if (ev.type === "auto_retry_start") {
-				// Retry events can arrive before the failed assistant message is persisted;
-				// retain the current-segment attribution for an ensuing timeout.
-				run.segmentFailedAttempts++;
-				const now = Date.now();
-				const retryWall = run.providerRetryMs + (run.providerRetry ? Math.max(0, now - run.providerRetry.startedAt) : 0);
-				if (run.providerRetry) {
-					run.providerRetryMs = retryWall;
-					run.providerRetry = undefined;
-				}
-				run.lastAttemptError = ev.errorMessage;
-				if (ev.attempt > MAX_PROVIDER_RETRIES || retryWall + ev.delayMs > MAX_PROVIDER_RETRY_MS) {
-					run.status = "error";
-					run.error = `Provider retry ceiling exceeded after ${ev.attempt} retries and ${Math.round(retryWall / 1000)}s; last error: ${ev.errorMessage}`;
-					finish(run, "error", run.error);
-					void session.abort();
-				} else {
-					run.providerRetry = { attempt: ev.attempt, maxAttempts: Math.min(ev.maxAttempts, MAX_PROVIDER_RETRIES), delayMs: ev.delayMs, errorMessage: ev.errorMessage, startedAt: Date.now() };
-				}
-			}
-			if (ev.type === "auto_retry_end" && run.providerRetry) {
-				run.providerRetryMs += Math.max(0, Date.now() - run.providerRetry.startedAt);
-				run.providerRetry = undefined;
-			}
-			if (ev.type === "tool_execution_start") {
-				run.lastTool = ev.toolName;
-				run.activeTools.set(ev.toolCallId, { name: ev.toolName, args: ev.args ?? {} });
-				if (run.toolCalls.length < MAX_TOOL_CALLS) run.toolCalls.push({ name: ev.toolName, args: (ev.args ?? {}) as Record<string, unknown>, at: Date.now() });
-				if (state.owners.get(run.ownerKey)?.binding?.pi === pi) onUpdate?.({ content: [{ type: "text", text: `${run.id}: ${ev.toolName}` }], details: view(run) });
-			}
-			if (ev.type === "tool_execution_update") {
-				const active = run.activeTools.get(ev.toolCallId);
-				if (active) active.result = { ...ev.partialResult, isError: false };
-			}
-			if (ev.type === "tool_execution_end") run.activeTools.delete(ev.toolCallId);
-			run.revision++;
-			if (ev.type === "message_end") {
-				if (ev.message?.role === "assistant") {
-					try { harvest(run); }
-					catch (error) { run.status = "error"; run.error = `Cannot read child transcript: ${String(error)}`; void session.abort(); }
-				}
-				try { saveRun(run); }
-				catch (error) { run.status = "error"; run.error = `Cannot save child state: ${String(error)}`; void session.abort(); }
-				if (run.status === "running" && ev.message?.role === "assistant") {
-					const text = ev.message.content?.filter((b: any) => b.type === "text").map((b: any) => b.text).join(" ").trim();
-					if (text) milestone(run, { kind: "note", text: text.slice(0, 500) });
-				}
-			}
-			changed();
-		});
-		// Binding starts the child's extensions (session_start), its nested pi-delegate among them, which
-		// attaches this child as its children's parent. It needs run.session set first: restored children may
-		// report into it at once. With no UI bound, extensions get Pi's headless UI, as in print mode.
-		await session.bindExtensions({ onError: (error: any) => extensionError(run, `${error.extensionPath}: ${error.event}: ${error.error}`) });
-		// Pi declares its default tools and the extension tools that ask to be; a tool the role names is declared too, as `pi --tools` does.
-		const named = session.getAllTools().filter((tool: any) => run.tools.includes(tool.name)).map((tool: any) => tool.name);
-		session.setActiveToolsByName([...new Set([...session.getActiveToolNames(), ...named])]);
-	}
-
-	async function launch(run: Run, task: string, onUpdate?: (u: any) => void, preparedLoader?: DefaultResourceLoader) {
-		if (run.runtime === "oven") return launchOven(run, task);
-		const sessionReady = (async () => {
-			await run.preparing;
-			run.preparing = undefined;
-			await openSession(run, onUpdate, preparedLoader);
-		})();
-		run.ready = sessionReady;
-		try {
-			await sessionReady;
-			if (run.status === "running") {
-				milestone(run, { kind: "started", task: task.slice(0, 600) });
-				run.dirtyBefore = snapshotDirty(run.cwd);
-				run.segmentStartedAt = Date.now();
-				armTimeout(run);
-				await run.session.prompt(task, { preflightResult: (accepted: boolean) => {
-					// Pi abort() cannot cancel prompt preflight while its agent is still idle.
-					// Recheck at the SDK's dispatch boundary, before it starts the agent loop.
-					if (accepted && run.status !== "running") throw new Error("Child stopped before prompt dispatch.");
-				} });
-				// Provider failures are assistant messages, not rejected prompt promises.
-				const last = messagesOf(run).findLast((message) => message.role === "assistant");
-				if (run.status === "running" && last?.stopReason === "error") throw new Error(last.errorMessage ?? "Child provider failed.");
-			}
-			finish(run, run.status === "running" ? "complete" : run.status);
-		} catch (e: any) {
-			finish(run, run.status === "running" ? "error" : run.status, run.error ?? String(e?.message ?? e));
-		} finally { run.ready = undefined; run.preparing = undefined; }
-	}
 
 	// What the control call was about, in the header rather than buried in its output.
 	const subject = (args: any): string => {
@@ -2037,7 +935,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		state.startedAt ??= Date.now();
 		state.interval ??= setInterval(() => ctx.invalidate(), 1000);
 		const child = run ? ` \u00b7 ${run.status === "running" ? run.activeTools.values().next().value?.name ?? "thinking" : run.status}` : "";
-		return framed((width) => [truncateToWidth(theme.fg("accent", `\u23f3 ${text}`) + theme.fg("dim", `${child} \u00b7 ${elapsed(Date.now() - state.startedAt!)} \u00b7 abort to stop waiting; the child keeps running`), width, "\u2026")]);
+		return framed((width) => [truncateToWidth(theme.fg("accent", `\u23f3 ${text}`) + theme.fg("dim", `${child} \u00b7 ${formatDuration(Date.now() - state.startedAt!)} \u00b7 abort to stop waiting; the child keeps running`), width, "\u2026")]);
 	};
 	const stopTicking = (ctx: any) => {
 		const state = ctx?.state as { interval?: ReturnType<typeof setInterval> } | undefined;
@@ -2049,6 +947,9 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		return framed((width) => resultView(title, ctx.args?.action, subject(ctx.args), result, opts, theme, width));
 	};
 
+	// What a start and a steer tell the model, either backend: the completion wakes it; wait joins it.
+	const START_HINT = "Completion will wake you; use delegate_ctl wait with this runId when dependent work needs the result.";
+	const STEER_HINT = "Completion will wake you; use wait to join.";
 	// --- acp results. A failure is reported by its code; it never becomes a different action.
 	const failed = (error: unknown, details?: AcpRunView) => {
 		if (!(error instanceof DelegateError)) throw error;
@@ -2063,107 +964,115 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 	const acpStartText = (v: AcpRunView) => {
 		const session = sessionLabel(v);
 		if (v.status === "idle") return `${v.id} idle (acp ${v.session.agent}, ${session}); no turn sent. Use delegate_ctl steer with this runId to send one, status or result to read it, close to disconnect.`;
-		return `${v.id} running (acp ${v.session.agent}, ${session}). Completion will wake you; use delegate_ctl wait with this runId when dependent work needs the result.`;
+		return `${v.id} running (acp ${v.session.agent}, ${session}). ${START_HINT}`;
 	};
-	/** One run in a wait report: its full report once settled, its one-line summary while pending. */
-	interface WaitRow { id: string; settled: boolean; report: string; summary: string; details: any; bad: boolean }
 	const acpRow = (v: AcpRunView, settled: boolean): WaitRow => ({ id: v.id, settled, report: acpResultText(v), summary: acpSummary(v), details: v, bad: settledBadly(v) });
-	const piRow = (run: Run): WaitRow => run.completion.settled
-		? { id: run.id, settled: true, report: resultText(run), summary: summary(run), details: finalResult(run).details, bad: run.status !== "complete" }
-		: { id: run.id, settled: false, report: resultText(run), summary: summary(run), details: recordedView(run), bad: false };
-	const waitResult = (reason: WaitOutcome<unknown>["reason"], rows: WaitRow[], runIds: readonly string[], timeoutMs?: number, lost = "these runs; they did not settle") => {
+	/**
+	 * A wait's report: a head saying why it ended, then each settled run's full report, then (unless the mode was
+	 * satisfied) each pending run's summary. One run's details are its own; several runs' are their rows.
+	 */
+	const waitResult = (outcome: Pick<JoinOutcome<unknown>, "reason" | "lost" | "stranded">, rows: WaitRow[], runIds: readonly string[], timeoutMs?: number) => {
+		const { reason } = outcome;
 		const settled = rows.filter((row) => row.settled), pending = rows.filter((row) => !row.settled);
 		const still = pending.map((row) => row.id).join(", ");
+		const one = runIds.length === 1 ? settled[0] ?? pending[0] : undefined;
+		const lost = () => {
+			if (!outcome.stranded) return `wait lost ${outcome.lost}: ${still}`;
+			if (!one) return `wait lost ${outcome.stranded}, which stopped without reporting completion (read its status or result; steer with restart:true if it must continue). Not settled: ${still}`;
+			return `${one.id}: wait lost the child — status=${one.details.status}${one.details.error ? `: ${one.details.error}` : ""}\nThe child stopped without reporting completion, so this wait cannot return a result. Read status or result for details; steer with restart:true if it must continue.`;
+		};
 		const head = reason === "timeout" ? `wait timed out after ${timeoutMs} ms; nothing was cancelled. Still running: ${still}`
-			: reason === "interrupted" ? `wait interrupted — queued messages are waiting for you; the runs keep going.\nAnswer the queued message(s) first, then call wait again to rejoin. Still running: ${still}`
-			: reason === "lost" ? `wait lost ${lost}: ${still}`
+			: reason === "interrupted" ? one
+				? `${one.id}: wait interrupted — queued messages are waiting for you; the child keeps running.\nAnswer the queued message(s) first, then call wait again to rejoin.`
+				: `wait interrupted — queued messages are waiting for you; the runs keep going.\nAnswer the queued message(s) first, then call wait again to rejoin. Still running: ${still}`
+			: reason === "lost" ? lost()
 			: pending.length ? `${settled.length} settled; still running: ${still}` : "";
 		const text = [head, ...settled.map((row) => row.report), ...(reason === "settled" ? [] : pending.map((row) => row.summary))].filter(Boolean).join("\n\n");
-		const details = runIds.length === 1 ? (settled[0] ?? pending[0])?.details : { kind: "runs", rows: [...settled, ...pending].map((row) => row.details), wait: { reason, pending: pending.map((row) => row.id) } };
+		const details = one ? one.details : { kind: "runs", rows: [...settled, ...pending].map((row) => row.details), wait: { reason, pending: pending.map((row) => row.id) } };
 		return { content: [{ type: "text" as const, text }], details, isError: reason === "lost" || (reason === "settled" && settled.some((row) => row.bad)) };
 	};
-	const acpWaitResult = async (outcome: WaitOutcome<AcpRunView>, runIds: readonly string[], timeoutMs?: number) => {
-		const pending = await Promise.all(outcome.pending.map((id) => acp.result(id)));
-		return waitResult(outcome.reason, [...outcome.settled.map((v) => acpRow(v, true)), ...pending.map((v) => acpRow(v, false))], runIds, timeoutMs, "the ACP coordinator (it is shutting down); these runs did not settle");
-	};
 
+	/** Every run this parent owns, by ID, for a not-found error. */
+	const knownRuns = (owner: Owner) => [...ownedRuns(owner).map((r) => r.id), ...acp.owned(owner.key).map((v) => v.id)].join(", ") || "none";
 	/**
-	 * delegate_ctl wait over runs of either backend, any or all. pi runs are joined through their
-	 * completion as a single-run wait joins them, so a segment that settles reports here instead of
-	 * waking the parent; ACP runs through the backend's join. Queued parent messages end the wait
-	 * early, a timeout ends it, and an abort only detaches: no run is ever cancelled. A run this wait
-	 * reports is delivered by it; any other run keeps its own wake-up.
+	 * delegate_ctl wait, for one run or several, of either backend, any or all (wait.ts). Each backend holds its
+	 * runs (piJoin, AcpBackend.join), so a run that settles reports here instead of waking the parent. Queued
+	 * parent messages end the wait early, a timeout ends it, and an abort only detaches: no run is ever cancelled.
+	 * A run this wait reports is delivered by it; any other run keeps its own wake-up.
 	 */
 	async function waitRuns(owner: Owner, ids: readonly string[], mode: "any" | "all", ctx: ExtensionContext, signal?: AbortSignal, timeoutMs?: number) {
-		const piRuns = new Map<string, Run>();
-		const acpIds: string[] = [];
+		const piIds: string[] = [], acpIds: string[] = [];
 		for (const id of ids) {
-			if (acp.find(id, owner.key)) { acpIds.push(id); continue; }
-			const run = runs.get(id);
-			if (!run || run.ownerKey !== owner.key) throw new DelegateError("RUN_NOT_FOUND", `unknown runId ${id}`, "runIds");
-			unwrap(requireAction(PI_CAPABILITIES, "wait"));
-			piRuns.set(id, run);
+			if (acp.find(id, owner.key)) acpIds.push(id);
+			else if (piBackend.find(id, owner.key)) piIds.push(id);
+			else throw new DelegateError("RUN_NOT_FOUND", `unknown runId ${id}; known: ${knownRuns(owner)}`, "runIds");
 		}
-		if (!piRuns.size) return acpWaitResult(await acp.wait({ runIds: acpIds, mode, ...(timeoutMs !== undefined ? { timeoutMs } : {}) }, signal, () => (ctx.hasPendingMessages() || noticePending())), ids, timeoutMs);
-		if (signal?.aborted) throw new DOMException("Wait cancelled; the runs are unaffected.", "AbortError");
-		const join = acp.join(acpIds);
-		let wake = () => {};
-		// While subscribed, a segment that settles is claimed by this wait, exactly as waitForChild claims it.
-		const joined = new Map([...piRuns].map(([id, run]) => [id, { completion: run.completion, settledAtJoin: run.completion.settled, unsubscribe: run.completion.subscribe(() => wake()) }]));
-		const deadline = timeoutMs === undefined ? Number.POSITIVE_INFINITY : Date.now() + timeoutMs;
-		const stoppedSince = new Map<string, number>();
-		let aborted = false, coordinatorLost = false;
-		// At most one Coordinator wait at a time: a pass woken by a pi run reuses the one still outstanding.
-		let acpNext: Promise<void> | undefined;
-		try {
-			for (;;) {
-				const acpViews = new Map(join.views().map((v) => [v.id, v]));
-				const rows = ids.map((id) => { const v = acpViews.get(id); return v ? acpRow(v, v.status !== "running") : piRow(piRuns.get(id)!); });
-				const settled = rows.filter((row) => row.settled);
-				const end = async (reason: WaitOutcome<unknown>["reason"], lost?: string) => {
-					const settledAcp = settled.flatMap((row) => acpViews.has(row.id) ? [acpViews.get(row.id)!] : []);
-					join.claim(settledAcp);
-					// An Amp run's thread cost is read once for its settled turn, so the result reports it.
-					const costed = new Map((await acp.withCosts(settledAcp)).map((v) => [v.id, v]));
-					return waitResult(reason, rows.map((row) => costed.has(row.id) ? acpRow(costed.get(row.id)!, true) : row), ids, timeoutMs, lost);
-				};
-				if (mode === "any" ? settled.length > 0 : settled.length === rows.length) return await end("settled");
-				if (signal?.aborted) { aborted = true; throw new DOMException("Wait cancelled; the runs are unaffected.", "AbortError"); }
-				if ((ctx.hasPendingMessages() || noticePending())) return await end("interrupted");
-				if (coordinatorLost) return await end("lost", "the ACP coordinator (it is shutting down, or another process owns these runs); not settled");
-				// A terminal status that never settles is a child that stopped without reporting completion (see waitForChild).
-				for (const [id, run] of piRuns) {
-					if (run.status === "running" || run.completion.settled) { stoppedSince.delete(id); continue; }
-					if (!stoppedSince.has(id)) stoppedSince.set(id, Date.now());
-					else if (Date.now() - stoppedSince.get(id)! >= 2 * WAIT_POLL_MS) return await end("lost", `${id}, which stopped without reporting completion (read its status or result; steer with restart:true if it must continue). Not settled`);
-				}
-				const left = deadline - Date.now();
-				if (left <= 0) return await end("timeout");
-				const slice = Math.min(WAIT_POLL_MS, left);
-				const pendingAcp = rows.flatMap((row) => !row.settled && acpViews.has(row.id) ? [acpViews.get(row.id)!] : []);
-				await new Promise<void>((resolve) => {
-					const onAbort = () => wake();
-					const timer = setTimeout(() => wake(), slice);
-					wake = () => { clearTimeout(timer); signal?.removeEventListener("abort", onAbort); wake = () => {}; resolve(); };
-					signal?.addEventListener("abort", onAbort, { once: true });
-					// The ACP slice ends early on a settling turn.
-					if (pendingAcp.length) acpNext ??= join.next(pendingAcp, slice).then((reported) => { if (!reported) coordinatorLost = true; }, () => {})
-						.finally(() => { acpNext = undefined; wake(); });
-				});
-			}
-		} finally {
-			for (const [id, entry] of joined) {
-				entry.unsubscribe();
-				// An abort reports nothing: a segment this wait claimed as it settled still wakes the parent.
-				if (aborted && !entry.settledAtJoin && entry.completion.settled && entry.completion.claimed && piRuns.get(id)?.completion === entry.completion) {
-					entry.completion.claimed = false;
-					publish(entry.completion);
-				}
-			}
-			join.release(aborted);
-		}
+		if (signal?.aborted) throw waitCancelled(ids.length === 1 ? "child" : "runs");
+		const joins: Join<WaitRow | AcpRunView>[] = [];
+		// Each join can refuse a run (a capability); take the ACP one before the pi runs are subscribed.
+		if (acpIds.length) joins.push(acp.join(acpIds));
+		if (piIds.length) joins.push(piBackend.join(piIds));
+		const outcome = await joinRuns(joins, ids, mode, {
+			...(signal ? { signal } : {}), ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+			interrupted: () => ctx.hasPendingMessages() || noticePending(), lost: ACP_JOIN_LOST,
+		});
+		const row = (v: WaitRow | AcpRunView, settled: boolean): WaitRow => (v as AcpRunView).backend === "acp" ? acpRow(v as AcpRunView, settled) : v as WaitRow;
+		return waitResult(outcome, [...outcome.settled.map((v) => row(v, true)), ...outcome.pending.map((v) => row(v, false))], ids, timeoutMs);
 	}
 
+	/**
+	 * What a pi start makes of the parent's call (PiBackend.start): the role, its offering, trust, tools and prompt.
+	 * A refusal is a DelegateError, and nothing was started.
+	 */
+	async function resolvePi(p: PiStartInput, { ctx }: PiCall, signal?: AbortSignal): Promise<PiRunSpec> {
+		const cap = maxDepth();
+		requireOwner();
+		const cwd = realpathSync(p.cwd ?? ctx.cwd);
+		const { trusted: projectTrusted, source: projectTrustSource } = await decideTrust(cwd, ctx, signal);
+		// Aborted while the trust question was open or queued: start nothing.
+		if (signal?.aborted) throw new DelegateError("ABORTED", "the delegate call was aborted before the child started; nothing was started");
+		// Again, after the trust await: parallel delegate calls each passed the first check before any of
+		// them existed. From here to runs.set nothing awaits, so this count includes every earlier start.
+		admit();
+		const roles = loadRoles(cwd, projectTrusted, AGENT_DIR);
+		const role = roles.get(p.role);
+		if (!role) throw new DelegateError("ROLE_UNKNOWN", `unknown role "${p.role}". available: ${[...roles.keys()].sort().join(", ")}`, "role");
+		// Model: explicit param, else the role's approved default, else the role's model list, else the parent's.
+		const approved = loadDefaults().approved[role.name];
+		let resolved: { model: any; thinking?: string; pick?: string };
+		try { resolved = p.model ?? approved?.spec ? resolveModel(p.model ?? approved!.spec, ctx) : resolveRoleModels(role.models, ctx); }
+		catch (error) { throw new DelegateError("MODEL_UNAVAILABLE", errorMessage(error), "model"); }
+		const { model, thinking: specThinking, pick: modelPick } = resolved;
+		if (!model) throw new DelegateError("MODEL_UNAVAILABLE", "no model available for child", "model");
+		const thinking = String(specThinking ?? (p.model ? undefined : approved && parseModelSpec(approved.spec).thinking) ?? role.thinking ?? ctx.thinkingLevel ?? "");
+		const timeoutMs = p.timeoutMs ?? role.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+		// A child at the cap could only fail its delegate calls, so it gets no delegation tools at all.
+		const atDepthCap = depth + 1 >= cap;
+		const tools = [...(role.tools ?? EVERY_TOOL)];
+		const withheld = atDepthCap ? [...DELEGATION_TOOLS] : undefined;
+		const { allows } = toolAllowlist(tools, withheld);
+		const delegates = allows("delegate");
+		const isWriter = WRITE_TOOLS.some(allows);
+		// Like the model: the role's line is a default the call can override.
+		const runtime = p.runtime ?? role.runtime ?? "in-process";
+		// An oven slice runs outside this process and never receives the conversation, as an ACP child.
+		const context = runtime === "oven" ? "fresh" : p.context ?? role.context ?? "fork";
+		const systemPrompt = role.systemPrompt + (role.systemPrompt.includes("STATUS:") ? "" : contractFooter(delegates, atDepthCap && toolAllowlist(tools).allows("delegate"), cap))
+			+ (delegates ? childrenFooter(depth + 1, cap) : "") + (context === "fork" ? FORK_FOOTER : "");
+		// An oven slice writes in its own copy, never in this tree.
+		if (isWriter && runtime !== "oven") {
+			const clash = activeWriter(cwd);
+			if (clash) throw new DelegateError("WRITER_CWD_OWNED", `refused: ${clash.id} (${clash.role}) is already writing in ${cwd}. One writer per tree — wait, cancel it, or give this child its own cwd/worktree.`, "cwd");
+		}
+		return {
+			role: role.name, task: p.task, cwd, model: modelKey(model), thinking, contextWindow: model.contextWindow, ...(modelPick ? { modelPick } : {}),
+			systemPrompt, context, tools, ...(withheld ? { withheld } : {}), writer: isWriter && runtime !== "oven", timeoutMs,
+			depth: depth + 1, ...(nesting ? { parentRunId: nesting.id } : {}),
+			...(runtime === "oven" ? { runtime: "oven" as const, extensions: role.extensions ?? [] } : {}),
+			projectTrusted, projectTrustSource,
+			inherited: () => context === "fork" ? convertToLlm(trimDangling(stripDelegation(buildSessionContext(ctx.sessionManager.buildContextEntries()).messages))) : [],
+		};
+	}
 	// Held by name so /delegate fork:|fresh: starts a run through the very same path as the tool.
 	const delegateTool = {
 		name: "delegate",
@@ -2220,189 +1129,14 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 					return failed(error, details);
 				}
 			}
-			const p = { ...params, role: (start.value as PiStartInput).role, task: (start.value as PiStartInput).task };
-			const owner = requireOwner();
-			const cwd = realpathSync(p.cwd ?? ctx.cwd);
-			const { trusted: projectTrusted, source: projectTrustSource } = await decideTrust(cwd, ctx, signal);
-			// Aborted while the trust question was open or queued: start nothing.
-			if (signal?.aborted) return failed(new DelegateError("ABORTED", "the delegate call was aborted before the child started; nothing was started"));
-			// Again, after the trust await: parallel delegate calls each passed the first check before any of
-			// them existed. From here to runs.set nothing awaits, so this count includes every earlier start.
-			const stillFull = capacityError();
-			if (stillFull) return failed(stillFull);
-			const roles = loadRoles(cwd, projectTrusted);
-			const role = roles.get(p.role);
-			if (!role) {
-				return {
-					content: [{ type: "text", text: `unknown role "${p.role}". available: ${[...roles.keys()].sort().join(", ")}` }],
-					isError: true, details: undefined,
-				};
-			}
-			// Model: explicit param, else the role's approved default, else the role's model list, else the parent's.
-			const approved = loadDefaults().approved[role.name];
-			let resolved: { model: any; thinking?: string; pick?: string };
-			try { resolved = p.model ?? approved?.spec ? resolveModel(p.model ?? approved!.spec, ctx) : resolveRoleModels(role.models, ctx); }
-			catch (error) { return failed(new DelegateError("MODEL_UNAVAILABLE", error instanceof Error ? error.message : String(error), "model")); }
-			const { model, thinking: specThinking, pick: modelPick } = resolved;
-			if (!model) return { content: [{ type: "text", text: "no model available for child" }], isError: true, details: undefined };
-			const thinking = String(specThinking ?? (p.model ? undefined : approved?.spec.split(":")[1]) ?? role.thinking ?? ctx.thinkingLevel ?? "");
-			const timeoutMs = p.timeoutMs ?? role.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-			// A child at the cap could only fail its delegate calls, so it gets no delegation tools at all.
-			const atDepthCap = depth + 1 >= cap;
-			const tools = [...(role.tools ?? EVERY_TOOL)];
-			const withheld = atDepthCap ? [...DELEGATION_TOOLS] : undefined;
-			const { allows } = toolAllowlist(tools, withheld);
-			const delegates = allows("delegate");
-			const isWriter = WRITE_TOOLS.some(allows);
-			// Like the model: the role's line is a default the call can override.
-			const runtime = (start.value as PiStartInput).runtime ?? role.runtime ?? "in-process";
-			// An oven slice runs outside this process and never receives the conversation, as an ACP child.
-			const context = runtime === "oven" ? "fresh" : p.context ?? role.context ?? "fork";
-			const systemPrompt = role.systemPrompt + (role.systemPrompt.includes("STATUS:") ? "" : contractFooter(delegates, atDepthCap && toolAllowlist(tools).allows("delegate"), cap))
-				+ (delegates ? childrenFooter(depth + 1, cap) : "") + (context === "fork" ? FORK_FOOTER : "");
-			// An oven slice writes in its own copy, never in this tree.
-			if (isWriter && runtime !== "oven") {
-				const clash = [...runs.values()].find((r) => !r.completion.settled && r.writer && r.cwd === cwd);
-				if (clash) return { content: [{ type: "text", text: `refused: ${clash.id} (${clash.role}) is already writing in ${cwd}. One writer per tree — wait, cancel it, or give this child its own cwd/worktree.` }], isError: true, details: undefined };
-			}
-			// Freeze the runtime inputs before advertising a run, including project instructions.
-			const dir = storageDir(cwd);
-			const created = SessionManager.create(cwd, dir);
-			const sessionFile = created.getSessionFile()!;
-			// Pi normally defers the first disk write until an assistant replies. Establish its own
-			// header now so a crash before the first response still leaves a resumable identity.
-			writeFileSync(sessionFile, `${JSON.stringify(created.getHeader())}\n`, { flag: "wx", mode: 0o600 });
-			const manager = SessionManager.open(sessionFile);
-			const id = newId(role.name);
-			const run: Run = {
-				id, ownerKey: owner.key, recordPath: join(dir, `${encodeURIComponent(id)}.json`),
-				segment: 1, stopped: false, acknowledged: false,
-				systemPrompt, contextFiles: [], appendSystemPrompt: [],
-				tools, timeoutMs,
-				sessionFile, sessionId: manager.getSessionId(),
-				completion: new RunCompletion<RunResult>(),
-				role: role.name,
-				model: modelKey(model),
-				thinking,
-				context,
-				cwd,
-				task: p.task,
-				status: "running",
-				startedAt: Date.now(), segmentStartedAt: Date.now(),
-				turns: 0, failedAttempts: 0,
-				tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-				cost: 0,
-				changedFiles: [],
-				// Read from what the child's session offered, once it settles.
-				droppedTools: [],
-				output: "",
-				// Fork context is materialized by the background preparation below. Until then the
-				// durable child contains only its header and has no child messages to harvest.
-				startIdx: 0,
-				segmentStartIdx: 0,
-				forkedMessages: context === "fork" ? 0 : undefined,
-				writer: isWriter && runtime !== "oven",
-				providerRetryMs: 0,
-				segmentFailedAttempts: 0,
-				segmentFailedAttemptsBase: 0,
-				toolCalls: [],
-				activeTools: new Map(),
-				revision: 0,
-				contextWindow: model.contextWindow,
-				...processOwner(),
-				depth: depth + 1,
-				...(nesting ? { parentRunId: nesting.id } : {}),
-				...(withheld ? { withheld } : {}),
-				...(runtime === "oven" ? { runtime: "oven" as const, extensions: role.extensions ?? [] } : {}),
-				projectTrusted,
-				projectTrustSource,
-				...(modelPick ? { modelPick } : {}),
-			};
-			linkParent(run, ctx);
-			const loader = run.runtime === "oven" ? undefined : childLoader(run, SettingsManager.create(cwd, AGENT_DIR, { projectTrusted }), false);
-			saveRun(run);
-			writeRecord(join(owner.dir, `${encodeURIComponent(run.id)}.json`), { version: 1, recordPath: run.recordPath });
-			runs.set(run.id, run);
-			changed();
-			const completion = run.completion;
-			// Preparation starts after the run is durable. A slow settings/package scan or a long
-			// forked parent transcript must not turn an asynchronous delegate call into a blocked
-			// parent turn. Yield once before the sync transcript copy so queued Intercom/follow-up
-			// messages can be delivered before large history is materialized.
-			if (loader) run.preparing = (async () => {
-				await new Promise<void>((resolve) => setImmediate(resolve));
-				requireOwner();
-				const inherited = context === "fork"
-					? convertToLlm(trimDangling(stripDelegation(buildSessionContext(ctx.sessionManager.buildContextEntries()).messages)))
-					: [];
-				for (let i = 0; i < inherited.length; i++) {
-					manager.appendMessage(inherited[i]);
-					if ((i + 1) % 32 === 0) await new Promise<void>((resolve) => setImmediate(resolve));
-				}
-				run.startIdx = inherited.length;
-				run.segmentStartIdx = inherited.length;
-				run.forkedMessages = context === "fork" ? inherited.length : undefined;
-				await loader.reload();
-				requireOwner();
-				run.contextFiles = loader.getAgentsFiles().agentsFiles;
-				run.appendSystemPrompt = loader.getAppendSystemPrompt();
-				saveRun(run);
-				changed();
-			})();
-			void launch(run, p.task, onUpdate, loader).then(() => publish(completion));
-			return { content: [{ type: "text", text: `${run.id} running (${run.runtime === "oven" ? "oven slice" : run.context}, ${run.model}). Completion will wake you; use delegate_ctl wait with this runId when dependent work needs the result.` }], details: recordedView(run) };
+			try {
+				const v = await piBackend.start(start.value, signal, { ctx, onUpdate });
+				const run = runs.get(v.id)!;
+				return { content: [{ type: "text", text: `${run.id} running (${run.runtime === "oven" ? "oven slice" : run.context}, ${run.model}). ${START_HINT}` }], details: recordedView(run) };
+			} catch (error) { return failed(error); }
 		},
 	};
 	pi.registerTool(delegateTool);
-
-const WAIT_POLL_MS = 1000;
-/**
- * Join the child, waking early when queued messages exist: pi delivers steering only after this
- * tool returns, so a blocking join would postpone every queued message until the child finishes.
- * Early return is not an error — the child keeps running and wait rejoins after the messages are handled.
- */
-async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSignal) {
-	if (signal?.aborted) throw new DOMException("Wait cancelled; the child is unaffected.", "AbortError");
-	const interrupted = {
-		content: [{ type: "text" as const, text: `${run.id}: wait interrupted — queued messages are waiting for you; the child keeps running.\nAnswer the queued message(s) first, then call wait again to rejoin.\n${summary(run)}` }],
-		details: recordedView(run),
-		isError: false, // an early wake is a normal result, not a failure
-	};
-	const lost = {
-		content: [{ type: "text" as const, text: `${run.id}: wait lost the child — status=${run.status}${run.error ? `: ${run.error}` : ""}\nThe child stopped without reporting completion, so this wait cannot return a result. Read status or result for details; steer with restart:true if it must continue.` }],
-		details: recordedView(run),
-		isError: true,
-	};
-	return new Promise<Awaited<ReturnType<typeof run.completion.wait>>>((resolve, reject) => {
-		let done = false;
-		let unsubscribe: () => void = () => {};
-		let lostPolls = 0;
-		let poll: ReturnType<typeof setInterval> | undefined;
-		const finish = (deliver: () => void) => {
-			if (done) return;
-			done = true;
-			unsubscribe();
-			if (poll !== undefined) clearInterval(poll);
-			signal?.removeEventListener("abort", onAbort);
-			deliver();
-		};
-		const onAbort = () => finish(() => reject(new DOMException("Wait cancelled; the child is unaffected.", "AbortError")));
-		// Settle wakes instantly (no poll latency); queued messages are polled at WAIT_POLL_MS.
-		// subscribe can fire synchronously when the child already settled: finish() guards the rest.
-		unsubscribe = run.completion.subscribe((value) => finish(() => resolve(value)));
-		if (done) return;
-		poll = setInterval(() => {
-			if ((ctx.hasPendingMessages() || noticePending())) { finish(() => resolve(interrupted)); return; }
-			// Terminal status without settle = a failure path that set status but never completed
-			// (see the child-state save catch). Two consecutive polls ride out finishRun's
-			// async persistence gap so a normal completion cannot false-positive.
-			if (run.status !== "running" && !run.completion.settled) lostPolls += 1;
-			else lostPolls = 0;
-			if (lostPolls >= 2) finish(() => resolve(lost));
-		}, WAIT_POLL_MS);
-		signal?.addEventListener("abort", onAbort, { once: true });
-	});
-}
 
 	pi.registerTool({
 		name: "delegate_ctl",
@@ -2428,7 +1162,7 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 			force: Type.Optional(Type.Boolean({ description: "close: cancel an active turn first instead of refusing" })),
 			discardPersistentState: Type.Optional(Type.Boolean({ description: "close, created acp sessions only: do not keep the session resumable" })),
 			restart: Type.Optional(Type.Boolean({ description: "steer only: restart an explicitly stopped child, only when the user requested it" })),
-			timeoutMs: Type.Optional(Type.Number({ description: "steer: give the child this time budget instead of its saved one \u2014 re-armed at once on a running child, applied to the next segment of an inactive one. wait with runIds, or on an acp run: stop waiting after this many ms; the runs keep going" })),
+			timeoutMs: Type.Optional(Type.Number({ description: "steer: give the child this time budget instead of its saved one \u2014 re-armed at once on a running child, applied to the next segment of an inactive one. wait: stop waiting after this many ms; the runs keep going" })),
 			message: Type.Optional(Type.String({ description: "steer: the correction. global models/deals: substring filter. approve: one-line reason the user agreed to" })),
 			ratings: Type.Optional(
 				Type.Array(
@@ -2451,8 +1185,8 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 				const { model, thinking } = resolveModel(p.model, ctx);
 				if (!model) return { content: [{ type: "text", text: `model not found: ${p.model}` }], isError: true, details: undefined };
 				const spec = `${modelKey(model)}${thinking ? `:${thinking}` : ""}`;
-				await saveDefault(p.role, { spec, reason: p.message, approvedAt: Date.now(), cost: model.cost ? { input: model.cost.input, output: model.cost.output } : undefined }, (ctx.modelRegistry as any).getAvailable());
-				return { content: [{ type: "text", text: `${p.role} \u2192 ${spec} saved as default (${SETTINGS_PATH.replace(homedir(), "~")}). Only call this after the user has agreed in conversation.` }], details: undefined };
+				await saveDefault(p.role, { spec, reason: p.message, approvedAt: Date.now(), cost: model.cost ? { input: model.cost.input, output: model.cost.output } : undefined }, availableModels(ctx));
+				return { content: [{ type: "text", text: `${p.role} \u2192 ${spec} saved as default (${tildify(SETTINGS_PATH)}). Only call this after the user has agreed in conversation.` }], details: undefined };
 			}
 			if (p.action === "rate") {
 				if (!p.ratings?.length) return { content: [{ type: "text", text: "rate requires ratings: [{model, score, source, note?}]" }], isError: true, details: undefined };
@@ -2487,7 +1221,7 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 				return { content: [{ type: "text", text }], details: { kind: "acp-models", runId: p.runId, agent: run.session.agent, ...models } };
 			}
 			if (p.action === "models") {
-				const all: any[] = (ctx.modelRegistry as any).getAvailable();
+				const all = availableModels(ctx);
 				const cur = ctx.model ? modelKey(ctx.model) : "";
 				const f = (p.message ?? "").toLowerCase();
 				const ratings = loadRatings();
@@ -2565,7 +1299,7 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 				return { content: [{ type: "text", text: `${defaultsReport(defaults)}\nRATINGS: ${details.ratings}\nOPENROUTER: ${details.openrouter.summary}\n\n${head}${body}${liveOnlyStr}\n\nproviders: ${provLine}` }], details };
 			}
 			if (p.action === "roles") {
-				const roles = [...loadRoles(ctx.cwd, ctx.isProjectTrusted()).values()].sort((a, b) => a.name.localeCompare(b.name));
+				const roles = sortedRoles(ctx);
 				const approved = loadDefaults().approved;
 				// The tools a child started from here would be offered: this session's, or, in a delegating child,
 				// what its own session was offered. The todo tool stays with the root parent.
@@ -2599,10 +1333,11 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 				const lines = [...owned.map((r) => `${summary(r).split("\n")[0]}${r.status === "running" && r.lastTool ? `  last: ${r.lastTool}` : ""}`), ...external.map((v) => acpSummary(v).split("\n")[0])];
 				return { content: [{ type: "text", text: lines.join("\n") || "no runs" }], details: { kind: "runs", rows: [...owned.map(recordedView), ...external] } };
 			}
-			if (p.action === "wait" && (p.runIds !== undefined || p.mode !== undefined)) {
+			// One wait for one run or several, of either backend (waitRuns).
+			if (p.action === "wait") {
 				const ids = [...new Set(p.runIds ?? (p.runId ? [p.runId] : []))];
 				try {
-					if (!ids.length) throw new DelegateError("INPUT_INVALID", "wait with mode needs runIds", "runIds");
+					if (!ids.length) throw new DelegateError("INPUT_INVALID", "wait needs runId or runIds", "runIds");
 					return await waitRuns(owner, ids, p.mode ?? "any", ctx, signal, p.timeoutMs);
 				} catch (error) { return failed(error); }
 			}
@@ -2623,17 +1358,12 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 							return { content: [{ type: "text", text: acpStatusText(v) }], details: v };
 						}
 						case "result": return acpRunResult(await read(() => acp.result(id)));
-						case "wait": {
-							const outcome = await acp.wait({ runIds: [id], mode: "all", ...(p.timeoutMs !== undefined ? { timeoutMs: p.timeoutMs } : {}) }, signal, () => (ctx.hasPendingMessages() || noticePending()));
-							return await acpWaitResult(outcome, [id], p.timeoutMs);
-						}
 						case "steer": {
 							const current = await acp.result(id);
-							if (current.status !== "running") { const full = capacityError(); if (full) return failed(full); }
 							const request = unwrap(validateSteer({ backend: "acp", origin: current.session.origin, agent: current.session.agent }, p as Record<string, unknown>));
 							const v = await acp.steer(id, request);
 							const queued = v.session.origin === "opened" && v.session.agent.toLowerCase() === "amp" && v.turns.at(-1)?.status === "running";
-							return { content: [{ type: "text", text: `${id}: turn ${v.turns.at(-1)?.requestId} ${queued ? "queued" : "sent"}${request.model ? ` on model ${request.model}` : ""}. Completion will wake you; use wait to join.` }], details: v };
+							return { content: [{ type: "text", text: `${id}: turn ${v.turns.at(-1)?.requestId} ${queued ? "queued" : "sent"}${request.model ? ` on model ${request.model}` : ""}. ${STEER_HINT}` }], details: v };
 						}
 						case "cancel": {
 							const v = await acp.cancel(id, {});
@@ -2648,41 +1378,29 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 				} catch (error) { return failed(error); }
 			}
 			const run = p.runId ? runs.get(p.runId) : undefined;
-			if (!run || run.ownerKey !== owner.key) return failed(new DelegateError("RUN_NOT_FOUND", `unknown runId ${p.runId ?? "(none)"}; known: ${[...ownedRuns(owner).map((r) => r.id), ...acp.owned(owner.key).map((v) => v.id)].join(", ") || "none"}`, "runId"));
+			if (!run || run.ownerKey !== owner.key) return failed(new DelegateError("RUN_NOT_FOUND", `unknown runId ${p.runId ?? "(none)"}; known: ${knownRuns(owner)}`, "runId"));
 			// The pi backend's capability report decides what it cannot do; that fails, it never becomes another action.
 			const capability = requireAction(PI_CAPABILITIES, p.action as LifecycleAction);
 			if (!capability.ok) return failed(new DelegateError(capability.error.code, capability.error.message));
 
 			switch (p.action) {
-				case "wait":
-					return await waitForChild(run, ctx, signal);
 				case "status":
 					if (run.session && run.status === "running") harvest(run);
 					return { content: [{ type: "text", text: `${summary(run)}${run.status === "running" ? `\nnow: ${run.providerRetry ? `provider retry ${run.providerRetry.attempt}/${run.providerRetry.maxAttempts}` : run.activeTools.values().next().value?.name ?? (run.lastTool ? `thinking after ${run.lastTool}` : "thinking")} \u00b7 ${run.toolCalls.length} tool call${run.toolCalls.length === 1 ? "" : "s"} so far \u00b7 ${Math.max(0, Math.round((run.timeoutMs - (Date.now() - run.segmentStartedAt)) / 60000))} min of current segment budget left` : ""}` }], details: recordedView(run) };
 				case "result":
 					return run.completion.settled ? finalResult(run) : { content: [{ type: "text", text: resultText(run) }], details: recordedView(run) };
 				case "cancel":
-					await cancelRun(run);
+					await piBackend.cancel(run.id, {});
 					return { content: [{ type: "text", text: `${run.id} stopped; automatic revival is disabled.` }], details: recordedView(run) };
 				case "steer": {
-					if (!p.message) throw new Error("steer requires message");
+					const request = unwrap(validateSteer({ backend: "pi" }, p as Record<string, unknown>));
 					const running = run.status === "running";
-					let replacement: { model?: string; thinking?: string; contextWindow?: number; timeoutMs?: number } | undefined;
-					if (p.model) {
-						const { model, thinking } = resolveModel(p.model, ctx);
-						if (!model) throw new Error(`model not found: ${p.model}`);
-						// Keep the saved reasoning level unless this spec names one.
-						replacement = { model: modelKey(model), thinking: thinking ?? run.thinking, contextWindow: model.contextWindow };
-					}
-					if (p.timeoutMs !== undefined) replacement = { ...replacement, timeoutMs: p.timeoutMs };
 					const previous = `${run.model}${run.thinking ? `:${run.thinking}` : ""}`;
-					// The model steered it: its completion wakes the model, whoever started it.
-					if (run.userStarted) { run.userStarted = undefined; saveRun(run); }
-					await steer(run, p.message, p.restart, replacement);
-					const moved = replacement?.model ? ` Model changed from ${previous} to ${run.model}${run.thinking ? `:${run.thinking}` : ""} for this and later segments; its earlier work keeps the model it ran on.` : "";
-					const retimed = replacement?.timeoutMs !== undefined ? ` Budget now ${Math.round(run.timeoutMs / 60000)} min for this and later segments.` : "";
+					await piBackend.steer(run.id, request, { ctx });
+					const moved = request.model ? ` Model changed from ${previous} to ${run.model}${run.thinking ? `:${run.thinking}` : ""} for this and later segments; its earlier work keeps the model it ran on.` : "";
+					const retimed = request.timeoutMs !== undefined ? ` Budget now ${Math.round(run.timeoutMs / 60000)} min for this and later segments.` : "";
 					const trust = run.projectTrustUnknown ? ` Note: ${TRUST_UNKNOWN}.` : "";
-					return { content: [{ type: "text", text: `${run.id}: ${running ? "steer queued" : "resumed in the background"}.${moved}${retimed}${trust} Completion will wake you; use wait to join.` }], details: recordedView(run) };
+					return { content: [{ type: "text", text: `${run.id}: ${running ? "steer queued" : "resumed in the background"}.${moved}${retimed}${trust} ${STEER_HINT}` }], details: recordedView(run) };
 				}
 			}
 			return { content: [{ type: "text", text: "unreachable" }], isError: true, details: undefined };
@@ -2731,21 +1449,21 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 	const childDrafts = new Map<string, string>();
 	/** The roles page: what a delegate call without model: would run on now, and where each role comes from. */
 	function roleLines(ctx: ExtensionContext): string[] {
-		const roles = [...loadRoles(ctx.cwd, ctx.isProjectTrusted()).values()].sort((a, b) => a.name.localeCompare(b.name));
+		const roles = sortedRoles(ctx);
 		const approved = loadDefaults().approved;
 		const lines = roles.flatMap((r) => {
 			let now: string;
 			try {
 				const resolved: { model: any; pick?: string } = approved[r.name] ? resolveModel(approved[r.name].spec, ctx) : resolveRoleModels(r.models, ctx);
 				now = `${resolved.model ? modelKey(resolved.model) : "no model"}${approved[r.name] ? " (approved default)" : r.models?.length ? resolved.pick ? ` — ${resolved.pick}` : " (role file)" : " (this session's model)"}`;
-			} catch (error) { now = `unavailable: ${error instanceof Error ? error.message : String(error)}`; }
+			} catch (error) { now = `unavailable: ${errorMessage(error)}`; }
 			return [`${r.name} — ${r.description}`,
 				`  models: ${r.models?.join(", ") ?? "inherits this session's model"}`,
 				`  runs on now: ${now}`,
 				`  ${r.context ?? "fork"} context${r.thinking ? ` · thinking ${r.thinking}` : ""} · tools: ${r.tools?.join(", ") ?? "every tool"}`,
 				`  ${r.source}`, ""];
 		});
-		return [...lines, "Edit a role's model: line to list models, most preferred first. Roles are read from the package, ~/.pi/agent/agents, ~/.agents/agents and a trusted project's .pi/agents."];
+		return [...lines, `Edit a role's model: line to list models, most preferred first. Roles are read from ${roleSourcesText(AGENT_DIR)}.`];
 	}
 	async function openSettings(ctx: ExtensionContext) {
 		if (ctx.mode !== "tui") {
@@ -2759,14 +1477,14 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 			const rows: SettingsRow[] = [
 				...delegateRows(() => settings, async (change) => { settings = await saveDelegateSettings(change, SETTINGS_PATH); if ("mode" in change) syncMode(ctx); }),
 				...todoRows(() => todoSettings, async (change) => { todoSettings = await saveTodoSettings(change, SETTINGS_PATH); }),
-				{ id: "roles", section: "Agents", label: "Roles", value: () => `${loadRoles(ctx.cwd, ctx.isProjectTrusted()).size} roles`,
+				{ id: "roles", section: "Agents", label: "Roles", value: () => `${loadRoles(ctx.cwd, ctx.isProjectTrusted(), AGENT_DIR).size} roles`,
 					help: "Each role's model list, the model a delegate call without model: runs on right now, and the file it comes from.",
 					submenu: (close) => textPage("Roles", () => roleLines(ctx), close, Math.max(6, tui.terminal.rows - 12)) },
-				{ id: "mom", section: "Mom", label: "Mom", value: () => activity?.hasMomSettings() ? "settings" : "not connected",
-					help: "Mom's own settings: background tracking, suggestions, continuity, map mode and her models. Esc returns here.",
-					submenu: (close) => activity?.momSettings(ctx, tui, close) ?? textPage("Mom", () => ["Mom is not connected yet. Her settings open here once her saved view has loaded."], close) },
+				// Path's own rows, in the same list: one settings screen for the whole package.
+				...(activity?.momRows(ctx, tui) ?? [{ id: "mom", section: "Path", label: "Path", value: () => "not connected",
+					help: "Path is not connected yet. Its settings are listed here once its saved view has loaded." }]),
 				{ id: "restore", section: "Reset", label: "Restore defaults", value: () => "",
-					help: "Set delegation and todo settings above back to their defaults. Mom's settings, approved role models and ratings are kept.",
+					help: "Set delegation and todo settings above back to their defaults. Path's settings, approved role models and ratings are kept.",
 					action: async () => {
 						settings = await saveDelegateSettings({ ...DEFAULT_DELEGATE_SETTINGS }, SETTINGS_PATH);
 						todoSettings = await saveTodoSettings({ ...DEFAULT_TODO_SETTINGS }, SETTINGS_PATH);
@@ -2782,9 +1500,9 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 		try {
 			await ctx.ui.custom<undefined>(
 				(childTui, childTheme, kb, done) => new ChildView(id, liveSource, childTheme, childTui, kb, SettingsManager.create(ctx.cwd, AGENT_DIR), () => done(undefined), childDrafts.get(id) ?? "", (draft) => { childDrafts.set(id, draft); }),
-				{ overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left", margin: 0 } },
+				FULLSCREEN,
 			);
-		} catch (e) { ctx.ui.notify(`Cannot open child: ${String(e)}`, "error"); }
+		} catch (e) { ctx.ui.notify(`Cannot open child: ${errorMessage(e)}`, "error"); }
 		finally { navigationOpen = false; }
 	}
 	async function openHistory(ctx: ExtensionContext) {
@@ -2798,7 +1516,7 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 				(tui, theme, _kb, done) => new AgentHistory(finished, theme, tui, done),
 				{ overlay: true, overlayOptions: { width: "90%", maxHeight: "100%", anchor: "center", margin: 1 } },
 			);
-		} catch (e) { ctx.ui.notify(`Cannot open agent history: ${String(e)}`, "error"); }
+		} catch (e) { ctx.ui.notify(`Cannot open agent history: ${errorMessage(e)}`, "error"); }
 		finally { navigationOpen = false; }
 		if (id) await openChild(ctx, id);
 	}
@@ -2842,7 +1560,7 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 					if (ctx.mode === "tui") {
 						details = await ctx.ui.custom<DealsDetails>((tui, theme, _keys, done) =>
 							new DealSheet(details, filter, theme, tui, done, () => discoverDeals(ctx, filter, undefined, true)),
-							{ overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left", margin: 0 } });
+							FULLSCREEN);
 					}
 					// Custom entries render in chat but are excluded from the model context.
 					pi.appendEntry("pi-delegate.deals", details);
@@ -2854,10 +1572,10 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 			handler: async (_args, ctx) => { await openHistory(ctx); },
 		});
 		pi.registerCommand("delegate", {
-			description: "Delegate settings (mode, limits, model picking, roles, Mom) · fork:<role> <task> · fresh:<role> <task>",
+			description: "Delegate settings (mode, limits, model picking, roles, Path) · fork:<role> <task> · fresh:<role> <task>",
 			getArgumentCompletions: (prefix) => {
 				const ctx = owner?.binding?.ctx;
-				const roles = ctx ? [...loadRoles(ctx.cwd, ctx.isProjectTrusted()).values()].sort((a, b) => a.name.localeCompare(b.name)) : [];
+				const roles = ctx ? sortedRoles(ctx) : [];
 				const items = [{ value: "settings", label: "settings", description: "Every pi-delegate setting, below the prompt" },
 					...roles.flatMap((r) => (["fork", "fresh"] as const).map((kind) => ({ value: `${kind}:${r.name} `, label: `${kind}:${r.name}`,
 						description: `${kind === "fork" ? "with this conversation" : "no conversation"} · ${r.description}` })))];
@@ -2877,7 +1595,7 @@ async function waitForChild(run: Run, ctx: ExtensionContext, signal?: AbortSigna
 					const run = result.details?.id ? runs.get(result.details.id) : undefined;
 					if (run && !result.isError) { run.userStarted = true; saveRun(run); changed(); }
 					ctx.ui.notify(result.content?.[0]?.text ?? "delegate returned nothing", result.isError ? "error" : "info");
-				} catch (error) { ctx.ui.notify(String(error instanceof Error ? error.message : error), "error"); }
+				} catch (error) { ctx.ui.notify(errorMessage(error), "error"); }
 			},
 		});
 		// Ctrl+J is also Pi's default secondary newline (tui.input.newLine), so Pi reports the override

@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -8,15 +7,10 @@ import { AcpBackend } from "../src/acp-backend.ts";
 import { configureAcpCoordinator, shutdownAcpCoordinator } from "../src/acp/instance.ts";
 import type { Profile, RuntimePort } from "../src/acp/domain/types.ts";
 import { fakeRuntime } from "./acp-fake-runtime.ts";
-
-function deferred() {
-	let resolve!: () => void;
-	const promise = new Promise<void>((done) => { resolve = done; });
-	return { promise, resolve };
-}
+import { deferred, tempDir } from "./capture.ts";
 
 test("ACP delegate launch returns before a slow session starts, and wait joins it", { timeout: 30_000 }, async (t) => {
-	const root = mkdtempSync(join(tmpdir(), "pi-delegate-async-launch-"));
+	const root = tempDir("pi-delegate-async-launch-");
 	const cwd = join(root, "project");
 	const runDir = join(root, "runs");
 	mkdirSync(cwd, { recursive: true });
@@ -45,7 +39,6 @@ test("ACP delegate launch returns before a slow session starts, and wait joins i
 		await backend.closeOwner(ownerKey);
 		await shutdownAcpCoordinator();
 		configureAcpCoordinator({});
-		rmSync(root, { recursive: true, force: true });
 	});
 
 	const startedAt = Date.now();

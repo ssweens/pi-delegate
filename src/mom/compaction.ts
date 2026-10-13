@@ -1,5 +1,6 @@
 import type { SessionBeforeCompactEvent, SessionCompactEvent } from "@earendil-works/pi-coding-agent";
 import { extractEvents, renderEvents, type Entry, type FeedEvent } from "./feed.ts";
+import { makeRef } from "../util/ref.ts";
 
 export interface PendingCompactionReview {
 	sessionId: string;
@@ -48,7 +49,7 @@ export function finishCompactionReview(pending: PendingCompactionReview, event: 
 	if (event.compactionEntry.firstKeptEntryId !== pending.firstKeptEntryId) {
 		throw new Error("Compaction result does not match the raw segment captured before compaction.");
 	}
-	const triggerRef = `${pending.sessionId}:${event.compactionEntry.id}`;
+	const triggerRef = makeRef(pending.sessionId, event.compactionEntry.id);
 	const triggerEvent = { ref: triggerRef, at: event.compactionEntry.timestamp, actor: "lead", kind: "compaction", claim: event.compactionEntry.summary ?? "" };
 	return { kind: "compaction_review", summary: event.compactionEntry.summary ?? "", firstKeptEntryId: pending.firstKeptEntryId,
 		triggerRef, triggerEvent, rawReplacedEvents: renderEvents(pending.rawEvents), rawEntryCount: pending.rawEntries.length, rawEventCount: pending.rawEvents.length,

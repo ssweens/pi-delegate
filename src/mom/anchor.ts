@@ -1,4 +1,5 @@
-/** Mom renders the post-compaction continuity anchor from her saved map; never a model call. */
+/** Path renders the post-compaction continuity anchor from its saved map; never a model call. */
+import { oneLine } from "../util/text.ts";
 import { isEndeavor, type GraphNode } from "./graph.ts";
 import type { FeedEvent } from "./feed.ts";
 import type { Checkpoint } from "./checkpoint.ts";
@@ -37,8 +38,7 @@ export interface AnchorFeed {
 }
 
 const effectLine = (command: string, status?: string): string => {
-	const flat = command.replace(/\s+/g, " ").trim();
-	const clipped = flat.length > MAX_COMMAND_CHARS ? `${flat.slice(0, MAX_COMMAND_CHARS).trimEnd()}…` : flat;
+	const clipped = oneLine(command, MAX_COMMAND_CHARS);
 	return status ? `${clipped} — ${status}` : clipped;
 };
 
@@ -59,10 +59,7 @@ export async function collectSideEffects(feed: AnchorFeed, limit = MAX_EFFECTS):
 	return effects;
 }
 
-const oneLine = (text: string): string => {
-	const flat = text.replace(/\s+/g, " ").trim();
-	return flat.length > MAX_INTENT_CHARS ? `${flat.slice(0, MAX_INTENT_CHARS).trimEnd()}…` : flat;
-};
+const intentLine = (text: string): string => oneLine(text, MAX_INTENT_CHARS);
 
 /** The anchor is a sourced interpretation, never verbatim authority or new direction. */
 export function renderAnchor(checkpoint: Checkpoint, effects: readonly string[], savedAgo?: string): string {
@@ -70,13 +67,13 @@ export function renderAnchor(checkpoint: Checkpoint, effects: readonly string[],
 	const nodes = new Map(graph.nodes.map(node => [node.id, node] as const));
 	const cite = (node: GraphNode) => node.purposeSource ?? node.sources[0];
 	const lines: string[] = [
-		`Mom — continuity anchor after the compaction summary (from her last saved map${savedAgo ? `, saved ${savedAgo} ago` : ""}; not the summary; descriptive, not new direction):`,
+		`Path — continuity anchor after the compaction summary (from its last saved map${savedAgo ? `, saved ${savedAgo} ago` : ""}; not the summary; descriptive, not new direction):`,
 	];
 	const root = graph.motherThread ? nodes.get(graph.motherThread) : undefined;
 	if (root) lines.push(`Mother thread — “${root.label}”: “${root.intent.trim() || root.label}”${cite(root) ? ` [src:${cite(root)}]` : ""}`);
 	const rules = graph.nodes.filter(node => node.kind === "rule" && node.state === "active").slice(0, MAX_RULES);
 	if (rules.length) {
-		lines.push("Recorded constraints (Mom's interpretation; check cited user direction and scope):");
+		lines.push("Recorded constraints (Path's interpretation; check cited user direction and scope):");
 		for (const rule of rules) {
 			const owner = rule.parent ? nodes.get(rule.parent) : undefined;
 			lines.push(`- “${rule.intent.trim() || rule.label}”${cite(rule) ? ` [src:${cite(rule)}]` : ""}${owner ? ` — under “${owner.label}”` : ""}`);
@@ -84,11 +81,11 @@ export function renderAnchor(checkpoint: Checkpoint, effects: readonly string[],
 	}
 	const focus = graph.focus ? nodes.get(graph.focus) : undefined;
 	if (focus) {
-		const intent = oneLine(focus.intent);
+		const intent = intentLine(focus.intent);
 		if (isEndeavor(focus)) lines.push(`Current — “${focus.label}”${intent ? `: ${intent}` : ""}`);
 		else {
 			const owner = focus.parent ? nodes.get(focus.parent) : undefined;
-			const ownerIntent = owner ? oneLine(owner.intent) : "";
+			const ownerIntent = owner ? intentLine(owner.intent) : "";
 			lines.push(owner ? `Current — “${owner.label}”${ownerIntent ? `: ${ownerIntent}` : ""} (attention on “${focus.label}”)`
 				: `Current — “${focus.label}”${intent ? `: ${intent}` : ""}`);
 		}
@@ -101,6 +98,3 @@ export function renderAnchor(checkpoint: Checkpoint, effects: readonly string[],
 	}
 	return lines.join("\n");
 }
-
-/** Local wall-clock HH:MM, matching the widget's anchor status. */
-export const clockTime = (at: number): string => new Date(at).toTimeString().slice(0, 5);

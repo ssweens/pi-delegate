@@ -1,17 +1,14 @@
-import { execFile } from "node:child_process";
+import { errorMessage } from "../../util/text.ts";
+import { git as runGit } from "../../util/git.ts";
 import { realpath } from "node:fs/promises";
-import { promisify } from "node:util";
 import type { WorkerRecord, WorktreeIdentity } from "./types.js";
 import { StringsError } from "./errors.js";
 
-const execFileAsync = promisify(execFile);
-
 async function git(cwd: string, ...args: string[]): Promise<string> {
   try {
-    const { stdout } = await execFileAsync("git", ["-C", cwd, ...args], { encoding: "utf8", timeout: 10_000 });
-    return stdout.trim();
+    return (await runGit(cwd, ...args)).trim();
   } catch (error) {
-    throw new StringsError("WRITER_ISOLATION_REQUIRED", `Cannot inspect git worktree at ${cwd}: ${error instanceof Error ? error.message : String(error)}`);
+    throw new StringsError("WRITER_ISOLATION_REQUIRED", `Cannot inspect git worktree at ${cwd}: ${errorMessage(error)}`);
   }
 }
 

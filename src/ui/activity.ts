@@ -1,22 +1,19 @@
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, visibleWidth, type Component, type Focusable, type TUI } from "@earendil-works/pi-tui";
+import { type Component, type Focusable, type TUI } from "@earendil-works/pi-tui";
 import { AgentsPanel, type LiveSource } from "../inspector.js";
-import { frame } from "../render.js";
+import { frame, withLegend } from "../render.js";
 import { renderTodoSectionLines } from "../todo-render.js";
 import type { TodoState } from "../todo.js";
-import { momSectionLines, type PanelView } from "./panel.ts";
+import { COMPACT_KEY, FOCUS_KEY, momSectionLines, type PanelView } from "./panel.ts";
+import { agentListHint, chordLabel, hint, joinHints } from "./hints.ts";
+import { cut } from "./text.ts";
+import { SPIN_MS, spinning } from "./trail-view.ts";
+import type { SettingsRow } from "./settings-panel.ts";
 
 export const ACTIVITY_WIDGET_KEY = "pi-delegate.activity";
-/** Mom's settings panel, built for a submenu: `close` returns to the panel that opened it. Undefined until she is connected. */
-export type MomSettingsFactory = (context: ExtensionContext, tui: TUI, close: () => void) => Component | undefined;
-
-const withLegend = (lines: string[], legend: string, theme: Theme, width: number): string[] => {
-	if (width < 8 || lines.length === 0) return lines;
-	const label = theme.fg("dim", truncateToWidth(` ${legend} `, width - 3, "…"));
-	lines[lines.length - 1] = theme.fg("borderAccent", "╰─") + label
-		+ theme.fg("borderAccent", "─".repeat(Math.max(0, width - 3 - visibleWidth(label))) + "╯");
-	return lines;
-};
+/** Path's settings panel, built for a submenu: `close` returns to the panel that opened it. Undefined until it is connected. */
+/** Path's rows of the settings panel; undefined until Path is connected. */
+export type MomRowsFactory = (context: ExtensionContext, tui: TUI) => SettingsRow[] | undefined;
 
 /** Compose one outer frame around already-unframed section rows. */
 export function renderActivityLines(sections: readonly (readonly string[])[], theme: Theme, width: number, focused = false): string[] {
@@ -29,7 +26,7 @@ export function renderActivityLines(sections: readonly (readonly string[])[], th
 	}
 	if (!body.length) return [];
 	const lines = frame("Activity", body, "borderAccent", theme, outer);
-	return withLegend(lines, focused ? "↑↓ select · → open · ← editor" : "← agents · Ctrl+Shift+J Mom · Ctrl+Shift+K compact", theme, outer);
+	return withLegend(lines, focused ? agentListHint() : joinHints(hint.left("agents"), `${chordLabel(FOCUS_KEY)} Path`, `${chordLabel(COMPACT_KEY)} compact`), "borderAccent", theme, outer);
 }
 
 /** The widget is the focus target; AgentsPanel remains the section renderer and input delegate. */
@@ -58,7 +55,8 @@ export class ActivityCoordinator {
 	private clearOnShrink?: boolean;
 	private installed = false;
 	private settledBefore = Date.now();
-	private momPanel?: MomSettingsFactory;
+	private momRowsFactory?: MomRowsFactory;
+	private spinner?: ReturnType<typeof setInterval>;
 
 	install(context: ExtensionContext, live: LiveSource, openChild: (id: string) => Promise<void>): void {
 		this.context = context;
@@ -96,7 +94,14 @@ export class ActivityCoordinator {
 
 	clearMom(): void {
 		this.mom = undefined;
+		this.spin(false);
 		this.tui?.requestRender();
+	}
+
+	/** Path's spinner repaints on its own clock while the last frame drew one; a state change alone would leave it frozen. */
+	private spin(on: boolean): void {
+		if (on && !this.spinner) { this.spinner = setInterval(() => this.tui?.requestRender(), SPIN_MS); this.spinner.unref?.(); }
+		if (!on && this.spinner) { clearInterval(this.spinner); this.spinner = undefined; }
 	}
 
 	focusAgents(): void {
@@ -110,12 +115,12 @@ export class ActivityCoordinator {
 		this.tui?.requestRender();
 	}
 
-	/** Mom offers her settings panel here, so /delegate settings can open it as a submenu. */
-	setMomSettings(factory: MomSettingsFactory | undefined): void { this.momPanel = factory; }
-	hasMomSettings(): boolean { return Boolean(this.momPanel); }
-	momSettings(context: ExtensionContext, tui: TUI, close: () => void): Component | undefined { return this.momPanel?.(context, tui, close); }
+	/** Path offers its settings panel here, so /delegate settings can open it as a submenu. */
+	setMomRows(factory: MomRowsFactory | undefined): void { this.momRowsFactory = factory; }
+	momRows(context: ExtensionContext, tui: TUI): SettingsRow[] | undefined { return this.momRowsFactory?.(context, tui); }
 
 	dispose(): void {
+		this.spin(false);
 		this.panel?.dispose();
 		this.panel = undefined;
 		this.widget = undefined;
@@ -136,8 +141,10 @@ export class ActivityCoordinator {
 		const sections: string[][] = [];
 		if (this.panel) sections.push(this.panel.renderSection(inner + 4));
 		if (this.todos) sections.push(renderTodoSectionLines(this.todos, theme, inner + 4));
-		if (this.mom) sections.push(momSectionLines(this.mom(), theme, inner + 4));
-		return renderActivityLines(sections, theme, outer, Boolean(this.panel?.focused)).map(line => truncateToWidth(line, outer, ""));
+		const mom = this.mom?.();
+		this.spin(Boolean(mom?.trail && spinning(mom.status)));
+		if (mom) sections.push(momSectionLines(mom, theme, inner + 4));
+		return renderActivityLines(sections, theme, outer, Boolean(this.panel?.focused)).map(line => cut(line, outer));
 	}
 }
 

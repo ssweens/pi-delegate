@@ -37,6 +37,7 @@ import {
 	todoPanelComponent,
 	todoWidgetComponent,
 } from "./todo-render.js";
+import { isRecord, textOf } from "./util/text.ts";
 
 /** Custom-entry namespace owned by pi-delegate. */
 export const TODO_CUSTOM_TYPE = "pi_delegate.todo";
@@ -83,7 +84,7 @@ const PARAMS = Type.Object({
 type TodoParams = Static<typeof PARAMS>;
 
 function entryState(entry: unknown): TodoState | undefined {
-	if (!entry || typeof entry !== "object") return undefined;
+	if (!isRecord(entry)) return undefined;
 	const e = entry as { type?: unknown; customType?: unknown; data?: unknown };
 	if (e.type !== "custom") return undefined;
 	if (e.customType !== TODO_CUSTOM_TYPE && e.customType !== LEGACY_TODO_CUSTOM_TYPE) return undefined;
@@ -293,11 +294,8 @@ function finalAssistantText(messages: readonly unknown[]): { text: string; stopR
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const m = messages[i] as { role?: unknown; content?: unknown; stopReason?: unknown } | undefined;
 		if (m?.role !== "assistant") continue;
-		const pieces = Array.isArray(m.content)
-			? m.content.filter((c): c is { type: string; text?: string } => Boolean(c) && typeof c === "object" && (c as { type?: unknown }).type === "text")
-			: [];
 		return {
-			text: pieces.map((c) => c.text ?? "").join(" ").trim(),
+			text: textOf(m.content, " ").trim(),
 			stopReason: typeof m.stopReason === "string" ? m.stopReason : undefined,
 		};
 	}

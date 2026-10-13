@@ -1,13 +1,13 @@
-// Map-maintenance modes: how Mom turns new activity into an update of her map — a work graph
+// Map-maintenance modes: how Path turns new activity into an update of its map — a work graph
 // (commit_graph, v2) or the trail (an append-only index into the transcript, docs/trail.md).
 //
 // One module, one responsibility — the mode DECLARATION and RESOLUTION. It deliberately does not
 // route or schedule anything: those stay on the existing seams (momConfiguration's instructions,
-// engine.begin's settlement boundary, Mom.prepare's staging, each finalizer's single-writer
+// engine.begin's settlement boundary, Path.prepare's staging, each finalizer's single-writer
 // acceptance). Adding a mode is one entry here plus the work named in docs/map-modes.md; it is not
 // a new runtime layer.
 //
-// Why modes exist: the map-maintenance judgment (Mom's "soul") is encoded as prose in one prompt,
+// Why modes exist: the map-maintenance judgment (Path's "soul") is encoded as prose in one prompt,
 // and a small local model cannot hold it all at once. Competing designs move different parts of
 // that judgment between the model and host code. A mode names which split is in force.
 import { MOM_PROMPT } from "./contract.ts";
@@ -35,7 +35,7 @@ export interface ModeApplyResult {
 }
 
 export interface MapMode {
-	/** Stable id, lowercase_underscore. Select with --mom-mode. */
+	/** Stable id, lowercase_underscore. Select with --path-mode. */
 	readonly name: string;
 	readonly description: string;
 	/** The model's standing map-maintenance instructions. The host appends the operation prompt
@@ -74,7 +74,7 @@ export const COMMIT_GRAPH_MODE: MapMode = {
 /**
  * The minimal map (src/mom/v2.ts): the model edits one tree of work, rules and notes directly with
  * commit_v2; the host checks structure and, when present, a per-node change spec. The decision model
- * reads eligible background batches before her model. Stored in the shared map record, so commit_graph
+ * reads eligible background batches before its model. Stored in the shared map record, so commit_graph
  * and every map reader are unchanged.
  */
 export const V2_MODE: MapMode = {
@@ -133,7 +133,7 @@ export const modeNames = (): string[] => MODES.map(mode => mode.name);
 export function assertRunnable(mode: MapMode): MapMode {
 	// One classification round plus one repair; preparation and audits are separate requests.
 	// A multi-stage mode needs the operation seam in docs/map-modes.md (M3) extended first.
-	if (mode.turns !== 1) throw new Error(`Mom mode ${JSON.stringify(mode.name)} needs ${mode.turns} model turns; the operation runs one. See docs/map-modes.md.`);
+	if (mode.turns !== 1) throw new Error(`Path mode ${JSON.stringify(mode.name)} needs ${mode.turns} model turns; the operation runs one. See docs/map-modes.md.`);
 	return mode;
 }
 
@@ -146,7 +146,7 @@ export function modeFor(name: string | undefined): MapMode {
 	const wanted = name?.trim();
 	if (!wanted) return COMMIT_GRAPH_MODE;
 	const mode = MODES.find(candidate => candidate.name === wanted);
-	if (!mode) throw new Error(`Unknown Mom mode ${JSON.stringify(wanted)}; --mom-mode accepts ${modeNames().join(", ")}.`);
+	if (!mode) throw new Error(`Unknown Path mode ${JSON.stringify(wanted)}; --path-mode accepts ${modeNames().join(", ")}.`);
 	return assertRunnable(mode);
 }
 

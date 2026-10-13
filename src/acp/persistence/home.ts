@@ -12,12 +12,12 @@
  * where that Coordinator kept it: <PI_AGENT_DIR, else ~/.pi/agent>/pi-strings/state.json, which is
  * the home above unless PI_CODING_AGENT_DIR moves Pi's agent dir.
  */
-import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { homedir, hostname } from "node:os";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import lockfile from "proper-lockfile";
+import { ownerAlive, processIdentity, type ProcessIdentity } from "../../util/process.ts";
 
 /**
  * Pi's getAgentDir(), copied (test/acp-processes.test.ts checks they agree; Windows shell paths
@@ -42,15 +42,6 @@ export function legacyAgentDir(): string { return process.env.PI_AGENT_DIR ?? jo
 /** The single state dir from before per-process state. */
 export function legacyStateDir(): string { return join(legacyAgentDir(), "pi-strings"); }
 
-/** This process, as its state dir and its claims name it. The token tells a reused PID from its earlier owner. */
-export interface ProcessIdentity { pid: number; host: string; token: string; startedAt: string }
-
-const IDENTITY = Symbol.for("@ssweens/pi-delegate/acp-process/1");
-export function processIdentity(): ProcessIdentity {
-  const g = globalThis as typeof globalThis & { [IDENTITY]?: ProcessIdentity };
-  return g[IDENTITY] ??= { pid: process.pid, host: hostname(), token: randomUUID().replaceAll("-", "").slice(0, 12), startedAt: new Date().toISOString() };
-}
-
 /** This process's own state dir. Stable for the process, so a Coordinator rebuilt after a shutdown finds its state. */
 export function processStateDir(home: string): string {
   const me = processIdentity();
@@ -60,23 +51,6 @@ export function processStateDir(home: string): string {
 export const OWNER_FILE = "owner.json";
 /** The state dir lock's staleness, as StateStore takes it: refreshed every 10 s by a live owner. */
 export const STATE_LOCK_STALE_MS = 30_000;
-
-export function pidAlive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; }
-  catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
-}
-
-/**
- * Whether a process that recorded this identity is still running. Another host cannot be probed,
- * so its owner counts as alive. Our PID with another token is an earlier process that reused it.
- */
-export function ownerAlive(owner: Pick<ProcessIdentity, "pid" | "host" | "token">): boolean {
-  const me = processIdentity();
-  if (owner.token === me.token) return true;
-  if (owner.host !== me.host) return true;
-  if (!Number.isInteger(owner.pid) || owner.pid === me.pid) return false;
-  return pidAlive(owner.pid);
-}
 
 export async function readOwner(stateDir: string): Promise<ProcessIdentity | undefined> {
   try {

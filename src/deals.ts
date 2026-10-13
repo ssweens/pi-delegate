@@ -1,3 +1,4 @@
+import { isRecord } from "./util/text.ts";
 // Read-only OpenRouter deal discovery. Prices are USD per token in the API;
 // the comparison basket is 1M prompt + 250k completion tokens, not a bill forecast.
 export interface TimedWindow { start: string; end: string; input: number; output: number; period: "peak" | "off-peak" }
@@ -87,7 +88,7 @@ function schedule(pricing: any, now: Date): { saving: number; period: NonNullabl
 	currentInput?: number; currentOutput?: number; timing: DealTiming;
 	description: string; price: NonNullable<ReturnType<typeof money>> } | undefined {
 	const windows: any[] = (Array.isArray(pricing?.overrides) ? pricing.overrides : []).filter((o: any) => {
-		if (!o || typeof o !== "object" || o.min_prompt_tokens !== undefined) return false;
+		if (!isRecord(o) || o.min_prompt_tokens !== undefined) return false;
 		if (Object.keys(o).some((key) => !PRICE_KEYS.has(key) && !CONDITIONS.has(key))) return false;
 		return o.utc_start !== undefined || o.utc_end !== undefined || Array.isArray(o.utc_days);
 	});

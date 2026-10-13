@@ -1,8 +1,8 @@
 # pi-delegate
 
-Install from a local checkout with `pi install ./pi-delegate`. This private package is not published to npm. During the tether compatibility window, use this package instead of `pi-tether`; do not list both packages in Pi or Oven settings because both declare Mom. The delegation tools, phased todo tool, `delegation` skill, and default roles all ship in the package. Nothing is copied to `~/.agents`.
+Install from a local checkout with `pi install ./pi-delegate`. This private package is not published to npm. During the tether compatibility window, use this package instead of `pi-tether`; do not list both packages in Pi or Oven settings because both declare Path. The delegation tools, phased todo tool, `delegation` skill, and default roles all ship in the package. Nothing is copied to `~/.agents`.
 
-Requires Pi 0.99.1 or newer, below 2.0.0. Minimal delegation for pi: durable child runs, role files, fork context, steer, honest run log, a stock-Pi phased todo list, and Mom's unified activity view. Mom's trail (the append-only index of waypoints into the transcript, mode `trail`) is documented in [`docs/trail.md`](docs/trail.md); the older work-graph modes are in [`docs/map-modes.md`](docs/map-modes.md). Replaces pi-subagents (125 schema params, 14.8k lines, 11 tools in context) and pi-strings.
+Requires Pi 0.99.1 or newer, below 2.0.0. Minimal delegation for pi: durable child runs, role files, fork context, steer, honest run log, a stock-Pi phased todo list, and Path's unified activity view. Path's trail (the append-only index of waypoints into the transcript, mode `trail`) is documented in [`docs/trail.md`](docs/trail.md); the older work-graph modes are in [`docs/map-modes.md`](docs/map-modes.md). Replaces pi-subagents (125 schema params, 14.8k lines, 11 tools in context) and pi-strings.
 
 One tool pair, two backends:
 
@@ -81,7 +81,7 @@ tools: read, grep, find, ls, bash, web_search, fetch_content, mcp__github__*
 
 The parent's own pi-delegate is not loaded a second time in a child. The child runs its own copy, which provides `delegate` and `delegate_ctl` when its tools allow them.
 
-Mom is the root parent's alone. No child runs her: an extension that brings her (this package installed, or pi-tether) is left out of every child's session, together with its `mom` tool, `/mom` command and shortcuts, so a child never follows, maps or advises on its own session. An ACP Pi worker skips her too, and an oven child gets only the extensions its role names.
+Path is the root parent's alone. No child runs it: an extension that brings it (this package installed, or pi-tether) is left out of every child's session, together with its `path` tool, `/path` command and shortcuts, so a child never follows, maps or advises on its own session. An ACP Pi worker skips it too, and an oven child gets only the extensions its role names.
 
 ### Extensions in a child
 
@@ -352,7 +352,7 @@ The child transcript uses Pi's own assistant/user message, built-in tool, and ed
 
 ## Settings
 
-**`/delegate settings`** (or plain `/delegate`) opens every pi-delegate setting in place of the editor, below the conversation, not in an overlay. Each row shows its value and is marked **●** when it differs from the default; **Enter** or **→** opens its choices in place, each with a one-line description, the help column beside the list explains the selected row or choice, and choosing saves to the relevant section of `~/.pi/agent/pi-delegate.json` at once. **Esc** or **←** steps back.
+**`/delegate settings`** (or plain `/delegate`) opens every pi-delegate setting, Path's included, in one list in place of the editor, below the conversation, not in an overlay. It is Pi's own settings list (the one behind Pi's `/settings`): type to search, and the selected row's help shows under the list. Each row shows its value and is marked **●** when it differs from the default. **Enter** cycles an on/off row, or opens a row's choices, each with a one-line description and its own help; Path's model and decision model open Pi's model selector. Choosing saves to the relevant section of `~/.pi/agent/pi-delegate.json` at once. **Esc** steps back. `/path settings` shows Path's rows alone.
 
 | Row | Choices | Default |
 | --- | --- | --- |
@@ -361,9 +361,9 @@ The child transcript uses Pi's own assistant/user message, built-in tool, and ed
 | Max running | No limit, 2, 4, 8, 16, 32, 64: unsettled runs of both backends at once, across the whole tree. A start or revival over the limit fails with `CONCURRENCY_LIMIT`; nothing is queued, and the agent can `wait` for one to finish. | 16 |
 | Model picking | **First scoped** or **First available**, for role model lists (see [Roles](#roles)) | First scoped |
 | Roles | Each role's models, what it would run on now, and its file. Read only. | |
-| Mom | Mom's own settings panel, as `/mom settings` opens it. | |
+| Path | Path's own settings panel, as `/path settings` opens it. | |
 | Todo reminders | **Off** or **On**. When on, send a bounded follow-up after a turn ends with open todo items. The todo tool, command and widget work either way. | Off |
-| Restore defaults | Resets delegation and todo rows; Mom's settings, approved defaults and ratings are kept. | |
+| Restore defaults | Resets delegation and todo rows; Path's settings, approved defaults and ratings are kept. | |
 
 The mode applies from the main session's next turn, the limits and model picking from the next `delegate` call. No reload is needed.
 

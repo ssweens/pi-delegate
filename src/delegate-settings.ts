@@ -3,7 +3,9 @@
  * applies (a delegate call, a turn start), so a change in the settings panel takes effect on the next
  * call without a reload.
  */
-import { readSettings, settingsFile, writeSettings } from "./settings-file.ts";
+import { modelKey, matchesSpec, parseModelSpec } from "./model-ref.ts";
+import { defineSection } from "./settings-file.ts";
+import { isRecord } from "./util/text.ts";
 
 /**
  * - `opportunistic`: delegate for context isolation, parallelism, or a model-tier switch; otherwise do the work.
@@ -37,7 +39,7 @@ const int = (value: unknown, { min, max }: { min: number; max: number }, fallbac
 
 /** A section that is missing or malformed field by field reads as its default for that field. */
 export function normalizeDelegateSettings(value: unknown): DelegateSettings {
-	const raw = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+	const raw = isRecord(value) ? value : {};
 	const d = DEFAULT_DELEGATE_SETTINGS;
 	return {
 		mode: DELEGATION_MODES.includes(raw.mode as DelegationMode) ? raw.mode as DelegationMode : d.mode,
@@ -47,22 +49,12 @@ export function normalizeDelegateSettings(value: unknown): DelegateSettings {
 	};
 }
 
-export function readDelegateSettings(file: string = settingsFile()): DelegateSettings {
-	return normalizeDelegateSettings(readSettings(file).delegate);
-}
-
+const section = defineSection("delegate", normalizeDelegateSettings);
+export const readDelegateSettings = section.read;
 /** Validates the change before writing, so the file never holds a value this module would ignore. */
-export async function saveDelegateSettings(change: Partial<DelegateSettings>, file: string = settingsFile()): Promise<DelegateSettings> {
-	const next = normalizeDelegateSettings({ ...readDelegateSettings(file), ...change });
-	for (const [key, value] of Object.entries(change)) {
-		if (next[key as keyof DelegateSettings] !== value) throw new Error(`invalid ${key}: ${JSON.stringify(value)}`);
-	}
-	const written = await writeSettings({ delegate: { ...change } }, file);
-	return normalizeDelegateSettings(written.delegate);
-}
+export const saveDelegateSettings = section.save;
 
 export interface ModelCandidate { provider: string; id: string }
-const key = (m: ModelCandidate) => `${m.provider}/${m.id}`;
 
 /**
  * The first entry of a role's ordered `model:` list the session can use. An entry is `provider/id` (exact
@@ -73,16 +65,13 @@ const key = (m: ModelCandidate) => `${m.provider}/${m.id}`;
  */
 export function pickModel<M extends ModelCandidate>(entries: readonly string[], available: readonly M[], scoped: readonly M[], picking: ModelPicking):
 	{ model: M; entry: string; thinking?: string; skipped: string[] } | { model?: undefined; skipped: string[] } {
-	const scope = picking === "scoped" && scoped.length ? new Set(scoped.map(key)) : undefined;
+	const scope = picking === "scoped" && scoped.length ? new Set(scoped.map(modelKey)) : undefined;
 	const skipped: string[] = [];
 	for (const entry of entries) {
-		const colon = entry.lastIndexOf(":");
-		const spec = colon > 0 && !entry.slice(colon + 1).includes("/") ? entry.slice(0, colon) : entry;
-		const thinking = spec === entry ? undefined : entry.slice(colon + 1);
-		const slash = spec.indexOf("/");
-		const matching = available.filter((m) => slash > 0 ? m.provider === spec.slice(0, slash) && m.id === spec.slice(slash + 1) : m.id === spec);
+		const { thinking, ...spec } = parseModelSpec(entry);
+		const matching = available.filter((m) => matchesSpec(m, spec));
 		if (!matching.length) { skipped.push(`${entry}: no credentials or not in the catalog`); continue; }
-		const allowed = scope ? matching.filter((m) => scope.has(key(m))) : matching;
+		const allowed = scope ? matching.filter((m) => scope.has(modelKey(m))) : matching;
 		if (!allowed.length) { skipped.push(`${entry}: not in Pi's scoped models`); continue; }
 		return { model: allowed[0], entry, ...(thinking ? { thinking } : {}), skipped };
 	}

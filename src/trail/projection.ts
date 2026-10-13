@@ -3,7 +3,8 @@
  * pointers in recorded order, so every question about the journey is a fold over that list. See
  * docs/trail.md "Projections".
  */
-import { lineKey, type Trail, type Waypoint } from "./types.ts";
+import { lineKey, trailEntries, type Trail, type Waypoint } from "./types.ts";
+import { clockTime } from "../util/format.ts";
 
 export type LineStatus = "open" | "returned" | "landed" | "dead_end" | "quiet";
 
@@ -34,9 +35,9 @@ const LANDED_KINDS = new Set(["decided", "learned", "closed"]);
 const LANDING_KINDS = new Set(["decided", "learned", "dead_end", "returned", "closed"]);
 
 const supersededIds = (trail: Trail): Set<string> => new Set(trail.waypoints.flatMap(w => w.supersedes ? [w.supersedes] : []));
-/** Ids closed by the kinds that may close them; `closes` always names an earlier waypoint, so order needs no check. */
+/** Ids closed by the kinds that may close them, steps included (a finding can answer a parked question); `closes` always names an earlier entry, so order needs no check. */
 const closedIds = (trail: Trail, by: readonly Waypoint["kind"][]): Set<string> =>
-	new Set(trail.waypoints.flatMap(w => w.closes && by.includes(w.kind) ? [w.closes] : []));
+	new Set(trailEntries(trail).flatMap(w => w.closes && by.includes(w.kind) ? [w.closes] : []));
 const closedDetours = (trail: Trail) => detourWalk(trail.waypoints).closed;
 const closedOpens = (trail: Trail) => closedIds(trail, ["closed", "dead_end"]);
 
@@ -159,6 +160,10 @@ export interface Glance {
 	current?: { detour: Waypoint; returnTo: string };
 	/** Open items on the thread we are on. */
 	open: Waypoint[];
+	/** The widget's tree; absent on an empty trail. */
+	tree?: GlanceTree;
+	/** Open items on every thread, oldest first. */
+	parked: Waypoint[];
 	last?: Waypoint;
 	/** How many detours are open. */
 	depth: number;
@@ -170,7 +175,77 @@ export function glance(trail: Trail): Glance {
 	const crumbs = root === undefined ? [] : [root, ...standing.detours.map(entry => entry.detour.line)];
 	const goals = root === undefined ? [] : trail.waypoints.filter(w => lineKey(w.line) === lineKey(root) && (w.kind === "set_out" || w.kind === "reframed"));
 	const opening = goals.find(w => w.kind === "set_out") ?? goals[0];
-	return { goal: standing.goal, opening, changed: goals.some(w => w.kind === "reframed"), crumbs, current: lastOf(standing.detours), open: standing.open, last: lastOf(trail.waypoints), depth: standing.detours.length };
+	const parked = openItems(trail).flatMap(group => group.items);
+	return { goal: standing.goal, opening, changed: goals.some(w => w.kind === "reframed"), crumbs, current: lastOf(standing.detours), open: standing.open,
+		tree: glanceTree(trail, parked), parked, last: lastOf(trail.waypoints), depth: standing.detours.length };
+}
+
+/** Kinds that finish something: a choice made, an open item closed, a detour come back from. */
+const DONE_KINDS = new Set<Waypoint["kind"]>(["decided", "closed", "returned"]);
+const GOAL_KINDS = new Set<Waypoint["kind"]>(["set_out", "reframed"]);
+
+/**
+ * The widget's tree, as tasks. The current goal is the latest goal on any thread (a new set_out on its own thread
+ * replaces the last one as much as a reframe does), with the goals before it, newest first, as what led there. Under
+ * it hang what is still open and the detours still open, each nested in the one it left and carrying what led to it
+ * (its `from`). Everything finished is left out, except the most recent finished thing, which shows under the level
+ * it happened in and reads as the thing it finished: a `returned` as its detour, a `closed` as its open item.
+ */
+function glanceTree(trail: Trail, parked: readonly Waypoint[]): GlanceTree | undefined {
+	const all = trail.waypoints, entries = trailEntries(trail);
+	if (!all.length) return undefined;
+	const byId = new Map(entries.map(w => [w.id, w]));
+	const goals = all.filter(w => GOAL_KINDS.has(w.kind));
+	const goal = lastOf(goals) ?? all[0]!;
+	// Transcript position over waypoints and steps alike.
+	const position = new Map(entries.map((w, i) => [w.id, i]));
+	const at = (w: Waypoint) => position.get(w.id) ?? -1;
+	const isWaypoint = new Set(all.map(w => w.id));
+	const before = goals.filter(w => at(w) < at(goal)).reverse();
+	const detours = openDetours(trail);
+	const from = (w: Waypoint) => w.from ? byId.get(w.from) : undefined;
+	const levels: GlanceLevel[] = [{ head: goal, open: [] }, ...detours.map(({ detour }) => ({ head: detour, from: from(detour), open: [] as Waypoint[] }))];
+	// An item belongs to the level whose thread it names: an open detour's, else the goal's; on any other thread, to
+	// the innermost open detour that began before it, else to the goal.
+	const levelOf = (w: Waypoint) => {
+		const key = lineKey(w.line), named = levels.findLastIndex(level => lineKey(level.head.line) === key);
+		if (named >= 0) return named;
+		let level = 0; detours.forEach((d, i) => { if (at(d.detour) < at(w)) level = i + 1; }); return level;
+	};
+	for (const item of parked) levels[levelOf(item)]!.open.push(item);
+	// Finished: a waypoint that decides, closes or returns, or a step that closes a parked item (it answered it).
+	const done = lastOf(entries.filter(w => DONE_KINDS.has(w.kind) && (isWaypoint.has(w.id) || (w.closes !== undefined && byId.has(w.closes)))));
+	if (done) levels[levelOf(done)]!.done = { waypoint: (done.closes ? byId.get(done.closes) : undefined) ?? done, at: done.at, kind: done.kind };
+	return { goal, before, levels };
+}
+
+export interface GlanceLevel {
+	/** The current goal (level 0) or an open detour. */
+	head: Waypoint;
+	/** What led to this detour, when Path recorded it. */
+	from?: Waypoint;
+	/** The most recent finished thing, when it happened here: what to label it by, when, and how it finished. */
+	done?: { waypoint: Waypoint; at: number; kind: Waypoint["kind"] };
+	/** Open items raised here. */
+	open: Waypoint[];
+}
+export interface GlanceTree {
+	/** The current goal. */
+	goal: Waypoint;
+	/** The goals before it, newest first: how the work got here. */
+	before: Waypoint[];
+	/** The current goal's level, then each open detour, outermost first; the last is where we are. */
+	levels: GlanceLevel[];
+}
+
+/**
+ * What the glance shows that has no title yet, the most visible first, then every other untitled waypoint newest
+ * first. Path is offered these to title (trail.untitled); a pass over an older trail starts where the eye does.
+ */
+export function untitledEntries(trail: Trail): Waypoint[] {
+	const tree = glance(trail).tree;
+	const shown = tree ? [tree.goal, ...tree.before, ...tree.levels.flatMap(level => [level.head, ...(level.from ? [level.from] : []), ...(level.done ? [level.done.waypoint] : []), ...level.open])] : [];
+	return [...new Set([...shown, ...[...trail.waypoints].reverse()])].filter(w => !w.title);
 }
 
 /** Each waypoint's detour depth when it was recorded: how many detours were open. A `returned` sits at the depth of the thread it resumes. */
@@ -221,8 +296,6 @@ export function evolution(trail: Trail): Waypoint[] {
 	return trail.waypoints.filter(w => lineKey(w.line) === key && (w.kind === "set_out" || w.kind === "reframed"));
 }
 
-// Local wall-clock HH:MM, as src/mom/anchor.ts clockTime renders it; copied so the trail stays free of Mom's modules.
-const clockTime = (at: number): string => new Date(at).toTimeString().slice(0, 5);
 const refs = (w: Waypoint): string => w.refs.map(ref => `[src:${ref}]`).join(" ");
 const cited = (w: Waypoint): string => `${w.caption} ${refs(w)}`;
 
@@ -239,7 +312,7 @@ export function renderStanding(trail: Trail): string {
 	const standing = whereWeAre(trail);
 	const last = lastOf(trail.waypoints);
 	if (!last) return "";
-	const out = ["Mom's trail — where we are (descriptive, not direction):"];
+	const out = ["Path's trail — where we are (descriptive, not direction):"];
 	if (standing.goal) out.push(`Set out${standing.goal.kind === "reframed" ? " (reframed)" : ""}: ${cited(standing.goal)}`);
 	// Innermost first: the detour we are on matters most, and deep stacks must not crowd out the rest.
 	const depth = standing.detours.length;

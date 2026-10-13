@@ -1,18 +1,28 @@
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { IsolationMode, Profile, WorkerKind } from "./types.js";
+import type { IsolationMode, Profile, WorkerKind, WorkerRole } from "./types.js";
+import { errorMessage } from "../../util/text.ts";
+
 import { StringsError } from "./errors.js";
 import { agentDir } from "../persistence/home.js";
 
 const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls"]);
 const KINDS = new Set(["oracle", "finder", "worker", "free"]);
 const ISOLATION_MODES = new Set(["shared", "worktree"]);
+/** The bounds of a profile that sets none, and the short bound (a wait's default; a finder's turn limit). */
+export const ACP_DEFAULTS = { timeoutMs: 900_000, cancellationGraceMs: 5_000, maxOutputBytes: 256_000, shortTimeoutMs: 300_000 } as const;
+
+/** A profile with the default bounds: a direct (agent-named) worker, or a stored worker whose profile is gone. */
+export function defaultProfile(agent: string, role: WorkerRole, tools: readonly string[] = []): Profile {
+  return { agent, role, tools: [...tools], timeoutMs: ACP_DEFAULTS.timeoutMs, cancellationGraceMs: ACP_DEFAULTS.cancellationGraceMs, maxOutputBytes: ACP_DEFAULTS.maxOutputBytes };
+}
+
 const DEFAULTS: Record<string, Profile> = {
-  "pi-reviewer": { agent: "pi", role: "read-only", kind: "free", tools: ["read", "grep", "find", "ls"], timeoutMs: 900_000, cancellationGraceMs: 5_000, maxOutputBytes: 256_000 },
+  "pi-reviewer": { ...defaultProfile("pi", "read-only", [...READ_ONLY_TOOLS]), kind: "free" },
   "pi-writer": { agent: "pi", role: "writer", kind: "worker", tools: ["read", "grep", "find", "ls", "bash", "edit", "write"], isolation: "shared", timeoutMs: 1_800_000, cancellationGraceMs: 10_000, maxOutputBytes: 512_000 },
-  "pi-oracle": { agent: "pi", role: "read-only", kind: "oracle", tools: ["read", "grep", "find", "ls"], timeoutMs: 900_000, cancellationGraceMs: 5_000, maxOutputBytes: 256_000 },
-  "pi-finder": { agent: "pi", role: "read-only", kind: "finder", tools: ["read", "grep", "find", "ls"], timeoutMs: 300_000, cancellationGraceMs: 5_000, maxOutputBytes: 256_000, maxTurns: 12 },
+  "pi-oracle": { ...defaultProfile("pi", "read-only", [...READ_ONLY_TOOLS]), kind: "oracle" },
+  "pi-finder": { ...defaultProfile("pi", "read-only", [...READ_ONLY_TOOLS]), kind: "finder", timeoutMs: ACP_DEFAULTS.shortTimeoutMs, maxTurns: 12 },
 };
 
 /** A config file's profiles; undefined when there is no file. */
@@ -22,7 +32,7 @@ async function readConfig(path: string): Promise<Record<string, unknown> | undef
     return parsed.profiles ?? {};
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-    throw new StringsError("CONFIG_INVALID", `Cannot load ${path}: ${error instanceof Error ? error.message : String(error)}`);
+    throw new StringsError("CONFIG_INVALID", `Cannot load ${path}: ${errorMessage(error)}`);
   }
 }
 
@@ -55,9 +65,9 @@ function parseProfile(name: string, raw: unknown): Profile {
     ...(typeof value.thinking === "string" ? { thinking: value.thinking } : {}),
     ...(fallbackModels !== undefined ? { fallbackModels: fallbackModels as string[] } : {}),
     ...(isolation !== undefined ? { isolation: isolation as IsolationMode } : {}),
-    timeoutMs: boundedInteger(value.timeoutMs, 900_000, "timeoutMs", 1_000, 86_400_000),
-    cancellationGraceMs: boundedInteger(value.cancellationGraceMs, 5_000, "cancellationGraceMs", 100, 60_000),
-    maxOutputBytes: boundedInteger(value.maxOutputBytes, 256_000, "maxOutputBytes", 1_024, 10_485_760),
+    timeoutMs: boundedInteger(value.timeoutMs, ACP_DEFAULTS.timeoutMs, "timeoutMs", 1_000, 86_400_000),
+    cancellationGraceMs: boundedInteger(value.cancellationGraceMs, ACP_DEFAULTS.cancellationGraceMs, "cancellationGraceMs", 100, 60_000),
+    maxOutputBytes: boundedInteger(value.maxOutputBytes, ACP_DEFAULTS.maxOutputBytes, "maxOutputBytes", 1_024, 10_485_760),
     ...(value.maxTurns !== undefined ? { maxTurns: boundedInteger(value.maxTurns, undefined, "maxTurns", 1, 100) } : {}),
     ...(value.maxAttempts !== undefined ? { maxAttempts: boundedInteger(value.maxAttempts, undefined, "maxAttempts", 1, 5) } : {}),
   };

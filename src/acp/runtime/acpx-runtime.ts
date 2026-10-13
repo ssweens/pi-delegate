@@ -1,3 +1,4 @@
+import { errorMessage } from "../../util/text.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { copyFile, mkdir } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
@@ -116,7 +117,7 @@ export class AcpxRuntimePort implements RuntimePort {
     catch (error) {
       const rpc = error as { code?: number; data?: unknown };
       if (rpc.code === -32601) throw new StringsError("NATIVE_OPEN_UNSUPPORTED", "This adapter does not yet advertise verified native opening.");
-      throw new StringsError("NATIVE_LOOKUP_FAILED", typeof rpc.data === "string" ? rpc.data : error instanceof Error ? error.message : String(error));
+      throw new StringsError("NATIVE_LOOKUP_FAILED", typeof rpc.data === "string" ? rpc.data : errorMessage(error));
     }
   }
 

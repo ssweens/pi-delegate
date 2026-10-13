@@ -2,6 +2,7 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { tildify } from "./util/path.ts";
 
 export interface Role {
 	name: string;
@@ -59,17 +60,18 @@ export function droppedTools(entries: readonly string[], offered: Iterable<strin
  */
 export const PROJECT_ROLES_DIR = join(".pi", "agents");
 
-/** Lowest → highest priority; later dirs override same-named roles. */
-export function roleDirs(cwd: string, projectTrusted: boolean): string[] {
-	const home = homedir();
-	const dirs = [
-		join(HERE, "..", "roles"),
-		join(home, ".pi", "agent", "agents"),
-		join(home, ".agents", "agents"),
-	];
+/** The user's role folders, lowest → highest priority: Pi's agent dir (the caller's, so PI_CODING_AGENT_DIR counts) and the shared `~/.agents`. */
+export const userRoleDirs = (agentDir: string): string[] => [join(agentDir, "agents"), join(homedir(), ".agents", "agents")];
+
+/** Lowest → highest priority; later dirs override same-named roles. `agentDir` is Pi's (index.ts's AGENT_DIR): this module cannot import Pi. */
+export function roleDirs(cwd: string, projectTrusted: boolean, agentDir: string): string[] {
+	const dirs = [join(HERE, "..", "roles"), ...userRoleDirs(agentDir)];
 	if (projectTrusted) dirs.push(join(cwd, PROJECT_ROLES_DIR));
 	return dirs;
 }
+
+/** Where roles are read from, for prose: the package, the user's folders and a trusted project's. */
+export const roleSourcesText = (agentDir: string): string => `the package, ${userRoleDirs(agentDir).map(tildify).join(", ")} and a trusted project's ${PROJECT_ROLES_DIR}`;
 
 function* mdFiles(dir: string): Generator<string> {
 	if (!existsSync(dir)) return;
@@ -123,9 +125,9 @@ export function modelList(v: string | undefined): string[] | undefined {
 	return list?.length ? [...new Set(list)] : undefined;
 }
 
-export function loadRoles(cwd: string, projectTrusted: boolean): Map<string, Role> {
+export function loadRoles(cwd: string, projectTrusted: boolean, agentDir: string): Map<string, Role> {
 	const roles = new Map<string, Role>();
-	for (const dir of roleDirs(cwd, projectTrusted)) {
+	for (const dir of roleDirs(cwd, projectTrusted, agentDir)) {
 		for (const file of mdFiles(dir)) {
 			let text: string;
 			try {
@@ -149,7 +151,7 @@ export function loadRoles(cwd: string, projectTrusted: boolean): Map<string, Rol
 				timeoutMs: fm.timeoutMs ? Number(fm.timeoutMs) || undefined : undefined,
 				runtime: fm.runtime === "oven" || fm.runtime === "in-process" ? fm.runtime : undefined,
 				extensions: toolList(fm.extensions),
-				source: file.replace(homedir(), "~"),
+				source: tildify(file),
 			});
 		}
 	}

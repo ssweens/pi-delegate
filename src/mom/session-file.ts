@@ -1,14 +1,14 @@
 import { readFileSync } from "node:fs";
+import { completeLines } from "../util/jsonl.ts";
 import type { Entry, SessionReader } from "./feed.ts";
 
 /**
- * A lead session read from its JSONL file, on the branch that ends at `leaf`: what Mom's tools see in
+ * A lead session read from its JSONL file, on the branch that ends at `leaf`: what Path's tools see in
  * oven, where there is no live session. Pi writes each entry as it happens; a half-written last line is
  * not read yet.
  */
 export function sessionFromFile(file: string, leaf: string | null): SessionReader {
-	const text = readFileSync(file, "utf8");
-	const lines = text.slice(0, text.lastIndexOf("\n") + 1).split("\n").filter(Boolean);
+	const lines = completeLines(readFileSync(file)).map(({ line }) => line);
 	const header = JSON.parse(lines[0] ?? "{}");
 	if (header.type !== "session" || typeof header.id !== "string") throw new Error(`Not a Pi session file: ${file}`);
 	const entries = new Map<string, Entry & { id: string }>();
@@ -16,7 +16,7 @@ export function sessionFromFile(file: string, leaf: string | null): SessionReade
 		const entry = JSON.parse(line);
 		if (typeof entry?.id === "string") entries.set(entry.id, entry);
 	}
-	if (leaf !== null && !entries.has(leaf)) throw new Error(`Mom's session file does not have entry ${leaf} yet: ${file}`);
+	if (leaf !== null && !entries.has(leaf)) throw new Error(`Path's session file does not have entry ${leaf} yet: ${file}`);
 	const branch: (Entry & { id: string })[] = [];
 	for (let id = leaf; id !== null && id !== undefined;) {
 		const entry = entries.get(id);
@@ -33,8 +33,7 @@ export function sessionFromFile(file: string, leaf: string | null): SessionReade
 
 /** The ID of the file's last complete entry: Pi's current leaf, since Pi appends to the leaf. */
 export function lastLeaf(file: string): string | null {
-	const text = readFileSync(file, "utf8");
-	const lines = text.slice(0, text.lastIndexOf("\n") + 1).split("\n").filter(Boolean);
+	const lines = completeLines(readFileSync(file)).map(({ line }) => line);
 	for (let i = lines.length - 1; i > 0; i--) {
 		try { const entry = JSON.parse(lines[i]); if (typeof entry?.id === "string" && entry.type !== "session") return entry.id; } catch { /* a torn line */ }
 	}

@@ -6,6 +6,7 @@ import {
 	getMarkdownTheme, type SettingsManager, type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Container, type Component, type TUI, type TuiMouseEvent, Text } from "@earendil-works/pi-tui";
+import { textOf } from "./util/text.ts";
 
 export interface ActiveTool {
 	name: string;
@@ -54,7 +55,7 @@ export class ChildTranscript {
 					component.updateContent(message, streaming);
 					entry = { message, streaming, component };
 				} else if (message.role === "user") {
-					const text = typeof message.content === "string" ? message.content : message.content.filter((b) => b.type === "text").map((b) => b.text).join("\n");
+					const text = textOf(message.content);
 					entry = { message, streaming, component: new UserMessageComponent(text, this.markdown, this.settings.getOutputPad()) };
 				} else entry = { message, streaming };
 				this.entries[i] = entry;

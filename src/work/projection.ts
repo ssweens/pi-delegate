@@ -184,7 +184,7 @@ const latestBy = <T>(items: readonly T[], key: (item: T) => string): T[] => {
 	return [...latest.values()];
 };
 
-/** Pure, read-only projection. It never mutates a todo, Mom graph, delegate record, or sidecar. */
+/** Pure, read-only projection. It never mutates a todo, Path graph, delegate record, or sidecar. */
 export function projectWork(input: WorkProjectionInput = {}): WorkProjection {
 	const result = emptyWorkProjection();
 	const entries = input.entries ?? [];

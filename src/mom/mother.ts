@@ -1,16 +1,16 @@
 /**
- * Mom's operations, as they run in oven: each delivery or request is one operation on a fresh `Mom`,
- * rebuilt from the lead's session file and her `.mom` file. `prepare` stages the evidence (bounded batches,
- * the cold-start digest, skipped-range retries, compaction audits) and returns what her turn reviews;
- * her tools accept the map; `settle` records what an operation that was not accepted leaves (a retry
- * record, a skipped range, a retired range) and her usage.
+ * Path's operations, as they run in oven: each delivery or request is one operation on a fresh `Path`,
+ * rebuilt from the lead's session file and its `.mom` file. `prepare` stages the evidence (bounded batches,
+ * the cold-start digest, skipped-range retries, compaction audits) and returns what its turn reviews;
+ * its tools accept the map; `settle` records what an operation that was not accepted leaves (a retry
+ * record, a skipped range, a retired range) and its usage.
  */
 import { randomUUID } from "node:crypto";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { MomStore } from "./sidecar.ts";
 import type { AdvisorScreenRecord, SessionAdvisor } from "./advisor.ts";
 import { branchCheckpoints, emptyUsage, graphChange, loadState, noticeKey, sumUsage, type AnchorState, type Backfill, type Checkpoint, type CursorFailure, type SkippedGap, type Usage, type WindowLive, type WindowOutcome } from "./checkpoint.ts";
-import { extractEvents, isUserDirection, LiveFeed, renderUpdateEvent, renderUpdateEvents, suffix, type Cut, type FeedEvent, type SessionReader } from "./feed.ts";
+import { branchIds, extractEvents, isUserDirection, LiveFeed, renderUpdateEvent, renderUpdateEvents, suffix, type Cut, type FeedEvent, type SessionReader } from "./feed.ts";
 import type { CompactionReview } from "./compaction.ts";
 import { reconstructThreadMap, THREAD_MAP_PROMPT, type ThreadMap } from "./audit.ts";
 import { bootstrapDigest, chapterDigest, DEFAULT_BOOTSTRAP_POLICY, segmentChapters, type BootstrapPolicy } from "./bootstrap.ts";
@@ -18,6 +18,9 @@ import { CHAPTER_STATE_FIELDS, REFLECTION_PROMPT, normalizeEvidence } from "./co
 import { emptyGraph, graphForModel, graphSlice } from "./graph.ts";
 import { OPERATION_FAILED, type OperationHeader } from "./operation.ts";
 import { PROCESS_RISK_CLASSES, emptyEngagement, type FindingFeedback, type ProcessRiskClass } from "./process-health.ts";
+import { makeRef, parseRef } from "../util/ref.ts";
+import { textOf } from "../util/text.ts";
+import { NO_ACCEPTED_TRANSACTION, UNREADABLE_SOURCES } from "./status.ts";
 
 export const DEFAULT_MODEL = "openai-codex/gpt-5.6-sol";
 export const MAX_DEFERRAL_MS = 60000;
@@ -39,7 +42,7 @@ function boundedGapEvents(events: readonly FeedEvent[], limit = 24000): { events
 		if (renderUpdateEvents([...selected, event]).length > limit) break;
 		selected.push(event);
 	}
-	if (!selected.length && events.length) throw new Error("One recorded gap event exceeds Mom's 24,000-character recovery limit; nothing was truncated.");
+	if (!selected.length && events.length) throw new Error("One recorded gap event exceeds Path's 24,000-character recovery limit; nothing was truncated.");
 	return { events: selected, remaining: events.slice(selected.length).map(event => event.ref) };
 }
 
@@ -50,7 +53,7 @@ function recordedRange(events: readonly FeedEvent[], range: Pick<CursorFailure, 
 	return events.slice(first, last + 1);
 }
 
-/** What Mom reads of the lead: its folder, whether it is working, its session, and where she notifies. */
+/** What Path reads of the lead: its folder, whether it is working, its session, and where it notifies. */
 export type MomContext = Pick<ExtensionContext, "cwd" | "isIdle"> & {
 	sessionManager: SessionReader;
 	ui: Pick<ExtensionContext["ui"], "notify">;
@@ -77,12 +80,12 @@ export interface MomHost {
 	advisor?: SessionAdvisor;
 	/** Durable state lives beside the session transcript, never inside it. */
 	store: MomStore;
-	/** Runs a step in a child context of her slice. */
+	/** Runs a step in a child context of its slice. */
 	steps: StepRunner;
 	changed(): void;
 }
 
-/** What `prepare` hands her turn: the evidence to review, nothing (with why), or a wait. */
+/** What `prepare` hands its turn: the evidence to review, nothing (with why), or a wait. */
 export type Prepared =
 	| { kind: "work"; header: OperationHeader; body: Record<string, unknown>; guidance: string; batch: StagedBatch }
 	| { kind: "idle"; reason: string }
@@ -97,9 +100,9 @@ export function readStep(messages: readonly any[], slice?: any): StepOutcome {
 			const u = message.usage;
 			// Every provider request counts, mom_begin's included: "model calls" is what the user pays for.
 			if (u) outcome.usage = sumUsage(outcome.usage, { calls: 1, input: u.input ?? 0, output: u.output ?? 0, cacheRead: u.cacheRead ?? 0, cacheWrite: u.cacheWrite ?? 0, nominalCost: u.cost?.total ?? 0, elapsedMs: 0 });
-			if (message.stopReason === "error") outcome.failure = message.errorMessage ?? "Mom provider failed.";
+			if (message.stopReason === "error") outcome.failure = message.errorMessage ?? "Path provider failed.";
 		} else if (message.role === "toolResult") {
-			const text = (message.content ?? []).filter((part: any) => part.type === "text").map((part: any) => part.text).join("\n");
+			const text = textOf(message.content);
 			if (text.startsWith(OPERATION_FAILED)) outcome.failure = text.slice(OPERATION_FAILED.length);
 			else if (["commit_graph", "commit_v2", "record_waypoints"].includes(message.toolName)) {
 				if (!message.isError && (text.startsWith("Map saved.") || text.startsWith("Trail saved."))) outcome.accepted = true;
@@ -107,25 +110,25 @@ export function readStep(messages: readonly any[], slice?: any): StepOutcome {
 			} else if (message.toolName === "record_thread_map" && !message.isError && text.startsWith("Chapter state recorded.\n")) outcome.audit = JSON.parse(text.slice(text.indexOf("\n") + 1));
 		}
 	}
-	if (!outcome.accepted && !outcome.failure && slice?.state === "failed") outcome.failure = slice.detail ?? `Mom's slice failed (${slice.reason ?? "unknown"}).`;
+	if (!outcome.accepted && !outcome.failure && slice?.state === "failed") outcome.failure = slice.detail ?? `Path's slice failed (${slice.reason ?? "unknown"}).`;
 	return outcome;
 }
 
-/** Mom for one operation: her saved state, rebuilt from her `.mom` file and the lead's session file. */
+/** Path for one operation: its saved state, rebuilt from its `.mom` file and the lead's session file. */
 export class Mom {
 	feed: LiveFeed;
 	checkpoint?: Checkpoint;
 	checkpointId?: string;
 	private readonly initialGraph = emptyGraph();
-	private coverageCut?: Cut;
+	coverageCut?: Cut;
 	get graph() { return this.checkpoint?.graph ?? this.initialGraph; }
 	enabled = true;
 	/** Which map-maintenance split is in force (docs/map-modes.md). Durable, like enabled and inject. */
 	/** Which map-maintenance split is in force (docs/map-modes.md). "" = never saved. */
 	mode = "";
-	/** The model this Mom runs on, as provider/id. Empty means the configured default. */
+	/** The model this Path runs on, as provider/id. Empty means the configured default. */
 	model = "";
-	/** Anchor and window injection. Off silences the post-compaction surfaces without pausing Mom. */
+	/** Anchor and window injection. Off silences the post-compaction surfaces without pausing Path. */
 	inject = true;
 	nudgedClasses: ReadonlySet<ProcessRiskClass>;
 	readonly unresolvedNotices = new Set<string>();
@@ -134,8 +137,8 @@ export class Mom {
 	usage = emptyUsage();
 	screen?: AdvisorScreenRecord;
 	error?: string;
-	/** What the operation is doing, for her status. */
-	activity?: "reading history" | "screening" | "starting Mom" | "thinking" | "saving";
+	/** What the operation is doing, for its status. */
+	activity?: "reading history" | "screening" | "starting Path" | "thinking" | "saving";
 	/** The cut this operation covers if accepted: its scope, never claimed coverage. */
 	target?: Cut;
 	recovering = false;
@@ -203,7 +206,7 @@ export class Mom {
 		let retry: StagedBatch | undefined;
 		if (state.failure) try {
 			await this.feed.restore(state.failure.through);
-			const events = recordedRange(this.feed.events, state.failure, "Mom cannot restore the evidence range recorded for retry.");
+			const events = recordedRange(this.feed.events, state.failure, "Path cannot restore the evidence range recorded for retry.");
 			retry = { events, cut: state.failure.through, from: state.failure.from, gaps: [], more: false,
 				startIndex: this.feed.events.length - events.length, endIndex: this.feed.events.length };
 		} catch {
@@ -221,7 +224,7 @@ export class Mom {
 		this.committed = retry ? retry.startIndex : this.feed.events.length;
 		this.chapterBoundary = null;
 		for (let i = 0; i < this.committed; i++) if (this.feed.events[i].kind === "compaction") this.chapterBoundary = this.feed.events[i].ref;
-		this.checkpoints = branchCheckpoints(await this.host.store.load(), new Set(this.host.ctx.sessionManager.getBranch().map(e => e.id)))
+		this.checkpoints = branchCheckpoints(await this.host.store.load(), branchIds(this.host.ctx.sessionManager))
 			.filter(item => item.id !== cutoverCheckpointId);
 	}
 
@@ -234,21 +237,21 @@ export class Mom {
 		suffix(this.host.ctx.sessionManager, this.host.ctx.sessionManager.getLeafId(), cut.parent);
 	}
 
-	/** Unreviewed lead compactions after her coverage, newest last. */
+	/** Unreviewed lead compactions after its coverage, newest last. */
 	/** The thread-map section being reconstructed, while a compaction review runs. */
 	auditProgress?: { section: number; of: number };
 
 	unreviewedCompactions(): FeedEvent[] {
 		const manager = this.host.ctx.sessionManager;
 		const captured = this.feed.events.slice(this.committed).filter(event => event.actor === "lead" && event.kind === "compaction");
-		// Her operation starts from the session file: entries nothing has read yet may hold a compaction.
+		// Its operation starts from the session file: entries nothing has read yet may hold a compaction.
 		const unread = suffix(manager, manager.getLeafId(), this.feed.cut().parent).flatMap(entry => extractEvents({ key: manager.getSessionId(), actor: "lead" }, entry))
 			.filter(event => event.kind === "compaction");
 		return [...captured, ...unread];
 	}
 
 	/**
-	 * Stage this operation's evidence and build what her turn reviews. A compaction review first
+	 * Stage this operation's evidence and build what its turn reviews. A compaction review first
 	 * reconstructs an independent thread map in child steps.
 	 */
 	async prepare(options: { refresh: boolean; review?: CompactionReview; force?: boolean; relabel?: boolean; forceDigest?: boolean; job: string; signal?: AbortSignal }): Promise<Prepared> {
@@ -258,10 +261,10 @@ export class Mom {
 		const started = performance.now();
 		const timing = { startupMs: 0, requestMs: 0, totalMs: 0, oldestEvidenceAgeMs: 0 };
 		let screen: AdvisorScreenRecord | undefined;
-		if (options.relabel && this.checkpoint) {
-			// Repair saved labels without consuming or waiting for the unrelated live backlog.
-			this.staged = { events: [], cut: this.checkpoint.cut, from: this.checkpoint.cut,
-				gaps: [], more: false, startIndex: this.committed, endIndex: this.committed };
+		if (options.relabel && (this.checkpoint || (this.trailMode && this.coverageCut))) {
+			// Repair saved labels (the trail: title its entries) without consuming or waiting for the unrelated live backlog.
+			const cut = this.checkpoint?.cut ?? this.coverageCut!;
+			this.staged = { events: [], cut, from: cut, gaps: [], more: false, startIndex: this.committed, endIndex: this.committed };
 		} else if (compactionReview) {
 			const from = this.checkpoint?.cut ?? this.feed.cut();
 			const captured = await this.feed.capture(Infinity, false);
@@ -280,7 +283,7 @@ export class Mom {
 				gaps: [...new Set([...this.staged.gaps, ...next.gaps])], more: next.more, endIndex: this.feed.events.length };
 		}
 		this.screenDeferred = false;
-		// A failed range (restored from her `.mom` file) is retried alone; later evidence waits for the next operation.
+		// A failed range (restored from its `.mom` file) is retried alone; later evidence waits for the next operation.
 		const retryingGaps = () => !options.relabel && (refresh || (!this.failure && !this.staged!.events.length)) && this.gaps.length > 0 && !compactionReview;
 		if (retryingGaps()) {
 			// A skipped range whose sources are gone can never be re-reviewed: retire it durably.
@@ -293,10 +296,10 @@ export class Mom {
 		}
 		if (retryingGaps()) {
 			const gap = this.gaps[0];
-			const old = recordedRange(this.feed.events, gap, "Mom cannot retry a skipped range because its recorded sources are unreadable.");
+			const old = recordedRange(this.feed.events, gap, UNREADABLE_SOURCES);
 			const chunk = boundedGapEvents(old, 24000);
 			const gapStart = this.feed.events.findIndex(event => event.ref === chunk.events[0]?.ref);
-			if (gapStart < 0) throw new Error("Mom cannot locate the recorded gap boundary in the restored evidence stream.");
+			if (gapStart < 0) throw new Error("Path cannot locate the recorded gap boundary in the restored evidence stream.");
 			this.staged = { events: chunk.events, cut: this.coverageCut ?? gap.through, from: gap.from,
 				gaps: [], more: chunk.remaining.length > 0 || this.staged!.events.length > 0 || this.staged!.more, startIndex: gapStart, endIndex: this.committed,
 				retryGapId: gap.id, retryGapRemaining: chunk.remaining };
@@ -358,7 +361,7 @@ export class Mom {
 		let audit: ThreadMap[] | undefined, auditedGaps: string[] = [];
 		if (compactionReview) {
 			this.stage("thinking");
-			// Her saved map already covers everything up to its cut: audit only what it has not (pending
+			// Its saved map already covers everything up to its cut: audit only what it has not (pending
 			// evidence plus the compaction event), not the session's whole history again.
 			const covered = new Set(this.feed.events.slice(0, batch.startIndex).map(event => event.ref));
 			const captured = new Map(compactionReview.historyEvents.filter(event => !covered.has(event.ref)).map(event => [event.ref, event]));
@@ -411,7 +414,7 @@ export class Mom {
 		};
 		const header: OperationHeader = { job, step: "map", mode: "update", session, cut: batch.cut, from: batch.from,
 			refs: batch.events.map(event => event.ref), gaps: batch.gaps.length,
-			// Backfill still to do keeps her going: the client starts the next operation as soon as she is idle.
+			// Backfill still to do keeps it going: the client starts the next operation as soon as it is idle.
 			more: batch.more || (this.backfillAfter !== undefined ? this.backfillAfter !== null : Boolean(this.backfill)),
 			...(this.backfillAfter !== undefined ? { backfill: this.backfillAfter } : {}), ...(this.backfilling ? { backfilling: true } : {}),
 			...(batch.retryGapId ? { retryGap: { id: batch.retryGapId, remaining: batch.retryGapRemaining ?? [] } } : {}),
@@ -428,7 +431,7 @@ export class Mom {
 	 * Trail catch-up, live first. A backlog that spans compactions is not read oldest-first in one proposal: the
 	 * feed drains locally (no model) to the start of the latest chapter, this operation indexes that chapter, and
 	 * everything before it is recorded as backfill for later operations. The user sees where the session is now
-	 * after one call; history fills in behind it while she is otherwise idle.
+	 * after one call; history fills in behind it while it is otherwise idle.
 	 */
 	private async liveFirst(job: string): Promise<void> {
 		const manager = this.host.ctx.sessionManager, lead = manager.getSessionId(), staged = this.staged!;
@@ -437,7 +440,7 @@ export class Mom {
 		let live = -1;
 		for (let i = branch.length - 1; i > first; i--) if (branch[i].type === "compaction") { live = i; break; }
 		if (live < 0) return; // one chapter: the digest covers it in one proposal
-		const liveRef = `${lead}:${branch[live].id}`;
+		const liveRef = makeRef(lead, branch[live].id);
 		if (staged.events.some(event => event.ref === liveRef)) return; // the history before it fits one window: no split
 		this.stage("reading history");
 		const beforeLive = (events: readonly FeedEvent[]) => !events.some(event => event.ref === liveRef);
@@ -460,10 +463,10 @@ export class Mom {
 	/**
 	 * One backfill operation: the oldest remaining history, up to the next compaction or BACKFILL_USER_TURNS user
 	 * turns, as a chapter digest. Coverage of the live frontier is unchanged. A stretch with no user turn holds no
-	 * waypoint, so it is passed over without asking her model.
+	 * waypoint, so it is passed over without asking its model.
 	 */
 	private async backfillChunk(job: string): Promise<void> {
-		const manager = this.host.ctx.sessionManager, lead = `${manager.getSessionId()}:`, branch = manager.getBranch();
+		const manager = this.host.ctx.sessionManager, lead = manager.getSessionId(), branch = manager.getBranch();
 		const ids = branch.map(entry => entry.id);
 		let backfill: Backfill | null = this.backfill!;
 		while (backfill) {
@@ -476,7 +479,7 @@ export class Mom {
 				if (m?.role === "user" && ++turns > BACKFILL_USER_TURNS) { stop = i; break; }
 			}
 			const chunk = new Set(ids.slice(start, stop));
-			const events = this.feed.events.filter(event => event.ref.startsWith(lead) && chunk.has(event.ref.slice(lead.length).split(":")[0]!));
+			const events = this.feed.events.filter(event => { const ref = parseRef(event.ref); return ref?.stream === lead && chunk.has(ref.entryId); });
 			const after: Backfill | null = stop < end ? { ...backfill, next: ids[stop]! } : null;
 			const digest = events.some(isUserDirection) ? chapterDigest(segmentChapters(events), this.host.bootstrapPolicy ?? DEFAULT_BOOTSTRAP_POLICY) : undefined;
 			if (digest) {
@@ -494,19 +497,19 @@ export class Mom {
 	}
 
 	/**
-	 * What an operation that was not accepted leaves. A provider outage or a failure of her own tooling is
+	 * What an operation that was not accepted leaves. A provider outage or a failure of its own tooling is
 	 * not a verdict on the evidence: only usage is recorded. A rejected batch is recorded for one retry,
 	 * then skipped (coverage moves past it); a rejected skipped range is retired. Returns the error to
-	 * show, and whether the rejection counts toward her rejected streak.
+	 * show, and whether the rejection counts toward its rejected streak.
 	 */
 	async settle(header: OperationHeader, outcome: StepOutcome, usage: Usage): Promise<{ error?: string; retiredRejection?: string }> {
 		const job = header.job;
 		const record = (error: string | null) => this.host.store.append("usage", { usage, error }, `${job}:usage`);
 		if (outcome.accepted) { await record(null); return {}; }
 		if (outcome.failure) { await record(outcome.failure); return { error: outcome.failure }; }
-		const failureError = outcome.rejection ?? "Mom finished without an accepted background graph transaction.";
+		const failureError = outcome.rejection ?? NO_ACCEPTED_TRANSACTION;
 		if (header.backfilling) {
-			// Backfill is best effort: a chunk her model could not index is passed over, so history never wedges the trail.
+			// Backfill is best effort: a chunk its model could not index is passed over, so history never wedges the trail.
 			await this.host.store.append("map", { backfill: header.backfill ?? null }, `${job}:backfill-skipped`);
 			await record(failureError);
 			return { retiredRejection: failureError };
@@ -539,7 +542,7 @@ export class Mom {
 	}
 }
 
-/** Her saved map as the `mom` tool and the panel read it: a slice of the current or an earlier checkpoint. */
+/** Its saved map as the `mom` tool and the panel read it: a slice of the current or an earlier checkpoint. */
 export function readGraph(checkpoints: readonly { id: string; data: Checkpoint }[], current: Checkpoint | undefined, currentId: string | undefined,
 	events: readonly FeedEvent[], options: { nodes?: string[]; depth?: number; checkpoint?: string } = {}) {
 	let checkpoint = current, checkpointId = currentId;

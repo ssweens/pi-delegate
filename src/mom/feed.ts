@@ -3,6 +3,8 @@ import { createReadStream } from "node:fs";
 import { open, readFile, realpath, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { scheduler } from "node:timers/promises";
+import { makeRef, parseRef } from "../util/ref.ts";
+import { oneLine, textOf } from "../util/text.ts";
 export interface SessionReader {
 	getSessionId(): string;
 	getSessionFile(): string | undefined;
@@ -11,6 +13,8 @@ export interface SessionReader {
 	getEntry(id: string): Entry | undefined;
 	getBranch(): (Entry & { id: string })[];
 }
+/** The ids on the session's current branch. */
+export const branchIds = (reader: Pick<SessionReader, "getBranch">): Set<string> => new Set(reader.getBranch().map(entry => entry.id));
 
 // Raw transcript records are the compatibility boundary (Pi session versions 2 and 3).
 export type Entry = Record<string, any>;
@@ -55,10 +59,10 @@ export interface Cut {
 	parent: string | null;
 	workers: WorkerCursor[];
 }
-/** Original Pi tool records observed by Mom, scoped to the lead branch that requested them. */
+/** Original Pi tool records observed by Path, scoped to the lead branch that requested them. */
 export interface Observation { key: string; parent: string | null; entries: Entry[] }
 
-/** A raw transcript entry with its immutable identity. Mom reads these; it never writes them. */
+/** A raw transcript entry with its immutable identity. Path reads these; it never writes them. */
 export interface SourceEntryObservation {
 	ref: string;
 	stream: string;
@@ -81,8 +85,13 @@ export const EMPTY_HASH = createHash("sha256").digest("hex");
 export const CORRECTION = "pi-tether.user-correction";
 const isCorrection = (e: Entry) => e.type === "custom_message" && e.customType === CORRECTION && e.details?.origin === "user-command";
 export const isMomEntry = (e: Entry) => !isCorrection(e) && (e.customType ?? e.message?.customType ?? "").startsWith("pi-tether.");
-export const textBlocks = (content: unknown): string => typeof content === "string" ? content : Array.isArray(content)
-	? content.filter((b) => b?.type === "text" && typeof b.text === "string").map((b) => b.text).join("\n") : "";
+/** A tool call's key within its stream. Not an evidence ref. */
+export const callKey = (stream: string, callId: string | undefined): string => `${stream}:${callId}`;
+/** The source (entry) ref a block ref belongs to; an entry ref is its own. */
+export function entryRefOf(ref: string): string {
+	const parsed = parseRef(ref);
+	return parsed ? makeRef(parsed.stream, parsed.entryId) : ref;
+}
 const dialogs = new Set(["ask_user", "gather_input"]);
 const digest = (data: string | Buffer) => createHash("sha256").update(data).digest("hex");
 const TOOL_EXCERPT_CHARS = 6000;
@@ -121,7 +130,7 @@ export const TODO_TYPES = new Set(["pi_delegate.todo", "pi_omp.todo"]);
 export const isTodoEntry = (entry: Entry): boolean => entry.type === "custom" && typeof entry.customType === "string" && TODO_TYPES.has(entry.customType);
 function todoText(phases: unknown): string {
 	if (!Array.isArray(phases)) return "";
-	const clean = (value: unknown, max: number) => String(value ?? "").replace(/\s+/g, " ").trim().slice(0, max);
+	const clean = (value: unknown, max: number) => oneLine(String(value ?? ""), max, { ellipsis: "" });
 	return phases.flatMap((phase: any) => (Array.isArray(phase?.tasks) ? phase.tasks : []).map((task: any) => {
 		const content = clean(task?.content, 110);
 		if (!content) return "";
@@ -144,14 +153,14 @@ function dialogPrompt(args: any): string | undefined {
 /** Exact narrative + recorded metadata. No summary, task classification, or tool-success inference. */
 export function extractEvents(stream: Pick<Stream, "key" | "actor">, e: Entry): FeedEvent[] {
 	if (isMomEntry(e) || typeof e.id !== "string") return [];
-	const ref = `${stream.key}:${e.id}`;
+	const ref = makeRef(stream.key, e.id);
 	const events: FeedEvent[] = [];
 	const emit = (value: Omit<FeedEvent, "ref" | "at" | "actor">, block?: number) => {
-		events.push({ ref: block === undefined ? ref : `${ref}:b${block}`, at: e.timestamp, actor: stream.actor, ...value });
+		events.push({ ref: makeRef(stream.key, e.id, block), at: e.timestamp, actor: stream.actor, ...value });
 	};
-	if (isCorrection(e)) { emit({ kind: "user", text: textBlocks(e.content), correction: true }); return events; }
+	if (isCorrection(e)) { emit({ kind: "user", text: textOf(e.content), correction: true }); return events; }
 	if (["compaction", "context_edit", "branch_summary"].includes(e.type)) {
-		emit({ kind: e.type, fromRef: e.fromId ? `${stream.key}:${e.fromId}` : undefined,
+		emit({ kind: e.type, fromRef: e.fromId ? makeRef(stream.key, e.fromId) : undefined,
 			...(e.type === "compaction" && typeof e.summary === "string" && e.summary ? { claim: e.summary } : {}) });
 		return events; // Original history remains available; never substitute a generated summary.
 	}
@@ -169,9 +178,9 @@ export function extractEvents(stream: Pick<Stream, "key" | "actor">, e: Entry): 
 		// A joined delegate call reports its worker's terminal outcome in the result itself: that is a receipt too.
 		const joined = m.toolName === "delegate" && typeof m.details?.id === "string" && ["complete", "failed", "error", "stopped", "cancelled", "interrupted"].includes(m.details?.status);
 		if (joined) emit({ kind: "delegate_receipt", name: m.details.id, status: m.details.status, ...(m.details.segment !== undefined ? { segment: m.details.segment } : {}) }, 1);
-		const answer = dialogs.has(m.toolName) && !m.isError ? textBlocks(m.content) : "";
+		const answer = dialogs.has(m.toolName) && !m.isError ? textOf(m.content) : "";
 		emit({ kind: answer ? "user_answer" : "tool_result", name: m.toolName, callId: m.toolCallId,
-			isError: m.isError, ...(answer ? { text: answer } : { text: evidenceExcerpt(textBlocks(m.content), ref) }) });
+			isError: m.isError, ...(answer ? { text: answer } : { text: evidenceExcerpt(textOf(m.content), ref) }) });
 		return events;
 	}
 	if (m.role === "bashExecution") {
@@ -187,12 +196,12 @@ export function extractEvents(stream: Pick<Stream, "key" | "actor">, e: Entry): 
 		emit({ kind: "delegate_receipt", name: m.details.id, status: m.details.status, ...(m.details.segment !== undefined ? { segment: m.details.segment } : {}) });
 		return events;
 	}
-	const text = narrativeExcerpt(textBlocks(m.content), ref, m.role !== "assistant");
+	const text = narrativeExcerpt(textOf(m.content), ref, m.role !== "assistant");
 	if (text) emit({ kind: m.role === "custom" || m.role === "hookMessage" ? "extension" : m.role,
 		text, name: m.customType, status: m.role === "assistant" ? m.stopReason : undefined });
 	if (Array.isArray(m.content)) m.content.forEach((block: any, i: number) => {
 		if (block.type === "toolCall") {
-			const blockRef = `${ref}:b${i}`;
+			const blockRef = makeRef(stream.key, e.id, i);
 			emit({ kind: "tool_call", name: block.namespace ? `${block.namespace}.${block.name}` : block.name,
 				callId: block.id, text: dialogs.has(block.name) ? dialogPrompt(block.arguments)
 					: evidenceExcerpt(JSON.stringify(block.arguments), blockRef) }, i);
@@ -206,7 +215,7 @@ export function extractEvents(stream: Pick<Stream, "key" | "actor">, e: Entry): 
 export function suffix(manager: SessionReader, leaf: string | null, after: string | null): Entry[] {
 	const entries: Entry[] = [];
 	for (let id = leaf; id !== after;) {
-		if (id === null) throw new Error("Mom's consumed cursor is not on the selected branch.");
+		if (id === null) throw new Error("Path's consumed cursor is not on the selected branch.");
 		const entry = manager.getEntry(id);
 		if (!entry) throw new Error(`Missing session entry: ${id}`);
 		entries.push(entry);
@@ -262,23 +271,23 @@ export class LiveFeed {
 		this.parentStream = { key: this.sessionId, sessionId: this.sessionId, actor: "lead", file: manager.getSessionFile() ?? "", forkedMessages: 0 };
 	}
 
-	/** Register Mom's own observed tool records without making them new lead activity or moving a cursor. */
+	/** Register Path's own observed tool records without making them new lead activity or moving a cursor. */
 	observe(observation: Observation): void {
 		const stream = { key: observation.key, actor: "mom" };
 		for (const entry of observation.entries) {
-			const base = `${stream.key}:${entry.id}`;
+			const base = makeRef(stream.key, entry.id);
 			if (this.sources.has(base)) throw new Error(`Duplicate source identity: ${base}`);
 			this.sources.set(base, { entryId: entry.id, entry, stream: stream.key, actor: stream.actor, hash: digest(JSON.stringify(entry)) });
 			for (const event of extractEvents(stream, entry)) {
 				this.byRef.set(event.ref, event);
-				const callKey = `${stream.key}:${event.callId}`;
-				if (event.kind === "tool_call" && event.callId) this.invocations.set(callKey, event.ref);
-				if (["tool_result", "user_answer"].includes(event.kind) && event.callId) this.returns.set(callKey, event.ref);
+				const key = callKey(stream.key, event.callId);
+				if (event.kind === "tool_call" && event.callId) this.invocations.set(key, event.ref);
+				if (["tool_result", "user_answer"].includes(event.kind) && event.callId) this.returns.set(key, event.ref);
 			}
 		}
 	}
 
-	/** Original Mom intents without recorded outcomes; never evidence of success or safe replay. */
+	/** Original Path intents without recorded outcomes; never evidence of success or safe replay. */
 	uncertainEffects(): Array<{ ref: string; name?: string }> {
 		const uncertain = [];
 		for (const [key, ref] of this.invocations) {
@@ -305,7 +314,7 @@ export class LiveFeed {
 				}
 			} catch (error) {
 				// Do not reinterpret old citations against replacement data or silently skip missing history.
-				throw new Error(`Cannot restore Mom's sources: ${String(error)}`);
+				throw new Error(`Cannot restore Path's sources: ${String(error)}`);
 			}
 		}
 	}
@@ -328,7 +337,7 @@ export class LiveFeed {
 
 	private fits(events: FeedEvent[]): boolean {
 		const size = renderUpdateEvents(events).length;
-		if (size > 24000 && Number.isFinite(this.remaining)) throw new Error("One entry's rendered events exceed Mom's 24,000-character batch limit even after per-event clipping (many events in one entry); inspect that entry's ref with inspect_evidence and split or shorten the source entry. Nothing was truncated.");
+		if (size > 24000 && Number.isFinite(this.remaining)) throw new Error("One entry's rendered events exceed Path's 24,000-character batch limit even after per-event clipping (many events in one entry); inspect that entry's ref with inspect_evidence and split or shorten the source entry. Nothing was truncated.");
 		if (size > this.remaining) { this.full = true; return false; }
 		if (this.admit && !this.admit(events)) { this.full = true; return false; }
 		this.remaining -= size;
@@ -337,13 +346,13 @@ export class LiveFeed {
 
 	private add(stream: Stream, entry: Entry, source: Source, emitted = extractEvents(stream, entry)): void {
 		if (!emitted.length) return;
-		const base = `${stream.key}:${entry.id}`;
+		const base = makeRef(stream.key, entry.id);
 		if (this.sources.has(base)) throw new Error(`Duplicate source identity: ${base}`);
 		this.sources.set(base, { ...source, stream: stream.key, actor: stream.actor });
 		for (const event of emitted) {
 			this.events.push(event);
 			this.byRef.set(event.ref, event);
-			const key = `${stream.key}:${event.callId}`;
+			const key = callKey(stream.key, event.callId);
 			if (event.kind === "tool_call" && event.callId) this.invocations.set(key, event.ref);
 			if (["tool_result", "user_answer"].includes(event.kind) && event.callId) this.returns.set(key, event.ref);
 		}
@@ -449,7 +458,7 @@ export class LiveFeed {
 	sourceEntries(): SourceEntryObservation[] {
 		return [...this.sources.values()]
 			.filter((source): source is Source & { entry: Entry; stream: string; actor: string } => Boolean(source.entry && source.stream && source.actor))
-			.map(source => ({ ref: `${source.stream}:${source.entryId}`, stream: source.stream, actor: source.actor, entry: structuredClone(source.entry) }));
+			.map(source => ({ ref: makeRef(source.stream, source.entryId), stream: source.stream, actor: source.actor, entry: structuredClone(source.entry) }));
 	}
 
 	/** Structured todo observations from the lead and captured worker streams. */
@@ -460,8 +469,7 @@ export class LiveFeed {
 	pairedSource(ref: string): string | undefined {
 		const event = this.byRef.get(ref);
 		if (!event?.callId) return undefined;
-		const base = ref.replace(/(:[^:]+):b\d+$/, "$1");
-		const key = `${base.slice(0, base.lastIndexOf(":"))}:${event.callId}`;
+		const key = callKey(parseRef(ref)?.stream ?? ref, event.callId);
 		return event.kind === "tool_call" ? this.returns.get(key) : this.invocations.get(key);
 	}
 
@@ -478,9 +486,9 @@ export class LiveFeed {
 				signal?.throwIfAborted();
 				try {
 					const entry = await this.sourceEntry(event.ref), m = entry.message ?? entry;
-					const block = /:[^:]+:b(\d+)$/.exec(event.ref);
-					const payload = block ? JSON.stringify(m.content[Number(block[1])].arguments)
-						: event.kind === "shell_result" ? String(m.output ?? "") : textBlocks(m.content);
+					const block = parseRef(event.ref)?.block;
+					const payload = block !== undefined ? JSON.stringify(m.content[block].arguments)
+						: event.kind === "shell_result" ? String(m.output ?? "") : textOf(m.content);
 					text += `\n${payload}`;
 				} catch (error) {
 					unreadable++;
@@ -494,7 +502,7 @@ export class LiveFeed {
 
 	private async sourceEntry(ref: string): Promise<Entry> {
 		if (!this.byRef.has(ref)) throw new Error(`Unknown/unobserved source: ${ref}`);
-		const source = this.sources.get(ref.replace(/(:[^:]+):b\d+$/, "$1"))!;
+		const source = this.sources.get(entryRefOf(ref))!;
 		let entry: Entry;
 		if (source.entry) return source.entry;
 		if (source.file) {
@@ -525,9 +533,9 @@ export class LiveFeed {
 		if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 24000) throw new Error("Evidence pages allow offset >= 0 and limit 1..24000.");
 		const entry = await this.sourceEntry(ref);
 		const m = entry.message ?? entry;
-		const block = /:[^:]+:b(\d+)$/.exec(ref);
-		const value = block ? m.content[Number(block[1])] : ["user", "assistant", "custom"].includes(m.role)
-			? { role: m.role, text: textBlocks(m.content), stopReason: m.stopReason, errorMessage: m.errorMessage } : m;
+		const block = parseRef(ref)?.block;
+		const value = block !== undefined ? m.content[block] : ["user", "assistant", "custom"].includes(m.role)
+			? { role: m.role, text: textOf(m.content), stopReason: m.stopReason, errorMessage: m.errorMessage } : m;
 		const text = JSON.stringify(value);
 		return { ref, offset, totalChars: text.length, nextOffset: offset + limit < text.length ? offset + limit : null, text: text.slice(offset, offset + limit) };
 	}
@@ -640,8 +648,7 @@ export function rankSearchDocuments(events: readonly FeedEvent[], documents: Rea
 		const event = candidate.event, pair = pairedSource(event.ref), paired = pair ? eventByRef.get(pair) : undefined;
 		const selected = paired && event.kind === "tool_call" && ["tool_result", "shell_result"].includes(paired.kind)
 			? { ...candidate, event: paired, pairedRef: event.ref } : { ...candidate, ...(pair ? { pairedRef: pair } : {}) };
-		const base = selected.event.ref.replace(/(:[^:]+):b\d+$/, "$1"), stream = base.slice(0, base.lastIndexOf(":"));
-		const key = selected.event.callId ? `${stream}\0${selected.event.callId}` : selected.event.ref;
+		const key = selected.event.callId ? `${parseRef(selected.event.ref)?.stream}\0${selected.event.callId}` : selected.event.ref;
 		(groups.get(key) ?? groups.set(key, []).get(key)!).push(selected);
 	}
 	const preferred = [...groups.values()].map(group => group.sort((a, b) => {

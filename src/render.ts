@@ -1,7 +1,12 @@
 import type { Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme, keyHint } from "@earendil-works/pi-coding-agent";
 import { formatPercent, type DealsDetails, type DealRow } from "./deals.js";
-import { type Component, Markdown, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { type Component, Markdown, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { formatDuration } from "./util/format.ts";
+import { textOf } from "./util/text.ts";
+import { BOX, GLYPH } from "./ui/glyphs.ts";
+import { cut, fit, fitAlign, fitPad } from "./ui/text.ts";
+import { tildify } from "./util/path.ts";
 import type { AcpRunView } from "./backend.js";
 
 export interface RunView {
@@ -119,19 +124,15 @@ export function runTitle(v: Pick<RunView, "task" | "role">): string {
 	return String(v.task ?? "").trim().split("\n", 1)[0] || v.role || "(untitled)";
 }
 
-export function elapsed(ms: number): string {
-	const s = Math.floor(ms / 1000);
-	return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s`;
-}
 
 /** The durable outcome. No live status, frame, or duplicate dispatch record. */
 /** Status colour and glyph, shared by every surface that shows a child. */
 export function statusMark(v: Pick<RunView, "status">): { color: ThemeColor; glyph: string } {
-	if (v.status === "running") return { color: "accent", glyph: "●" };
-	if (v.status === "complete") return { color: "success", glyph: "✓" };
-	if (v.status === "idle") return { color: "muted", glyph: "○" };
-	if (v.status === "error") return { color: "error", glyph: "✗" };
-	return { color: "warning", glyph: "⊘" };
+	if (v.status === "running") return { color: "accent", glyph: GLYPH.running };
+	if (v.status === "complete") return { color: "success", glyph: GLYPH.done };
+	if (v.status === "idle") return { color: "muted", glyph: GLYPH.idle };
+	if (v.status === "error") return { color: "error", glyph: GLYPH.failed };
+	return { color: "warning", glyph: GLYPH.stopped };
 }
 
 /**
@@ -146,7 +147,7 @@ export function runLine(v: RunView, theme: Theme, width: number, now = Date.now(
 		v.status === "running" ? theme.fg("accent", v.activeTool?.name ?? v.lastTool ?? "thinking") : v.status === "complete" ? "" : theme.fg(color, v.status),
 		theme.fg("muted", v.role ?? ""),
 		v.backend === "acp" && v.nativeSessionId ? dim(v.nativeSessionId) : "",
-		dim(elapsed(v.durationMs ?? 0)),
+		dim(formatDuration(v.durationMs ?? 0)),
 		v.turns ? dim(`${v.turns} turn${v.turns === 1 ? "" : "s"}`) : "",
 		v.cost ? theme.fg("muted", `$${(v.cost ?? 0).toFixed(4)}`) : "",
 		v.providerRetry ? theme.fg("warning", `retry ${v.providerRetry.attempt}/${v.providerRetry.maxAttempts}`) : "",
@@ -154,9 +155,9 @@ export function runLine(v: RunView, theme: Theme, width: number, now = Date.now(
 		v.changedFiles?.length ? theme.fg("success", `${v.changedFiles.length} changed`) : "",
 	].filter(Boolean);
 	const suffix = dim("  ") + facts.join(dim(" · "));
-	const title = truncateToWidth(runTitle(v), Math.max(4, width - 2 - visibleWidth(suffix)), "…");
+	const title = fit(runTitle(v), Math.max(4, width - 2 - visibleWidth(suffix)));
 	void now;
-	return truncateToWidth(`${theme.fg(color, glyph)} ${theme.bold(title)}${suffix}`, width, "…");
+	return fit(`${theme.fg(color, glyph)} ${theme.bold(title)}${suffix}`, width);
 }
 
 export function resultLines(v: RunView, expanded: boolean, theme: Theme, width: number): string[] {
@@ -188,8 +189,7 @@ export function resultLines(v: RunView, expanded: boolean, theme: Theme, width: 
 }
 
 export function formatToolCall(name: string, args: Record<string, unknown>, theme: Theme): string {
-	const home = process.env.HOME ?? "";
-	const short = (p: unknown) => (typeof p === "string" && home && p.startsWith(home) ? `~${p.slice(home.length)}` : String(p ?? "…"));
+	const short = (p: unknown) => (typeof p === "string" ? tildify(p) : String(p ?? "…"));
 	switch (name) {
 		case "bash":
 			return theme.fg("muted", "$ ") + theme.fg("toolOutput", String(args.command ?? "…").replace(/\s+/g, " "));
@@ -204,21 +204,37 @@ export function formatToolCall(name: string, args: Record<string, unknown>, them
 	}
 }
 
+/** What a frame needs of a theme; Pi's `Theme` and the todo panel's styler both fit. */
+export interface FrameTheme { fg(color: ThemeColor, text: string): string }
+
+export interface FrameOptions {
+	/** Cut long lines to the width instead of wrapping them onto more rows. */
+	truncate?: boolean;
+}
+
 /** Rounded OMP-style frame, including terminals narrower than the usual layout. */
-export function frame(header: string, body: string[], border: ThemeColor, theme: Theme, width: number): string[] {
-	if (width < 6) return [header, ...body].map((l) => truncateToWidth(l, Math.max(0, width), ""));
+export function frame(header: string, body: string[], border: ThemeColor, theme: FrameTheme, width: number, options: FrameOptions = {}): string[] {
+	if (width < 6) return [header, ...body].map((l) => cut(l, width));
 	const b = (s: string) => theme.fg(border, s);
 	const inner = width - 4;
-	const label = truncateToWidth(` ${header} `, width - 4, "…");
-	const top = b("╭─") + label + b("─".repeat(Math.max(0, width - 3 - visibleWidth(label))) + "╮");
-	const rows = [top];
+	const label = fit(` ${header} `, width - 4);
+	const rows = [b(`${BOX.topLeft}${BOX.h}`) + label + b(BOX.h.repeat(Math.max(0, width - 3 - visibleWidth(label))) + BOX.topRight)];
 	for (const line of body) {
-		for (const wrapped of wrapTextWithAnsi(line, inner)) {
-			rows.push(`${b("│")} ${wrapped}${" ".repeat(Math.max(0, inner - visibleWidth(wrapped)))} ${b("│")}`);
+		for (const part of options.truncate ? [line] : wrapTextWithAnsi(line, inner)) {
+			rows.push(`${b(BOX.v)} ${fitPad(part, inner)} ${b(BOX.v)}`);
 		}
 	}
-	rows.push(b(`╰${"─".repeat(width - 2)}╯`));
+	rows.push(b(`${BOX.bottomLeft}${BOX.h.repeat(width - 2)}${BOX.bottomRight}`));
 	return rows;
+}
+
+/** Replace the frame's bottom border with its navigation legend, in the colour the frame above was drawn in. */
+export function withLegend(lines: string[], legend: string, border: ThemeColor, theme: FrameTheme, width: number): string[] {
+	if (width < 8 || lines.length === 0) return lines;
+	const label = fit(` ${legend} `, width - 3);
+	lines[lines.length - 1] = theme.fg(border, `${BOX.bottomLeft}${BOX.h}`) + theme.fg("dim", label)
+		+ theme.fg(border, BOX.h.repeat(Math.max(0, width - 3 - visibleWidth(label))) + BOX.bottomRight);
+	return lines;
 }
 
 export function empty(): Component {
@@ -351,7 +367,7 @@ function packed(entries: string[], width: number, theme: Theme): string[] {
 	entries.forEach((raw, i) => {
 		// A line that continues ends in " ·", two columns it must leave free; only the last may fill.
 		const room = i === entries.length - 1 ? width : width - 2;
-		const entry = truncateToWidth(raw, Math.max(1, width - 2), "\u2026");
+		const entry = fit(raw, Math.max(1, width - 2));
 		const next = line ? `${line}${theme.fg("dim", " \u00b7 ")}${entry}` : entry;
 		if (line && visibleWidth(next) > room) { lines.push(line + theme.fg("dim", " \u00b7")); line = entry; } else line = next;
 	});
@@ -379,22 +395,17 @@ function modelTable(rows: ModelRow[], expanded: boolean, theme: Theme, width: nu
 	while (keep > 2 && keyNeed + span(keep) > width) keep--;
 	cols.length = keep;
 	const keyWidth = Math.max(12, Math.min(keyNeed, width - span(keep)));
-	const fit = (text: string, w: number, right?: true) => {
-		const t = truncateToWidth(text, w, "\u2026");
-		const gap = " ".repeat(Math.max(0, w - visibleWidth(t)));
-		return right ? gap + t : t + gap;
-	};
 	// Notes take only what the columns leave; a clipped row must never cut into a price.
 	const line = (key: string, rest: string, notes: string) => {
 		const base = `  ${key}${rest}`;
 		const room = width - visibleWidth(base) - 2;
-		return truncateToWidth(notes && room >= 4 ? `${base}  ${truncateToWidth(notes, room, "\u2026")}` : base, width, "\u2026");
+		return fit(notes && room >= 4 ? `${base}  ${fit(notes, room)}` : base, width);
 	};
-	const out = [line(theme.fg("dim", fit("offering", keyWidth)), cols.map((c, i) => `  ${theme.fg("dim", fit(c.head, widths[i], c.right))}`).join(""), "")];
+	const out = [line(theme.fg("dim", fitAlign("offering", keyWidth)), cols.map((c, i) => `  ${theme.fg("dim", fitAlign(c.head, widths[i], c.right))}`).join(""), "")];
 	rows.forEach((r, n) => {
-		const key = fit(r.key, keyWidth);
+		const key = fitAlign(r.key, keyWidth);
 		out.push(line(r.current ? theme.bold(theme.fg("accent", key)) : theme.fg("text", key),
-			cols.map((c, i) => `  ${theme.fg(cells[n][i][1], fit(cells[n][i][0], widths[i], c.right))}`).join(""), modelNotes(r, theme)));
+			cols.map((c, i) => `  ${theme.fg(cells[n][i][1], fitAlign(cells[n][i][0], widths[i], c.right))}`).join(""), modelNotes(r, theme)));
 		if (!expanded) return;
 		const l = r.live;
 		const detail = [
@@ -413,14 +424,14 @@ function modelsView(title: string, subject: string, d: ModelsDetails, expanded: 
 	const sep = dim(" \u00b7 ");
 	const { approved, drift } = d.defaults;
 	const shown = expanded ? d.rows : d.rows.slice(0, MODEL_PREVIEW_ROWS);
-	const out = [truncateToWidth(theme.fg("toolTitle", theme.bold(title)) + ` ${theme.fg("accent", "models")}` + (subject ? theme.fg("muted", ` ${subject}`) : "")
-		+ theme.fg("muted", `  ${d.matched}${d.filter ? "" : " rated"} of ${d.total} offerings`), width, "\u2026")];
+	const out = [fit(theme.fg("toolTitle", theme.bold(title)) + ` ${theme.fg("accent", "models")}` + (subject ? theme.fg("muted", ` ${subject}`) : "")
+		+ theme.fg("muted", `  ${d.matched}${d.filter ? "" : " rated"} of ${d.total} offerings`), width)];
 	// Collapsed, one line says what the defaults are and whether anything needs attention; the
 	// expand spells each of those out below the table instead.
-	if (!expanded) out.push(truncateToWidth("  " + dim("defaults ")
+	if (!expanded) out.push(fit("  " + dim("defaults ")
 		+ (approved.length ? approved.map((a) => theme.fg("text", a.role) + dim(" \u2192 ") + theme.fg("muted", a.spec)).join(sep) : dim("none approved"))
 		+ (drift.length ? sep + theme.fg("warning", `${drift.length} change${drift.length === 1 ? "" : "s"} since approval`) : "")
-		+ (d.openrouter.error ? sep + theme.fg("warning", `OpenRouter ${d.openrouter.summary}`) : ""), width, "\u2026"));
+		+ (d.openrouter.error ? sep + theme.fg("warning", `OpenRouter ${d.openrouter.summary}`) : ""), width));
 	if (shown.length) out.push(...modelTable(shown, expanded, theme, width));
 	else out.push("  " + theme.fg("muted", d.filter ? `no registry offering matches "${d.filter}"` : "no rated offerings yet"));
 	if (!expanded) {
@@ -503,11 +514,7 @@ export function dealTableLines(rows: DealRow[], metric: DealMetric, theme: Theme
 		`Off ${displayDealWindow(r.timing.off.start, r.timing.off.end)}`,
 		`Peak ${displayDealWindow(r.timing.peak.start, r.timing.peak.end)}`,
 	] : [r.reason, ""];
-	const fit = (s: string, size: number, right = false) => {
-		const clipped = truncateToWidth(s, Math.max(1, size), "…");
-		const gap = " ".repeat(Math.max(0, size - visibleWidth(clipped)));
-		return right ? gap + clipped : clipped + gap;
-	};
+	const cell = (s: string, size: number, right = false) => fitAlign(s, Math.max(1, size), right);
 	const narrow = width < (metric === "saving" ? 103 : metric === "discount" ? 92 : 76);
 	const label = metric === "discount" ? "Disc" : metric === "saving" ? "Save" : "Basket";
 	if (narrow) {
@@ -519,21 +526,21 @@ export function dealTableLines(rows: DealRow[], metric: DealMetric, theme: Theme
 			if (metric === "saving") out.push(theme.fg("muted", `  ${off}`), theme.fg("muted", `  ${peak}`));
 			out.push(theme.fg("text", `  In ${displayDealRate(r.input)}  Out ${displayDealRate(r.output)}  · AA ${score(r.quality)}/${score(r.coding)}`));
 		}
-		return out.map((line) => truncateToWidth(line, width, "…"));
+		return out.map((line) => fit(line, width));
 	}
 	const rateWidth = Math.max(6, ...rows.flatMap((r) => [displayDealRate(r.input).length, displayDealRate(r.output).length]));
 	const providerWidth = width >= (metric === "saving" ? 103 : 92) ? 16 : 0;
 	const columns = [providerWidth, rateWidth, rateWidth, 7, 6, 6, ...(metric === "saving" ? [8] : [])].filter((w) => w > 0);
 	const modelWidth = Math.min(44, width - 2 - columns.reduce((sum, n) => sum + n, 0) - 2 * columns.length);
 	const cols = (model: string, provider: string, input: string, output: string, amount: string, intel: string, coding: string, status: string) =>
-		`  ${fit(model, modelWidth)}${providerWidth ? `  ${fit(provider, providerWidth)}` : ""}  ${fit(input, rateWidth, true)}  ${fit(output, rateWidth, true)}  ${fit(amount, 7, true)}  ${fit(intel, 6, true)}  ${fit(coding, 6, true)}${metric === "saving" ? `  ${fit(status, 8)}` : ""}`;
+		`  ${cell(model, modelWidth)}${providerWidth ? `  ${cell(provider, providerWidth)}` : ""}  ${cell(input, rateWidth, true)}  ${cell(output, rateWidth, true)}  ${cell(amount, 7, true)}  ${cell(intel, 6, true)}  ${cell(coding, 6, true)}${metric === "saving" ? `  ${cell(status, 8)}` : ""}`;
 	const out = [theme.fg("dim", cols("Model", "Provider", "In", "Out", label, "AA I", "AA C", "At scan"))];
 	for (const [i, r] of rows.entries()) {
 		out.push(cols(theme.fg(i === selected ? "accent" : "text", `${i === selected ? "›" : " "}${displayDealId(r.id)}`),
 			displayDealProvider(r.provider), displayDealRate(r.input), displayDealRate(r.output), value(r), score(r.quality), score(r.coding), state(r)));
 		if (metric === "saving") out.push(theme.fg("muted", `    ${windows(r).filter(Boolean).join("  ·  ")}`));
 	}
-	return out.map((line) => truncateToWidth(line, width, "…"));
+	return out.map((line) => fit(line, width));
 }
 
 function dealsView(title: string, d: DealsDetails, expanded: boolean, theme: Theme, width: number): string[] {
@@ -554,7 +561,7 @@ function dealsView(title: string, d: DealsDetails, expanded: boolean, theme: The
 	group(`light value · AA next 35% (≥${d.lightFloor ?? "?"})`, d.light, "basket", 2);
 	if (expanded) out.push(...indented(dim(`AA = Artificial Analysis Intelligence / Coding indices, not percentages. Endpoint discount % is already in that provider's price, not a comparison to the model-wide price. Off-peak saving % is against the highest-priced UTC window; off-peak $/M is the cheaper window's rate, not necessarily the active rate. At scan means the active rate when evaluated. Window times are Pacific (PDT/PST). Evaluated ${d.evaluatedAt}; catalog/endpoints may be cached up to 10m. Basket = 1M input + 250k output. No model selected.`), 2, width));
 	else out.push(...indented(dim("/deals opens the full sortable sheet · ") + keyHint("app.tools.expand", "for evidence"), 2, width));
-	return out.map((line) => truncateToWidth(line, width, "…"));
+	return out.map((line) => fit(line, width));
 }
 
 export function resultView(
@@ -594,7 +601,7 @@ export function resultView(
 		// Its prose is written for the model and does not survive a column, so it waits for the expand.
 		return [
 			theme.fg("toolTitle", theme.bold(title)) + ` ${theme.fg("accent", "roles")}` + theme.fg("muted", ` ${rows.length}`),
-			...rows.map((r) => truncateToWidth("  "
+			...rows.map((r) => fit("  "
 				+ theme.fg("text", pad(r.name, nameWidth)) + "  "
 				+ theme.fg("muted", pad(r.mode, modeWidth)) + "  "
 				+ theme.fg(r.approved === true ? "dim" : "warning", pad(r.model, modelWidth)) + "  "
@@ -603,7 +610,7 @@ export function resultView(
 				+ theme.fg("dim", r.tools.length === 1 && r.tools[0] === "*" ? " · every tool" : ` · ${r.tools.length} tools`)
 				+ (r.timeoutMs ? theme.fg("dim", ` · ${Math.round(r.timeoutMs / 60000)}m`) : "")
 				+ ((r.dropped?.length ?? 0) ? theme.fg("warning", ` · ${r.dropped.length} unavailable`) : ""),
-				inner, "\u2026")),
+				inner)),
 			...(opts.expanded
 				? rows.flatMap((r) => [
 					"",
@@ -618,14 +625,13 @@ export function resultView(
 	// Pi exits on any line wider than the terminal, and this record is re-rendered at whatever width
 	// the terminal has after a reload. The view wraps to fit; the clamp makes that a guarantee.
 	if (action === "models" && isModelsDetails(result.details)) {
-		return modelsView(title, subject, result.details, Boolean(opts.expanded), theme, inner).map((l) => truncateToWidth(l, inner, "\u2026"));
+		return modelsView(title, subject, result.details, Boolean(opts.expanded), theme, inner).map((l) => fit(l, inner));
 	}
 	if (action === "deals" && isDealsDetails(result.details)) {
 		return dealsView(title, result.details, Boolean(opts.expanded), theme, inner);
 	}
 
-	const blocks = Array.isArray(result.content) ? result.content : [];
-	const text = blocks.filter((b) => b?.type === "text").map((b) => String(b.text ?? "")).join("\n").trim();
+	const text = textOf(result.content).trim();
 	const header = theme.fg("toolTitle", theme.bold(title))
 		+ (action ? ` ${theme.fg("accent", action)}` : "")
 		+ (subject ? theme.fg("muted", ` ${subject}`) : "");

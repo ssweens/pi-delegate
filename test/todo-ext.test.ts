@@ -1,9 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { existsSync, readdirSync } from "node:fs";
 import {
 	LEGACY_TODO_CUSTOM_TYPE,
@@ -14,6 +12,7 @@ import {
 	loadState,
 } from "../src/todo-ext.ts";
 import type { TodoStyler } from "../src/todo-render.ts";
+import { fakePi, tempDir } from "./capture.ts";
 
 const plainTheme: TodoStyler = {
 	fg: (_color, text) => text,
@@ -36,27 +35,10 @@ interface Harness {
 }
 
 function harness(options: Parameters<typeof installTodo>[1] = {}): Harness {
-	const tools = new Map<string, any>();
-	const commands = new Map<string, any>();
-	const handlers = new Map<string, Array<(event: any, ctx: any) => unknown>>();
-	const entries: Harness["entries"] = [];
+	const { pi, tools, commands, entries, sent, fire } = fakePi();
 	const widgets: WidgetRecord[] = [];
 	const notices: Harness["notices"] = [];
-	const sent: string[] = [];
-
-	const pi = {
-		registerTool: (tool: any) => void tools.set(tool.name, tool),
-		registerCommand: (name: string, command: any) => void commands.set(name, command),
-		on: (event: string, handler: (event: any, ctx: any) => unknown) => {
-			const list = handlers.get(event) ?? [];
-			list.push(handler);
-			handlers.set(event, list);
-			return () => {};
-		},
-		appendEntry: (customType: string, data: unknown) => void entries.push({ type: "custom", customType, data }),
-		sendUserMessage: (content: string) => void sent.push(content),
-	};
-	installTodo(pi as unknown as ExtensionAPI, options);
+	installTodo(pi, options);
 
 	const ui = {
 		setWidget: (key: string, content: WidgetRecord["content"], options?: unknown) => void widgets.push({ key, content, options }),
@@ -71,9 +53,7 @@ function harness(options: Parameters<typeof installTodo>[1] = {}): Harness {
 		sent,
 		ui,
 		ctx: (branch: unknown[] = entries) => ({ sessionManager: { getBranch: () => branch }, ui, cwd: "/tmp", mode: "tui" }),
-		fire: (event, payload, ctx) => {
-			for (const handler of handlers.get(event) ?? []) handler(payload, ctx);
-		},
+		fire,
 	};
 }
 
@@ -161,41 +141,37 @@ test("malformed tool input degrades to an error component instead of throwing", 
 	assert.ok(rendered.includes("☑ Todo 0 tasks"));
 });
 
-test("/todo command edits state, exports and imports Markdown", async () => {
-	const dir = mkdtempSync(join(tmpdir(), "pi-delegate-todo-"));
-	try {
-		const h = harness();
-		const command = h.commands.get("todo");
-		const ctx = { ...h.ctx(), cwd: dir };
+test("/todo command edits state, exports and imports Markdown", async (t) => {
+	const dir = tempDir("pi-delegate-todo-", t);
+	const h = harness();
+	const command = h.commands.get("todo");
+	const ctx = { ...h.ctx(), cwd: dir };
 
-		await command.handler("add Ship the transfer", ctx);
-		assert.equal(h.entries.at(-1)?.customType, TODO_CUSTOM_TYPE);
-		assert.deepEqual(h.widgets.at(-1)?.key, TODO_WIDGET_KEY);
-		assert.ok(h.notices.at(-1)!.message.includes("Added: Ship the transfer"));
+	await command.handler("add Ship the transfer", ctx);
+	assert.equal(h.entries.at(-1)?.customType, TODO_CUSTOM_TYPE);
+	assert.deepEqual(h.widgets.at(-1)?.key, TODO_WIDGET_KEY);
+	assert.ok(h.notices.at(-1)!.message.includes("Added: Ship the transfer"));
 
-		await command.handler("", ctx);
-		assert.ok(h.notices.at(-1)!.message.includes("Todos: 1 open across 1 phase(s)."));
+	await command.handler("", ctx);
+	assert.ok(h.notices.at(-1)!.message.includes("Todos: 1 open across 1 phase(s)."));
 
-		await command.handler("export", ctx);
-		const target = join(dir, "TODO.md");
-		assert.equal(readFileSync(target, "utf8"), "# Tasks\n- [ ] Ship the transfer");
+	await command.handler("export", ctx);
+	const target = join(dir, "TODO.md");
+	assert.equal(readFileSync(target, "utf8"), "# Tasks\n- [ ] Ship the transfer");
 
-		await command.handler("done Ship the transfer", ctx);
-		assert.deepEqual(h.widgets.at(-1), { key: TODO_WIDGET_KEY, content: undefined, options: undefined });
+	await command.handler("done Ship the transfer", ctx);
+	assert.deepEqual(h.widgets.at(-1), { key: TODO_WIDGET_KEY, content: undefined, options: undefined });
 
-		await command.handler("import", ctx);
-		assert.equal(h.notices.at(-1)!.message.includes("Imported 1 open tasks"), true);
-		assert.equal(loadState(ctx.sessionManager).phases[0]!.tasks[0]!.content, "Ship the transfer");
+	await command.handler("import", ctx);
+	assert.equal(h.notices.at(-1)!.message.includes("Imported 1 open tasks"), true);
+	assert.equal(loadState(ctx.sessionManager).phases[0]!.tasks[0]!.content, "Ship the transfer");
 
-		writeFileSync(target, "# From file\n- [/] Halfway there\n");
-		await command.handler(`import ${target}`, ctx);
-		assert.equal(loadState(ctx.sessionManager).phases[0]!.tasks[0]!.status, "in_progress");
+	writeFileSync(target, "# From file\n- [/] Halfway there\n");
+	await command.handler(`import ${target}`, ctx);
+	assert.equal(loadState(ctx.sessionManager).phases[0]!.tasks[0]!.status, "in_progress");
 
-		await command.handler("add", ctx);
-		assert.equal(h.notices.at(-1)!.level, "warning");
-	} finally {
-		rmSync(dir, { recursive: true, force: true });
-	}
+	await command.handler("add", ctx);
+	assert.equal(h.notices.at(-1)!.level, "warning");
 });
 
 function todoBranch() {

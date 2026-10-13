@@ -1,3 +1,4 @@
+import { errorMessage } from "../../util/text.ts";
 import type { StringsResponse } from "./types.js";
 
 export class StringsError extends Error {
@@ -15,6 +16,5 @@ export function failure(action: string, error: unknown): StringsResponse {
   if (error instanceof StringsError) {
     return { ok: false, action, error: { code: error.code, message: error.message, retryable: error.retryable } };
   }
-  const message = error instanceof Error ? error.message : String(error);
-  return { ok: false, action, error: { code: "INTERNAL_ERROR", message, retryable: false } };
+  return { ok: false, action, error: { code: "INTERNAL_ERROR", message: errorMessage(error), retryable: false } };
 }

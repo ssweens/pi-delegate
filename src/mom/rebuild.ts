@@ -9,8 +9,9 @@ import { extractEvents } from "./feed.ts";
 import { readGraph } from "./mother.ts";
 import { encodeRequest } from "./operation.ts";
 import { oven, ovenSliceUrl } from "./oven.ts";
-import { formatElapsed } from "./status.ts";
+import { formatDuration } from "../util/format.ts";
 import { sessionFromFile } from "./session-file.ts";
+import { completeLines } from "../util/jsonl.ts";
 import { SidecarStore } from "./sidecar.ts";
 import { identityOf, momConfiguration, type SessionIdentity } from "./slice.ts";
 import { presentGraph, type WorkView } from "../ui/presentation.ts";
@@ -34,7 +35,7 @@ function sameBranch(context: ExtensionContext, candidate: RebuiltMap): boolean {
 		sameIds(context.sessionManager.getBranch().map(entry => entry.id), candidate.branchIds);
 }
 
-/** Reuse Mom's cold thread-map catch-up, but in an unfollowed ephemeral Oven slice with its own session copy and sidecar. */
+/** Reuse Path's cold thread-map catch-up, but in an unfollowed ephemeral Oven slice with its own session copy and sidecar. */
 export async function rebuildMap(context: ExtensionContext, identity: SessionIdentity, flags: Record<string, string | boolean | undefined>,
 	progress: (message: string, sliceUrl?: string) => void, signal: AbortSignal): Promise<RebuiltMap> {
 	const branch = context.sessionManager.getBranch();
@@ -48,18 +49,16 @@ export async function rebuildMap(context: ExtensionContext, identity: SessionIde
 	let slice: string | undefined;
 	try {
 		const bytes = await readFile(identity.sessionFile);
-		const end = bytes.lastIndexOf(0x0a) + 1;
-		if (!end) throw new Error("The session transcript has no complete entries.");
-		const frozen = bytes.subarray(0, end).toString("utf8");
-		await writeFile(file, frozen, { mode: 0o600 });
+		const lines = completeLines(bytes);
+		if (!lines.length) throw new Error("The session transcript has no complete entries.");
+		await writeFile(file, bytes.subarray(0, bytes.lastIndexOf(0x0a) + 1), { mode: 0o600 });
 		// Validate the selected branch against saved bytes before adding anything to the copy.
 		const reader = sessionFromFile(file, leaf);
 		if (!sameIds(reader.getBranch().map(entry => entry.id), branchIds))
 			throw new Error("The selected branch is not fully recorded in the transcript yet.");
 		// Pi can select a branch other than the file's last leaf. Put its recorded leaf last
 		// in the private copy so Oven's current-session reader follows that same branch.
-		const lastLine = frozen.slice(frozen.lastIndexOf("\n", frozen.length - 2) + 1).trimEnd();
-		if (JSON.parse(lastLine).id !== leaf) await appendFile(file, JSON.stringify(reader.getEntry(leaf)) + "\n");
+		if (JSON.parse(lines[lines.length - 1]!.line).id !== leaf) await appendFile(file, JSON.stringify(reader.getEntry(leaf)) + "\n");
 		if (signal.aborted) throw signal.reason;
 		const config = momConfiguration({ ...identity, sessionFile: file },
 			{ ...flags, "mom-bootstrap": "1" }, context.modelRegistry);
@@ -69,7 +68,7 @@ export async function rebuildMap(context: ExtensionContext, identity: SessionIde
 		});
 		slice = created.id;
 		if (created.missingTools?.includes("mom_begin") || created.missingTools?.includes("commit_graph"))
-			throw new Error("Oven's Mom extension is stale; restart Oven before rebuilding.");
+			throw new Error("Oven's Path extension is stale; restart Oven before rebuilding.");
 		const store = new SidecarStore(() => file, identity.sessionId);
 		let previousCut = "";
 		const sliceUrl = ovenSliceUrl(slice);
@@ -78,7 +77,7 @@ export async function rebuildMap(context: ExtensionContext, identity: SessionIde
 			const started = Date.now();
 			let activity = "starting", streamed = 0, shown = "";
 			const report = () => {
-				const message = `Rebuilding · pass ${batch} · ${activity}${streamed ? ` · ${streamed.toLocaleString()} chars streamed` : ""} · ${formatElapsed(Date.now() - started)}`;
+				const message = `Rebuilding · pass ${batch} · ${activity}${streamed ? ` · ${streamed.toLocaleString()} chars streamed` : ""} · ${formatDuration(Date.now() - started)}`;
 				if (message !== shown) { shown = message; progress(message, sliceUrl); }
 			};
 			const observe = (event: any) => {
@@ -118,7 +117,7 @@ export async function rebuildMap(context: ExtensionContext, identity: SessionIde
 			if (state.skipped?.length || state.gaps.length || status?.unavailable?.length)
 				throw new Error("Some transcript or worker evidence was unavailable; the incomplete map cannot replace the saved one.");
 			const cut = state.coverageCut ?? state.checkpoint?.cut;
-			if (!cut || !state.checkpoint) throw new Error("Mom did not produce a map from the selected branch.");
+			if (!cut || !state.checkpoint) throw new Error("Path did not produce a map from the selected branch.");
 			if (status?.more) {
 				const key = JSON.stringify(cut);
 				if (key === previousCut) throw new Error("Rebuild made no progress; the saved map is unchanged.");
@@ -126,7 +125,7 @@ export async function rebuildMap(context: ExtensionContext, identity: SessionIde
 				continue;
 			}
 			const checkpoint = { ...state.checkpoint, cut };
-			if (!isCheckpoint(checkpoint)) throw new Error("Mom produced an invalid rebuilt map.");
+			if (!isCheckpoint(checkpoint)) throw new Error("Path produced an invalid rebuilt map.");
 			const events = branch.flatMap(entry => extractEvents({ key: identity.sessionId, actor: "lead" }, entry));
 			return { checkpoint, view: presentGraph(readGraph([], checkpoint, state.checkpointId, events)), baseId,
 				session: identity, branchIds, sourceSize: bytes.length, batches: batch };
@@ -145,11 +144,11 @@ export async function acceptRebuiltMap(context: ExtensionContext, candidate: Reb
 	const store = new SidecarStore(() => session.sessionFile, session.sessionId);
 	const verify = async () => {
 		if ((await stat(session.sessionFile)).size !== candidate.sourceSize)
-			throw new Error("The session transcript changed while Mom rebuilt it; rebuild again before replacing her map.");
-		if (!sameBranch(context, candidate)) throw new Error("The session branch changed; rebuild again before replacing Mom's map.");
+			throw new Error("The session transcript changed while Path rebuilt it; rebuild again before replacing its map.");
+		if (!sameBranch(context, candidate)) throw new Error("The session branch changed; rebuild again before replacing Path's map.");
 		const fresh = new SidecarStore(() => session.sessionFile, session.sessionId);
 		const state = await loadState(fresh, context.sessionManager);
-		if (state.checkpointId !== baseId) throw new Error("Mom's saved map changed while you inspected the rebuild; rebuild again before replacing it.");
+		if (state.checkpointId !== baseId) throw new Error("Path's saved map changed while you inspected the rebuild; rebuild again before replacing it.");
 		return state;
 	};
 	const state = await verify();

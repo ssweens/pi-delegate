@@ -1,10 +1,19 @@
 import { stripVTControlCharacters } from "node:util";
 import type { Theme } from "@earendil-works/pi-coding-agent";
-import { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type TUI } from "@earendil-works/pi-tui";
+import { matchesKey, visibleWidth, wrapTextWithAnsi, type Component, type TUI } from "@earendil-works/pi-tui";
 import type { AnnotationView, EndeavorView, WorkView } from "./presentation.ts";
-import { formatElapsed, updateErrorSummary } from "../mom/status.ts";
+import { formatTiming, formatUsage, updateErrorSummary, WAITING_FOR_VIEW } from "../mom/status.ts";
+import { frame, withLegend } from "../render.js";
+import { formatDuration } from "../util/format.ts";
+import { flatten } from "../util/text.ts";
+import { GLYPH, TREE } from "./glyphs.ts";
+import { chordLabel, graphHints, hint, joinHints, keyLabel } from "./hints.ts";
+import { navKeys } from "./keys.ts";
+import { PagedText, Scroller } from "./scroll.ts";
+import { fit, fitPad, sideBySide } from "./text.ts";
+import { isFinished, isWaiting, kindClass, kindWord, stateWord } from "./vocabulary.ts";
 import { GraphBrowser } from "./graph-browser.ts";
-import { plainTrailRows, statusSlot, trailCompactRow, TrailBrowser, trailRows } from "./trail-view.ts";
+import { plainTrailRows, statusSlot, titleWithSlot, trailCompactRow, TrailBrowser, trailRows } from "./trail-view.ts";
 import type { Snapshot, SourcePage } from "../mom/client.ts";
 import type { Trail } from "../trail/types.ts";
 import type { Glance } from "../trail/projection.ts";
@@ -15,8 +24,8 @@ export type PanelNoteTag = "Heads up" | "Worth considering";
 export type FindingDisposition = "understood" | "dismiss" | "incorrect";
 export interface PanelView {
 	status: string; summary: string; complete?: boolean; compact?: boolean; note?: string; noteTag?: PanelNoteTag; error?: string; sliceUrl?: string; rebuild?: string; rebuildUrl?: string; work?: WorkView; coverage?: { consumed: number; total: number; percent: number };
-	/** Trail mode: where we are at a glance, how many entries the branch has, and what Mom is doing when busy. */
-	trail?: { glance: Glance; count: number; stage?: string };
+	/** Trail mode: where we are at a glance, how many entries the branch has, and what Path is doing when busy. */
+	trail?: { glance: Glance; count: number; stage?: string; task?: string; since?: number };
 }
 export interface PanelDiagnostics { sections: { title: string; text: string }[]; raw: string }
 export interface WorkspaceStatus {
@@ -39,9 +48,8 @@ export interface PanelSource {
 	trail?(): Trail | undefined;
 }
 
-/** Trail mode's widget rows: where we are, Mom's state at the far right of the first. */
-const trailWidgetRows = (view: PanelView, theme: Theme, width: number) =>
-	trailRows(view.trail!.glance, theme, width, statusSlot(view, theme, view.trail!.glance.last));
+/** Trail mode's widget rows: where we are, Path's state at the far right of the first. */
+const trailWidgetRows = (view: PanelView, theme: Theme, width: number) => trailRows(view.trail!.glance, theme, width);
 
 /**
  * F1–F4 as the kitty keyboard protocol sends them: `ESC [ P` … `ESC [ S`, with any modifier as `ESC [ 1 ; m P`.
@@ -56,39 +64,24 @@ export function functionKey(data: string, key: "f1" | "f2" | "f3" | "f4"): boole
 }
 
 const PREVIEW_NEIGHBORS = 6;
-const finished = (state: string) => ["settled", "finished", "completed", "done"].includes(state);
-const waiting = (state: string) => ["parked", "waiting", "blocked"].includes(state);
-const clean = (text: string) => text.replace(/\[src:[^\]]+\]/g, "").replace(/\s+/g, " ").trim();
-const clip = (text: string, width: number) => width > 0 ? truncateToWidth(text, width, "…") : "";
+const clean = (text: string) => flatten(text.replace(/\[src:[^\]]+\]/g, ""));
+/** The note under the map, tagged by what it is. */
+const noteLine = (view: PanelView): string => `${view.noteTag ?? "Worth considering"}: ${clean(view.note!)}`;
 const fallback = (summary: string) => clean(summary.split("\n").find(line => line.trim() && !line.startsWith("#")) ?? "");
 
-function annotationLabel(annotation: AnnotationView): string {
-	if (["rule", "constraint", "postulate"].includes(annotation.kind)) return "Rule";
-	if (["choice", "question", "decision"].includes(annotation.kind)) return "Choice";
-	return "Observed";
-}
-
 function annotationText(annotation: AnnotationView): string {
-	const label = annotationLabel(annotation);
-	const text = clean(label === "Observed" ? annotation.observed || annotation.intent || annotation.label : annotation.intent || annotation.label);
-	const state = finished(annotation.state) ? " (finished)" : waiting(annotation.state) ? " (waiting)" : "";
-	return `${label}${state}: ${text}`;
-}
-
-function stateName(state: string): string {
-	if (finished(state)) return "done";
-	if (state === "active") return "in progress";
-	if (state === "abandoned") return "dropped";
-	return state;
+	const rule = kindClass(annotation.kind), choice = rule === "choice";
+	const text = clean(rule === "rule" || choice ? annotation.intent || annotation.label : annotation.observed || annotation.intent || annotation.label);
+	const state = isFinished(annotation.state) ? " (finished)" : isWaiting(annotation.state) ? " (waiting)" : "";
+	return `${kindWord(annotation.kind)}${state}: ${text}`;
 }
 
 /** Open work items under the current endeavor, todo-style; finished ones show only when nothing is open. */
 const FOCUS_TASK_CAP = 5;
 const FOCUS_STATE_LINES = 2;
-const CHECKED = "☑", UNCHECKED = "☐";
 interface FocusTask { label: string; state: string; choice: boolean; question?: string; node?: EndeavorView }
-const taskRank = (task: FocusTask) => finished(task.state) || task.state === "abandoned" ? 6
-	: task.choice ? 2 : task.state === "active" ? 0 : task.state === "blocked" ? 1 : task.state === "proposed" ? 3 : waiting(task.state) ? 4 : 5;
+const taskRank = (task: FocusTask) => isFinished(task.state) || task.state === "abandoned" ? 6
+	: task.choice ? 2 : task.state === "active" ? 0 : task.state === "blocked" ? 1 : task.state === "proposed" ? 3 : isWaiting(task.state) ? 4 : 5;
 
 /** Work nodes and their current state. The current endeavor adds its state and open work items, todo-style;
  * rules and observations appear only in the expanded panel. */
@@ -110,7 +103,7 @@ function hierarchy(work: WorkView, theme: Theme, width: number, expanded: boolea
 	if (!expanded) {
 		if (work.purpose && index.has(work.purpose)) selected.add(work.purpose);
 		const candidates = work.endeavors.filter(node => !selected.has(node.id)).sort((a, b) => {
-			const rank = (n: EndeavorView) => n.parent && path.has(n.parent) ? 0 : n.parent === null ? 1 : n.state === "active" ? 2 : waiting(n.state) ? 3 : 4;
+			const rank = (n: EndeavorView) => n.parent && path.has(n.parent) ? 0 : n.parent === null ? 1 : n.state === "active" ? 2 : isWaiting(n.state) ? 3 : 4;
 			return rank(a) - rank(b);
 		});
 		for (const node of candidates.slice(0, PREVIEW_NEIGHBORS)) selected.add(node.id);
@@ -125,57 +118,57 @@ function hierarchy(work: WorkView, theme: Theme, width: number, expanded: boolea
 		const visit = (id: string) => { for (const child of children.get(id) ?? []) if (!seen.has(child.id)) { seen.add(child.id); descendants.push(child); visit(child.id); } };
 		visit(node.id);
 		const counted = descendants.length ? descendants : [node];
-		return ` · ${counted.filter(n => finished(n.state)).length}/${counted.length} done`;
+		return ` · ${counted.filter(n => isFinished(n.state)).length}/${counted.length} done`;
 	}
 	function row(node: EndeavorView, prefix: string, root: boolean): string {
 		// The header states freshness; the marker always shows where the saved map says you are.
 		const here = node.id === focused;
 		let marker = here ? " · you are here" : "";
-		const safePrefix = clip(prefix, Math.max(0, width - (here ? "you are here".length : 1)));
+		const safePrefix = fit(prefix, Math.max(0, width - (here ? "you are here".length : 1)));
 		const budget = Math.max(0, width - visibleWidth(safePrefix));
-		let meta = here && node.state === "active" ? "" : ` · ${stateName(node.state)}`;
+		let meta = here && node.state === "active" ? "" : ` · ${stateWord(node.state)}`;
 		if (node.id === work.motherThread && budget >= visibleWidth(marker + meta) + 32) meta += " · mother thread";
 		else if (node.id === work.purpose && budget >= visibleWidth(marker + meta) + 28) meta += " · main line";
 		if (root && budget >= visibleWidth(marker + meta) + visibleWidth(progress(node)) + 18) meta += progress(node);
 		if (visibleWidth(marker + meta) >= budget) { marker = here ? "you are here" : ""; meta = here ? "" : meta.trim(); }
 		// Labels are model-written semantic text. Truncate only to the terminal width; never drop words by a fixed count.
-		const label = clip(node.label, Math.max(0, budget - visibleWidth(marker + meta)));
+		const label = fit(node.label, Math.max(0, budget - visibleWidth(marker + meta)));
 		let title: string;
 		if (here) title = theme.bold(theme.fg("accent", label));
-		else if (finished(node.state)) title = theme.fg("success", theme.strikethrough(label));
+		else if (isFinished(node.state)) title = theme.fg("success", theme.strikethrough(label));
 		else if (node.state === "abandoned") title = theme.fg("error", theme.strikethrough(label));
 		else if (node.state === "blocked") title = theme.fg("warning", label);
-		else if (waiting(node.state)) title = theme.fg("dim", label);
+		else if (isWaiting(node.state)) title = theme.fg("dim", label);
 		else if (path.has(node.id)) title = theme.bold(theme.fg("accent", label));
 		else title = theme.fg("muted", label);
-		return clip(theme.fg("dim", safePrefix) + title + (marker ? theme.bold(theme.fg("accent", marker)) : "") + theme.fg("dim", meta), width);
+		return fit(theme.fg("dim", safePrefix) + title + (marker ? theme.bold(theme.fg("accent", marker)) : "") + theme.fg("dim", meta), width);
 	}
 	function detail(text: string, prefix: string, color: "muted" | "warning" | "dim", preserveSources = false) {
-		const safePrefix = clip(prefix, Math.max(0, width - 1)), available = Math.max(1, width - visibleWidth(safePrefix));
-		const content = preserveSources ? text.replace(/\s+/g, " ").trim() : clean(text);
-		const body = expanded ? wrapTextWithAnsi(content, available) : [clip(content, available)];
-		for (const line of body) lines.push(clip(theme.fg("dim", safePrefix) + theme.fg(color, line), width));
+		const safePrefix = fit(prefix, Math.max(0, width - 1)), available = Math.max(1, width - visibleWidth(safePrefix));
+		const content = preserveSources ? flatten(text) : clean(text);
+		const body = expanded ? wrapTextWithAnsi(content, available) : [fit(content, available)];
+		for (const line of body) lines.push(fit(theme.fg("dim", safePrefix) + theme.fg(color, line), width));
 	}
 	function taskLine(task: FocusTask, prefix: string): string {
-		const safePrefix = clip(prefix, Math.max(0, width - 1)), budget = Math.max(0, width - visibleWidth(safePrefix) - 2);
-		const done = finished(task.state), dropped = task.state === "abandoned";
-		let meta = done || dropped ? "" : task.choice ? " · waiting on you" : task.state === "active" ? "" : ` · ${stateName(task.state)}`;
+		const safePrefix = fit(prefix, Math.max(0, width - 1)), budget = Math.max(0, width - visibleWidth(safePrefix) - 2);
+		const done = isFinished(task.state), dropped = task.state === "abandoned";
+		let meta = done || dropped ? "" : task.choice ? " · waiting on you" : task.state === "active" ? "" : ` · ${stateWord(task.state)}`;
 		if (task.node && children.get(task.node.id)?.length) meta += progress(task.node);
 		if (visibleWidth(meta) >= budget) meta = "";
-		const label = clip(task.label, Math.max(0, budget - visibleWidth(meta)));
-		const glyph = done ? CHECKED : UNCHECKED;
+		const label = fit(task.label, Math.max(0, budget - visibleWidth(meta)));
+		const glyph = done ? GLYPH.checked : GLYPH.unchecked;
 		const body = done ? theme.fg("success", `${glyph} ${theme.strikethrough(label)}`)
 			: dropped ? theme.fg("error", `${glyph} ${theme.strikethrough(label)}`)
 			: task.choice || task.state === "blocked" ? theme.fg("warning", `${glyph} ${label}${meta}`)
 			: task.state === "active" ? theme.fg("accent", `${glyph} ${label}`) + theme.fg("dim", meta)
 			: theme.fg("dim", `${glyph} ${label}${meta}`);
-		return clip(theme.fg("dim", safePrefix) + body, width);
+		return fit(theme.fg("dim", safePrefix) + body, width);
 	}
 	/** The current endeavor's state, then its open work items: child endeavors and choices waiting on you. */
 	function focusDetail(node: EndeavorView, prefix: string) {
 		const all: FocusTask[] = [
 			...(children.get(node.id) ?? []).map(child => ({ label: child.label, state: child.state, choice: false, node: child })),
-			...node.annotations.filter(note => annotationLabel(note) === "Choice").map(note => ({ label: note.label, state: note.state, choice: true, question: note.intent })),
+			...node.annotations.filter(note => kindClass(note.kind) === "choice").map(note => ({ label: note.label, state: note.state, choice: true, question: note.intent })),
 		];
 		const open = all.filter(task => taskRank(task) < 6);
 		const pool = (open.length ? open : all).sort((a, b) => taskRank(a) - taskRank(b));
@@ -185,27 +178,27 @@ function hierarchy(work: WorkView, theme: Theme, width: number, expanded: boolea
 			const available = Math.max(1, width - visibleWidth(stem));
 			const wrapped = wrapTextWithAnsi(clean(node.observed), available);
 			const kept = wrapped.slice(0, FOCUS_STATE_LINES);
-			if (wrapped.length > kept.length) kept[kept.length - 1] = visibleWidth(kept[kept.length - 1]!) + 2 <= available ? `${kept[kept.length - 1]} …` : clip(kept[kept.length - 1]!, available);
-			for (const line of kept) lines.push(clip(theme.fg("dim", stem) + theme.fg("muted", line), width));
+			if (wrapped.length > kept.length) kept[kept.length - 1] = visibleWidth(kept[kept.length - 1]!) + 2 <= available ? `${kept[kept.length - 1]} …` : fit(kept[kept.length - 1]!, available);
+			for (const line of kept) lines.push(fit(theme.fg("dim", stem) + theme.fg("muted", line), width));
 		}
 		shown.forEach((task, i) => {
 			if (task.node) visited.add(task.node.id);
 			const last = i === shown.length - 1 && !extra;
-			lines.push(taskLine(task, `${prefix}${last ? "└─ " : "├─ "}`));
+			lines.push(taskLine(task, `${prefix}${last ? `${TREE.last} ` : `${TREE.branch} `}`));
 			// A waiting choice is only useful with its question: what exactly is waiting on you.
 			if (task.choice && taskRank(task) < 6 && task.question && clean(task.question) !== clean(task.label)) {
 				const stem = `${prefix}${last ? "   " : "│  "}  `;
-				lines.push(clip(theme.fg("dim", stem) + theme.fg("muted", clip(clean(task.question), Math.max(1, width - visibleWidth(stem)))), width));
+				lines.push(fit(theme.fg("dim", stem) + theme.fg("muted", fit(clean(task.question), Math.max(1, width - visibleWidth(stem)))), width));
 			}
 		});
-		if (extra) lines.push(clip(theme.fg("dim", `${prefix}└─ +${extra} more`), width));
+		if (extra) lines.push(fit(theme.fg("dim", `${prefix}${TREE.last} +${extra} more`), width));
 	}
 	function visit(parent: string | null, prefix: string) {
 		const siblings = (children.get(parent) ?? []).filter(node => selected.has(node.id));
 		for (let i = 0; i < siblings.length; i++) {
 			const node = siblings[i]; if (visited.has(node.id)) continue; visited.add(node.id);
 			const last = i === siblings.length - 1;
-			lines.push(row(node, `${prefix}${last ? "└─ " : "├─ "}`, parent === null));
+			lines.push(row(node, `${prefix}${last ? `${TREE.last} ` : `${TREE.branch} `}`, parent === null));
 			const continuation = `${prefix}${last ? "   " : "│  "}`;
 			if (!expanded && node.id === focused) { focusDetail(node, continuation); continue; }
 			if (expanded) {
@@ -213,9 +206,9 @@ function hierarchy(work: WorkView, theme: Theme, width: number, expanded: boolea
 				if (node.observed) detail(`State: ${node.observed}`, `${continuation}  `, "muted");
 				if (node.history) detail("Earlier work was folded away; its sources are still available.", `${continuation}  `, "dim");
 				if (node.sources.length) detail(`Sources: ${node.sources.map(source => `[src:${source}]`).join(" ")}`, `${continuation}  `, "dim", true);
-				const annotations = [...node.annotations].sort((a, b) => Number(finished(a.state)) - Number(finished(b.state)));
+				const annotations = [...node.annotations].sort((a, b) => Number(isFinished(a.state)) - Number(isFinished(b.state)));
 				for (const annotation of annotations) {
-					detail(annotationText(annotation), `${continuation}  `, annotation.state === "blocked" ? "warning" : waiting(annotation.state) ? "dim" : "muted");
+					detail(annotationText(annotation), `${continuation}  `, annotation.state === "blocked" ? "warning" : isWaiting(annotation.state) ? "dim" : "muted");
 					if (annotation.sources.length) detail(`Sources: ${annotation.sources.map(source => `[src:${source}]`).join(" ")}`, `${continuation}    `, "dim", true);
 				}
 			}
@@ -224,72 +217,50 @@ function hierarchy(work: WorkView, theme: Theme, width: number, expanded: boolea
 	}
 	visit(null, "");
 	const hidden = work.endeavors.length - visited.size;
-	if (hidden) lines.push(clip(theme.fg("dim", ` … ${hidden} more endeavor${hidden === 1 ? "" : "s"} · Ctrl+Shift+J to read`), width));
+	if (hidden) lines.push(fit(theme.fg("dim", ` … ${hidden} more endeavor${hidden === 1 ? "" : "s"} · ${chordLabel(FOCUS_KEY)} to read`), width));
 	if (work.outside.length) {
 		if (expanded) for (const outside of work.outside) detail(`Outside this view: ${outside}`, " ", "dim");
-		else lines.push(clip(theme.fg("dim", " More work is outside this view · Ctrl+Shift+J for context"), width));
+		else lines.push(fit(theme.fg("dim", ` More work is outside this view · ${chordLabel(FOCUS_KEY)} for context`), width));
 	}
-	return lines;
-}
-
-/** Rounded frame with the header embedded in the top border — the Agents panel's construction (pi-delegate src/render.ts). */
-function frame(header: string, body: string[], theme: Theme, width: number): string[] {
-	if (width < 6) return [header, ...body].map(line => truncateToWidth(line, Math.max(0, width), ""));
-	// Like focused Agents, use the accent border: borderMuted can disappear on the terminal background.
-	const border = (text: string) => theme.fg("borderAccent", text);
-	const inner = width - 4;
-	const label = truncateToWidth(` ${header} `, width - 4, "…");
-	const rows = [border("╭─") + label + border("─".repeat(Math.max(0, width - 3 - visibleWidth(label))) + "╮")];
-	for (const line of body) {
-		const clipped = truncateToWidth(line, inner, "…");
-		rows.push(`${border("│")} ${clipped}${" ".repeat(Math.max(0, inner - visibleWidth(clipped)))} ${border("│")}`);
-	}
-	rows.push(border(`╰${"─".repeat(width - 2)}╯`));
-	return rows;
-}
-
-/** Replace the frame's bottom border with its navigation legend — the Agents panel's construction (pi-delegate src/inspector.ts). */
-function withLegend(lines: string[], legend: string, theme: Theme, width: number): string[] {
-	if (width < 8) return lines;
-	const label = truncateToWidth(` ${legend} `, width - 3, "…");
-	lines[lines.length - 1] = theme.fg("borderAccent", "╰─") + theme.fg("dim", label) + theme.fg("borderAccent", "─".repeat(Math.max(0, width - 3 - visibleWidth(label))) + "╯");
 	return lines;
 }
 
 /** Collapsed tool results stay out of the transcript's multi-line map; the activity widget owns that view.
  *  A trail read shows where we are: the widget's rows, without colour. */
 export function momToolPreview(view: PanelView, trail?: string): string {
-	if (trail !== undefined) return [`Mom · ${view.status}${view.error ? " ⚠" : ""}`, ...(view.trail ? plainTrailRows(view.trail.glance) : [])].join("\n");
+	if (trail !== undefined) return [`Path · ${view.status}${view.error ? " ⚠" : ""}`, ...(view.trail ? plainTrailRows(view.trail.glance) : [])].join("\n");
 	const work = view.work;
 	const index = new Map((work?.endeavors ?? []).map(node => [node.id, node]));
 	const focused = work ? index.get(work.focusEndeavor ?? "") : undefined;
 	const where = focused ? ` · ${clean(focused.label)}` : "";
 	const marker = view.error ? " ⚠" : view.note ? " ◆" : "";
-	return `Mom · ${view.status}${where}${marker}`;
+	return `Path · ${view.status}${where}${marker}`;
 }
 
 /**
- * Cached hierarchy framed like the Agents panel: the bold-accent `Mom` title with
+ * Cached hierarchy framed like the Agents panel: the bold-accent `Path` title with
  * its muted status in the top border, the tree (or fallback summary, note, error)
  * as the framed body, and the focus hint in the bottom border's legend.
  */
 export function momSectionLines(view: PanelView, theme: Theme, width: number): string[] {
 	const w = Math.max(0, Math.floor(width));
-	// The trail's rows carry Mom's state as one symbol at the right; the long status lives in /mom detail.
-	const header = theme.bold(theme.fg("accent", "Mom")) + (view.trail ? "" : theme.fg("muted", ` · ${view.status}`));
+	// In trail mode Path's state is a symbol (a spinner while it works) beside the title; the long status and the
+	// slice links live in /path detail.
+	const title = theme.bold(theme.fg("accent", "Path"));
+	const header = view.trail ? titleWithSlot(title, statusSlot(view, theme, view.trail.glance.last)) : title + theme.fg("muted", ` · ${view.status}`);
 	const inner = Math.max(0, w - 4);
-	const links = [
-		...(view.sliceUrl ? [clip(theme.fg("dim", `Slice: ${view.sliceUrl}`), inner)] : []),
-		...(view.rebuildUrl ? [clip(theme.fg("dim", `Rebuild slice: ${view.rebuildUrl}`), inner)] : []),
+	const links = view.trail ? [] : [
+		...(view.sliceUrl ? [fit(theme.fg("dim", `Slice: ${view.sliceUrl}`), inner)] : []),
+		...(view.rebuildUrl ? [fit(theme.fg("dim", `Rebuild slice: ${view.rebuildUrl}`), inner)] : []),
 	];
-	if (view.compact) return [header, compactLine(view, theme, w), ...(view.rebuild ? [clip(theme.fg("accent", view.rebuild), inner)] : []), ...links];
+	if (view.compact) return [header, compactLine(view, theme, w), ...(view.rebuild ? [fit(theme.fg("accent", view.rebuild), inner)] : []), ...links];
 	const body: string[] = [];
 	if (view.trail) body.push(...trailWidgetRows(view, theme, inner));
 	else if (view.work?.endeavors.length) body.push(...hierarchy(view.work, theme, inner, false));
-	else body.push(clip(theme.fg("muted", fallback(view.summary) || "Nothing saved yet."), inner));
-	if (view.error) body.push(clip(theme.fg("warning", view.error), inner));
-	else if (view.note) body.push(clip(theme.fg("accent", `${view.noteTag ?? "Worth considering"}: ${clean(view.note)}`), inner));
-	if (view.rebuild) body.push(clip(theme.fg("accent", view.rebuild), inner));
+	else body.push(fit(theme.fg("muted", fallback(view.summary) || "Nothing saved yet."), inner));
+	if (view.error) body.push(fit(theme.fg("warning", view.error), inner));
+	else if (view.note) body.push(fit(theme.fg("accent", noteLine(view)), inner));
+	if (view.rebuild) body.push(fit(theme.fg("accent", view.rebuild), inner));
 	return [header, ...body, ...links];
 }
 
@@ -297,19 +268,21 @@ export function widgetLines(view: PanelView, theme: Theme, width: number): strin
 	const w = Math.max(0, Math.floor(width));
 	const section = momSectionLines(view, theme, w);
 	if (view.compact) return section.slice(1);
-	return withLegend(frame(section[0]!, section.slice(1), theme, w), "Ctrl+Shift: J Mom · K compact · /mom", theme, w);
+	// Like focused Agents, the accent border: borderMuted can disappear on the terminal background.
+	return withLegend(frame(section[0]!, section.slice(1), "borderAccent", theme, w, { truncate: true }),
+		joinHints(`${chordLabel(FOCUS_KEY)} Path`, `${chordLabel(COMPACT_KEY)} compact`, "/path"), "borderAccent", theme, w);
 }
 
 /** One line: freshness, then the current endeavor with its open and waiting counts. */
 function compactLine(view: PanelView, theme: Theme, width: number): string {
-	if (view.trail) return trailCompactRow(view.trail.glance, theme, width, statusSlot(view, theme, view.trail.glance.last));
+	if (view.trail) return trailCompactRow(view.trail.glance, theme, width);
 	const work = view.work, index = new Map((work?.endeavors ?? []).map(node => [node.id, node]));
 	const focused = work ? index.get(work.focus ?? "") ?? work.endeavors.find(node => node.annotations.some(a => a.id === work.focus)) : undefined;
 	let where = "";
 	if (focused) {
 		const tasks: FocusTask[] = [
 			...(work!.endeavors.filter(node => node.parent === focused.id).map(node => ({ label: node.label, state: node.state, choice: false }))),
-			...focused.annotations.filter(note => annotationLabel(note) === "Choice").map(note => ({ label: note.label, state: note.state, choice: true })),
+			...focused.annotations.filter(note => kindClass(note.kind) === "choice").map(note => ({ label: note.label, state: note.state, choice: true })),
 		].filter(task => taskRank(task) < 6);
 		const waitingOnYou = tasks.filter(task => task.choice).length;
 		where = theme.fg("dim", " │ ") + theme.bold(theme.fg("accent", focused.label))
@@ -320,17 +293,18 @@ function compactLine(view: PanelView, theme: Theme, width: number): string {
 	const status = theme.fg("muted", ` · ${view.status}`);
 	// The current work is useful at every width. Freshness yields first; a finding marker never does.
 	const focus = focused ? theme.bold(theme.fg("accent", focused.label))
-		+ (where.includes(" · ") ? where.slice(where.indexOf(" · ")) : "") : theme.bold(theme.fg("accent", "Mom"));
-	const primary = clip(focus, Math.max(0, width - visibleWidth(finding))) + finding;
-	return primary + clip(status, Math.max(0, width - visibleWidth(primary)));
+		+ (where.includes(" · ") ? where.slice(where.indexOf(" · ")) : "") : theme.bold(theme.fg("accent", "Path"));
+	const primary = fit(focus, Math.max(0, width - visibleWidth(finding))) + finding;
+	return primary + fit(status, Math.max(0, width - visibleWidth(primary)));
 }
 
-/** Mom's full-viewport view: her saved map, its original sources, and her status. It owns neither the
- *  lead editor nor lead messages. It shows what she saved; R reads it again and T retries her update. */
+/** Path's full-viewport view: its saved map, its original sources, and its status. It owns neither the
+ *  lead editor nor lead messages. It shows what it saved; R reads it again and T retries its update. */
 export class MomView implements Component {
 	private notice = "";
-	private scroll = 0;
+	private readonly scroller = new Scroller();
 	private pageRows = 1;
+	private total = 0;
 	private snapshot: PanelView;
 	private diagnostics?: PanelDiagnostics;
 	private status?: WorkspaceStatus;
@@ -358,7 +332,7 @@ export class MomView implements Component {
 	private get trailMode(): boolean { return Boolean(this.snapshot.trail); }
 	private get mapLabel(): string { return this.trailMode ? "Trail" : "Map"; }
 
-	/** Show her latest saved view; with `retry`, run the failed update again first. */
+	/** Show its latest saved view; with `retry`, run the failed update again first. */
 	private async refresh(retry = false): Promise<void> {
 		try {
 			if (retry) {
@@ -395,10 +369,11 @@ export class MomView implements Component {
 		for (const [key, tab] of ([["f1", "Overview"], ["f2", "Map"], ["f3", "Status"]] as const)) {
 			if (functionKey(data, key)) { this.switchTab(tab); this.tui.requestRender(); return; }
 		}
-		if (matchesKey(data, "escape") && this.tab === "Map" && this.mapPane !== "tree") {
-			this.mapPane = this.mapPane === "source" && !this.trailMode ? "details" : "tree"; this.sourceRequest++; this.scroll = 0; this.tui.requestRender(); return;
+		const nav = navKeys(data);
+		if (nav === "cancel" && this.tab === "Map" && this.mapPane !== "tree") {
+			this.mapPane = this.mapPane === "source" && !this.trailMode ? "details" : "tree"; this.sourceRequest++; this.scroller.top = 0; this.tui.requestRender(); return;
 		}
-		if (matchesKey(data, "escape") || matchesKey(data, FOCUS_KEY)) { this.done(); return; }
+		if (nav === "cancel" || matchesKey(data, FOCUS_KEY)) { this.done(); return; }
 		const finding = this.snapshot.note;
 		const actions = this.source.findingAction || this.source.prepareLeadDraft;
 		if (finding && actions && matchesKey(data, "alt+u")) void this.findingAction("understood", finding);
@@ -414,16 +389,14 @@ export class MomView implements Component {
 		else if (this.tab === "Status" && data === "v") this.raw = !this.raw;
 		else if (data === "r") void this.refresh();
 		else if (data === "c") void this.copy();
-		else if (matchesKey(data, "pageUp")) this.scroll = Math.max(0, (Number.isFinite(this.scroll) ? this.scroll : Number.MAX_SAFE_INTEGER) - this.pageRows);
-		else if (matchesKey(data, "pageDown")) this.scroll = Number.isFinite(this.scroll) ? this.scroll + this.pageRows : this.scroll;
-		else if (matchesKey(data, "ctrl+end")) this.scroll = Number.POSITIVE_INFINITY;
+		else this.scroller.handle(nav, this.pageRows, this.total);
 		this.tui.requestRender();
 	}
 
 	private switchTab(tab: typeof this.tab): void {
 		this.sourceRequest++;
 		if (this.mapPane === "source" && this.sourceRead?.kind !== "loaded") this.mapPane = this.trailMode ? "tree" : "details";
-		this.tab = tab; this.scroll = 0; this.notice = "";
+		this.tab = tab; this.scroller.top = 0; this.notice = "";
 	}
 
 	/** Trail tab: ↑↓ select an entry, Enter shows it in the transcript, [ ] its other sources, N/B page through it. */
@@ -439,13 +412,9 @@ export class MomView implements Component {
 			else return false;
 			return true;
 		}
-		if (matchesKey(data, "enter") || data === "s") { this.sourceIndex = 0; this.sourceOffsets = []; void this.openSource(0); return true; }
-		if (matchesKey(data, "up")) this.trailBrowser.move(-1);
-		else if (matchesKey(data, "down")) this.trailBrowser.move(1);
-		else if (matchesKey(data, "home")) this.trailBrowser.first();
-		else if (matchesKey(data, "end")) this.trailBrowser.last();
-		else return false;
-		this.sourceRequest++; this.sourceRead = undefined; this.sourceIndex = 0; this.sourceOffsets = []; this.scroll = 0;
+		if (navKeys(data) === "confirm" || data === "s") { this.sourceIndex = 0; this.sourceOffsets = []; void this.openSource(0); return true; }
+		if (!this.trailBrowser.handleKey(data)) return false;
+		this.sourceRequest++; this.sourceRead = undefined; this.sourceIndex = 0; this.sourceOffsets = []; this.scroller.top = 0;
 		return true;
 	}
 
@@ -462,15 +431,10 @@ export class MomView implements Component {
 		} else if (data === "n" && page && page.nextOffset !== null) {
 			this.sourceOffsets.push(page.offset); void this.openSource(page.nextOffset);
 		} else if (data === "b" && this.sourceOffsets.length) void this.openSource(this.sourceOffsets.pop()!);
-		else if (matchesKey(data, "enter")) { this.mapPane = "details"; this.scroll = 0; }
+		else if (navKeys(data) === "confirm") { this.mapPane = "details"; this.scroller.top = 0; }
 		else if (this.mapPane === "tree") {
-			if (matchesKey(data, "up")) this.browser.move(-1);
-			else if (matchesKey(data, "down")) this.browser.move(1);
-			else if (matchesKey(data, "right") || data === " ") this.browser.toggle();
-			else if (matchesKey(data, "left")) this.browser.parent();
-			else if (matchesKey(data, "home")) this.browser.first();
-			else return false;
-			this.sourceRequest++; this.sourceRead = undefined; this.sourceIndex = 0; this.sourceOffsets = []; this.scroll = 0;
+			if (!this.browser.handleKey(data)) return false;
+			this.sourceRequest++; this.sourceRead = undefined; this.sourceIndex = 0; this.sourceOffsets = []; this.scroller.top = 0;
 		} else return false;
 		return true;
 	}
@@ -485,12 +449,12 @@ export class MomView implements Component {
 		const ref = this.sources()[this.sourceIndex];
 		if (!ref || !this.source.readSource) { this.notice = this.trailMode ? "This entry has no readable transcript source." : "No readable source is selected."; return; }
 		const request = ++this.sourceRequest;
-		this.mapPane = "source"; this.sourceRead = { kind: "loading" }; this.scroll = 0;
+		this.mapPane = "source"; this.sourceRead = { kind: "loading" }; this.scroller.top = 0;
 		this.tui.requestRender();
 		try {
 			const page = await this.source.readSource(ref, offset);
 			if (request !== this.sourceRequest) return;
-			this.sourceRead = { kind: "loaded", page }; this.scroll = 0;
+			this.sourceRead = { kind: "loaded", page }; this.scroller.top = 0;
 		} catch (error) { if (request === this.sourceRequest) this.sourceRead = { kind: "failed", error: updateErrorSummary(String(error)) }; }
 		finally { this.tui.requestRender(); }
 	}
@@ -527,7 +491,7 @@ export class MomView implements Component {
 
 	private content(width: number): string[] {
 		const view = this.snapshot;
-		const wrap = (text: string) => wrapTextWithAnsi(text, Math.max(1, width)).map(line => clip(line, width));
+		const wrap = (text: string) => wrapTextWithAnsi(text, Math.max(1, width)).map(line => fit(line, width));
 		const lines: string[] = [];
 		if (this.tab === "Map") return (this.trailMode && this.mapPane !== "source" ? this.trailBrowser.render(this.theme, width, Number.MAX_SAFE_INTEGER, this.slot()) : this.mapDetails()).flatMap(wrap);
 		if (this.tab === "Status") {
@@ -539,15 +503,14 @@ export class MomView implements Component {
 				const live = this.source.view();
 				if (live.rebuild) lines.push(...wrap(live.rebuild));
 				if (live.rebuildUrl) lines.push(...wrap(`Rebuild slice: ${live.rebuildUrl}`));
-				if (host) lines.push(...wrap(`oven PID ${host.pid} · slice ${host.slice} (${host.state}) · Age ${formatElapsed(host.sampledAt - host.startedAt)}`),
+				if (host) lines.push(...wrap(`oven PID ${host.pid} · slice ${host.slice} (${host.state}) · Age ${formatDuration(host.sampledAt - host.startedAt)}`),
 					...wrap(`Sampled ${new Date(host.sampledAt).toLocaleTimeString()} · R refresh status`));
-				else lines.push(...wrap("Mom's slice in oven has not been read yet. R refreshes status."));
+				else lines.push(...wrap("Path's slice in oven has not been read yet. R refreshes status."));
 				if (telemetry) lines.push(...wrap(`Model: ${telemetry.model}`), ...wrap(`Activity: ${telemetry.activity}`),
 					...wrap(`Awaiting review: ${telemetry.pendingRanges} ranges · Unavailable sources: ${telemetry.unavailableSources}`));
 				if (telemetry?.lastSavedAt) lines.push(...wrap(`Last saved: ${new Date(telemetry.lastSavedAt).toLocaleString()}`));
-				if (telemetry?.timing) lines.push(...wrap(`Last operation: ${formatElapsed(telemetry.timing.totalMs)} · Startup ${formatElapsed(telemetry.timing.startupMs)} · Request ${formatElapsed(telemetry.timing.requestMs)}`));
-				if (usage) lines.push(...wrap(`Session: ${usage.calls} model calls · ${usage.input.toLocaleString()} input · ${usage.output.toLocaleString()} output tokens`),
-					...wrap(`Cache read ${usage.cacheRead.toLocaleString()} · Cache write ${usage.cacheWrite.toLocaleString()} · $${usage.nominalCost.toFixed(4)} nominal`));
+				if (telemetry?.timing) lines.push(...wrap(`Last operation: ${formatTiming(telemetry.timing)}`));
+				if (usage) lines.push(...formatUsage(usage).split("\n").flatMap(wrap));
 				lines.push(...wrap("P pause/resume · T retry update · V raw records"), "");
 			}
 			for (const section of this.diagnostics?.sections ?? []) {
@@ -565,40 +528,40 @@ export class MomView implements Component {
 			lines.push(this.theme.bold(this.theme.fg("accent", "Current work")));
 			if (view.error) lines.push(...wrap(this.theme.fg("warning", view.error)),
 				...wrap(this.theme.fg("muted", view.status === "reconnecting"
-					? "Mom must reconnect before updates can run."
+					? "Path must reconnect before updates can run."
 					: "T on F3 Status retries the update. Saved notes are unchanged.")), "");
 			if (view.trail) lines.push(...trailWidgetRows(view, this.theme, width));
 			else if (view.work?.endeavors.length) lines.push(...hierarchy(view.work, this.theme, width, false));
 			else lines.push(...wrap(this.theme.fg("muted", fallback(view.summary) ||
 				(view.status === "reconnecting" || view.status === "connecting"
-					? "Waiting for Mom's saved view. Existing notes have not been loaded."
+					? WAITING_FOR_VIEW
 					: "No saved work yet."))));
-			if (view.note) lines.push("", ...wrap(this.theme.fg("accent", `${view.noteTag ?? "Worth considering"}: ${clean(view.note)}`)));
+			if (view.note) lines.push("", ...wrap(this.theme.fg("accent", noteLine(view))));
 			if (view.work && !view.trail) {
 				lines.push("", this.theme.bold(this.theme.fg("accent", "Saved map")),
 					...wrap(`${view.work.totalRecords} records · ${view.work.connections.length} relationships · F2 explore`));
 				if (view.work.at) lines.push(...wrap(`Saved ${new Date(view.work.at).toLocaleString()}`));
-				const pending = view.work.endeavors.filter(node => waiting(node.state));
+				const pending = view.work.endeavors.filter(node => isWaiting(node.state));
 				if (pending.length) lines.push("", this.theme.bold(this.theme.fg("accent", "Waiting work")), ...pending.flatMap(node => wrap(`• ${node.label}`)));
 			}
 			if (view.coverage) lines.push(...wrap(`History reviewed: ${view.coverage.consumed.toLocaleString()} / ${view.coverage.total.toLocaleString()} entries`));
 		}
-		return lines.map(line => clip(line, width));
+		return lines.map(line => fit(line, width));
 	}
 
 	private mapDetails(): string[] {
 		if (this.mapPane === "source") {
-			if (this.sourceRead?.kind === "failed") return [this.sourceRead.error, `Press S to retry, or Esc to return to the ${this.trailMode ? "trail" : "node"}.`];
+			if (this.sourceRead?.kind === "failed") return [this.sourceRead.error, `Press S to retry, or ${keyLabel("tui.select.cancel")} to return to the ${this.trailMode ? "trail" : "node"}.`];
 			if (this.sourceRead?.kind !== "loaded") return ["Reading original source…"];
 			const page = this.sourceRead.page;
 			return [`Original source ${this.sourceIndex + 1}/${this.sources().length}`, page.ref,
 				`Characters ${page.offset + 1}–${Math.min(page.totalChars, page.offset + page.text.length)} of ${page.totalChars}`,
-				`[ ] source · N next page · B previous · Esc ${this.trailMode ? "trail" : "node"}`, "", ...page.text.split("\n")];
+				`[ ] source · N next page · B previous · ${hint.cancel(this.trailMode ? "trail" : "node")}`, "", ...page.text.split("\n")];
 		}
-		return [...this.browser.details(), "", "S sources · D draft for lead", "← parent · → expand/collapse · Enter inspect"];
+		return [...this.browser.details(), "", "S sources · D draft for lead", joinHints(graphHints.parent(), graphHints.expand(), hint.enter("inspect"))];
 	}
 
-	/** Mom's state for the Trail tab's first row. */
+	/** Path's state for the Trail tab's first row. */
 	private slot() { return statusSlot(this.snapshot, this.theme, this.snapshot.trail?.glance.last); }
 
 	statusChanged(): void {
@@ -613,39 +576,41 @@ export class MomView implements Component {
 	render(width: number): string[] {
 		const w = Math.max(1, Math.floor(width));
 		const height = Math.max(5, this.tui.terminal.rows);
+		const divider = this.theme.fg("dim", " │ ");
 		const status = this.source.status?.();
-		const heading = this.theme.bold(this.theme.fg("accent", "Mom")) + this.theme.fg("dim", ` · ${this.tab === "Status" ? "diagnostics" : this.snapshot.status}`);
+		const heading = this.theme.bold(this.theme.fg("accent", "Path")) + this.theme.fg("dim", ` · ${this.tab === "Status" ? "diagnostics" : this.snapshot.status}`);
 		const tabs = (["Overview", "Map", "Status"] as const).map((tab, index) => tab === this.tab
 			? this.theme.bg("selectedBg", this.theme.bold(this.theme.fg("accent", ` F${index + 1} ${tab === "Map" ? this.mapLabel : tab} `))) : ` F${index + 1} ${tab === "Map" ? this.mapLabel : tab} `);
-		const header = [clip(heading + (status ? ` · ${status.project.split("/").at(-1)} · ${status.connection}` : ""), w),
-			...(status?.telemetry ? [clip(`${status.telemetry.model} · ${status.telemetry.activity}${status.host ? ` · PID ${status.host.pid}` : ""}`, w)] : []),
+		const header = [fit(heading + (status ? ` · ${status.project.split("/").at(-1)} · ${status.connection}` : ""), w),
+			...(status?.telemetry ? [fit(`${status.telemetry.model} · ${status.telemetry.activity}${status.host ? ` · PID ${status.host.pid}` : ""}`, w)] : []),
 			...(visibleWidth(tabs.join(" ")) <= w ? [tabs.join(" ")] : [tabs.slice(0, 2).join(" "), tabs.slice(2).join(" ")]), ""];
 		const findingKeys = w < 80 ? "Alt+U understood · Alt+D dismiss · Alt+I incorrect · Alt+L discuss"
 			: "Alt+U understood · Alt+D dismiss · Alt+I incorrect · Alt+L discuss with lead";
-		const navigation = this.tab === "Map" && this.trailMode ? (this.mapPane === "tree" ? "↑↓ move · Enter show in transcript · " : "[ ] source · N/B page · Esc trail · ")
-			: this.tab === "Map" ? `${this.mapPane === "tree" ? "↑↓ select · Enter inspect · " : ""}S source · D draft · `
-			: this.tab === "Status" ? "P pause/resume · T retry · V raw · " : "";
+		const navigation = this.tab === "Map" && this.trailMode ? (this.mapPane === "tree" ? joinHints(hint.move("move"), hint.enter("show in transcript")) : joinHints("[ ] source", "N/B page", hint.cancel("trail")))
+			: this.tab === "Map" ? joinHints(this.mapPane === "tree" && hint.move("select"), this.mapPane === "tree" && hint.enter("inspect"), "S source", "D draft")
+			: this.tab === "Status" ? "P pause/resume · T retry · V raw" : "";
 		const footer = [
-			...(this.notice ? [clip(this.theme.fg("dim", this.notice), w)] : []),
+			...(this.notice ? [fit(this.theme.fg("dim", this.notice), w)] : []),
 			...(this.snapshot.note && (this.source.findingAction || this.source.prepareLeadDraft)
 				? wrapTextWithAnsi(this.theme.fg("dim", findingKeys), w) : []),
-			...wrapTextWithAnsi(this.theme.fg("dim", `${navigation}R refresh · C copy · Esc back · PgUp/PgDn scroll · View held steady until R`), w),
+			...wrapTextWithAnsi(this.theme.fg("dim", joinHints(navigation, "R refresh", "C copy", hint.cancel("back"), hint.scroll(), "View held steady until R")), w),
 		];
 		const available = Math.max(1, height - footer.length - header.length);
 		this.pageRows = Math.max(1, available - 1);
 		const detailWidth = this.tab === "Map" && !this.trailMode && w >= 80 ? w - Math.floor(w * 0.4) - 3 : w;
 		const content = this.content(detailWidth);
 		const max = Math.max(0, content.length - this.pageRows);
-		if (!Number.isFinite(this.scroll) || this.scroll > max) this.scroll = max;
-		let visible = content.slice(this.scroll, this.scroll + this.pageRows);
+		this.total = content.length;
+		const top = this.scroller.window(content.length, this.pageRows);
+		let visible = content.slice(top, top + this.pageRows);
 		if (this.tab === "Map" && this.trailMode && this.mapPane !== "source") {
 			// Wide enough, the selected entry's details sit beside the trail; otherwise the trail has the row.
 			const detailWidth = w >= 100 ? Math.min(44, Math.floor(w * 0.3)) : 0;
 			const leftWidth = detailWidth ? w - detailWidth - 3 : w;
 			const rows = this.trailBrowser.render(this.theme, leftWidth, this.pageRows, this.slot());
-			const details = detailWidth ? this.trailBrowser.details(this.theme).flatMap(line => wrapTextWithAnsi(line, detailWidth).map(part => clip(part, detailWidth))) : [];
+			const details = detailWidth ? this.trailBrowser.details(this.theme).flatMap(line => wrapTextWithAnsi(line, detailWidth).map(part => fit(part, detailWidth))) : [];
 			visible = Array.from({ length: this.pageRows }, (_, i) => detailWidth
-				? clip(rows[i] ?? "", leftWidth) + " ".repeat(Math.max(0, leftWidth - visibleWidth(rows[i] ?? ""))) + this.theme.fg("dim", " │ ") + (details[i] ?? "")
+				? sideBySide(rows[i] ?? "", details[i] ?? "", leftWidth, divider, w)
 				: rows[i] ?? "");
 		}
 		else if (this.tab === "Map" && (w >= 80 || this.mapPane === "tree")) {
@@ -653,12 +618,13 @@ export class MomView implements Component {
 			const tree = this.browser.render(this.theme, leftWidth, this.pageRows);
 			const details = visible;
 			visible = Array.from({ length: this.pageRows }, (_, i) => w >= 80
-				? clip(tree[i] ?? "", leftWidth) + " ".repeat(Math.max(0, leftWidth - visibleWidth(tree[i] ?? ""))) + this.theme.fg("dim", " │ ") + clip(details[i] ?? "", w - leftWidth - 3)
+				? sideBySide(tree[i] ?? "", details[i] ?? "", leftWidth, divider, w)
 				: tree[i] ?? "");
 		}
 		while (visible.length < this.pageRows) visible.push("");
-		if (available > 1) visible.push(clip(this.theme.fg("dim", this.scroll < max ? "More below · PgDn" : this.scroll ? "More above · PgUp" : this.tab === "Map" ? (this.trailMode ? "Trail held steady · Enter shows the entry in the transcript" : "Map held steady · → expand/collapse") : ""), w));
-		return [...header, ...visible, ...footer].slice(0, height).map(line => clip(line, w) + " ".repeat(Math.max(0, w - visibleWidth(line))));
+		if (available > 1) visible.push(fit(this.theme.fg("dim", top < max ? joinHints("More below", keyLabel("tui.select.pageDown")) : top ? joinHints("More above", keyLabel("tui.select.pageUp"))
+			: this.tab === "Map" ? (this.trailMode ? `Trail held steady · ${keyLabel("tui.select.confirm")} shows the entry in the transcript` : joinHints("Map held steady", graphHints.expand())) : ""), w));
+		return [...header, ...visible, ...footer].slice(0, height).map(line => fitPad(line, w));
 	}
 
 	invalidate(): void {}
@@ -670,37 +636,38 @@ export class MomPanel implements Component {
 	private width = -1;
 	private text = "";
 	private lines: string[] = [];
-	private offset = 0;
-	constructor(private source: () => PanelView, private theme: Theme, private height: () => number, private done: () => void) {}
-
-	handleInput(data: string): void {
-		if (matchesKey(data, "escape") || matchesKey(data, FOCUS_KEY)) { this.done(); return; }
-		if (matchesKey(data, "up")) this.offset--;
-		else if (matchesKey(data, "down")) this.offset++;
-		else if (matchesKey(data, "pageUp")) this.offset -= this.height();
-		else if (matchesKey(data, "pageDown")) this.offset += this.height();
-		else if (matchesKey(data, "home")) this.offset = 0;
-		else if (matchesKey(data, "end")) this.offset = this.lines.length;
-		this.offset = Math.max(0, Math.min(this.offset, Math.max(0, this.lines.length - this.height() + 2)));
+	private readonly page: PagedText;
+	constructor(private source: () => PanelView, private theme: Theme, private height: () => number, private done: () => void) {
+		this.page = new PagedText({
+			lines: width => this.content(width),
+			rows: () => Math.max(1, Math.max(3, this.height()) - 2),
+			chrome: width => ({ foot: ["", fit(this.theme.fg("dim", joinHints(hint.move("scroll"), hint.cancel("close"), "/path correct <text>", "/path detail for sources")), width)] }),
+			onKey: data => {
+				if (!(navKeys(data) === "cancel" || matchesKey(data, FOCUS_KEY))) return false;
+				this.done();
+				return true;
+			},
+		});
 	}
 
-	render(width: number): string[] {
-		const view = this.source(), w = Math.max(0, Math.floor(width)), text = JSON.stringify(view);
+	handleInput(data: string): void { this.page.handleInput(data); }
+
+	private content(w: number): string[] {
+		const view = this.source(), text = JSON.stringify(view);
 		if (w !== this.width || text !== this.text) {
-			const wrap = (value: string) => w > 0 ? wrapTextWithAnsi(value, w).map(line => clip(line, w)) : [""];
-			this.lines = [clip(this.theme.bold(this.theme.fg("accent", "Mom")) + this.theme.fg("dim", ` · ${view.status}`), w)];
+			const wrap = (value: string) => w > 0 ? wrapTextWithAnsi(value, w).map(line => fit(line, w)) : [""];
+			this.lines = [fit(this.theme.bold(this.theme.fg("accent", "Path")) + this.theme.fg("dim", ` · ${view.status}`), w)];
 			if (view.error) this.lines.push(...wrap(this.theme.fg("warning", view.error)), "");
 			if (view.trail) this.lines.push("", ...trailWidgetRows(view, this.theme, w));
 			else if (view.work?.endeavors.length) this.lines.push(...hierarchy(view.work, this.theme, w, true));
 			else this.lines.push("", ...wrap(fallback(view.summary) || "Nothing saved yet."));
 			if (view.work?.orientation) this.lines.push("", ...wrap(this.theme.fg("muted", view.work.orientation)));
-			if (view.note) this.lines.push("", ...wrap(this.theme.fg("accent", `${view.noteTag ?? "Worth considering"}: ${clean(view.note)}`)));
+			if (view.note) this.lines.push("", ...wrap(this.theme.fg("accent", noteLine(view))));
 			this.width = w; this.text = text;
 		}
-		const height = Math.max(3, this.height());
-		this.offset = Math.max(0, Math.min(this.offset, Math.max(0, this.lines.length - height + 2)));
-		return [...this.lines.slice(this.offset, this.offset + height - 2), "",
-			clip(this.theme.fg("dim", "↑↓ scroll · esc close · /mom correct <text> · /mom detail for sources"), w)];
+		return this.lines;
 	}
+
+	render(width: number): string[] { return this.page.render(Math.max(0, Math.floor(width))); }
 	invalidate(): void { this.width = -1; }
 }

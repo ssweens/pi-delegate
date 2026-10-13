@@ -21,7 +21,10 @@
  * Pure and theme-agnostic: takes a minimal {@link TodoStyler} so it is unit-
  * testable with a stub; the real pi `Theme` satisfies it structurally.
  */
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { visibleWidth } from "@earendil-works/pi-tui";
+import { frame } from "./render.js";
+import { GLYPH, TREE } from "./ui/glyphs.ts";
+import { fit } from "./ui/text.ts";
 import type { TodoState, TodoItem } from "./todo.js";
 
 /** Subset of pi's ThemeColor used by the todo panel. */
@@ -45,20 +48,15 @@ export interface TodoStyler {
 
 // --- Symbols (omp unicode preset) ---
 
-export const CHECKED = "☑";
-export const UNCHECKED = "☐";
+export const CHECKED = GLYPH.checked;
+export const UNCHECKED = GLYPH.unchecked;
 /** Pending hourglass shown while the `todo` tool call streams. */
-export const PENDING_ICON = "⏳";
+export const PENDING_ICON = GLYPH.pending;
 /** Checkbox icon shown on the completed tool result header. */
-export const TODO_ICON = "☑";
-export const TREE_BRANCH = "├─";
-export const TREE_LAST = "└─";
-export const TREE_VERTICAL = "│";
-
-// --- Box drawing (Agents panel frame construction, src/render.ts) ---
-
-const BOX_H = "─";
-const BOX_V = "│";
+export const TODO_ICON = GLYPH.checked;
+export const TREE_BRANCH = TREE.branch;
+export const TREE_LAST = TREE.last;
+export const TREE_VERTICAL = TREE.vertical;
 
 const SEP_DOT = " · ";
 /** Visible width of a single tree prefix (`├─ ` / `└─ ` / `│  ` / `   `). */
@@ -71,14 +69,6 @@ export function romanNumeral(oneBased: number): string {
 }
 
 // --- Width helpers ---
-
-/** ANSI-aware truncation with a unicode ellipsis. */
-function clip(label: string, width: number): string {
-	if (width <= 0) return "";
-	const w = visibleWidth(label);
-	if (w <= width) return label;
-	return truncateToWidth(label, width, "…");
-}
 
 function phaseDisplayName(name: string, index: number): string {
 	return `${romanNumeral(index)}. ${name}`;
@@ -117,7 +107,7 @@ function renderStatusLine(icon: string, title: string, meta: string[], theme: To
 		if (width !== undefined) {
 			const prefixLen = visibleWidth(icon) + 1 + visibleWidth(title) + 1;
 			if (prefixLen + visibleWidth(metaText) > width) {
-				line += ` ${theme.fg("dim", clip(metaText, Math.max(0, width - prefixLen)))}`;
+				line += ` ${theme.fg("dim", fit(metaText, Math.max(0, width - prefixLen)))}`;
 				return line;
 			}
 		}
@@ -157,29 +147,29 @@ function renderTodoTaskLine(task: TodoItem, theme: TodoStyler, width: number): s
 	const chromeLen = 2; // checkbox glyph + space
 	switch (task.status) {
 		case "completed": {
-			const label = clip(task.content, width - chromeLen);
+			const label = fit(task.content, width - chromeLen);
 			return theme.fg("success", `${CHECKED} ${theme.strikethrough(label)}`);
 		}
 		case "in_progress": {
-			const label = clip(task.content, width - chromeLen);
+			const label = fit(task.content, width - chromeLen);
 			return theme.fg("accent", `${UNCHECKED} ${label}`);
 		}
 		case "blocked": {
 			const note = task.blocker ? ` (blocked: ${task.blocker})` : " (blocked)";
 			const suffixLen = visibleWidth(note);
 			if (suffixLen >= width - chromeLen) {
-				return theme.fg("warning", clip(`${UNCHECKED} ${note.trim()}`, width));
+				return theme.fg("warning", fit(`${UNCHECKED} ${note.trim()}`, width));
 			}
-			const label = clip(task.content, Math.max(0, width - chromeLen - suffixLen));
+			const label = fit(task.content, Math.max(0, width - chromeLen - suffixLen));
 			return theme.fg("warning", `${UNCHECKED} ${label}${note}`);
 		}
 		case "abandoned": {
-			const label = clip(task.content, width - chromeLen);
+			const label = fit(task.content, width - chromeLen);
 			return theme.fg("error", `${UNCHECKED} ${theme.strikethrough(label)}`);
 		}
 		case "pending":
 		default: {
-			const label = clip(task.content, width - chromeLen);
+			const label = fit(task.content, width - chromeLen);
 			return theme.fg("dim", `${UNCHECKED} ${label}`);
 		}
 	}
@@ -203,7 +193,7 @@ function renderPhaseHeaderLine(
 	const done = phase.tasks.filter((t) => t.status === "completed").length;
 	const progress = `${SEP_DOT}${done}/${phase.tasks.length}`;
 	const labelBudget = width - visibleWidth(progress);
-	const labelClipped = clip(label, labelBudget);
+	const labelClipped = fit(label, labelBudget);
 	const labelStyled = isActive ? theme.bold(theme.fg("accent", labelClipped)) : theme.fg("muted", labelClipped);
 	return labelStyled + theme.fg("dim", progress);
 }
@@ -286,7 +276,7 @@ function renderNestedTree(
 		if (hidden > 0) {
 			const summary = `… ${hidden} more task${hidden === 1 ? "" : "s"}`;
 			const last = theme.fg("dim", treeBranchPrefix(true));
-			single.push(`${last}${theme.fg("muted", clip(summary, budget))}`);
+			single.push(`${last}${theme.fg("muted", fit(summary, budget))}`);
 		}
 		return single;
 	}
@@ -328,7 +318,7 @@ function renderNestedTree(
 			if (hidden > 0) {
 				const summary = `… ${hidden} more task${hidden === 1 ? "" : "s"}`;
 				const innerLast = theme.fg("dim", treeBranchPrefix(true));
-				lines.push(`${outerCont}${innerLast}${theme.fg("muted", clip(summary, taskBudget))}`);
+				lines.push(`${outerCont}${innerLast}${theme.fg("muted", fit(summary, taskBudget))}`);
 			}
 		}
 	}
@@ -337,7 +327,7 @@ function renderNestedTree(
 		const hidden = phases.length - end;
 		const summary = `… ${hidden} more phase${hidden === 1 ? "" : "s"}`;
 		const outerLast = theme.fg("dim", treeBranchPrefix(true));
-		lines.push(`${outerLast}${theme.fg("muted", clip(summary, headerBudget))}`);
+		lines.push(`${outerLast}${theme.fg("muted", fit(summary, headerBudget))}`);
 	}
 
 	return lines;
@@ -379,13 +369,13 @@ function renderToolResultBody(
 			if (showTasks) {
 				// Active/touched phase: accent-bold roman name, no progress.
 				const name = phaseDisplayName(phase.name, i + 1);
-				lines.push(theme.bold(theme.fg("accent", clip(name, headerBudget))));
+				lines.push(theme.bold(theme.fg("accent", fit(name, headerBudget))));
 			} else {
 				// Untouched phase: dim-bold name + dim "  done/total" (2-space gap).
 				const name = phaseDisplayName(phase.name, i + 1);
 				const done = phase.tasks.filter((t) => t.status === "completed").length;
 				const progress = `  ${done}/${phase.tasks.length}`;
-				const nameClipped = clip(name, Math.max(0, headerBudget - visibleWidth(progress)));
+				const nameClipped = fit(name, Math.max(0, headerBudget - visibleWidth(progress)));
 				lines.push(theme.fg("dim", theme.bold(nameClipped)) + theme.fg("dim", progress));
 			}
 		}
@@ -400,7 +390,7 @@ function renderToolResultBody(
 			if (hidden > 0) {
 				const summary = `… ${hidden} more task${hidden === 1 ? "" : "s"}`;
 				const innerLast = theme.fg("dim", treeBranchPrefix(true));
-				lines.push(`${indent}${innerLast}${theme.fg("muted", clip(summary, taskBudget))}`);
+				lines.push(`${indent}${innerLast}${theme.fg("muted", fit(summary, taskBudget))}`);
 			}
 		}
 	}
@@ -447,18 +437,7 @@ function renderFramedBlock(
 	width: number,
 	borderColor: TodoColor = "borderMuted",
 ): string[] {
-	if (width < 6) return [header, ...bodyLines].map((l) => truncateToWidth(l, Math.max(0, width), ""));
-	const border = (text: string) => theme.fg(borderColor, text);
-	const inner = width - 4;
-	const label = clip(` ${header} `, width - 4);
-	const rows = [border("╭─") + label + border(`${BOX_H.repeat(Math.max(0, width - 3 - visibleWidth(label)))}╮`)];
-	for (const body of bodyLines) {
-		const clipped = clip(body, inner);
-		const pad = Math.max(0, inner - visibleWidth(clipped));
-		rows.push(`${border(BOX_V)} ${clipped}${" ".repeat(pad)} ${border(BOX_V)}`);
-	}
-	rows.push(border(`╰${BOX_H.repeat(width - 2)}╯`));
-	return rows;
+	return frame(header, [...bodyLines], borderColor, theme, width, { truncate: true });
 }
 
 // --- Widget (above-editor, collapsed, open tasks only) ---
@@ -559,7 +538,7 @@ export function todoErrorComponent(message: string, theme: TodoStyler): Renderab
 			const w = Math.max(8, width);
 			const icon = theme.fg("error", "✘");
 			const header = renderStatusLine(icon, "Todo", [], theme, w);
-			return renderFramedBlock(header, [theme.fg("error", clip(message, w - 4))], theme, w, "error");
+			return renderFramedBlock(header, [theme.fg("error", fit(message, w - 4))], theme, w, "error");
 		},
 		invalidate() {},
 	};

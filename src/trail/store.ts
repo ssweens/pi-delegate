@@ -1,57 +1,23 @@
 /**
- * Mom's trail on disk: `session.trail` beside `session.jsonl`, one JSON record per line, append-only.
- * Same discipline as the `.mom` sidecar (src/mom/sidecar.ts): the lead and Mom's tools in oven both
- * append, so every write takes the file lock, finishes a torn last line first and fsyncs; on read only
- * complete lines count and an unreadable one is skipped and reported, never fatal. The IO is copied
- * rather than shared because the sidecar keeps it private and the two files must stay independent.
+ * Path's trail on disk: `session.trail` beside `session.jsonl`, one JSON record per line, append-only.
+ * Same discipline as the `.mom` sidecar: the lead and Path's tools in oven both append through the shared JSONL IO
+ * (src/util/jsonl.ts), which locks, finishes a torn last line and fsyncs; on read only complete lines count and an
+ * unreadable one is skipped and reported, never fatal.
  */
-import { open, readFile, stat } from "node:fs/promises";
-import lockfile from "proper-lockfile";
-import { isStep, WAYPOINT_KINDS, type Strike, type Trail, type TrailRecord, type Waypoint, type WaypointKind } from "./types.ts";
+import { entryIdOf } from "../util/ref.ts";
+import { nodeJsonlIO, parseJsonLines, readIfExists, siblingFile, type JsonlIO } from "../util/jsonl.ts";
+import { isRecord } from "../util/text.ts";
+import { isStep, WAYPOINT_KINDS, type Retitle, type Strike, type Trail, type TrailRecord, type Waypoint, type WaypointKind } from "./types.ts";
 
-// Pi's session lister scans every *.jsonl file in the session directory; the trail must not match.
-export const trailFile = (sessionFile: string) => sessionFile.replace(/\.jsonl$/, "") + ".trail";
+export const trailFile = (sessionFile: string) => siblingFile(sessionFile, "trail");
 
-export interface TrailIO {
-	/** Stable file identity (device:inode), or undefined when the file does not exist. */
-	identity(file: string): Promise<string | undefined>;
-	read(file: string): Promise<Buffer>;
-	/** Append one record durably, serialized with every other writer of the file. */
-	append(file: string, data: string, beforeWrite?: () => Promise<void>): Promise<void>;
-}
-
-const nodeIO: TrailIO = {
-	identity: (file) => stat(file).then(info => `${info.dev}:${info.ino}`, (error: NodeJS.ErrnoException) => {
-		if (error.code === "ENOENT") return undefined;
-		throw error;
-	}),
-	read: (file) => readFile(file),
-	append: async (file, data, beforeWrite) => {
-		const release = await lockfile.lock(file, { realpath: false, stale: 15_000, retries: { retries: 40, minTimeout: 25, maxTimeout: 250 } });
-		try {
-			await beforeWrite?.();
-			const handle = await open(file, "a+");
-			try {
-				// A crashed writer may have left the last line open: finish it so a torn record stays one skippable
-				// line and never merges with this one.
-				const { size } = await handle.stat();
-				let prefix = "";
-				if (size > 0) { const last = Buffer.alloc(1); await handle.read(last, 0, 1, size - 1); if (last[0] !== 0x0a) prefix = "\n"; }
-				await handle.appendFile(prefix + data);
-				await handle.sync();
-			} finally { await handle.close(); }
-		} finally { await release(); }
-	},
-};
-
-const isObject = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value);
 const isParent = (value: unknown): value is string | null => value === null || typeof value === "string";
 const optionalString = (value: unknown): value is string | undefined => value === undefined || typeof value === "string";
 const isRefs = (value: unknown): value is string[] => Array.isArray(value) && value.length > 0 && value.every(ref => typeof ref === "string" && ref.length > 0);
 
 /** The record a line holds, rebuilt from its known fields so a stray key never reaches a projection; or why it is not one. */
 function readRecord(value: unknown): TrailRecord | string {
-	if (!isObject(value)) return "not a trail record";
+	if (!isRecord(value)) return "not a trail record";
 	if (typeof value.id !== "string" || typeof value.sessionId !== "string" || typeof value.at !== "number" || !Number.isFinite(value.at) || !isParent(value.parent)) return "not a trail record";
 	const base = { id: value.id, sessionId: value.sessionId, at: value.at, parent: value.parent };
 	if (value.type === "waypoint") {
@@ -62,9 +28,15 @@ function readRecord(value: unknown): TrailRecord | string {
 		const waypoint: TrailRecord = { type: "waypoint", ...base, kind: value.kind as WaypointKind, line: value.line, refs: [...value.refs], caption: value.caption, by: value.by };
 		if (value.closes !== undefined) waypoint.closes = value.closes;
 		if (value.supersedes !== undefined) waypoint.supersedes = value.supersedes;
+		if (typeof value.title === "string" && value.title) waypoint.title = value.title;
+		if (typeof value.from === "string" && value.from) waypoint.from = value.from;
 		if (typeof value.anchor === "string" && value.anchor) waypoint.anchor = value.anchor;
 		if (value.step === true) waypoint.step = true;
 		return waypoint;
+	}
+	if (value.type === "title") {
+		if (typeof value.target !== "string" || typeof value.title !== "string" || !value.title) return "title lacks a target or text";
+		return { type: "title", ...base, target: value.target, title: value.title };
 	}
 	if (value.type === "strike") {
 		if (typeof value.target !== "string" || !optionalString(value.reason)) return "strike lacks a target";
@@ -81,9 +53,9 @@ export class TrailStore {
 	/** Identity of the file the cache was read from; a replaced file means the cache lies. */
 	private seen?: string;
 	constructor(private readonly sessionFile: () => string | undefined, private readonly sessionId: string,
-		private readonly io: TrailIO = nodeIO) {}
+		private readonly io: JsonlIO = nodeJsonlIO) {}
 
-	/** Forget what was read: Mom's tools in oven append to the same file. */
+	/** Forget what was read: Path's tools in oven append to the same file. */
 	invalidate(): void { this.records = undefined; }
 
 	/** Why each unreadable line of the last load was skipped. */
@@ -96,21 +68,13 @@ export class TrailStore {
 		const session = this.sessionFile();
 		if (!session) return this.records;
 		const file = trailFile(session);
-		let bytes: Buffer = Buffer.alloc(0);
-		try { bytes = await this.io.read(file); }
-		catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+		const bytes = await readIfExists(this.io, file);
 		this.seen = await this.io.identity(file);
-		// Only complete lines count, found in bytes not decoded characters: a torn or still-written tail may end in
-		// the middle of a UTF-8 sequence.
-		this.unreadable = [];
-		const text = bytes.subarray(0, bytes.lastIndexOf(0x0a) + 1).toString("utf8");
-		for (const [number, line] of text.split("\n").entries()) {
-			if (!line) continue;
-			let parsed: unknown;
-			try { parsed = JSON.parse(line); }
-			catch (error) { this.unreadable.push(`line ${number + 1}: ${error instanceof Error ? error.message : String(error)}`); continue; }
-			const record = readRecord(parsed);
-			if (typeof record === "string") { this.unreadable.push(`line ${number + 1}: ${record}`); continue; }
+		const parsed = parseJsonLines(bytes);
+		this.unreadable = parsed.unreadable;
+		for (const { number, value } of parsed.values) {
+			const record = readRecord(value);
+			if (typeof record === "string") { this.unreadable.push(`line ${number}: ${record}`); continue; }
 			if (record.sessionId === this.sessionId) this.records.push(record);
 		}
 		return this.records;
@@ -123,6 +87,8 @@ export class TrailStore {
 		return stored;
 	}
 
+	async appendTitle(title: Retitle): Promise<void> { await this.append({ type: "title", ...title }); }
+
 	async appendStrike(strike: Strike): Promise<Strike> {
 		const record = await this.append({ type: "strike", ...strike });
 		const { type: _type, ...stored } = record as { type: "strike" } & Strike;
@@ -131,7 +97,7 @@ export class TrailStore {
 
 	private async append(record: TrailRecord): Promise<TrailRecord> {
 		const session = this.sessionFile();
-		if (!session) throw new Error("Mom's trail needs a persisted session file; in-memory sessions keep none.");
+		if (!session) throw new Error("Path's trail needs a persisted session file; in-memory sessions keep none.");
 		const file = trailFile(session);
 		if (record.sessionId !== this.sessionId) throw new Error(`Trail record ${record.id} belongs to session ${record.sessionId}, not ${this.sessionId}`);
 		try {
@@ -156,7 +122,7 @@ export class TrailStore {
 /**
  * One branch's trail: a record whose parent is null or on `branch` belongs to it. Struck waypoints move
  * to `struck`; a strike that names nothing on this trail is ignored.
- * Order is transcript order, not file order: Mom backfills older history after newer, so each waypoint sorts
+ * Order is transcript order, not file order: Path backfills older history after newer, so each waypoint sorts
  * by its position on `branch` (iterated root to leaf): its `anchor`, else the earliest entry its refs
  * (`<stream>:<entryId>[:b<n>]`) name on the branch, else the position of the record before it in the file.
  * The sort is stable, so ties keep file order.
@@ -172,7 +138,7 @@ export function trailFor(records: readonly TrailRecord[], branch: ReadonlySet<st
 		if (anchored !== undefined) return anchored;
 		let best: number | undefined;
 		for (const ref of w.refs) {
-			const at = index.get(ref.split(":")[1] ?? "");
+			const at = index.get(entryIdOf(ref) ?? "");
 			if (at !== undefined && (best === undefined || at < best)) best = at;
 		}
 		return best;
@@ -186,6 +152,12 @@ export function trailFor(records: readonly TrailRecord[], branch: ReadonlySet<st
 		waypoints.set(record.id, waypoint);
 		previous = positionOf(waypoint) ?? previous;
 		position.set(record.id, previous);
+	}
+	// A later title record names a waypoint anew (a titling or repair pass); the latest wins over its own title.
+	for (const record of onBranch) {
+		if (record.type !== "title") continue;
+		const target = waypoints.get(record.target);
+		if (target) waypoints.set(target.id, { ...target, title: record.title });
 	}
 	const strikes = new Map<string, Strike>();
 	for (const record of onBranch) {

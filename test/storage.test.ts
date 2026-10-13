@@ -1,15 +1,14 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { spawnSync } from "node:child_process";
-import { ownedElsewhere, processOwner, readRecord, storageDir, writeRecord } from "../src/storage.ts";
+import { ownedElsewhere, ownedElsewhereError, processOwner, readRecord, releaseOwner, RunStore, storageDir, writeRecord } from "../src/storage.ts";
+import { ownerAlive, pidAlive, processIdentity } from "../src/util/process.ts";
+import { tempDir } from "./capture.ts";
 
 function fixture(t: any) {
-	const dir = mkdtempSync(join(tmpdir(), "delegate-storage-"));
-	t.after(() => rmSync(dir, { recursive: true, force: true }));
-	return dir;
+	return tempDir("delegate-storage-", t);
 }
 
 test("records distinguish missing, corrupt, and atomically replaced values", (t) => {
@@ -51,4 +50,74 @@ test("runs are owned per process: a live owner elsewhere is read-only, a dead ow
 	assert.equal(ownedElsewhere({ ...me, ownerToken: "other", ownerPid: exited }), false, "a dead owner is adoptable");
 	assert.equal(ownedElsewhere({ ...me, ownerToken: "other" }), false, "same pid, other token: an earlier process that reused our pid");
 	assert.equal(ownedElsewhere({ ...me, ownerToken: "other", ownerHost: "elsewhere.invalid" }), true, "another host's owner is never taken");
+});
+
+test("one process identity: run records and the Coordinator name the same owner, with one liveness rule", () => {
+	const me = processIdentity();
+	assert.equal(processIdentity(), me, "the identity is stable within a process");
+	assert.deepEqual(processOwner(), { ownerPid: me.pid, ownerHost: me.host, ownerToken: me.token }, "a run record's owner is the process identity");
+	assert.equal(pidAlive(process.pid), true);
+	const exited = spawnSync(process.execPath, ["-e", ""]).pid!;
+	assert.equal(pidAlive(exited), false);
+	assert.equal(ownerAlive(me), true, "this process");
+	assert.equal(ownerAlive({ ...me, token: "other", pid: process.ppid }), true, "a live process on this host");
+	assert.equal(ownerAlive({ ...me, token: "other", pid: exited }), false, "a dead process");
+	assert.equal(ownerAlive({ ...me, token: "other" }), false, "our pid with another token: an earlier process that reused it");
+	assert.equal(ownerAlive({ ...me, token: "other", host: "elsewhere.invalid" }), true, "another host cannot be probed");
+	// A record an older version wrote carries a full UUID token: it is never ours, and its owner is probed the same way.
+	assert.equal(ownedElsewhere({ ownerPid: process.ppid, ownerHost: me.host, ownerToken: "3f2504e0-4f89-11d3-9a0c-0305e82c3301" }), true);
+	assert.equal(ownedElsewhere({ ownerPid: exited, ownerHost: me.host, ownerToken: "3f2504e0-4f89-11d3-9a0c-0305e82c3301" }), false);
+	const run = { id: "r", ...processOwner() };
+	releaseOwner(run);
+	assert.deepEqual(run, { id: "r" }, "a released run names no owner");
+	assert.equal(ownedElsewhereError({ id: "r", ownerPid: 7, ownerHost: "h" }).code, "RUN_OWNED_ELSEWHERE");
+});
+
+interface TestRun { id: string; ownerKey: string; status: string; note?: string; ownerPid?: number; ownerHost?: string; ownerToken?: string; foreign?: boolean; live?: true; recovered?: number }
+type TestRecord = Omit<TestRun, "foreign" | "live" | "recovered">;
+const store = (foreignSave: "throw" | "skip", tag?: Record<string, string>) => new RunStore<TestRun, TestRecord>({
+	...(tag ? { tag } : {}),
+	valid: (record) => typeof record.status === "string",
+	revive: (record) => ({ ...record, live: true }),
+	recover: (run, savedAt) => { if (run.status === "running") { run.status = "interrupted"; run.recovered = savedAt; } },
+	persisted: ({ foreign: _foreign, live: _live, recovered: _recovered, ...record }) => record,
+	foreignSave,
+});
+
+test("a run store saves whole records and restores them: validated, adopted or foreign, recovered", (t) => {
+	const dir = fixture(t);
+	const runs = store("throw", { backend: "test" });
+	const path = RunStore.recordPath(dir, "role/1");
+	assert.equal(path, join(dir, "role%2F1.json"), "the ID is encoded into one file name");
+	runs.save({ id: "role/1", ownerKey: "parent", status: "running", ...processOwner(), live: true }, path);
+	const saved = readRecord<Record<string, unknown>>(path)!;
+	assert.equal(saved.version, 1);
+	assert.equal(saved.backend, "test");
+	assert.equal(typeof saved.savedAt, "number");
+	assert.equal("live" in saved, false, "in-process fields are not saved");
+
+	const ours = runs.load(path, "parent");
+	assert.equal(ours.foreign, undefined, "our own run is adopted");
+	assert.equal(ours.live, true);
+	assert.equal(ours.status, "interrupted", "what was running when it was saved is recovered");
+	assert.equal(ours.recovered, saved.savedAt);
+	assert.equal("version" in ours || "savedAt" in ours || "backend" in ours, false, "record framing is not part of the run");
+
+	const other = RunStore.recordPath(dir, "role-2");
+	writeRecord(other, { id: "role-2", ownerKey: "parent", status: "running", ownerPid: process.ppid, ownerHost: processOwner().ownerHost, ownerToken: "other", version: 1, backend: "test", savedAt: 1 });
+	const theirs = runs.load(other, "parent");
+	assert.equal(theirs.foreign, true, "a live owner elsewhere keeps it");
+	assert.equal(theirs.status, "running", "a foreign run is never recovered here");
+	assert.equal(theirs.ownerToken, "other");
+	assert.throws(() => runs.save(theirs, other), { code: "RUN_OWNED_ELSEWHERE" });
+	store("skip").save(theirs, other);
+	assert.equal(readRecord<TestRecord>(other)!.status, "running", "a skipping store leaves a foreign record alone");
+	assert.deepEqual(RunStore.recordFiles(dir), [other, path].sort());
+	assert.deepEqual(RunStore.recordFiles(join(dir, "missing")), []);
+
+	for (const bad of [{ version: 2 }, { ownerKey: "another parent" }, { id: 7 }, { backend: "acp" }, { status: 1 }]) {
+		writeRecord(other, { id: "role-2", ownerKey: "parent", status: "idle", version: 1, backend: "test", savedAt: 1, ...bad });
+		assert.throws(() => runs.load(other, "parent"), { message: `Cannot restore delegate metadata: ${other}` }, JSON.stringify(bad));
+	}
+	assert.throws(() => runs.load(join(dir, "gone.json"), "parent"), /Cannot restore delegate metadata/);
 });

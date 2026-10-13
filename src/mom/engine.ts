@@ -1,20 +1,20 @@
 /**
- * Mom's operations in oven. Every message her slice gets (a delivery of new lead entries from oven's
- * follow, or a request from the lead's client) is one operation: her turn calls `mom_begin`, which settles
- * the previous operation, applies requests, prepares the evidence, and hands her the review; her finalizers
- * accept the map. Only this code writes her `.mom` file. Her status for clients lives in Durable documents
- * of her slice, which oven serves through `oven_state` and `oven_watch`.
+ * Path's operations in oven. Every message its slice gets (a delivery of new lead entries from oven's
+ * follow, or a request from the lead's client) is one operation: its turn calls `mom_begin`, which settles
+ * the previous operation, applies requests, prepares the evidence, and hands it the review; its finalizers
+ * accept the map. Only this code writes its `.mom` file. Its status for clients lives in Durable documents
+ * of its slice, which oven serves through `oven_state` and `oven_watch`.
  */
 import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, statSync } from "node:fs";
 import type * as Durable from "@earendil-works/pi-durable";
 import { ANCHOR, collectSideEffects, renderAnchor } from "./anchor.ts";
 import { SystemOneAdvisor } from "./advisor.ts";
-import { Decider } from "./decider.ts";
+import { Decider, type DeciderQuestion } from "./decider.ts";
 import { DEFAULT_BOOTSTRAP_POLICY, type BootstrapPolicy } from "./bootstrap.ts";
 import { emptyUsage, graphChange, isCheckpoint, loadState, noticeKey, sumUsage, type Checkpoint, type Usage, type WindowLive } from "./checkpoint.ts";
 import { reviewFromSession, type CompactionReview } from "./compaction.ts";
-import { extractEvents, isUserDirection, renderEvents, type FeedEvent, type SessionReader } from "./feed.ts";
+import { branchIds, extractEvents, isUserDirection, renderEvents, type FeedEvent, type SessionReader } from "./feed.ts";
 import { Mom, readStep, type StepRequest, type StepRunner } from "./mother.ts";
 import { isEndeavor } from "./graph.ts";
 import { Beverly } from "./classify.ts";
@@ -27,12 +27,15 @@ import { decodeStart, encodeOperation, OPERATION_FAILED, type MomRequest, type O
 import { feedbackApplies, recordEngagement } from "./process-health.ts";
 import { currentSession, leadRunning } from "./session-file.ts";
 import { SidecarStore } from "./sidecar.ts";
-import { formatElapsed } from "./status.ts";
+import { formatDuration } from "../util/format.ts";
+import { entryIdOf, makeRef } from "../util/ref.ts";
+import { clipText, textOf } from "../util/text.ts";
+import { NO_ACCEPTED_TRANSACTION } from "./status.ts";
 import { collectTurnSignals, lastDirectionOf, MAX_WINDOW_CHECKS, MAX_WINDOW_TURNS, offeredRefs, parseWindowVerdict, renderCorrection, stageOne, windowMessages, windowPurpose } from "./window.ts";
-import { TRAIL_BACKFILL_TASK, TRAIL_DIGEST_TASK, TRAIL_UPDATE_TASK, trailBody } from "../trail/prompt.ts";
+import { TRAIL_BACKFILL_TASK, TRAIL_DIGEST_TASK, TRAIL_REPAIR_TASK, TRAIL_TITLE_TASK, TRAIL_UPDATE_TASK, trailBody } from "../trail/prompt.ts";
 import { TrailStore, trailFor } from "../trail/store.ts";
 
-/** The operation in her slice's current context. */
+/** The operation in its slice's current context. */
 export interface OperationState {
 	/** The entry that started it (a delivery or a request). */
 	startEntry?: number;
@@ -41,33 +44,35 @@ export interface OperationState {
 	start?: OperationStart;
 	status: "none" | "open" | "accepted" | "rejected" | "done";
 	rejection?: string;
-	/** Set when the operation failed in a way oven should retry: her turn ends as a failed turn. */
+	/** Set when the operation failed in a way oven should retry: its turn ends as a failed turn. */
 	fault?: string;
 	/** Usage of the operation's child steps (audit sections, continuity checks). */
 	childUsage?: Usage;
-	/** Her usage before the operation, from her `.mom` file. */
+	/** Its usage before the operation, from its `.mom` file. */
 	baseUsage?: Usage;
-	/** Shadow: the decider's guess per open item, made before her model saw the batch; compared once she saves. */
+	/** Shadow: the decider's guess per open item, made before its model saw the batch; compared once it saves. */
 	shadow?: { guesses: { id: string; label: string; state: string; guess: string; p: number }[]; latencyMs: number };
-	/** v2: the ops the decision model decided for this batch, and the names it chose; logged once she saves. */
+	/** v2: the ops the decision model decided for this batch, and the names it chose; logged once it saves. */
 	read?: { ops: SpecOp[]; chosen: Record<string, string> };
 }
 
-/** What clients show of her: what she is doing, and what the `.mom` file cannot say. */
+/** What clients show of it: what it is doing, and what the `.mom` file cannot say. */
 export interface MomStatus {
-	op?: { job: string; mode: string; startedAt: number; thinkingAt?: number; activity: string; target?: string | null; recovering?: boolean; section?: { section: number; of: number } };
+	op?: { job: string; mode: string; startedAt: number; thinkingAt?: number; activity: string; target?: string | null; recovering?: boolean; section?: { section: number; of: number };
+		/** What this run is, in the widget's word: reading (new activity), titling, repairing or backfilling. Trail only. */
+		task?: string };
 	waitingForWorkers?: boolean;
 	deferredUntil?: number;
 	more?: boolean;
 	rejectedStreak: number;
 	lastRejection?: string;
-	/** Her saved notes could not be opened: she needs the user. */
+	/** Its saved notes could not be opened: it needs the user. */
 	openingError?: string;
 	lastError?: string;
 	operationTiming?: { startupMs: number; requestMs: number; totalMs: number; oldestEvidenceAgeMs: number };
-	/** Evidence she could not read (a missing worker transcript), and tool calls whose outcome is unknown: for the workspace's Status tab. */
+	/** Evidence it could not read (a missing worker transcript), and tool calls whose outcome is unknown: for the workspace's Status tab. */
 	unavailable?: string[];
-	/** Why the lead's own transcript cannot be read past some entry: her coverage cannot advance until it is fixed. */
+	/** Why the lead's own transcript cannot be read past some entry: its coverage cannot advance until it is fixed. */
 	blocked?: string;
 	uncertainEffects?: { ref: string; name?: string }[];
 	/** Messages for the user, newest last. */
@@ -82,23 +87,23 @@ export const STATUS_DOC = "pi-tether.mom-status";
 export const OPERATION_DOC = "pi-tether.mom-operation";
 /** More unreviewed compactions than this are a backlog, not live activity. */
 const MAX_QUEUED_REVIEWS = 3;
-/** The prompt that sends her back to mom_begin when she ended again without a finalizer: that call fails the operation. */
+/** The prompt that sends it back to mom_begin when it ended again without a finalizer: that call fails the operation. */
 export const GIVE_UP = "You ended without finishing, twice. Call mom_begin.";
 const emptyStatus = (): MomStatus => ({ rejectedStreak: 0, notices: [], answers: {}, auditAttempts: {} });
 
-/** Settings the lead passes in her instructions (the `--mom-*` flags). */
+/** Settings the lead passes in its instructions (the `--path-*` flags). */
 export interface MomSettings { mapMode?: string; bootstrap?: false | BootstrapPolicy; advisor?: { url: string; model: string; threshold: number; timeoutMs: number }; decider?: { url: string; clear: number };
 	/** The decision model every semantic gate asks (classify.ts), resolved from the chosen decider. */
 	classifier?: { url: string; model: string; timeoutMs?: number } }
 const SETTINGS = /<!-- mom-settings (\{.*\}) -->/;
 export const settingsLine = (settings: MomSettings) => `<!-- mom-settings ${JSON.stringify(settings)} -->`;
-export function readSettings(instructions: string | undefined): MomSettings {
+export function readInstructionSettings(instructions: string | undefined): MomSettings {
 	try { return JSON.parse(SETTINGS.exec(instructions ?? "")?.[1] ?? "{}"); } catch { return {}; }
 }
 
 interface Docs { operation: Durable.ConversationDocToken<OperationState & Durable.JsonObject>; status: Durable.ConversationDocToken<MomStatus & Durable.JsonObject> }
 const cache = new WeakMap<object, Docs>();
-/** Her documents, defined once per Durable instance. */
+/** Its documents, defined once per Durable instance. */
 export function docsFor(durable: typeof Durable): Docs {
 	let docs = cache.get(durable);
 	if (!docs) {
@@ -110,9 +115,6 @@ export function docsFor(durable: typeof Durable): Docs {
 	}
 	return docs;
 }
-
-const textOf = (message: any) => typeof message?.content === "string" ? message.content
-	: (message?.content ?? []).filter((part: any) => part.type === "text").map((part: any) => part.text).join("");
 
 /** Entries of a conversation from `min` on (oldest first), with their model messages. */
 async function entriesFrom(api: Durable.ToolExecutionApi, ctx: any, conversationId: number, min?: number, max?: number) {
@@ -128,7 +130,7 @@ async function entriesFrom(api: Durable.ToolExecutionApi, ctx: any, conversation
 	}, ctx);
 }
 
-/** The newest entry of her slice that started an operation, and how. */
+/** The newest entry of its slice that started an operation, and how. */
 export async function latestStart(api: Durable.ToolExecutionApi, ctx: any): Promise<{ entry: number; start: OperationStart } | undefined> {
 	return api.commit(async tx => {
 		let cursor: any;
@@ -136,7 +138,7 @@ export async function latestStart(api: Durable.ToolExecutionApi, ctx: any): Prom
 			const page = await tx.scanEntries({ conversationId: api.conversationId }, 50, cursor);
 			for (const entry of page.items) for (const message of entry.model ?? []) {
 				if (message.role !== "user") continue;
-				const start = decodeStart(textOf(message));
+				const start = decodeStart(textOf(message?.content, ""));
 				if (start) return { entry: Number(entry.id), start };
 			}
 			cursor = page.next;
@@ -166,7 +168,7 @@ export const writeStatus = (engine: Engine, api: Durable.ToolExecutionApi, ctx: 
 		for (const [id] of answers.slice(0, Math.max(0, answers.length - 8))) delete status.answers[id];
 	}, ctx);
 
-/** A step in a child conversation of her slice: its own fresh context, instructions and tools. */
+/** A step in a child conversation of its slice: its own fresh context, instructions and tools. */
 function stepRunner(engine: Engine, api: Durable.ToolExecutionApi, ctx: any, usage: { total: Usage }): StepRunner {
 	return async (request: StepRequest) => {
 		const key = `${request.header.job}:${request.header.step}`;
@@ -182,7 +184,7 @@ function stepRunner(engine: Engine, api: Durable.ToolExecutionApi, ctx: any, usa
 			id = await api.memo<number>(`step:${key}`, created, ctx);
 		}
 		const child = await api.conversation(id as any, ctx);
-		if (!child) throw new Error(`Mom's step ${key} lost its context.`);
+		if (!child) throw new Error(`Path's step ${key} lost its context.`);
 		const texts = [encodeOperation(request.header, request.body), ...(request.more ?? [])];
 		for (const [index, text] of texts.entries()) {
 			const submission = await child.submit({ type: "input", content: text, requestId: index ? `${key}:${index}` : key }, ctx);
@@ -194,12 +196,12 @@ function stepRunner(engine: Engine, api: Durable.ToolExecutionApi, ctx: any, usa
 	};
 }
 
-/** The lead's session as Mom reads it in oven, with her notices collected for clients. */
+/** The lead's session as Path reads it in oven, with its notices collected for clients. */
 function leadContext(file: string, notices: MomStatus["notices"]) {
 	let reader = currentSession(file);
 	const modifiedAt = () => { try { return statSync(file).mtimeMs; } catch { return 0; } };
 	let modified = modifiedAt();
-	// The session file keeps growing while she waits: `refresh` reads it again.
+	// The session file keeps growing while it waits: `refresh` reads it again.
 	const sessionManager: SessionReader = { getSessionId: () => reader.getSessionId(), getSessionFile: () => reader.getSessionFile(), getCwd: () => reader.getCwd(),
 		getLeafId: () => reader.getLeafId(), getEntry: id => reader.getEntry(id), getBranch: () => reader.getBranch() };
 	return { cwd: reader.getCwd(), isIdle: () => !leadRunning(reader, modified), sessionManager,
@@ -212,7 +214,7 @@ const sleep = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve, 
 	signal?.addEventListener("abort", () => { clearTimeout(timer); reject(signal.reason ?? new Error("aborted")); }, { once: true });
 });
 
-/** The messages of an earlier operation of her slice: its entries from its start to just before `before`. */
+/** The messages of an earlier operation of its slice: its entries from its start to just before `before`. */
 async function operationMessages(api: Durable.ToolExecutionApi, ctx: any, start: number, before: number) {
 	return (await entriesFrom(api, ctx, api.conversationId as any, start, before === Number.MAX_SAFE_INTEGER ? undefined : before - 1)).flatMap(entry => entry.model);
 }
@@ -233,7 +235,7 @@ async function settlePrevious(engine: Engine, api: Durable.ToolExecutionApi, ctx
 	return true;
 }
 
-/** `mom_begin`: start the operation her context holds. Returns her tool result. */
+/** `mom_begin`: start the operation its context holds. Returns its tool result. */
 export async function begin(engine: Engine, api: Durable.ToolExecutionApi, ctx: any): Promise<Durable.ToolExecutionResult> {
 	const text = (value: string) => [{ type: "text" as const, text: value }];
 	const done = (value: string): Durable.ToolExecutionResult => ({ content: text(value), control: { terminate: true } });
@@ -241,11 +243,11 @@ export async function begin(engine: Engine, api: Durable.ToolExecutionApi, ctx: 
 	if (!latest || latest.start.kind === "step") return done("There is no delivery or request to work on.");
 	const previous = await readOperation(engine, api, ctx);
 	if (previous.startEntry === latest.entry && previous.status !== "none") {
-		// She was told to finish and called mom_begin again instead: the operation gave no finalizer. It fails as a rejected one does.
+		// It was told to finish and called mom_begin again instead: the operation gave no finalizer. It fails as a rejected one does.
 		if (previous.status === "open" && previous.header && previous.startEntry !== undefined) {
 			const messages = (await entriesFrom(api, ctx, api.conversationId as any, previous.startEntry)).flatMap(entry => entry.model);
-			if (messages.some((message: any) => message.role === "user" && (typeof message.content === "string" ? message.content : message.content.map((part: any) => part.text ?? "").join("")).startsWith(GIVE_UP))) {
-				const message = "Mom finished without an accepted background graph transaction.";
+			if (messages.some((message: any) => message.role === "user" && textOf(message.content, "").startsWith(GIVE_UP))) {
+				const message = NO_ACCEPTED_TRANSACTION;
 				await rejected(engine, api, ctx, previous.header, message);
 				const failedOp = await readOperation(engine, api, ctx);
 				return failedOp.fault ? { content: text(`${OPERATION_FAILED}${message}`), isError: true, control: { terminate: true } } : { content: text(`${OPERATION_FAILED}${message}`), control: { terminate: true } };
@@ -256,7 +258,7 @@ export async function begin(engine: Engine, api: Durable.ToolExecutionApi, ctx: 
 	const start = latest.start;
 	const agent = await api.agent(ctx);
 	const model = agent.model ? `${agent.model.provider}/${agent.model.modelId}` : "";
-	const settings = readSettings(agent.instructions);
+	const settings = readInstructionSettings(agent.instructions);
 	const status = await readStatus(engine, api, ctx);
 	const notices: MomStatus["notices"] = [];
 	const job = randomUUID();
@@ -277,7 +279,7 @@ export async function begin(engine: Engine, api: Durable.ToolExecutionApi, ctx: 
 		? new Decider(settings.classifier.url, settings.classifier.timeoutMs ?? 15000, settings.classifier.model) : undefined;
 	let decider: { client: Decider; clear: number } | undefined;
 	try { if (settings.decider?.url) decider = { client: new Decider(settings.decider.url), clear: settings.decider.clear }; } catch { /* a bad URL disables it */ }
-	// A slice configured by an older package may still select the retired `mom-ask` extension: Mom has only `mom`.
+	// A slice configured by an older package may still select the retired `mom-ask` extension: Path has only `mom`.
 	if (agent.extensions.some(extension => extension.name !== "mom")) {
 		const wanted = [api.registry.extension("mom")].filter((e): e is Durable.Extension => Boolean(e));
 		await api.commit(tx => engine.durable.configure(tx, api.conversationId, { extensions: wanted }), ctx);
@@ -290,11 +292,11 @@ export async function begin(engine: Engine, api: Durable.ToolExecutionApi, ctx: 
 			change?.(current);
 		});
 	};
-	// A settings change: saved, and answered to the client waiting for it (also when her notes cannot be opened).
+	// A settings change: saved, and answered to the client waiting for it (also when its notes cannot be opened).
 	const controls = async () => {
 		const request = start.kind === "request" && start.request.kind === "controls" ? start.request : undefined;
 		if (!request) return undefined;
-		// Her controls are saved globally by the client (globals.ts) before this request arrives; her
+		// Its controls are saved globally by the client (globals.ts) before this request arrives; its
 		// slice only acknowledges it and re-reads the file on its next operation.
 		await save({ status: "done" }, current => { current.answers[request.id] = { answer: "Saved.", at: Date.now() }; });
 		return done("Saved.");
@@ -306,14 +308,14 @@ export async function begin(engine: Engine, api: Durable.ToolExecutionApi, ctx: 
 		const saved = await controls();
 		if (saved) return saved;
 		status.openingError = String(error);
-		notices.push({ at: Date.now(), text: `Mom needs you: she couldn't open her saved notes. ${String(error)}`, level: "warning" });
+		notices.push({ at: Date.now(), text: `Path needs you: it couldn't open its saved notes. ${String(error)}`, level: "warning" });
 		await save({ status: "done" });
-		return done(`Mom couldn't open her saved notes: ${String(error)}`);
+		return done(`Path couldn't open its saved notes: ${String(error)}`);
 	}
 	status.openingError = undefined;
 	try {
 		if (await settlePrevious(engine, api, ctx, previous, latest.entry, mom, status)) mom = await open();
-	} catch (error) { status.lastError = `Mom could not record her last operation: ${String(error)}`; }
+	} catch (error) { status.lastError = `Path could not record its last operation: ${String(error)}`; }
 	const reader = currentSession(start.session);
 	const store = new SidecarStore(() => start.session, reader.getSessionId());
 	const leaf = reader.getLeafId();
@@ -323,7 +325,7 @@ export async function begin(engine: Engine, api: Durable.ToolExecutionApi, ctx: 
 		if (request.kind === "controls") return (await controls())!;
 		if (request.kind === "finding") {
 			const note = mom.checkpoint?.note;
-			if (!note || note.text !== request.finding) { notices.push({ at: Date.now(), text: "This finding has changed; reopen Mom.", level: "info" }); await save({ status: "done" }); return done("That finding has changed."); }
+			if (!note || note.text !== request.finding) { notices.push({ at: Date.now(), text: "This finding has changed; reopen Path.", level: "info" }); await save({ status: "done" }); return done("That finding has changed."); }
 			await store.append("notice", { key: noticeKey(note), action: request.action, note, parent: leaf });
 			await save({ status: "done" });
 			return done("Recorded.");
@@ -332,7 +334,7 @@ export async function begin(engine: Engine, api: Durable.ToolExecutionApi, ctx: 
 	}
 	if (!mom.enabled && !(start.kind === "request" && start.request.kind === "rebuild")) {
 		await save({ status: "done" });
-		return done("Mom is paused; nothing to do.");
+		return done("Path is paused; nothing to do.");
 	}
 	let review: CompactionReview | undefined;
 	try {
@@ -341,7 +343,7 @@ export async function begin(engine: Engine, api: Durable.ToolExecutionApi, ctx: 
 		const mode = modeFor(settings.mapMode ?? mom.mode);
 		store.track = mode.name === "trail" ? "trail" : "graph"; // map records this operation writes belong to its mode's coverage track
 		const rebuild = start.kind === "request" && start.request.kind === "rebuild";
-		if (mode.name === "trail" && (relabel || rebuild)) throw new Error("Mom's trail has no work graph to relabel or rebuild; this command applies to the graph modes.");
+		if (mode.name === "trail" && rebuild) throw new Error("Path's trail has no work graph to rebuild; /path reindex indexes the trail again.");
 		const reviewing = await continuity(mom, start, host(start.session), store, decider);
 		if (reviewing) mom = await open();
 		// An explicit update handles the pending evidence now; the post-compaction audit remains queued for background delivery.
@@ -349,20 +351,20 @@ export async function begin(engine: Engine, api: Durable.ToolExecutionApi, ctx: 
 		review = mode.name === "trail" || relabel || (start.kind === "request" && (start.request.kind === "update" || start.request.kind === "rebuild"))
 			? undefined : compactionToReview(mom, reader, status);
 		await writeStatus(engine, api, ctx, current => { current.op = { job, mode: review ? "audit" : "update", startedAt: Date.now(), activity: "reading history" }; });
-		let prepared = await mom.prepare({ refresh: start.kind === "request" && start.request.kind !== "update" && !relabel, review, force: relabel && Boolean(mom.checkpoint),
+		let prepared = await mom.prepare({ refresh: start.kind === "request" && start.request.kind !== "update" && !relabel, review, force: relabel && Boolean(mom.checkpoint || (mode.name === "trail" && mom.coverageCut)),
 			forceDigest: start.kind === "request" && start.request.kind === "rebuild", relabel, job, signal: ctx?.abortSignal });
 		while (prepared.kind === "defer") {
 			await writeStatus(engine, api, ctx, current => { current.waitingForWorkers = mom.waitingForWorkers; current.deferredUntil = prepared.kind === "defer" ? prepared.until : undefined; });
 			await sleep(Math.max(250, Math.min(2000, prepared.until - Date.now())), ctx?.abortSignal);
 			lead?.refresh();
-			prepared = await mom.prepare({ refresh: start.kind === "request" && start.request.kind !== "update" && !relabel, review, force: relabel && Boolean(mom.checkpoint),
+			prepared = await mom.prepare({ refresh: start.kind === "request" && start.request.kind !== "update" && !relabel, review, force: relabel && Boolean(mom.checkpoint || (mode.name === "trail" && mom.coverageCut)),
 				forceDigest: start.kind === "request" && start.request.kind === "rebuild", relabel, job, signal: ctx?.abortSignal });
 		}
 		status.waitingForWorkers = false; status.deferredUntil = undefined;
 		status.unavailable = [...mom.feed.gaps.values()]; status.uncertainEffects = mom.feed.uncertainEffects();
 		// A worker transcript that went missing is a side note; the lead's own transcript stuck is a stop, said as one.
 		const blocked = mom.feed.gaps.get("parent");
-		if (blocked) status.blocked = `Mom cannot read past an entry of this session: ${blocked}`; else delete status.blocked;
+		if (blocked) status.blocked = `Path cannot read past an entry of this session: ${blocked}`; else delete status.blocked;
 		if (prepared.kind === "idle") {
 			status.more = false;
 			await save({ status: "done" }, current => { delete current.op; });
@@ -376,6 +378,8 @@ export async function begin(engine: Engine, api: Durable.ToolExecutionApi, ctx: 
 		prepared.header.mapMode = operationMode.name;
 		prepared.header.digest = Boolean(prepared.batch.digest);
 		prepared.header.relabel = relabel;
+		const repair = relabel && mode.name === "trail" && start.kind === "request" && start.request.kind === "relabel" && start.request.repair === true;
+		if (repair) prepared.header.repair = true;
 		const correction = prepared.batch.events.some(event => event.correction === true);
 		const specSkip = operationMode !== V2_MODE ? undefined
 			: start.kind !== "delivery" ? "not-delivery"
@@ -402,7 +406,7 @@ export async function begin(engine: Engine, api: Durable.ToolExecutionApi, ctx: 
 		}
 		if (read) prepared.header.spec = read.ops;
 		let body: Record<string, unknown> = { ...prepared.body, ...(prepared.guidance.trim() ? { guidance: prepared.guidance.trim() } : {}) };
-		if (relabel) body = { task: "Repair the saved work map. Give a decision only for the work that needs one: a concise, meaningful label to keep it, or retired with a short reason. An ID you leave out keeps its saved label. Mom tracks only durable, multi-turn things — retire status questions, one-off meta questions, and instructions the next turn fully satisfied. Keep genuine multi-turn work even when phrased as a question. Never retire settled work or work holding unfinished work. The host preserves sources, structure, notes and obligations.",
+		if (relabel && operationMode.name !== "trail") body = { task: "Repair the saved work map. Give a decision only for the work that needs one: a concise, meaningful label to keep it, or retired with a short reason. An ID you leave out keeps its saved label. Path tracks only durable, multi-turn things — retire status questions, one-off meta questions, and instructions the next turn fully satisfied. Keep genuine multi-turn work even when phrased as a question. Never retire settled work or work holding unfinished work. The host preserves sources, structure, notes and obligations.",
 			work: mom.graph.nodes.filter(isEndeavor).map(node => ({ id: node.id, label: node.label, intent: node.intent, observed: node.observed, state: node.state })) };
 		else if (prepared.batch.digest) body.task = "Fast historical catch-up. This is a host-compressed thread-map digest, not raw evidence: reconcile it once and preserve cited sources.";
 		if (operationMode === V2_MODE) {
@@ -417,11 +421,11 @@ export async function begin(engine: Engine, api: Durable.ToolExecutionApi, ctx: 
 				guidance: prepared.guidance });
 		}
 		if (operationMode.name === "trail") {
-			// The trail's own body: the evidence and what she already wrote (lines to reuse, ids to link),
+			// The trail's own body: the evidence and what it already wrote (lines to reuse, ids to link),
 			// read from `session.trail` on the lead's current branch. Nothing of the graph vocabulary.
-			const trail = trailFor(await new TrailStore(() => start.session, reader.getSessionId()).load(), new Set(reader.getBranch().map(entry => entry.id)));
-			body = trailBody({ task: prepared.header.backfilling ? TRAIL_BACKFILL_TASK : prepared.batch.digest ? TRAIL_DIGEST_TASK : TRAIL_UPDATE_TASK,
-				newEvents: prepared.body.newEvents as string,
+			const trail = trailFor(await new TrailStore(() => start.session, reader.getSessionId()).load(), branchIds(reader));
+			body = trailBody({ repair, task: repair ? TRAIL_REPAIR_TASK : relabel ? TRAIL_TITLE_TASK : prepared.header.backfilling ? TRAIL_BACKFILL_TASK : prepared.batch.digest ? TRAIL_DIGEST_TASK : TRAIL_UPDATE_TASK,
+				newEvents: relabel ? "" : prepared.body.newEvents as string,
 				newUserDirections: prepared.body.newUserDirections as { ref: string; text?: string }[] | undefined,
 				trail, recovery: prepared.body.recovery as Record<string, unknown> | undefined, guidance: prepared.guidance });
 		}
@@ -429,18 +433,29 @@ export async function begin(engine: Engine, api: Durable.ToolExecutionApi, ctx: 
 		status.more = prepared.header.more;
 		// v2: only a background batch the decision model can read is decided up front. An explicit
 		// request, a correction, a first map, catch-up, an audit, a retry and a recovery all skip the
-		// questions and go straight to her model, which then runs on structural checks alone.
+		// questions and go straight to its model, which then runs on structural checks alone.
 		// The trail has no work items to guess about, even when a graph checkpoint survives a mode switch.
 		const shadow = decider && prepared.kind === "work" && mom.checkpoint && read?.ops.length !== 0 && operationMode.name !== "trail" ? await shadowGuesses(decider.client, mom, prepared.batch.events) : undefined;
 		await save({ status: "open", job, header: prepared.header, childUsage: usage.total, baseUsage: mom.usage, ...(shadow ? { shadow } : {}),
-			// Recorded only when her model will run on it: the skip below logs its own `ran: false`, and
+			// Recorded only when its model will run on it: the skip below logs its own `ran: false`, and
 			// one batch must produce exactly one line either way.
 			...(read?.ops.length ? { read: { ops: read.ops, chosen: read.chosen } } : {}) }, current => {
 			current.op = { job, mode: review ? "audit" : "update", startedAt: current.op?.startedAt ?? Date.now(), thinkingAt: Date.now(), activity: "thinking",
-				target: prepared.kind === "work" ? prepared.header.cut?.parent ?? null : null, recovering: mom.recovering };
+				target: prepared.kind === "work" ? prepared.header.cut?.parent ?? null : null, recovering: mom.recovering,
+				...(operationMode.name === "trail" ? { task: repair ? "repairing" : relabel ? "titling" : prepared.header.backfilling ? "backfilling" : "reading" } : {}) };
 		});
+		// The trail: the decision model reads each user turn of the batch; when none steers the work (a status
+		// question, an acknowledgement, a correction of how the same task is done), nothing goes on the trail and
+		// its model is skipped. A batch with no user turn, a request, a retry or a recovery always runs.
+		if (operationMode.name === "trail" && beverly && !relabel && !prepared.header.retryGap && !mom.recovering
+			&& await routineBatch(beverly, prepared.batch.events, mom.feed.events)) {
+			await store.append("map", { base: null, cut: prepared.header.cut, failure: null,
+				...(prepared.header.backfill !== undefined ? { backfill: prepared.header.backfill } : {}) }, `${job}:map`);
+			await accepted(engine, api, ctx, prepared.header);
+			return done("Trail unchanged: the decision model found no steering in this batch. Evidence coverage saved.");
+		}
 		if (read && !read.ops.length) {
-			// The decision model read the batch and found nothing to record: save coverage, skip her model.
+			// The decision model read the batch and found nothing to record: save coverage, skip its model.
 			specLog(start.session, { job, ran: false, ops: [], chosen: read.chosen });
 			await store.append("map", { base: mom.checkpointId, cut: prepared.header.cut, failure: null, ...(prepared.header.screen ? { screen: prepared.header.screen } : {}) }, `${job}:map`);
 			await accepted(engine, api, ctx, prepared.header);
@@ -452,7 +467,7 @@ export async function begin(engine: Engine, api: Durable.ToolExecutionApi, ctx: 
 		if (ctx?.abortSignal?.aborted) throw error;
 		try { await store.append("usage", { usage: sumUsage(mom.usage, usage.total), error: message }, `${job}:usage`); } catch { /* the failure stays visible */ }
 		status.lastError = message;
-		// A review that failed still watches the lead after the compaction, from her last accepted map.
+		// A review that failed still watches the lead after the compaction, from its last accepted map.
 		if (review && mom.inject && mom.checkpoint) try { await openWindow(store, reader, mom.window, review.triggerRef); } catch { /* the failure stays visible */ }
 		await save({ status: "done", fault: message }, current => { delete current.op; });
 		return { content: text(`${OPERATION_FAILED}${message}`), isError: true, control: { terminate: true } };
@@ -460,18 +475,66 @@ export async function begin(engine: Engine, api: Durable.ToolExecutionApi, ctx: 
 }
 
 /**
- * The newest compaction after her coverage that has not been reviewed twice without success: its review
+ * Asked of each user turn by the trail's gate: how much it steers, on ordered levels. A scale, not a yes/no: the
+ * cutoff sits between "none" and "minor", so a turn the model is unsure about still runs the update.
+ */
+const STEERS: DeciderQuestion = { type: "score",
+	instructions: "Judge the user's message in a coding session (the assistant's preceding words are context only). How much does it steer where the work goes?",
+	criteria: [
+		"None: asks about status, acknowledges, says go on or try again, or corrects how the assistant does the same task.",
+		"Minor: adds a detail or constraint to the task already under way.",
+		"Clear: makes or approves a choice, starts a new task, parks something for later, or finishes or drops something.",
+		"Major: sets a new goal, or turns to different work, or comes back to earlier work.",
+	] };
+/**
+ * A batch is routine when every user turn scores below this (levels 0–3). Calibrated on a real session's 57 turns
+ * with the preceding assistant words in the state: 0.9 skipped 4 of 27 routine turns and lost none of 30 steering
+ * ones; 1.1 lost one. Without that context no cutoff separated them. Low on purpose: a missed turn loses a waypoint.
+ */
+export const STEER_CUTOFF = 0.9;
+/** The assistant words a turn is judged against: "go", "proceed" approve whatever was just proposed. */
+const CONTEXT_CHARS = 800;
+
+/**
+ * Whether a trail batch is routine: it has user turns and the decision model finds none that steers. Any failure
+ * to ask counts as not routine, so the model runs.
+ */
+export async function routineBatch(beverly: Beverly, events: readonly FeedEvent[], history: readonly FeedEvent[] = events): Promise<boolean> {
+	const users = events.filter(isUserDirection).filter(event => (event.text ?? "").trim());
+	if (!users.length) return false;
+	// Each turn with the lead's last words before it, from the whole feed: a batch usually starts at the turn.
+	const before = (turn: FeedEvent) => {
+		const at = history.findIndex(event => event.ref === turn.ref);
+		for (let i = (at < 0 ? history.length : at) - 1; i >= 0; i--) {
+			const event = history[i]!;
+			if (isUserDirection(event)) return "";
+			if (event.actor === "lead" && event.kind === "assistant" && event.text?.trim()) return event.text.trim().slice(-CONTEXT_CHARS);
+		}
+		return "";
+	};
+	const states = users.map(turn => `The assistant had just said: ${before(turn) || "(nothing)"}\n\nThe user then sent: ${turn.text!.trim().slice(0, 2000)}`);
+	try {
+		const scores = await Promise.all(states.map(state => beverly.answers(state, { steers: STEERS })
+			.then(answers => answers.steers?.type === "score" ? answers.steers.score : Infinity)));
+		return scores.every(score => score < STEER_CUTOFF);
+	} catch { return false; }
+}
+
+/**
+ * The newest compaction after its coverage that has not been reviewed twice without success: its review
  * (a thread-map audit before the map update). Its anchor is prepared first, as the live lead did.
  */
 function compactionToReview(mom: Mom, reader: ReturnType<typeof currentSession>, status: MomStatus): CompactionReview | undefined {
 	// A backlog (read cold, or still being caught up) has compactions that are history, read by the catch-up itself:
-	// only a few compactions since her last save, on a saved map, are worth an audit.
+	// only a few compactions since its last save, on a saved map, are worth an audit.
 	const queued = mom.unreviewedCompactions();
 	const trigger = mom.checkpoint && !status.more && queued.length <= MAX_QUEUED_REVIEWS ? queued.at(-1) : undefined;
 	if (!trigger) return undefined;
 	if ((status.auditAttempts[trigger.ref] ?? 0) >= 2) return undefined;
 	status.auditAttempts[trigger.ref] = (status.auditAttempts[trigger.ref] ?? 0) + 1;
-	const id = trigger.ref.slice(trigger.ref.indexOf(":") + 1);
+	// A compaction's ref names its entry (no block suffix): the review wants that entry id.
+	const id = entryIdOf(trigger.ref);
+	if (!id) return undefined;
 	try { return reviewFromSession(reader.getBranch(), reader.getSessionId(), id); } catch { return undefined; }
 }
 
@@ -483,7 +546,7 @@ async function continuity(mom: Mom, start: OperationStart, host: ConstructorPara
 	decider: { client: Decider; clear: number } | undefined): Promise<boolean> {
 	let changed = false;
 	const reader = host.ctx.sessionManager, branch = reader.getBranch(), leaf = reader.getLeafId();
-	// The lead delivered the anchor she prepared: record it.
+	// The lead delivered the anchor it prepared: record it.
 	const reserved = mom.reservedAnchor;
 	if (reserved && branch.some(entry => entry.type === "custom_message" && entry.customType === ANCHOR && entry.details?.key === reserved.key)) {
 		await store.append("injection", { kind: "anchor", action: "delivered", key: reserved.key, compaction: reserved.key, content: reserved.content, parent: leaf }, `${reserved.key}:delivered`);
@@ -494,9 +557,9 @@ async function continuity(mom: Mom, start: OperationStart, host: ConstructorPara
 	const known = (await store.load()).some(record => record.type === "injection" && record.data.kind === "anchor" && record.data.key === trigger?.ref);
 	if (trigger && mom.inject && !known) {
 		await store.append("injection", { kind: "anchor", action: "pending", key: trigger.ref, compaction: trigger.ref, parent: leaf }, `${trigger.ref}:pending`);
-		if (!mom.checkpoint) await store.append("injection", { kind: "anchor", action: "skipped", key: trigger.ref, compaction: trigger.ref, reason: "Mom had no saved map to anchor from", parent: leaf }, `${trigger.ref}:skipped`);
+		if (!mom.checkpoint) await store.append("injection", { kind: "anchor", action: "skipped", key: trigger.ref, compaction: trigger.ref, reason: "Path had no saved map to anchor from", parent: leaf }, `${trigger.ref}:skipped`);
 		else {
-			const content = renderAnchor(mom.checkpoint, await collectSideEffects(mom.feed), formatElapsed(Date.now() - mom.checkpoint.at));
+			const content = renderAnchor(mom.checkpoint, await collectSideEffects(mom.feed), formatDuration(Date.now() - mom.checkpoint.at));
 			await store.append("injection", { kind: "anchor", action: "reserved", key: trigger.ref, compaction: trigger.ref, content, parent: leaf }, `${trigger.ref}:reserved`);
 		}
 		changed = true;
@@ -515,7 +578,7 @@ async function continuity(mom: Mom, start: OperationStart, host: ConstructorPara
 	const boundary = records.at(-1)?.data.parent ?? null;
 	const check = new Mom(host); await check.open();
 	await check.feed.capture(24000, true);
-	const events = check.feed.events, from = boundary === null ? 0 : events.findIndex(event => event.ref.split(":")[1] === boundary) + 1;
+	const events = check.feed.events, from = boundary === null ? 0 : events.findIndex(event => entryIdOf(event.ref) === boundary) + 1;
 	const turn = events.slice(Math.max(0, from)).filter(event => event.actor === "lead");
 	if (!turn.length) return changed;
 	const compactAt = events.findIndex(event => event.ref === win.compaction);
@@ -541,14 +604,14 @@ async function continuity(mom: Mom, start: OperationStart, host: ConstructorPara
 		if (p >= decider.clear) cleared = { p, latencyMs };
 	} catch { /* the decider is optional: the model check runs */ }
 	if (canCheck && !cleared) try {
-		const texts = windowMessages({ flags, turnEvents: turn, purpose, lastUserDirection: direction }).map(message => textOf(message));
+		const texts = windowMessages({ flags, turnEvents: turn, purpose, lastUserDirection: direction }).map(message => textOf((message as any).content, ""));
 		const checkJob = `window-${createHash("sha256").update(JSON.stringify(texts)).digest("hex").slice(0, 32)}`;
 		const session = { file: reader.getSessionFile()!, id: reader.getSessionId(), cwd: host.ctx.cwd, leaf };
 		const result = await host.steps({ header: { job: checkJob, step: "check", mode: "check", refs: [], session }, body: texts[0], more: texts.slice(1),
 			instructions: "Check post-compaction continuity using the supplied evidence.", tools: [], thinking: "low" });
 		const reply = [...result.messages].reverse().find((message: any) => message.role === "assistant");
-		if (!reply || reply.stopReason === "error") throw new Error(reply?.errorMessage ?? "Mom's check returned no answer.");
-		verdict = parseWindowVerdict(textOf(reply), offeredRefs({ flags, turnEvents: turn, lastUserDirection: direction }));
+		if (!reply || reply.stopReason === "error") throw new Error(reply?.errorMessage ?? "Path's check returned no answer.");
+		verdict = parseWindowVerdict(textOf((reply as any)?.content, ""), offeredRefs({ flags, turnEvents: turn, lastUserDirection: direction }));
 		if (!verdict) error = "The check reply was not a cited verdict; no correction.";
 	} catch (cause) { error = String(cause); }
 	const turns = win.turns + 1, checks = canCheck ? win.checks + 1 : win.checks;
@@ -568,7 +631,7 @@ const STATE_CHOICES = {
 	blocked: "This activity left it blocked, waiting on the user or something else.",
 	abandoned: "This activity dropped it, rejected it, or replaced it with another approach.",
 };
-/** Shadow only: for each open item on her map, the decider's guess of what this batch did to it. Failures are silent. */
+/** Shadow only: for each open item on its map, the decider's guess of what this batch did to it. Failures are silent. */
 async function shadowGuesses(client: Decider, mom: Mom, events: readonly FeedEvent[]): Promise<OperationState["shadow"]> {
 	const open = (mom.checkpoint?.graph.nodes ?? []).filter(node => ["active", "proposed", "parked"].includes(node.state) && ["feature", "theory", "postulate", "try"].includes(node.kind)).slice(0, 12);
 	if (!open.length || !events.length) return undefined;
@@ -577,7 +640,7 @@ async function shadowGuesses(client: Decider, mom: Mom, events: readonly FeedEve
 	let latencyMs = 0;
 	try {
 		for (const node of open) {
-			const state = `WORK ITEM: [${node.state}] ${node.label}${node.intent ? ` — ${node.intent.slice(0, 300)}` : ""}\n\nWHAT HAPPENED SINCE THE LAST UPDATE:\n${activity}`;
+			const state = `WORK ITEM: [${node.state}] ${node.label}${node.intent ? ` — ${clipText(node.intent, 300, { ellipsis: "" })}` : ""}\n\nWHAT HAPPENED SINCE THE LAST UPDATE:\n${activity}`;
 			const { answers, latencyMs: ms } = await client.ask(state, { fate: { type: "choice", instructions: "What did this activity do to the work item?", criteria: STATE_CHOICES } });
 			latencyMs += ms;
 			const a = answers.fate;
@@ -587,8 +650,8 @@ async function shadowGuesses(client: Decider, mom: Mom, events: readonly FeedEve
 	return { guesses, latencyMs };
 }
 
-/** What the decision model decided, and once known what her model then did with it: evaluation data in
- *  its own log beside her .mom file, never her state. Best-effort, and the record the constants are
+/** What the decision model decided, and once known what its model then did with it: evaluation data in
+ *  its own log beside its .mom file, never its state. Best-effort, and the record the constants are
  *  re-fitted from (docs/v2-change-spec.md). */
 function specLog(sessionFile: string, entry: Record<string, unknown>) {
 	try { appendFileSync(sessionFile.replace(/\.jsonl$/, "") + ".mom-decider", JSON.stringify({ at: Date.now(), kind: "v2-spec", ...entry }) + "\n"); } catch { /* evaluation data */ }
@@ -602,7 +665,7 @@ async function openWindow(store: SidecarStore, reader: ReturnType<typeof current
 }
 
 /**
- * After her finalizer saved the map: usage, her finding for the user, and for a compaction review the
+ * After its finalizer saved the map: usage, its finding for the user, and for a compaction review the
  * continuity window. Runs in the finalizer's tool call.
  */
 export async function accepted(engine: Engine, api: Durable.ToolExecutionApi, ctx: any, header: OperationHeader, diagnostics?: { unmet?: string[] }) {
@@ -611,21 +674,21 @@ export async function accepted(engine: Engine, api: Durable.ToolExecutionApi, ct
 	const file = header.session.file;
 	const store = new SidecarStore(() => file, header.session.id);
 	const messages = op.startEntry ? (await entriesFrom(api, ctx, api.conversationId as any, op.startEntry)).flatMap(entry => entry.model) : [];
-	// Her turn's wall time (the model's replies and her tool calls), from the end of the preparation to now.
+	// Its turn's wall time (the model's replies and its tool calls), from the end of the preparation to now.
 	const before = await readStatus(engine, api, ctx), turnMs = before.op?.thinkingAt ? Math.max(0, Date.now() - before.op.thinkingAt) : 0;
 	const turn = readStep(messages).usage;
 	const usage = sumUsage(sumUsage(op.baseUsage ?? emptyUsage(), op.childUsage ?? emptyUsage()), { ...turn, elapsedMs: turn.elapsedMs + turnMs });
 	await store.append("usage", { usage, error: null }, `${header.job}:usage`);
 	const reader = currentSession(file);
 	const state = await loadState(store, reader, { mode: header.mapMode });
-	// The spec read this batch: whether her model then changed the map is what labels the ops.
+	// The spec read this batch: whether its model then changed the map is what labels the ops.
 	if (op.read) specLog(file, { job: header.job, ran: true, ...op.read, ...(diagnostics?.unmet?.length ? { unmet: diagnostics.unmet } : {}),
 		changed: (await store.load()).some(record => record.id === `${header.job}:map` && record.data.snapshot !== undefined) });
 	if (op.shadow?.guesses.length) {
 		const after = new Map((state.checkpoint?.graph.nodes ?? []).map(node => [node.id, node.state]));
 		const actual = (before: string, now: string | undefined) => now === undefined ? "removed" : now === before ? "unchanged"
 			: now === "settled" ? "finished" : now === "parked" ? "blocked" : `now ${now}`;
-		// Its own log beside her .mom file: evaluation data, not her state (older readers reject unknown record types).
+		// Its own log beside its .mom file: evaluation data, not its state (older readers reject unknown record types).
 		try {
 			appendFileSync(file.replace(/\.jsonl$/, "") + ".mom-decider", JSON.stringify({ at: Date.now(), kind: "state-shadow", job: header.job, latencyMs: op.shadow.latencyMs,
 				items: op.shadow.guesses.map(g => ({ ...g, actual: actual(g.state, after.get(g.id)) })) }) + "\n");
@@ -633,7 +696,7 @@ export async function accepted(engine: Engine, api: Durable.ToolExecutionApi, ct
 	}
 	const notices: MomStatus["notices"] = [];
 	{
-		// Her finding reaches the user when her account is complete and the user wants that kind of finding.
+		// Its finding reaches the user when its account is complete and the user wants that kind of finding.
 		const note = state.checkpoint?.note, key = note ? noticeKey(note) : undefined;
 		const offered = note && state.engagement.last?.key === key && note.riskRefs.every(ref => state.engagement.last!.riskRefs.includes(ref));
 		if (note && key && state.enabled && !header.more && !state.gaps.length && !state.failure && state.nudgedClasses.includes(note.riskClass) && !offered && !feedbackApplies(state.feedback[key], note)) {
@@ -643,7 +706,7 @@ export async function accepted(engine: Engine, api: Durable.ToolExecutionApi, ct
 		}
 		// A reviewed compaction opens its continuity window.
 		// A compaction queued behind this one opens its own window instead.
-		const branch = reader.getBranch(), at = branch.findIndex(entry => `${header.session.id}:${entry.id}` === header.trigger?.ref);
+		const branch = reader.getBranch(), at = branch.findIndex(entry => makeRef(header.session.id, entry.id) === header.trigger?.ref);
 		const superseded = at >= 0 && branch.slice(at + 1).some(entry => entry.type === "compaction");
 		if (header.trigger && state.inject && state.checkpoint && !superseded) await openWindow(store, reader, state.window, header.trigger.ref);
 	}
@@ -676,14 +739,14 @@ export async function rejected(engine: Engine, api: Durable.ToolExecutionApi, ct
 		const result = await mom.settle(header, outcome, sumUsage(sumUsage(op.baseUsage ?? mom.usage, op.childUsage ?? emptyUsage()), outcome.usage));
 		if (result.retiredRejection) { status.rejectedStreak++; status.lastRejection = result.retiredRejection; }
 		settled = true;
-	} catch (error) { status.lastError = `Mom could not record her rejected notes: ${String(error)}`; }
+	} catch (error) { status.lastError = `Path could not record its rejected notes: ${String(error)}`; }
 	await writeOperation(engine, api, ctx, current => { current.status = settled ? "done" : "rejected"; current.rejection = rejection; if (fault) current.fault = fault; });
 	await writeStatus(engine, api, ctx, current => {
 		delete current.op; current.lastError = rejection; current.rejectedStreak = status.rejectedStreak; current.lastRejection = status.lastRejection;
 	});
 }
 
-/** Her own tooling failed mid-operation: the operation ends; an update's turn fails so oven retries it. */
+/** Its own tooling failed mid-operation: the operation ends; an update's turn fails so oven retries it. */
 export async function failed(engine: Engine, api: Durable.ToolExecutionApi, ctx: any, error: string) {
 	const op = await readOperation(engine, api, ctx);
 	if (op.status !== "open") return;

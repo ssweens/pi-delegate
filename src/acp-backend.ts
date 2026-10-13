@@ -35,10 +35,13 @@
  * cached on the record with its time; drawing a view never runs Amp.
  */
 import { randomUUID } from "node:crypto";
-import { existsSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync } from "node:fs";
 import type { RequestRecord, SessionOrigin, StringsResponse, WorkerRecord, WorkerRole } from "./acp/domain/types.js";
 import type { Coordinator } from "./acp/orchestration/coordinator.js";
+import { ACP_DEFAULTS } from "./acp/domain/config.js";
+import { withTimeout } from "./util/async.ts";
+import { type Join, joinRuns } from "./wait.ts";
+import { errorMessage } from "./util/text.ts";
 import { acpAgents, acpCoordinator, existingAcpCoordinator } from "./acp/instance.js";
 import {
 	type AcpModelsView,
@@ -47,10 +50,8 @@ import {
 	type BackendCapabilities,
 	type CancelRequest,
 	type CloseRequest,
-	type ContractError,
 	type DelegateBackend,
 	type SteerRequest,
-	type Validated,
 	type WaitOutcome,
 	type WaitRequest,
 	acpAgentName,
@@ -58,29 +59,20 @@ import {
 	acpRunStatus,
 	checkCancel,
 	checkClose,
+	DelegateError,
 	requireAction,
+	unwrap,
 	turnView,
 } from "./backend.js";
 import { type ObserveCursor, observationText, observeAmpThread } from "./amp-observe.js";
-import { AMP_LABEL, AMP_THREAD_ID, ampThreadLabel, ampThreadUsage, parseAmpCost, type AmpRun } from "./acp/runtime/amp-cli.js";
+import { AMP_CLI_TIMEOUT_MS, AMP_DELEGATE_LABEL, AMP_THREAD_ID, ampRunLabel, ampThreadLabel, ampThreadTitle, ampThreadUsage, describeAmpRun, parseAmpCost } from "./acp/runtime/amp-cli.js";
 import type { AmpThreadUsage } from "./backend.js";
-import { acpUsage, currentAcpTaskDurationMs, elapsed } from "./render.js";
-import { ownedElsewhere, processOwner, readRecord, type RunOwner, writeRecord } from "./storage.js";
+import { acpUsage, currentAcpTaskDurationMs } from "./render.js";
+import { formatDuration } from "./util/format.ts";
+import { ownedElsewhereError, processOwner, releaseOwner, type RunOwner, RunStore } from "./storage.js";
 import type { ChildActivity } from "./transcript.js";
 
-/** A failure the tool layer reports by code: a contract violation, or a Coordinator error passed through. */
-export class DelegateError extends Error {
-	constructor(readonly code: string, message: string, readonly field?: string, readonly runId?: string) {
-		super(message);
-		this.name = "DelegateError";
-	}
-}
-
-export function unwrap<T>(validated: Validated<T>): T {
-	if (!validated.ok) throw contractError(validated.error);
-	return validated.value;
-}
-function contractError(error: ContractError): DelegateError { return new DelegateError(error.code, error.message, error.field); }
+export { DelegateError, unwrap } from "./backend.js";
 
 /** What this backend records about a run. The Coordinator owns the live session and its turns. */
 interface AcpRunRecord extends Partial<RunOwner> {
@@ -149,7 +141,8 @@ interface AcpRunRecord extends Partial<RunOwner> {
 	turnUsage?: { requestId: string; done: Promise<void> };
 }
 
-type AcpRunFile = Omit<AcpRunRecord, "waiters" | "claimed" | "foreign" | "reviving" | "startPromise" | "observing" | "labeling" | "turnUsage"> & { version: 1; backend: "acp"; savedAt: number };
+/** A run's saved fields: the record without what lives only in this process. */
+type AcpRunFields = Omit<AcpRunRecord, "waiters" | "claimed" | "foreign" | "reviving" | "startPromise" | "observing" | "labeling" | "turnUsage">;
 
 // Process-wide like the pi runtime state: a /reload rebinds the tools, the runs stay.
 const RUNS_KEY = Symbol.for("@ssweens/pi-delegate/acp-runs/1");
@@ -157,6 +150,46 @@ const registry = (): Map<string, AcpRunRecord> => {
 	const g = globalThis as typeof globalThis & { [RUNS_KEY]?: Map<string, AcpRunRecord> };
 	return g[RUNS_KEY] ??= new Map();
 };
+
+/** ACP run records, under each parent's subsession directory (AcpBackendHooks.runDir). */
+const store = new RunStore<AcpRunRecord, AcpRunFields>({
+	tag: { backend: "acp" },
+	valid: (record) => typeof record.worker === "string" && typeof record.agent === "string" && typeof record.cwd === "string" && typeof record.startedAt === "number" &&
+		(record.origin === "created" || record.origin === "opened") && typeof record.prompts === "object" && record.prompts !== null,
+	revive: (record) => {
+		const run: AcpRunRecord = { ...record, waiters: 0, claimed: new Set() };
+		// An unreadable cursor only costs repetition: the next observation lists from the start.
+		if (run.observed !== undefined && (typeof run.observed !== "object" || run.observed === null || typeof run.observed.remaining !== "number")) delete run.observed;
+		// The same for a cached cost (read again on the next status) and the record of labeling.
+		if (run.usage !== undefined && (typeof run.usage !== "object" || run.usage === null || typeof run.usage.at !== "number")) delete run.usage;
+		if (run.labeled !== undefined && (typeof run.labeled !== "object" || run.labeled === null || !Array.isArray(run.labeled.labels))) delete run.labeled;
+		if (run.notes !== undefined && (!Array.isArray(run.notes) || run.notes.some((note) => typeof note !== "string"))) delete run.notes;
+		return run;
+	},
+	recover: (run, savedAt) => {
+		if (run.closedAt === undefined && run.parkedAt === undefined && !run.startError) {
+			// Its process ended without parking it: nothing released its session, and nothing holds it now.
+			delete run.starting;
+			run.parkedAt = savedAt;
+			run.unreleased = true;
+		}
+		// A turn still running in the record ended with the process that ran it, parked or not.
+		for (const request of run.last?.requests ?? []) {
+			if (request.status !== "running") continue;
+			request.status = "failed";
+			request.finishedAt = new Date(savedAt).toISOString();
+			request.failure = { code: "PARENT_PROCESS_LOST", message: "Pi exited before this request reached a terminal result.", retryable: request.delivery === undefined };
+			if (request.delivery !== undefined) request.delivery = "unknown";
+			if (run.closedAt === undefined) run.interruptedTurn = request.id;
+		}
+	},
+	persisted: (run) => {
+		view(run);
+		const { waiters: _waiters, claimed: _claimed, foreign: _foreign, reviving: _reviving, startPromise: _startPromise, observing: _observing, labeling: _labeling, turnUsage: _turnUsage, ...record } = run;
+		return record satisfies AcpRunFields;
+	},
+	foreignSave: "skip",
+});
 
 /** A run's turns as a conversation for the child view: each prompt sent, then the agent's output. */
 function recordActivity(run: AcpRunRecord): ChildActivity {
@@ -184,39 +217,14 @@ export function runningAcpRuns(): number {
 	return [...registry().values()].filter((run) => !run.foreign && (run.starting || view(run).status === "running")).length;
 }
 
-const WAIT_SLICE_MS = 1000;
 /** The Coordinator's default profile bound, for a run whose worker profile was never seen. */
-const DEFAULT_MAX_OUTPUT_BYTES = 256_000;
 const WATCH_SLICE_MS = 60_000;
-/** Bounds on the Amp CLI calls a run makes besides its turns: a slow Amp delays, never blocks, a status or a wake. */
-const AMP_LABEL_TIMEOUT_MS = 15_000;
-const AMP_USAGE_TIMEOUT_MS = 15_000;
 /** Bound on the model read a status/result makes: a slow Coordinator makes the models unknown, never the status late. */
 const MODELS_READ_TIMEOUT_MS = 3_000;
-/** Every thread delegate creates carries this label, so leftover threads are easy to find. */
-export const AMP_DELEGATE_LABEL = "pi-delegate";
-/** Amp's own limit is 256 characters; a title is the brief's first line, not the brief. */
-const AMP_TITLE_MAX = 120;
+/** A thrown value as an Error, for a result that carries a failure instead of throwing. */
+const asError = (error: unknown): Error => error instanceof Error ? error : new Error(errorMessage(error));
 
 const isAmp = (run: Pick<AcpRunRecord, "agent">): boolean => run.agent === "amp";
-
-/**
- * The label that names a run in Amp. Amp labels are at most 32 lowercase alphanumerics and hyphens,
- * so the 40-character run ID cannot be one: its UUID without hyphens (32 hex digits) names it exactly.
- */
-export function ampRunLabel(runId: string): string {
-	const uuid = /([0-9a-f]{8})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{12})$/i.exec(runId);
-	const label = (uuid ? uuid.slice(1).join("") : runId).toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+/, "").slice(0, 32);
-	return AMP_LABEL.test(label) ? label : AMP_DELEGATE_LABEL;
-}
-
-/** The title of a thread delegate creates: the brief's first line, as the delegate tool asks briefs to start. */
-export function ampThreadTitle(task: string): string | undefined {
-	// Markdown markers go, so a title never reads as a CLI option (`--title -x`).
-	const line = task.split("\n").map((text) => text.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").replace(/^[\s#>*\-–—]+/, "").trim()).find(Boolean);
-	if (!line) return undefined;
-	return line.length > AMP_TITLE_MAX ? `${line.slice(0, AMP_TITLE_MAX - 1).trimEnd()}…` : line;
-}
 
 /** The run's Amp thread ID: an opened run's own, or the T-ID a created run's adapter reported. Never an ACP session ID. */
 function ampThreadId(run: AcpRunRecord): string | undefined {
@@ -227,13 +235,6 @@ function ampThreadId(run: AcpRunRecord): string | undefined {
 /** Where an Amp CLI call about this run's thread runs: the thread's own workspace, when it still exists. */
 function ampCwd(run: AcpRunRecord): string {
 	return [run.last?.worker?.native?.cwd, run.open?.cwd, run.cwd].find((dir): dir is string => typeof dir === "string" && existsSync(dir)) ?? process.cwd();
-}
-
-/** Why an Amp CLI call failed, in one line. */
-function ampFailure(command: string, run: AmpRun | Error): string {
-	if (run instanceof Error) return `${command} could not start: ${run.message}`;
-	if (run.timedOut) return `${command} timed out`;
-	return `${command} exited ${run.code ?? "by signal"}${run.stderr ? `: ${run.stderr.split("\n")[0]}` : ""}`;
 }
 
 function slug(agent: string): string {
@@ -322,16 +323,8 @@ function view(run: AcpRunRecord): AcpRunView {
 	return v;
 }
 
-/** One wait's hold on its runs. While held, a turn that settles reports to the wait instead of waking the parent. */
-export interface AcpJoin {
-	views(): AcpRunView[];
-	/** Block until a pending run's turn settles or `ms` passes. False when no Coordinator can report them (shut down, or another process owns them). */
-	next(pending: readonly AcpRunView[], ms: number): Promise<boolean>;
-	/** These settled runs were reported by the wait: they wake no one. */
-	claim(settled: readonly AcpRunView[]): void;
-	/** End the hold. With redeliver, a turn that settled during the wait but was never reported wakes the parent as usual. */
-	release(redeliver: boolean): void;
-}
+/** What a wait lost when no Coordinator can report its runs (Join.next is false). */
+export const ACP_JOIN_LOST = "the ACP coordinator (it is shutting down, or another process owns these runs); these runs did not settle";
 
 export interface AcpBackendHooks {
 	/** The attached parent's key. Throws when no parent is attached. */
@@ -342,6 +335,8 @@ export interface AcpBackendHooks {
 	settled(view: AcpRunView, ownerKey: string): void;
 	/** Where this parent's ACP run records live. */
 	runDir(ownerKey: string): string;
+	/** A steer is about to start a turn on a run that is not running: throw when the parent's limit on running runs refuses it. */
+	admit?(): void;
 }
 
 const RESUME_REFUSALS = new Set(["RESUME_UNSUPPORTED", "RESUME_PROVENANCE_UNKNOWN"]);
@@ -365,7 +360,7 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 
 	/** A run another live process owns is read-only here: it can be read, never steered, cancelled or closed. */
 	private writable(run: AcpRunRecord): void {
-		if (run.foreign) throw new DelegateError("RUN_OWNED_ELSEWHERE", `${run.id} is owned by another live Pi process (pid ${run.ownerPid} on ${run.ownerHost}); it is read-only here. Use that session, or wait for it to exit.`);
+		if (run.foreign) throw ownedElsewhereError(run);
 	}
 
 	owned(ownerKey: string): AcpRunView[] {
@@ -375,15 +370,12 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 	// --- Durable records -----------------------------------------------------------------------
 
 	private recordPath(run: Pick<AcpRunRecord, "id" | "ownerKey">): string {
-		return join(this.hooks.runDir(run.ownerKey), `${encodeURIComponent(run.id)}.json`);
+		return RunStore.recordPath(this.hooks.runDir(run.ownerKey), run.id);
 	}
 
 	/** Save the run as last seen. Never writes a run another live process owns. */
 	private save(run: AcpRunRecord): void {
-		if (run.foreign) return;
-		view(run);
-		const { waiters: _waiters, claimed: _claimed, foreign: _foreign, reviving: _reviving, startPromise: _startPromise, observing: _observing, labeling: _labeling, turnUsage: _turnUsage, ...record } = run;
-		writeRecord(this.recordPath(run), { ...record, version: 1, backend: "acp", savedAt: Date.now() } satisfies AcpRunFile);
+		store.save(run, this.recordPath(run));
 	}
 
 	/** Background saves (a turn settling) must not fail the turn; the next lifecycle step saves again. */
@@ -397,44 +389,10 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 	 * A run another live process owns is shown read-only. A corrupt record fails the attach.
 	 */
 	restore(ownerKey: string): void {
-		const dir = this.hooks.runDir(ownerKey);
-		if (!existsSync(dir)) return;
 		const restored: AcpRunRecord[] = [];
-		for (const name of readdirSync(dir).filter((n) => n.endsWith(".json")).sort()) {
-			const path = join(dir, name);
-			const record = readRecord<AcpRunFile>(path);
-			if (!record || record.version !== 1 || record.backend !== "acp" || record.ownerKey !== ownerKey || typeof record.id !== "string" ||
-				typeof record.worker !== "string" || typeof record.agent !== "string" || typeof record.cwd !== "string" || typeof record.startedAt !== "number" ||
-				(record.origin !== "created" && record.origin !== "opened") || typeof record.prompts !== "object" || record.prompts === null) {
-				throw new Error(`Cannot restore delegate metadata: ${path}`);
-			}
-			if (registry().has(record.id)) continue;
-			const { version: _version, backend: _backend, savedAt, ...fields } = record;
-			const run: AcpRunRecord = { ...fields, waiters: 0, claimed: new Set() };
-			// An unreadable cursor only costs repetition: the next observation lists from the start.
-			if (run.observed !== undefined && (typeof run.observed !== "object" || run.observed === null || typeof run.observed.remaining !== "number")) delete run.observed;
-			// The same for a cached cost (read again on the next status) and the record of labeling.
-			if (run.usage !== undefined && (typeof run.usage !== "object" || run.usage === null || typeof run.usage.at !== "number")) delete run.usage;
-			if (run.labeled !== undefined && (typeof run.labeled !== "object" || run.labeled === null || !Array.isArray(run.labeled.labels))) delete run.labeled;
-			if (run.notes !== undefined && (!Array.isArray(run.notes) || run.notes.some((note) => typeof note !== "string"))) delete run.notes;
-			if (ownedElsewhere(run)) { run.foreign = true; restored.push(run); continue; }
-			Object.assign(run, processOwner());
-			if (run.closedAt === undefined && run.parkedAt === undefined && !run.startError) {
-				// Its process ended without parking it: nothing released its session, and nothing holds it now.
-				delete run.starting;
-				run.parkedAt = savedAt;
-				run.unreleased = true;
-			}
-			// A turn still running in the record ended with the process that ran it, parked or not.
-			for (const request of run.last?.requests ?? []) {
-				if (request.status !== "running") continue;
-				request.status = "failed";
-				request.finishedAt = new Date(savedAt).toISOString();
-				request.failure = { code: "PARENT_PROCESS_LOST", message: "Pi exited before this request reached a terminal result.", retryable: request.delivery === undefined };
-				if (request.delivery !== undefined) request.delivery = "unknown";
-				if (run.closedAt === undefined) run.interruptedTurn = request.id;
-			}
-			restored.push(run);
+		for (const path of RunStore.recordFiles(this.hooks.runDir(ownerKey))) {
+			const run = store.load(path, ownerKey);
+			if (!registry().has(run.id)) restored.push(run);
 		}
 		for (const run of restored) { registry().set(run.id, run); this.save(run); }
 	}
@@ -453,7 +411,7 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 	private async recordStartFailure(run: AcpRunRecord, coordinator: Coordinator | undefined, error: unknown): Promise<never> {
 		const failure = error instanceof DelegateError
 			? error
-			: new DelegateError("ACP_START_FAILED", error instanceof Error ? error.message : String(error));
+			: new DelegateError("ACP_START_FAILED", errorMessage(error));
 		if (coordinator) {
 			await coordinator.execute({ action: "close", name: run.worker, force: true }).catch(() => undefined);
 			try { run.last = coordinator.snapshot(run.worker); } catch { /* the failed spawn left no worker */ }
@@ -542,6 +500,8 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 
 	async steer(runId: string, input: SteerRequest): Promise<AcpRunView> {
 		const run = this.get(runId);
+		// A turn on a run that is not running makes one more running run.
+		if (view(run).status !== "running") this.hooks.admit?.();
 		this.writable(run);
 		unwrap(requireAction(acpCapabilities(run), "steer"));
 		if (run.starting && view(run).turns.length === 0) throw new DelegateError("RUN_STARTING", `${run.id} is still starting; use delegate_ctl status or wait before steering`);
@@ -638,8 +598,14 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 		throw coordinatorError(resumed, run);
 	}
 
-	/** Hold runs for one wait. Used by wait here and by the tool layer's mixed-backend wait. */
-	join(runIds: readonly string[]): AcpJoin {
+	/**
+	 * Hold runs for one wait (see wait.ts), here and in the tool layer's mixed-backend wait. While held, a turn that
+	 * settles reports to the wait instead of waking the parent. next() is false when no Coordinator can report the
+	 * pending runs (shut down, or another process owns them). Claimed runs wake no one, and each Amp run's thread
+	 * cost is read for its settled turn, so the result reports it. A release after an abort redelivers: a turn that
+	 * settled during the wait but was never reported wakes the parent as usual.
+	 */
+	join(runIds: readonly string[]): Join<AcpRunView> {
 		const runs = runIds.map((id) => this.get(id));
 		for (const run of runs) unwrap(requireAction(acpCapabilities(run), "wait"));
 		// The turns running when the wait began: if one settles and the wait never reports it, it still wakes the parent.
@@ -647,13 +613,13 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 		for (const run of runs) run.waiters += 1;
 		let released = false;
 		return {
-			views: () => runs.map(view),
+			views: () => runs.map(view).map((v) => ({ id: v.id, settled: v.status !== "running", view: v })),
 			next: async (pending, ms) => {
 				// Startup is part of the run, but it has no Coordinator request to wait on yet.
 				// Joining it must not return an idle snapshot or make the parent poll forever.
 				const starts = runs.filter((run) => run.starting && pending.some((v) => v.id === run.id)).map((run) => run.startPromise).filter((promise): promise is Promise<void> => promise !== undefined);
 				if (starts.length) {
-					await Promise.race([Promise.race(starts), new Promise<void>((resolve) => setTimeout(resolve, ms))]);
+					await withTimeout(Promise.race(starts), ms);
 					return true;
 				}
 				const coordinator = existingAcpCoordinator();
@@ -668,6 +634,7 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 			},
 			claim: (settled) => {
 				for (const v of settled) { const turn = v.turns.at(-1); if (turn) registry().get(v.id)?.claimed.add(turn.requestId); }
+				return this.withCosts(settled);
 			},
 			release: (redeliver) => {
 				if (released) return;
@@ -684,34 +651,15 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 	}
 
 	/**
-	 * Join runs until the mode is satisfied. A timeout, an abort or queued parent messages end the
-	 * wait only: nothing is cancelled. Coordinator waits are sliced so those checks stay prompt.
-	 * Every run a returned outcome reports as settled is delivered by it; an abort delivers nothing,
-	 * so a turn that settled meanwhile wakes the parent as it would have without the wait.
+	 * Join runs until the mode is satisfied (wait.ts). A timeout, an abort or queued parent messages end the wait
+	 * only: nothing is cancelled. Every run a returned outcome reports as settled is delivered by it; an abort
+	 * delivers nothing, so a turn that settled meanwhile wakes the parent as it would have without the wait.
 	 */
 	async wait(request: WaitRequest, signal?: AbortSignal, interrupted?: () => boolean): Promise<WaitOutcome<AcpRunView>> {
-		const join = this.join(request.runIds);
-		const deadline = request.timeoutMs === undefined ? Number.POSITIVE_INFINITY : Date.now() + request.timeoutMs;
-		let aborted = false;
-		try {
-			for (;;) {
-				const views = join.views();
-				const settled = views.filter((v) => v.status !== "running");
-				const pending = views.filter((v) => v.status === "running");
-				const end = async (reason: WaitOutcome<AcpRunView>["reason"]): Promise<WaitOutcome<AcpRunView>> => {
-					join.claim(settled);
-					return { reason, settled: await this.withCosts(settled), pending: pending.map((v) => v.id) };
-				};
-				if (request.mode === "any" ? settled.length > 0 : pending.length === 0) return await end("settled");
-				if (signal?.aborted) { aborted = true; throw new DOMException("Wait cancelled; the runs are unaffected.", "AbortError"); }
-				if (interrupted?.()) return await end("interrupted");
-				const left = deadline - Date.now();
-				if (left <= 0) return await end("timeout");
-				if (!(await join.next(pending, Math.min(WAIT_SLICE_MS, left)))) return await end("lost");
-			}
-		} finally {
-			join.release(aborted);
-		}
+		const outcome = await joinRuns([this.join(request.runIds)], request.runIds, request.mode, {
+			...(signal ? { signal } : {}), ...(interrupted ? { interrupted } : {}), ...(request.timeoutMs !== undefined ? { timeoutMs: request.timeoutMs } : {}), lost: ACP_JOIN_LOST,
+		});
+		return { reason: outcome.reason, settled: outcome.settled, pending: outcome.pending.map((v) => v.id) };
 	}
 
 	/** A wait's settled views, with each Amp run's thread cost read for its settled turn (once per turn). */
@@ -749,7 +697,7 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 		const threadId = run.open?.sessionId ?? current.session.nativeSessionId;
 		if (!threadId) throw new DelegateError("RUN_NOT_OBSERVABLE", `${run.id} has no recorded native thread ID to observe`);
 		// The export reads the thread by ID; run it where the thread was verified, when that still exists.
-		const { observation, cursor } = await observeAmpThread({ threadId, cwd: ampCwd(run), ...(run.observed ? { cursor: run.observed } : {}), maxBytes: run.last?.worker?.profile.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES });
+		const { observation, cursor } = await observeAmpThread({ threadId, cwd: ampCwd(run), ...(run.observed ? { cursor: run.observed } : {}), maxBytes: run.last?.worker?.profile.maxOutputBytes ?? ACP_DEFAULTS.maxOutputBytes });
 		if (cursor) { run.observed = cursor; this.saveQuietly(run); }
 		return { ...view(run), observation };
 	}
@@ -799,12 +747,12 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 		};
 		if (!threadId) { run.usage = failed("the Amp thread ID is not known yet"); this.saveQuietly(run); return; }
 		const command = `amp threads usage ${threadId}`;
-		const read = await ampThreadUsage(threadId, ampCwd(run), { timeoutMs: AMP_USAGE_TIMEOUT_MS }).catch((error: unknown) => error instanceof Error ? error : new Error(String(error)));
+		const read = await ampThreadUsage(threadId, ampCwd(run), { timeoutMs: AMP_CLI_TIMEOUT_MS }).catch(asError);
 		// A park meanwhile owns the record now.
 		if (registry().get(run.id) !== run) return;
 		const amount = read instanceof Error || read.code !== 0 ? undefined : parseAmpCost(read.stdout.toString("utf8"));
 		run.usage = amount !== undefined ? { cost: { amount, currency: "USD" }, at, threadId }
-			: failed(read instanceof Error || read.code !== 0 ? ampFailure(command, read) : `${command} printed no Cost line`);
+			: failed(read instanceof Error || read.code !== 0 ? describeAmpRun(command, read) : `${command} printed no Cost line`);
 		this.saveQuietly(run);
 	}
 
@@ -821,10 +769,10 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 		const labels = [ampRunLabel(run.id), AMP_DELEGATE_LABEL];
 		const command = `amp threads label ${threadId} ${labels.join(" ")}`;
 		run.labeling = (async () => {
-			const done = await ampThreadLabel(threadId, labels, ampCwd(run), { timeoutMs: AMP_LABEL_TIMEOUT_MS }).catch((error: unknown) => error instanceof Error ? error : new Error(String(error)));
+			const done = await ampThreadLabel(threadId, labels, ampCwd(run), { timeoutMs: AMP_CLI_TIMEOUT_MS }).catch(asError);
 			const ok = !(done instanceof Error) && done.code === 0;
 			run.labeled = { at: Date.now(), labels, ok };
-			if (!ok) (run.notes ??= []).push(`labeling Amp thread ${threadId} failed (${ampFailure(command, done)}); the run is unaffected`);
+			if (!ok) (run.notes ??= []).push(`labeling Amp thread ${threadId} failed (${describeAmpRun(command, done)}); the run is unaffected`);
 		})().finally(() => { delete run.labeling; });
 		return run.labeling;
 	}
@@ -841,11 +789,7 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 		const coordinator = existingAcpCoordinator();
 		const status = coordinator?.snapshot(run.worker).worker?.status;
 		if (!coordinator || !status || status === "closing" || status === "closed") return undefined;
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		const response = await Promise.race([
-			coordinator.execute({ action: "status", name: run.worker }).catch((error: unknown) => error instanceof Error ? error : new Error(String(error))),
-			new Promise<undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), MODELS_READ_TIMEOUT_MS); }),
-		]).finally(() => clearTimeout(timer));
+		const response = await withTimeout(coordinator.execute({ action: "status", name: run.worker }).catch(asError), MODELS_READ_TIMEOUT_MS);
 		if (response === undefined) return { error: `model discovery did not answer within ${MODELS_READ_TIMEOUT_MS / 1000}s` };
 		if (response instanceof Error) return { error: response.message };
 		if (!response.ok) return { error: `${response.error.code}: ${response.error.message}` };
@@ -970,7 +914,7 @@ export class AcpBackend implements DelegateBackend<"acp"> {
 				if (before.status === "running") { const turn = before.turns.at(-1); if (turn) run.interruptedTurn = turn.requestId; }
 				run.parkedAt = Date.now();
 			}
-			delete run.ownerPid; delete run.ownerHost; delete run.ownerToken;
+			releaseOwner(run);
 			this.saveQuietly(run);
 			left.push({ view: view(run), activity: recordActivity(run) });
 		}
@@ -1035,7 +979,7 @@ export function acpModelsText(models: AcpModelsView): string {
 const modelsText = acpModelsText;
 
 export function acpSummary(v: AcpRunView): string {
-	const dur = elapsed(currentAcpTaskDurationMs(v));
+	const dur = formatDuration(currentAcpTaskDurationMs(v));
 	const { tokens: { input: tokensIn, output: tokensOut }, cost } = acpUsage(v);
 	// An Amp run's cost is its thread's, as last read; never read or unreadable is unknown, not zero.
 	const costText = v.session.agent === "amp"

@@ -3,9 +3,9 @@ import type { Cut, FeedEvent } from "./feed.ts";
 import type { SpecOp } from "./v2.ts";
 
 /**
- * One Mom step as her tools in oven see it: the header her tools read (from the first
- * message of the operation's fresh context) and the lead reads back after a reload. Everything else her
- * tools need is in the session file and her `.mom` file. The model never sees the header.
+ * One Path step as its tools in oven see it: the header its tools read (from the first
+ * message of the operation's fresh context) and the lead reads back after a reload. Everything else its
+ * tools need is in the session file and its `.mom` file. The model never sees the header.
  */
 export type OperationMode = "update" | "audit" | "check";
 
@@ -20,11 +20,13 @@ export interface OperationHeader {
 	digest?: boolean;
 	/** This request repairs existing model labels without changing graph structure or evidence. */
 	relabel?: boolean;
+	/** A trail relabel that revises the whole trail from its own entries (`/path reindex`), not just titles. */
+	repair?: boolean;
 	session: { file: string; id: string; cwd: string; leaf: string | null };
-	/** Evidence boundary: the feed her tools rebuild, and the coverage an accepted map records. */
+	/** Evidence boundary: the feed its tools rebuild, and the coverage an accepted map records. */
 	cut?: Cut;
 	from?: Cut;
-	/** The batch's evidence refs, in order: what she must review. */
+	/** The batch's evidence refs, in order: what it must review. */
 	refs: string[];
 	more?: boolean;
 	gaps?: number;
@@ -36,7 +38,7 @@ export interface OperationHeader {
 	/** A compaction review: its trigger is known evidence beyond the session's own entries. */
 	trigger?: FeedEvent;
 	auditedGaps?: string[];
-	/** v2: the ops the decision model decided, when it read this batch. Her finalizer is checked
+	/** v2: the ops the decision model decided, when it read this batch. Its finalizer is checked
 	 *  against them; absent means the batch ran with structural checks alone. */
 	spec?: SpecOp[];
 	screen?: AdvisorScreenRecord;
@@ -61,18 +63,18 @@ export function decodeOperation(text: string): { header?: OperationHeader; text:
 	} catch { return { text }; }
 }
 
-/** A tool result that ends the operation because Mom's own tooling failed, not because her notes were rejected. */
-export const OPERATION_FAILED = "Mom operation failed: ";
+/** A tool result that ends the operation because Path's own tooling failed, not because its notes were rejected. */
+export const OPERATION_FAILED = "Path operation failed: ";
 
-/** What the user did with Mom's finding. */
+/** What the user did with Path's finding. */
 export type FindingRequest = "understood" | "dismiss" | "incorrect" | "discuss";
 
-/** What the lead's client asks of Mom's slice; the session names the lead's session file. */
+/** What the lead's client asks of Path's slice; the session names the lead's session file. */
 export type MomRequest =
 	| { kind: "update" }
 	| { kind: "refresh" }
 	| { kind: "rebuild" }
-	| { kind: "relabel" }
+	| { kind: "relabel"; repair?: boolean }
 	| { kind: "resume" }
 	| { kind: "controls"; id: string; change: { inject: boolean } | { nudgedClasses: string[] } | { enabled: boolean } | { mode: string } | { model: string } | { decider: string } }
 	| { kind: "finding"; action: FindingRequest; finding: string };
