@@ -4,9 +4,8 @@
  * an operation: `mom_begin` (engine.ts) prepares it and keeps its header in a Durable document; its
  * other tools rebuild the evidence from the lead's session file and its `.mom` file, and keep
  * per-operation progress (pages read, rejections) in a Durable document. Acceptance writes the map record
- * `${job}:map` to the `.mom` file, once; in trail mode the waypoints go to `session.trail` first and that
- * record carries only the coverage cursor. Child steps (audits, checks) carry their header in their first
- * message instead. Only these tools write the `.mom` and `.trail` files on the Oven side.
+ * `${job}:map` to the `.mom` file, once. Child steps (audits, checks) carry their header in their first
+ * message instead. The trail is not kept here: its watcher (src/trail/watcher.ts) writes `.trail`.
  *
  * oven calls the default export with its own `@earendil-works/pi-durable`.
  */
@@ -16,25 +15,21 @@ import { Type, type Static } from "typebox";
 import { Check } from "typebox/value";
 import { validateToolArguments } from "@earendil-works/pi-ai/utils/validation";
 import { graphChange, isCheckpoint, loadState, noticeKey, type Checkpoint } from "./checkpoint.ts";
-import { acceptGraph, decodeJsonList, decodeLists, momTools, validateSearchQuery } from "./contract.ts";
+import { acceptGraph, decodeLists, momTools, validateSearchQuery } from "./contract.ts";
 import { V2_MODE, modeFor } from "./modes.ts";
 import { commitV2Tool } from "./v2.ts";
-import { branchIds, isUserDirection, LiveFeed, type FeedEvent } from "./feed.ts";
+import { LiveFeed, type FeedEvent } from "./feed.ts";
 import { editGraph, emptyGraph, isEndeavor, sourceSuggestion, Unfinished, type GraphNode } from "./graph.ts";
 import { Beverly, type LabelVerdict } from "./classify.ts";
 import { decodeOperation, decodeStart, OPERATION_FAILED, type OperationHeader } from "./operation.ts";
 import { accepted, begin, docsFor, failed, GIVE_UP, readOperation, readInstructionSettings, rejected, type Engine } from "./engine.ts";
 import { sessionFromFile } from "./session-file.ts";
 import { SidecarStore } from "./sidecar.ts";
-import { recordWaypointsTool } from "../trail/prompt.ts";
-import { TrailStore, trailFor } from "../trail/store.ts";
-import { sortTiers, STEP_KINDS, trailEntries, validateWaypointInputs, type Revision, type Waypoint } from "../trail/types.ts";
-import { planRepair } from "../trail/repair.ts";
 import { clipText, errorMessage, isRecord, textOf } from "../util/text.ts";
 import { parseRef } from "../util/ref.ts";
 import { UNREADABLE_SOURCES } from "./status.ts";
 
-const FINALIZERS = new Set(["commit_graph", "commit_v2", "commit_labels", "record_thread_map", "record_waypoints"]);
+const FINALIZERS = new Set(["commit_graph", "commit_v2", "commit_labels", "record_thread_map"]);
 const BEGIN = "mom_begin";
 const SOLE = "Path finalization requires a sole direct tool call, never a batch or nested call.";
 
@@ -176,16 +171,10 @@ const labelsDefinition = { name: "commit_labels", description: "Repair saved wor
 		parameters: Type.Object({ labels: Type.Array(Type.Object({ id: Type.String({ minLength: 1 }), label: Type.String({ minLength: 1, maxLength: 160 }),
 			state: Type.Optional(Type.Union([Type.Literal("active"), Type.Literal("parked")])) }, { additionalProperties: false }), { maxItems: 64 }),
 			retired: Type.Optional(Type.Array(Type.Object({ id: Type.String({ minLength: 1 }), reason: Type.String({ minLength: 1, maxLength: 240 }) }, { additionalProperties: false }), { maxItems: 64 })) }, { additionalProperties: false }) };
-	/** Normalize transport-only JSON strings before Pi validates any finalizer's arguments. The trail's
-	 *  lists are decoded here because decodeLists belongs to the graph contract. */
-	const listArgs = (args: unknown) => {
-		if (!isRecord(args)) return args ?? {};
-		const out = decodeLists(args);
-		for (const field of ["waypoints", "titles", "revise"]) out[field] = decodeJsonList(out[field], { allowNull: false });
-		return out;
-	};
+	/** Normalize transport-only JSON strings before Pi validates any finalizer's arguments. */
+	const listArgs = (args: unknown) => isRecord(args) ? decodeLists(args) : args ?? {};
 	/** The tool definition pi-ai validates a finalizer's arguments against. */
-	const finalizerDefinition = (name: string) => name === "commit_labels" ? labelsDefinition : name === "commit_v2" ? commitV2Tool() : name === "record_waypoints" ? recordWaypointsTool() : definition(name);
+	const finalizerDefinition = (name: string) => name === "commit_labels" ? labelsDefinition : name === "commit_v2" ? commitV2Tool() : definition(name);
 	/** Arguments as Durable checks and coerces them (pi-ai's validation); throws its "Validation failed" error. */
 	const check = (name: string, args: unknown) => validateToolArguments({ ...finalizerDefinition(name) } as any,
 		{ type: "toolCall", id: "check", name, arguments: JSON.parse(JSON.stringify(listArgs(args))) });
@@ -201,11 +190,10 @@ const labelsDefinition = { name: "commit_labels", description: "Repair saved wor
 		};
 		return op.retryGap.remaining.length && retried ? { gap: { action: "open", ...retried, ...range(op.retryGap.remaining) } } : { gap: { action: "resolved", id: op.retryGap.id } };
 	};
-	type Form = "transaction" | "v2" | "labels" | "trail";
-	const FORM_FINALIZER: Record<Form, string> = { transaction: "commit_graph", v2: "commit_v2", labels: "commit_labels", trail: "record_waypoints" };
+	type Form = "transaction" | "v2" | "labels";
+	const FORM_FINALIZER: Record<Form, string> = { transaction: "commit_graph", v2: "commit_v2", labels: "commit_labels" };
 	// Transaction commits a model-authored graph; acts derives work from model-written labels;
 	// relabels apply model-written display labels. All three use the same single-writer commit tail.
-	// Trail appends waypoints to `session.trail` and only its coverage cursor to `.mom`.
 	const finalize = (form: Form = "transaction") => ({ ...tool(finalizerDefinition(FORM_FINALIZER[form]), async (_args, op, api, ctx) => {
 		const { calls } = await operationContext(api, ctx);
 		const call = calls.find(each => each.id === api.callId);
@@ -221,8 +209,7 @@ const labelsDefinition = { name: "commit_labels", description: "Repair saved wor
 		// active mode did not ask it to do — otherwise a small model can reach for commit_graph in v2
 		// and author edits the host is supposed to check against the minimal schema.
 		const active = modeFor(op.mapMode ?? state.mode);
-		// A trail relabel is a titling pass: it finishes with record_waypoints like any trail operation.
-		const labels = op.relabel && active.name !== "trail";
+		const labels = op.relabel;
 		if (labels ? form !== "labels" : active.finalizer !== FORM_FINALIZER[form])
 			return await reject(`This operation requires ${labels ? "commit_labels" : active.finalizer}.`);
 		// The decider every semantic gate asks, from the same settings line `begin` read.
@@ -230,86 +217,7 @@ const labelsDefinition = { name: "commit_labels", description: "Repair saved wor
 		const settings = readInstructionSettings(agent.instructions);
 		const classifier = settings.classifier ? new Beverly(settings.classifier) : undefined;
 		const records = await new SidecarStore(() => op.session.file, op.session.id).load();
-		if (records.some(record => record.id === `${op.job}:map`)) return { content: text(form === "trail" ? "Trail saved." : "Map saved."), control: { terminate: true } };
-		if (form === "trail") {
-			// The trail keeps no graph: waypoints are appended to `session.trail`, and the `.mom` record
-			// is the coverage-without-a-map cursor, marked `trail: true` by the store. The trail is its own
-			// coverage track: loadState ignores graph checkpoints in trail mode, so there is never one here
-			// (base null) and a session switched from a graph mode indexes its whole history into the trail.
-			const value = listArgs(call?.arguments ?? _args) as Record<string, unknown>;
-			const repairs: string[] = [];
-			// Near-miss refs are canonicalized before validation, as the graph forms do; a ref that matches
-			// nothing is left for validation to name.
-			if (Array.isArray(value.waypoints)) value.waypoints = value.waypoints.map(item => !item || typeof item !== "object" || !Array.isArray((item as any).refs) ? item
-				: { ...item, refs: (item as { refs: unknown[] }).refs.map(ref => {
-					if (typeof ref !== "string" || known.has(ref)) return ref;
-					const to = sourceSuggestion(ref, known.keys());
-					if (to) repairs.push(`${ref}→${to}`);
-					return to ?? ref;
-				}) });
-			const trailStore = new TrailStore(() => op.session.file, op.session.id);
-			const branch = branchIds(sessionFromFile(op.session.file, op.session.leaf));
-			const existing = trailFor(await trailStore.load(), branch);
-			const idFor = (index: number) => `${op.job}:w${index}`;
-			const { inputs, titles, defects } = validateWaypointInputs(value, trailEntries(existing), new Set(known.keys()), idFor);
-			// A repair pass revises the trail it was shown (src/trail/repair.ts); no other operation may.
-			const revisions = Array.isArray(value.revise) ? value.revise as Revision[] : [];
-			if (revisions.length && !op.repair) defects.push("revise is only for a repair pass; leave it out.");
-			const repair = op.repair ? planRepair(existing, revisions, index => `${op.job}:r${index}`) : undefined;
-			if (repair) defects.push(...repair.defects);
-			if (defects.length) {
-				await update(api, ctx, op.job, doc => { doc.rejections++; });
-				return await reject(`Waypoints rejected; nothing was saved. ${defects.join(" ")}`);
-			}
-			// Waypoints are where the user steered; the rest are steps for the detail page (sortTiers). Ids keep the
-			// call index so a retry writes the same ones.
-			const isUserTurn = (ref: string) => { const event = known.get(ref); return Boolean(event && isUserDirection(event)); };
-			const tiers = sortTiers(inputs, idFor, isUserTurn);
-			// Re-indexing the same history (a retried backfill, a session switched between modes) never writes a moment
-			// twice: an item of the same kind citing a source the trail already holds is that entry. Links to it follow.
-			const held = trailEntries(existing), alias = new Map<string, string>();
-			inputs.forEach((input, index) => {
-				const same = held.find(entry => entry.kind === input.kind && entry.refs.some(ref => input.refs.includes(ref)));
-				if (same) alias.set(idFor(index), same.id);
-			});
-			const relink = (id: string | null | undefined) => id == null ? undefined : alias.get(id) ?? id;
-			// Where it sits in the transcript: the user turn it cites, else its first lead source, else the batch's.
-			const leadEntry = (ref: string) => { const parsed = parseRef(ref); return parsed?.stream === op.session.id ? parsed.entryId : undefined; };
-			const anchorOf = (refs: readonly string[]) => {
-				const ref = refs.find(isUserTurn) ?? refs.find(r => leadEntry(r)) ?? op.refs.find(r => leadEntry(r));
-				return ref ? leadEntry(ref) : undefined;
-			};
-			// When it happened, not when it was indexed: backfilled history keeps its own times.
-			const recorded = Date.now(), atOf = (refs: readonly string[]) => {
-				const time = Date.parse(known.get(refs.find(isUserTurn) ?? refs[0]!)?.at ?? "");
-				return Number.isFinite(time) ? time : recorded;
-			};
-			const all = [...tiers.waypoints.map(item => ({ ...item, step: false })), ...tiers.steps.map(item => ({ ...item, step: true }))]
-				.filter(item => !alias.has(idFor(item.index))).sort((a, b) => a.index - b.index);
-			for (const { index, input, step } of all) {
-				const closes = relink(input.closes), supersedes = relink(input.supersedes), from = relink(input.from), anchor = anchorOf(input.refs);
-				const waypoint: Waypoint = { id: idFor(index), sessionId: op.session.id, at: atOf(input.refs), kind: input.kind, line: input.line, refs: input.refs, caption: input.caption,
-					...(input.title ? { title: input.title } : {}), ...(from ? { from } : {}),
-					...(closes ? { closes } : {}), ...(supersedes ? { supersedes } : {}), ...(anchor ? { anchor } : {}), parent: op.session.leaf, by: "mom",
-					...(step && !STEP_KINDS.has(input.kind) ? { step: true as const } : {}) };
-				await trailStore.appendWaypoint(waypoint);
-			}
-			// Titles for waypoints recorded before titles existed; ids keep the call index, so a retry writes them once.
-			for (const [index, item] of [...titles, ...(repair?.titles ?? [])].entries())
-				await trailStore.appendTitle({ id: `${op.job}:t${index}`, sessionId: op.session.id, at: recorded, target: item.id, title: item.title, parent: op.session.leaf });
-			// A repair's revised copies first, then the strikes of what they replace: a crash between leaves both, never neither.
-			for (const copy of repair?.copies ?? []) await trailStore.appendWaypoint({ ...copy, parent: copy.parent ?? op.session.leaf });
-			for (const [index, item] of (repair?.strikes ?? []).entries())
-				await trailStore.appendStrike({ id: `${op.job}:s${index}`, sessionId: op.session.id, at: recorded, target: item.target, reason: item.reason, parent: op.session.leaf });
-			// Written after the waypoints: a crash between the two leaves the batch uncovered and retried, and
-			// the retry's ids are the same `${job}:w<n>`, so a reader sees the waypoints once.
-			try { await store.append("map", { base: state.checkpointId ?? null, cut: op.cut!, failure: null, ...gapChange(op, state, feed), ...(op.backfill !== undefined ? { backfill: op.backfill } : {}) }, `${op.job}:map`); }
-			catch (error) { throw new Error(`Path could not advance its trail coverage beside the session: ${String(error)}`); }
-			worlds.delete(`${op.job}:${op.step}`);
-			await accepted(engine, api, ctx, op);
-			const demoted = tiers.steps.filter(item => !STEP_KINDS.has(item.input.kind)).length;
-			return { content: text(`Trail saved.${alias.size ? ` ${alias.size} already on the trail, not repeated.` : ""}${demoted ? ` Filed ${demoted} as step${demoted === 1 ? "" : "s"}: a waypoint must cite the user turn that made it.` : ""}${repairs.length ? ` Repaired refs: ${repairs.join(", ")}.` : ""}`), control: { terminate: true } };
-		}
+		if (records.some(record => record.id === `${op.job}:map`)) return { content: text("Map saved."), control: { terminate: true } };
 		const done = await progress(api, ctx, op.job);
 		const inspected = new Set([...done.inspected, ...[...feed.byRef.keys()].filter(ref => ref.startsWith(`mom-${op.job}:`))]);
 		const graph = state.checkpoint?.graph ?? emptyGraph();
@@ -447,15 +355,6 @@ const labelsDefinition = { name: "commit_labels", description: "Repair saved wor
 	const inspect = tool({ ...definition("inspect_evidence") }, async (args, op, api, ctx) => {
 		const { feed, known, missing, state } = await world(op);
 		if (typeof args.ref !== "string" || !Number.isSafeInteger(args.offset) || args.offset < 0 || !Number.isSafeInteger(args.limit) || args.limit < 1 || args.limit > 24000) throw new Error("Invalid evidence request.");
-		// A trail waypoint id (bare, or written node:<id> as the graph's references are) is Path's own saved note.
-		if (op.mapMode === "trail" && !known.has(args.ref)) {
-			const id = args.ref.startsWith("node:") ? args.ref.slice(5) : args.ref;
-			const waypoint = (await new TrailStore(() => op.session.file, op.session.id).load()).find(record => record.type === "waypoint" && record.id === id);
-			if (waypoint || args.ref.startsWith("node:")) return { content: text(JSON.stringify(waypoint
-				? { ref: args.ref, authority: "Saved trail entry, not original evidence. Cite its refs, never this id.", waypoint }
-				: { ref: args.ref, error: `No trail entry ${id}.`, instruction: "Trail entries are linked through closes and supersedes by id; they are not evidence. Inspect [src:…] ids only." })),
-				...(waypoint ? {} : { isError: true }) };
-		}
 		if (args.ref.startsWith("node:") && op.mode !== "audit") {
 			const node = state.checkpoint?.graph.nodes.find(node => node.id === args.ref.slice(5));
 			// A wrong reference is the model's to correct, not a reason to fail the whole operation.
@@ -580,11 +479,11 @@ const labelsDefinition = { name: "commit_labels", description: "Repair saved wor
 		return decodeOperation(text).text;
 	};
 	const REPAIR_PREFIX = "No finalizer was executed.";
-	const repair = (header: OperationHeader) => `${REPAIR_PREFIX} Review the supplied evidence and finish with ${header.relabel && modeFor(header.mapMode).name !== "trail" ? "commit_labels" : modeFor(header.mapMode).finalizer} as a sole direct call. Your previous text did not save any changes.`;
+	const repair = (header: OperationHeader) => `${REPAIR_PREFIX} Review the supplied evidence and finish with ${header.relabel ? "commit_labels" : modeFor(header.mapMode).finalizer} as a sole direct call. Your previous text did not save any changes.`;
 /** Path's own tool surface. A stale or foreign slice configuration must never hand it native
  *  filesystem, shell or editor tools: a small model given those leaves the operation and wanders.
  *  The extension enforces its own boundary rather than trusting the allowlist it was given. */
-const MOM_TOOL_NAMES = new Set([BEGIN, "commit_graph", "commit_v2", "commit_labels", "record_thread_map", "record_waypoints", "inspect_evidence", "search_history"]);
+const MOM_TOOL_NAMES = new Set([BEGIN, "commit_graph", "commit_v2", "commit_labels", "record_thread_map", "inspect_evidence", "search_history"]);
 	const RELABEL_PROMPT = "You are Path repairing its saved work map, not processing new activity or answering the recorded conversation. First call mom_begin alone. Then read its work list and call commit_labels once. Give a decision only for the work that needs one: a concise, meaningful label to keep it, or retired with a short reason. An ID you leave out keeps its saved label.\n\n\n\nMom tracks only durable, multi-turn things. Retire work that is not: a status or progress question (\"where are we?\", \"is it in place now?\", \"were those labels from act mode or commit mode\"), a one-off meta question, or an instruction the next turn fully satisfied. Keep genuine multi-turn work even when it is phrased as a question (\"What else is fucking idiotic in this stack?\" is a real audit request). Never retire settled work, or work that still holds unfinished work — give those a label instead.\n\n\n\nA kept work item may also carry state: active when it is being worked on now, parked when it is deliberately deferred. Set active for work in progress, including an umbrella initiative whose child is current. Never mark work settled here — a completion needs its own evidence. Base every label on that work's intent and observed outcome; do not copy terminal markup or invent new work. Never call other tools, and never alter IDs, sources, or notes.";
 
 	const hooks = [durable.hook(durable.GenerationTask, {
@@ -603,19 +502,14 @@ const MOM_TOOL_NAMES = new Set([BEGIN, "commit_graph", "commit_v2", "commit_labe
 			const operationMode = modeFor(header?.mapMode ?? settings.mapMode);
 			const givingUp = messages.some(message => message.role === "user" && textOf(message.content, "").startsWith(GIVE_UP));
 			const allowed = new Set(!header || givingUp ? [BEGIN] : header.mode === "audit" ? ["record_thread_map", ...(header.section?.needsInspection ? ["inspect_evidence"] : [])]
-				// A trail relabel is a titling pass: it finishes with record_waypoints like every trail operation.
-				: header.relabel && operationMode.name !== "trail" ? ["commit_labels"]
+				: header.relabel ? ["commit_labels"]
 				// v2 owns every write, catch-up digests included; commit_graph owns its own digest.
 				: operationMode.name === "v2" ? ["commit_v2", "inspect_evidence", "search_history"]
-				// The trail has no graph: its one finalizer appends waypoints, digests included. It indexes the batch in
-				// front of its and never reconciles older history, so it gets no history search: a small model given
-				// one fishes with it (dozens of one-word queries per catch-up) instead of reading the evidence.
-				: operationMode.name === "trail" ? ["record_waypoints", "inspect_evidence"]
 				: ["commit_graph", "inspect_evidence", "search_history"]);
 			return { messages: messages.map(message => {
 				if (message.role === "system") return { ...message,
-					// A graph relabel gets its own instructions; a trail relabel keeps the trail's (it finishes with record_waypoints).
-					...(header?.relabel && operationMode.name !== "trail" && message.sections?.instructions ? { sections: { ...message.sections, instructions: RELABEL_PROMPT } } : {}),
+					// A map relabel gets its own instructions.
+					...(header?.relabel && message.sections?.instructions ? { sections: { ...message.sections, instructions: RELABEL_PROMPT } } : {}),
 					// Path's tools only. A stale slice configuration that carried native read/bash/codemode
 					// is corrected here, at the one place every request passes through.
 					...(message.toolsAdded ? { toolsAdded: message.toolsAdded.filter(tool => allowed.has(tool.name) && MOM_TOOL_NAMES.has(tool.name)) } : {}) };
@@ -647,7 +541,7 @@ const MOM_TOOL_NAMES = new Set([BEGIN, "commit_graph", "commit_v2", "commit_labe
 
 	return durable.defineExtension({
 		name: "mom",
-		tools: [beginTool, finalize(), finalize("v2"), finalize("labels"), finalize("trail"), inspect, search, record],
+		tools: [beginTool, finalize(), finalize("v2"), finalize("labels"), inspect, search, record],
 		hooks,
 	});
 }

@@ -112,7 +112,19 @@ test("an unfollowed Oven slice rebuilds the transcript independently, then accep
 		let modalSaved = false, opened = 0;
 		const live = h.ctx();
 		const notifications: string[] = [];
+		// /path opens Path's view; B on F3 Status starts or reviews the rebuild. `screens` holds what the view showed.
+		let viewKeys: string[] | undefined;
+		const screens: string[] = [];
 		const custom: any = async (factory: any, options: any) => {
+			if (viewKeys) {
+				const keys = viewKeys; viewKeys = undefined;
+				const tui: any = { terminal: { rows: 30, columns: 100 }, requestRender() {} };
+				const view = factory(tui, theme, undefined, () => {});
+				for (const key of keys) view.handleInput(key);
+				screens.push(view.render(100).join("\n"));
+				view.dispose?.();
+				return;
+			}
 			opened++;
 			assert.equal(options?.overlay, true, "review opens an overlay only after background reconstruction");
 			let finish!: (result: string) => void;
@@ -130,17 +142,19 @@ test("an unfollowed Oven slice rebuilds the transcript independently, then accep
 		const interactive = { ...live, mode: "tui", ui: { ...live.ui, custom, notify(text: string) { notifications.push(text); } } };
 		const tracking = (await daemon.oven.list()).find((slice: any) => slice.key === ownerKey(identity));
 		assert.ok(tracking, "the tracking slice uses the canonical session identity");
-		await h.commands.get("path").handler("status", interactive);
-		assert.ok(notifications.some(text => text.includes(`${process.env.OVEN_URL}/slice/${tracking.id}`)), "general Mom status links to the tracking slice, not the rebuild");
-		await h.commands.get("path").handler("rebuild", interactive);
+		const openView = async (...keys: string[]) => { viewKeys = keys; await h!.commands.get("path").handler("", interactive); };
+		await openView("\x1bOR");
+		assert.ok(screens.at(-1)!.includes(`${process.env.OVEN_URL}/slice/${tracking.id}`), "Path's Status tab links to the tracking slice, not the rebuild");
+		await openView("\x1bOR", "b");
 		assert.equal(opened, 0, "starting the rebuild returns without opening a modal");
 		for (const deadline = Date.now() + 12000; Date.now() < deadline && !notifications.some(text => text.includes("ready"));)
 			await new Promise(resolve => setTimeout(resolve, 20));
 		assert.match(notifications.join("\n"), /ready/, "background reconstruction reports when review is available");
-		await h.commands.get("path").handler("rebuild", interactive);
+		await openView("\x1bOR", "b");
+		for (const deadline = Date.now() + 5000; Date.now() < deadline && !modalSaved;) await new Promise(resolve => setTimeout(resolve, 20));
 		assert.ok(modalSaved, "review saves only after its action received Enter");
-		await h.commands.get("path").handler("graph", interactive);
-		assert.match(notifications.join("\n"), /Build a durable map/, "Mom's public graph view reloads after acceptance");
+		await openView();
+		assert.match(screens.at(-1)!, /Build a durable map/, "Path's view reloads after acceptance");
 		const saved = await loadState(new SidecarStore(() => file, identity.sessionId), manager);
 		assert.notEqual(saved.checkpointId, original.checkpointId);
 		assert.equal(saved.checkpoint?.graph.nodes[0]?.label, "Build a durable map");
@@ -185,7 +199,7 @@ test("Mom's widget shows background rebuild progress and the review action in bo
 		assert.ok(screen.includes(`Slice: ${base.sliceUrl}`));
 		assert.ok(screen.includes(`Rebuild slice: ${base.rebuildUrl}`));
 		assert.match(momSectionLines({ ...base, rebuild: "Rebuilding from the selected branch · pass 3" }, theme, 90).join("\n"), /pass 3/);
-		assert.match(momSectionLines({ ...base, rebuild: "Rebuild ready · \/path rebuild to review" }, theme, 90).join("\n"), /rebuild to review/);
+		assert.match(momSectionLines({ ...base, rebuild: "Rebuild ready · B on F3 Status to review" }, theme, 90).join("\n"), /to review/);
 	}
 });
 

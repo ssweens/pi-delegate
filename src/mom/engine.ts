@@ -10,11 +10,11 @@ import { appendFileSync, statSync } from "node:fs";
 import type * as Durable from "@earendil-works/pi-durable";
 import { ANCHOR, collectSideEffects, renderAnchor } from "./anchor.ts";
 import { SystemOneAdvisor } from "./advisor.ts";
-import { Decider, type DeciderQuestion } from "./decider.ts";
+import { Decider } from "./decider.ts";
 import { DEFAULT_BOOTSTRAP_POLICY, type BootstrapPolicy } from "./bootstrap.ts";
 import { emptyUsage, graphChange, isCheckpoint, loadState, noticeKey, sumUsage, type Checkpoint, type Usage, type WindowLive } from "./checkpoint.ts";
 import { reviewFromSession, type CompactionReview } from "./compaction.ts";
-import { branchIds, extractEvents, isUserDirection, renderEvents, type FeedEvent, type SessionReader } from "./feed.ts";
+import { extractEvents, isUserDirection, renderEvents, type FeedEvent, type SessionReader } from "./feed.ts";
 import { Mom, readStep, type StepRequest, type StepRunner } from "./mother.ts";
 import { isEndeavor } from "./graph.ts";
 import { Beverly } from "./classify.ts";
@@ -32,8 +32,6 @@ import { entryIdOf, makeRef } from "../util/ref.ts";
 import { clipText, textOf } from "../util/text.ts";
 import { NO_ACCEPTED_TRANSACTION } from "./status.ts";
 import { collectTurnSignals, lastDirectionOf, MAX_WINDOW_CHECKS, MAX_WINDOW_TURNS, offeredRefs, parseWindowVerdict, renderCorrection, stageOne, windowMessages, windowPurpose } from "./window.ts";
-import { TRAIL_BACKFILL_TASK, TRAIL_DIGEST_TASK, TRAIL_REPAIR_TASK, TRAIL_TITLE_TASK, TRAIL_UPDATE_TASK, trailBody } from "../trail/prompt.ts";
-import { TrailStore, trailFor } from "../trail/store.ts";
 
 /** The operation in its slice's current context. */
 export interface OperationState {
@@ -59,8 +57,7 @@ export interface OperationState {
 /** What clients show of it: what it is doing, and what the `.mom` file cannot say. */
 export interface MomStatus {
 	op?: { job: string; mode: string; startedAt: number; thinkingAt?: number; activity: string; target?: string | null; recovering?: boolean; section?: { section: number; of: number };
-		/** What this run is, in the widget's word: reading (new activity), titling, repairing or backfilling. Trail only. */
-		task?: string };
+		};
 	waitingForWorkers?: boolean;
 	deferredUntil?: number;
 	more?: boolean;
@@ -270,7 +267,7 @@ export async function begin(engine: Engine, api: Durable.ToolExecutionApi, ctx: 
 		bootstrapPolicy: settings.bootstrap === false ? undefined : settings.bootstrap ?? DEFAULT_BOOTSTRAP_POLICY,
 		advisor: settings.advisor?.url ? new SystemOneAdvisor(settings.advisor) : undefined,
 		changed: progress });
-	const relabel = start.kind === "request" && start.request.kind === "relabel";
+	const relabelRequested = start.kind === "request" && start.request.kind === "relabel";
 	// The decider every semantic gate asks. A configured-but-bad endpoint throws here: begin fails
 	// loudly rather than deriving from word lists.
 	const beverly = settings.classifier ? new Beverly(settings.classifier) : undefined;
@@ -338,27 +335,28 @@ export async function begin(engine: Engine, api: Durable.ToolExecutionApi, ctx: 
 	}
 	let review: CompactionReview | undefined;
 	try {
-		// The mode in force for this operation. The trail (docs/trail.md) keeps no graph, so the graph-only
+		// The mode in force for this operation. The trail is kept by its own watcher (src/trail/watcher.ts), never here.
 		// requests are refused here, as a recorded fault, before any preparation runs for them.
 		const mode = modeFor(settings.mapMode ?? mom.mode);
-		store.track = mode.name === "trail" ? "trail" : "graph"; // map records this operation writes belong to its mode's coverage track
+		if (mode.name === "trail") { await save({ status: "done" }); return done("Path's trail is kept by its watcher; nothing to do here."); }
+		store.track = "graph";
 		const rebuild = start.kind === "request" && start.request.kind === "rebuild";
-		if (mode.name === "trail" && rebuild) throw new Error("Path's trail has no work graph to rebuild; /path reindex indexes the trail again.");
+		const relabel = relabelRequested;
 		const reviewing = await continuity(mom, start, host(start.session), store, decider);
 		if (reviewing) mom = await open();
 		// An explicit update handles the pending evidence now; the post-compaction audit remains queued for background delivery.
-		// The trail audits no compaction: there is no map for a thread-map audit to reconcile against.
-		review = mode.name === "trail" || relabel || (start.kind === "request" && (start.request.kind === "update" || start.request.kind === "rebuild"))
+		review = relabel || (start.kind === "request" && (start.request.kind === "update" || start.request.kind === "rebuild"))
 			? undefined : compactionToReview(mom, reader, status);
 		await writeStatus(engine, api, ctx, current => { current.op = { job, mode: review ? "audit" : "update", startedAt: Date.now(), activity: "reading history" }; });
-		let prepared = await mom.prepare({ refresh: start.kind === "request" && start.request.kind !== "update" && !relabel, review, force: relabel && Boolean(mom.checkpoint || (mode.name === "trail" && mom.coverageCut)),
-			forceDigest: start.kind === "request" && start.request.kind === "rebuild", relabel, job, signal: ctx?.abortSignal });
+		const prepareOptions = { refresh: start.kind === "request" && start.request.kind !== "update" && !relabel, review,
+			force: relabel && Boolean(mom.checkpoint),
+			forceDigest: start.kind === "request" && start.request.kind === "rebuild", relabel, job, signal: ctx?.abortSignal };
+		let prepared = await mom.prepare(prepareOptions);
 		while (prepared.kind === "defer") {
 			await writeStatus(engine, api, ctx, current => { current.waitingForWorkers = mom.waitingForWorkers; current.deferredUntil = prepared.kind === "defer" ? prepared.until : undefined; });
 			await sleep(Math.max(250, Math.min(2000, prepared.until - Date.now())), ctx?.abortSignal);
 			lead?.refresh();
-			prepared = await mom.prepare({ refresh: start.kind === "request" && start.request.kind !== "update" && !relabel, review, force: relabel && Boolean(mom.checkpoint || (mode.name === "trail" && mom.coverageCut)),
-				forceDigest: start.kind === "request" && start.request.kind === "rebuild", relabel, job, signal: ctx?.abortSignal });
+			prepared = await mom.prepare(prepareOptions);
 		}
 		status.waitingForWorkers = false; status.deferredUntil = undefined;
 		status.unavailable = [...mom.feed.gaps.values()]; status.uncertainEffects = mom.feed.uncertainEffects();
@@ -370,16 +368,12 @@ export async function begin(engine: Engine, api: Durable.ToolExecutionApi, ctx: 
 			await save({ status: "done" }, current => { delete current.op; });
 			return done(prepared.reason);
 		}
-		// Historical catch-up is a chapter-chain thread-map operation. It deliberately uses the
-		// transaction finalizer for this operation, then returns to the saved frontier mode. v2 owns
-		// every write to its map, so it reconciles the digest itself; the trail owns digests and
-		// everything else, since it has no graph for commit_graph to write.
-		const operationMode = mode.name === "trail" ? mode : relabel || (prepared.batch.digest && mode !== V2_MODE) ? COMMIT_GRAPH_MODE : mode;
+		// Historical catch-up is a chapter-chain thread-map operation, under the transaction finalizer; v2 owns every
+		// write to its map, so it reconciles the digest itself.
+		const operationMode = relabel || (prepared.batch.digest && mode !== V2_MODE) ? COMMIT_GRAPH_MODE : mode;
 		prepared.header.mapMode = operationMode.name;
 		prepared.header.digest = Boolean(prepared.batch.digest);
 		prepared.header.relabel = relabel;
-		const repair = relabel && mode.name === "trail" && start.kind === "request" && start.request.kind === "relabel" && start.request.repair === true;
-		if (repair) prepared.header.repair = true;
 		const correction = prepared.batch.events.some(event => event.correction === true);
 		const specSkip = operationMode !== V2_MODE ? undefined
 			: start.kind !== "delivery" ? "not-delivery"
@@ -406,7 +400,7 @@ export async function begin(engine: Engine, api: Durable.ToolExecutionApi, ctx: 
 		}
 		if (read) prepared.header.spec = read.ops;
 		let body: Record<string, unknown> = { ...prepared.body, ...(prepared.guidance.trim() ? { guidance: prepared.guidance.trim() } : {}) };
-		if (relabel && operationMode.name !== "trail") body = { task: "Repair the saved work map. Give a decision only for the work that needs one: a concise, meaningful label to keep it, or retired with a short reason. An ID you leave out keeps its saved label. Path tracks only durable, multi-turn things — retire status questions, one-off meta questions, and instructions the next turn fully satisfied. Keep genuine multi-turn work even when phrased as a question. Never retire settled work or work holding unfinished work. The host preserves sources, structure, notes and obligations.",
+		if (relabel) body = { task: "Repair the saved work map. Give a decision only for the work that needs one: a concise, meaningful label to keep it, or retired with a short reason. An ID you leave out keeps its saved label. Path tracks only durable, multi-turn things — retire status questions, one-off meta questions, and instructions the next turn fully satisfied. Keep genuine multi-turn work even when phrased as a question. Never retire settled work or work holding unfinished work. The host preserves sources, structure, notes and obligations.",
 			work: mom.graph.nodes.filter(isEndeavor).map(node => ({ id: node.id, label: node.label, intent: node.intent, observed: node.observed, state: node.state })) };
 		else if (prepared.batch.digest) body.task = "Fast historical catch-up. This is a host-compressed thread-map digest, not raw evidence: reconcile it once and preserve cited sources.";
 		if (operationMode === V2_MODE) {
@@ -420,40 +414,20 @@ export async function begin(engine: Engine, api: Durable.ToolExecutionApi, ctx: 
 				recovery: prepared.body.recovery as Record<string, unknown> | undefined,
 				guidance: prepared.guidance });
 		}
-		if (operationMode.name === "trail") {
-			// The trail's own body: the evidence and what it already wrote (lines to reuse, ids to link),
-			// read from `session.trail` on the lead's current branch. Nothing of the graph vocabulary.
-			const trail = trailFor(await new TrailStore(() => start.session, reader.getSessionId()).load(), branchIds(reader));
-			body = trailBody({ repair, task: repair ? TRAIL_REPAIR_TASK : relabel ? TRAIL_TITLE_TASK : prepared.header.backfilling ? TRAIL_BACKFILL_TASK : prepared.batch.digest ? TRAIL_DIGEST_TASK : TRAIL_UPDATE_TASK,
-				newEvents: relabel ? "" : prepared.body.newEvents as string,
-				newUserDirections: prepared.body.newUserDirections as { ref: string; text?: string }[] | undefined,
-				trail, recovery: prepared.body.recovery as Record<string, unknown> | undefined, guidance: prepared.guidance });
-		}
 		status.operationTiming = mom.operationTiming;
 		status.more = prepared.header.more;
 		// v2: only a background batch the decision model can read is decided up front. An explicit
 		// request, a correction, a first map, catch-up, an audit, a retry and a recovery all skip the
 		// questions and go straight to its model, which then runs on structural checks alone.
-		// The trail has no work items to guess about, even when a graph checkpoint survives a mode switch.
-		const shadow = decider && prepared.kind === "work" && mom.checkpoint && read?.ops.length !== 0 && operationMode.name !== "trail" ? await shadowGuesses(decider.client, mom, prepared.batch.events) : undefined;
+		const shadow = decider && prepared.kind === "work" && mom.checkpoint && read?.ops.length !== 0 ? await shadowGuesses(decider.client, mom, prepared.batch.events) : undefined;
 		await save({ status: "open", job, header: prepared.header, childUsage: usage.total, baseUsage: mom.usage, ...(shadow ? { shadow } : {}),
 			// Recorded only when its model will run on it: the skip below logs its own `ran: false`, and
 			// one batch must produce exactly one line either way.
 			...(read?.ops.length ? { read: { ops: read.ops, chosen: read.chosen } } : {}) }, current => {
 			current.op = { job, mode: review ? "audit" : "update", startedAt: current.op?.startedAt ?? Date.now(), thinkingAt: Date.now(), activity: "thinking",
 				target: prepared.kind === "work" ? prepared.header.cut?.parent ?? null : null, recovering: mom.recovering,
-				...(operationMode.name === "trail" ? { task: repair ? "repairing" : relabel ? "titling" : prepared.header.backfilling ? "backfilling" : "reading" } : {}) };
+				};
 		});
-		// The trail: the decision model reads each user turn of the batch; when none steers the work (a status
-		// question, an acknowledgement, a correction of how the same task is done), nothing goes on the trail and
-		// its model is skipped. A batch with no user turn, a request, a retry or a recovery always runs.
-		if (operationMode.name === "trail" && beverly && !relabel && !prepared.header.retryGap && !mom.recovering
-			&& await routineBatch(beverly, prepared.batch.events, mom.feed.events)) {
-			await store.append("map", { base: null, cut: prepared.header.cut, failure: null,
-				...(prepared.header.backfill !== undefined ? { backfill: prepared.header.backfill } : {}) }, `${job}:map`);
-			await accepted(engine, api, ctx, prepared.header);
-			return done("Trail unchanged: the decision model found no steering in this batch. Evidence coverage saved.");
-		}
 		if (read && !read.ops.length) {
 			// The decision model read the batch and found nothing to record: save coverage, skip its model.
 			specLog(start.session, { job, ran: false, ops: [], chosen: read.chosen });
@@ -474,51 +448,6 @@ export async function begin(engine: Engine, api: Durable.ToolExecutionApi, ctx: 
 	}
 }
 
-/**
- * Asked of each user turn by the trail's gate: how much it steers, on ordered levels. A scale, not a yes/no: the
- * cutoff sits between "none" and "minor", so a turn the model is unsure about still runs the update.
- */
-const STEERS: DeciderQuestion = { type: "score",
-	instructions: "Judge the user's message in a coding session (the assistant's preceding words are context only). How much does it steer where the work goes?",
-	criteria: [
-		"None: asks about status, acknowledges, says go on or try again, or corrects how the assistant does the same task.",
-		"Minor: adds a detail or constraint to the task already under way.",
-		"Clear: makes or approves a choice, starts a new task, parks something for later, or finishes or drops something.",
-		"Major: sets a new goal, or turns to different work, or comes back to earlier work.",
-	] };
-/**
- * A batch is routine when every user turn scores below this (levels 0–3). Calibrated on a real session's 57 turns
- * with the preceding assistant words in the state: 0.9 skipped 4 of 27 routine turns and lost none of 30 steering
- * ones; 1.1 lost one. Without that context no cutoff separated them. Low on purpose: a missed turn loses a waypoint.
- */
-export const STEER_CUTOFF = 0.9;
-/** The assistant words a turn is judged against: "go", "proceed" approve whatever was just proposed. */
-const CONTEXT_CHARS = 800;
-
-/**
- * Whether a trail batch is routine: it has user turns and the decision model finds none that steers. Any failure
- * to ask counts as not routine, so the model runs.
- */
-export async function routineBatch(beverly: Beverly, events: readonly FeedEvent[], history: readonly FeedEvent[] = events): Promise<boolean> {
-	const users = events.filter(isUserDirection).filter(event => (event.text ?? "").trim());
-	if (!users.length) return false;
-	// Each turn with the lead's last words before it, from the whole feed: a batch usually starts at the turn.
-	const before = (turn: FeedEvent) => {
-		const at = history.findIndex(event => event.ref === turn.ref);
-		for (let i = (at < 0 ? history.length : at) - 1; i >= 0; i--) {
-			const event = history[i]!;
-			if (isUserDirection(event)) return "";
-			if (event.actor === "lead" && event.kind === "assistant" && event.text?.trim()) return event.text.trim().slice(-CONTEXT_CHARS);
-		}
-		return "";
-	};
-	const states = users.map(turn => `The assistant had just said: ${before(turn) || "(nothing)"}\n\nThe user then sent: ${turn.text!.trim().slice(0, 2000)}`);
-	try {
-		const scores = await Promise.all(states.map(state => beverly.answers(state, { steers: STEERS })
-			.then(answers => answers.steers?.type === "score" ? answers.steers.score : Infinity)));
-		return scores.every(score => score < STEER_CUTOFF);
-	} catch { return false; }
-}
 
 /**
  * The newest compaction after its coverage that has not been reviewed twice without success: its review

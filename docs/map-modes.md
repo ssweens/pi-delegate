@@ -74,11 +74,11 @@ inspection; a summary-only section establishes no new raw facts. Historical gaps
 audited merely because current evidence was reconciled. Recovery processes bounded prefixes and
 preserves the unattempted suffix and the coverage cursor.
 
-`/path rebuild` starts reconstruction in the background and returns to the editor immediately. Path's
+B on F3 Status in `/path` starts reconstruction in the background and returns to the editor immediately. Path's
 widget shows each pass, the current tool or model activity, streamed character count, elapsed time,
-and the rebuild's Oven slice URL. When complete, it prompts you to run `/path rebuild` again to open
+and the rebuild's Oven slice URL. When complete, it prompts you to press B on F3 Status again to open
 the review modal. The temporary slice retires when reconstruction ends, so its URL appears only
-while it is running. Normal Path's slice URL appears separately in the widget, `/path status`, and
+while it is running. Normal Path's slice URL appears separately in the widget and
 the Status tab. Rebuild activity stays live while the map view is held steady. Path copies the selected branch into a private, unfollowed Oven slice and reconstructs
 its map from bounded thread-map chapter digests, including a short, single-window history. Rebuild
 honors `--path-bootstrap-chapters` (default 24) and `--path-bootstrap-chars` (default 48000), rather
@@ -88,13 +88,13 @@ complete prefix in the private map and resumes from that evidence cut; it never 
 candidate tree; left at its root shows the current map, and right returns to the rebuild. Down past
 the last candidate item selects **Use rebuilt map**; Enter on that action replaces the
 saved graph. Escape discards the candidate without replacing the map. A failed rebuild appears in the
-widget; `/path rebuild` retries it. Changing sessions cancels an in-progress rebuild.
+widget; B on F3 Status retries it. Changing sessions cancels an in-progress rebuild.
 Incomplete/unreadable evidence or a changed branch or checkpoint blocks replacement. Accepted replacements append a new checkpoint based on the current one,
-so earlier maps remain in the sidecar and global settings are untouched. The command requires an
-interactive TUI and can run while background tracking is paused without resuming it; it does not
+so earlier maps remain in the sidecar and global settings are untouched. It requires an
+interactive TUI and can run while Path is off without turning it on; it does not
 create start/preview/apply subcommands.
 
-`/path relabel` repairs saved labels without consuming the live backlog. The model supplies IDs and
+Relabelling repairs saved labels without consuming the live backlog; no command starts it. The model supplies IDs and
 labels through `commit_labels`; the host applies them using the saved sources, and the decision
 model guards the rewrite — it refuses a label that describes the conversation rather than the work,
 and a replacement that names nothing in that work's intent. IDs, structure, evidence, notes, and

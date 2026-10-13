@@ -66,4 +66,5 @@ test("repair: drops leave the trail and links to them are cut; defects are named
 	assert.deepEqual([bad.copies, bad.strikes, bad.titles], [[], [], []]);
 	const user = { ...trail, entries: trail.entries!.map(w => w.id === "a" ? { ...w, by: "user" as const } : w) };
 	assert.match(planRepair(user, [{ id: "a", title: "Mine" }], i => `${i}`).defects[0]!, /marked by the user/);
+	assert.match(planRepair(trail, [{ id: "a", drop: "routine status update" }], i => `${i}`).defects[0]!, /a goal is never dropped/, "the goal the user set is never dropped");
 });

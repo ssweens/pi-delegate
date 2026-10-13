@@ -24,12 +24,11 @@ Those are answered by a trail with pointers, not a tree with states.
 ## Records
 
 Waypoints and strikes live in `session.trail` beside `session.jsonl` (same directory, same basename).
-One JSON record per line, append-only, written only by Path's Oven tools and the lead's `/path mark`
-and `/path strike` commands. Both writers take the file lock (same discipline as `.mom`).
+One JSON record per line, append-only, written only by Path's Oven tools, under the file lock (same discipline as `.mom`).
 
 ```ts
 interface Waypoint {
-  id: string;            // "<job>:w<n>" for model-written, "user:<uuid>" for /path mark
+  id: string;            // "<job>:w<n>"
   sessionId: string;
   at: number;            // ms epoch of the user turn it cites (else its first source); older records: when recorded
   kind: WaypointKind;
@@ -55,12 +54,8 @@ interface Retitle { id: string; sessionId: string; at: number; target: string; t
 The widget shows titles, never captions, as a task list. Path gives every item a `title` of two to five words
 naming the task or thing ("Convert Hop to Werkit", "Cross-runtime handoff plan", "OpenCode can't receive"), never a
 clipped sentence or filler ("Use an…", "Floated as…"). A record
-written before titles existed is titled later: its operation body lists up to 40 of them as `trail.untitled`
-(the ones the widget shows first), and `record_waypoints { titles: [{ id, title }] }` appends a `title` record per
-item. Once caught up, the client starts such a pass by itself (a trail-mode `relabel`: no evidence,
-`TRAIL_TITLE_TASK`, finished with `record_waypoints { waypoints: [], titles }`), and again while a pass titles
-something; a set it could not title is not asked for twice. By hand, `/path reindex` (the repair, below) titles
-as well; in trail mode `/path relabel` runs that repair. Nothing is rewritten: `trailFor` applies the latest title record to a waypoint that has no title of its own,
+written before titles existed is titled by a refresh (one is sent automatically when such records exist), whose
+revisions or `record_waypoints { titles: [{ id, title }] }` append a `title` record per item. Nothing is rewritten: `trailFor` applies the latest title record to a waypoint that has no title of its own,
 and a title naming an id the trail does not hold is dropped. Until then `label()` stands in: a `set_out`'s or
 `detour`'s line name, else the caption's first clause cut at a word near 30 characters.
 
@@ -83,7 +78,6 @@ The split is structural, never a judgment of captions, and never a count:
   The host files it as a step with `step: true` instead of rejecting the call.
 - Steps keep no links. A waypoint that `closes` an item filed as a step in the same call becomes a
   step too. A `supersedes` that names one is dropped.
-- A waypoint marked by the user (`/path mark`) is always a waypoint.
 - `trailFor` applies the kind rule on every read, so files written before the split sort the same way.
 
 Citing a user turn is necessary but not sufficient. The prompt also excludes corrections to *how* the
@@ -118,8 +112,8 @@ Rules the host enforces (structure only, never prose):
 
 ## Order
 
-The trail is ordered by transcript position, not file order. Path backfills older history after indexing
-the latest chapter, so older waypoints are appended to the file after newer ones. `trailFor(records, branch)`
+The trail is ordered by transcript position, not file order: revised copies, and trails written before the
+watcher read history oldest-first, put older entries after newer ones in the file. `trailFor(records, branch)`
 sorts waypoints, steps and struck entries (stably; ties keep file order) by position on the lead branch:
 
 1. the index of `anchor` on the branch;
@@ -127,7 +121,7 @@ sorts waypoints, steps and struck entries (stably; ties keep file order) by posi
 3. else (no anchor or ref on the branch, e.g. worker-only refs) the position of the record before it in the file.
 
 A `returned` without `closes` closes the innermost detour still open before it, because a live `returned`
-may be written before the detour it ends is backfilled, so its explicit link can be missing. An explicit
+may have been written before the detour it ends, so its explicit link can be missing. An explicit
 `closes` always wins. One helper, `detourWalk` in projection.ts, decides this for every projection and the
 detail view.
 
@@ -156,7 +150,7 @@ All pure functions of `Waypoint[]` (branch-scoped, strikes applied). No model ca
   `returned`, or a step that closes a parked item), which reads as the thing it finished: a `returned` as its
   detour, a `closed` as its open item. Four symbols: ◎ goal, ↳ detour, □ to do, ✓ done. A fresh session is one row.
   The header is "Path" with Path's state beside it (a spinner and a stage word while it works, repainted on its own
-  clock; `✓ age` when current). Slice links live in `/path detail` and F3 Status. The compact row is
+  clock; `✓ age` when current). Slice links live in F3 Status. The compact row is
   `◎ goal › ↳ detour …` plus `□N`.
 - The Trail tab (F2) lists every waypoint and step oldest first with the same hierarchy: goals are headings at
   depth 0, everything under a goal one in plus its detour depth, a step one deeper than the waypoints around it.
@@ -181,66 +175,30 @@ Last: <HH:MM> <kind> <caption> [src:…]
 Read more with the path tool: trail {line, query, before, open, evolution}.
 ```
 
-## The model's operation (Oven side)
+## The watcher
 
-Trail mode reuses Path's operation: `mom_begin` stages the batch (live increment, catch-up digest,
-retry range) exactly as today. The body it returns in trail mode is:
+The trail is kept by a watcher (`src/trail/watcher.ts`): a model that follows the lead's session file and keeps
+its own running memory of the session. Nothing is re-sent to it.
 
-```ts
-interface TrailBody {
-  task: string;                       // TRAIL_UPDATE_TASK or TRAIL_DIGEST_TASK
-  newEvents: string;                  // chapter-grouped rendering or the catch-up digest
-  newUserDirections?: { ref: string; text?: string }[];
-  trail: {                            // what Path already wrote, so it can link to it
-    lines: { name: string; status: string; goal?: string }[];
-    recent: { id: string; kind: string; line: string; title?: string; caption: string }[];  // last ≤ 40, oldest first
-    open: { id: string; line: string; title?: string; caption: string }[];                  // unclosed open/detour
-    untitled?: { id: string; kind: string; line: string; caption: string }[];              // ≤ 40 to title (see Titles)
-  };
-  recovery?: Record<string, unknown>;
-}
-```
+- **When it reads.** New entries reach it when an assistant turn ends, and when the user writes a message sent
+  within `--path-user-window-ms` (default 120000) of now. A message read from history waits for the next turn
+  end, so a backlog is not one run per old message. A compaction or an Esc goes at once; mid-turn tool work waits at
+  most `--path-max-wait-ms`. A long backlog arrives in pieces of 200 entries, oldest first.
+- **What it reads.** Each batch exactly as delivered: `New entries in the followed Pi session …` and one line per
+  entry, `<entry id> <role>: <start of its text>`. Every batch joins its memory; when that grows long it is
+  summarized like any conversation.
+- **How it answers.** One `record_waypoints` call per batch, and nothing else: no handshake, no other tools.
+  `record_waypoints { waypoints: [] }` means nothing worth finding again happened. It cites entry ids as delivered
+  (`3016e383`); the host records them as full refs. A saved call ends its turn; a refused one lists every defect
+  and the watcher calls again.
+- **Where it starts.** A new watcher resumes after the last entry the trail covers (its old coverage cursor, or the
+  newest entry a trail record points at), and is briefed with the trail as its first message.
 
-The finalizer is `record_waypoints { waypoints: [...], titles?: [...] }` where each waypoint item is a Waypoint without
-`id`, `sessionId`, `at`, `parent`, `by`. `record_waypoints { waypoints: [] }` means nothing worth
-finding again happened; the host still advances evidence coverage.
-
-Acceptance writes each waypoint to `.trail` with id `<job>:w<n>` (idempotent on retry), then appends
-the coverage cursor to `.mom` (`{ base: checkpointId ?? null, cut, failure: null }`), which is the
-existing "coverage without a new map" record. Path's open/prepare/retry/digest paths are unchanged.
-
-Trail mode skips: the decision model and spec (v2 only), compaction thread-map audits, the
-continuity window, the graph relabel (`/path relabel` runs the repair instead), and rebuild (refused with a clear
-error).
-
-## Catch-up: live first, history behind
-
-A session Path has not indexed (an existing session, or one switched from a graph mode) is caught up
-live first, so the widget shows where the session is now after one quick call:
-
-1. **Live first.** When an operation's uncovered backlog is larger than one capture window and spans a
-   compaction, the feed drains locally, with no model call, to the start of the latest chapter. That
-   operation indexes only the latest chapter (as a digest when it is large). Its acceptance writes the
-   coverage cursor and a `backfill` range `{ id, next, through }`: the lead entries from `next` up to
-   `through` (the latest chapter's compaction) still to index. Both go in one `.mom` record on the trail
-   track.
-2. **Backfill while idle.** Live evidence always goes first. When there is none and a backfill range
-   remains, an operation indexes the oldest stretch: up to the next compaction or
-   `BACKFILL_USER_TURNS` (12) user turns, as a chapter digest with the `TRAIL_BACKFILL_TASK`. Each
-   operation saves on its own and advances `next`, so a restart loses at most one stretch. A stretch
-   with no user turn holds no waypoint and is passed over without a model call. `more` stays true
-   while a range remains, so the lead's client starts the next operation as soon as Path is idle.
-3. **Never wedged.** A backfill stretch its model cannot index is passed over (the range advances) and
-   the error is recorded in usage; a provider failure retries the same stretch.
-4. **Order.** Backfilled waypoints are written after newer ones; the trail sorts by transcript position
-   (see Order), and a `returned` written before its backfilled detour still closes it.
-5. **No repeats.** Re-indexing history never writes a moment twice: an item of the same kind citing a
-   source the trail already holds is that entry, and links to it are redirected.
-
-Trail operations get `record_waypoints` and `inspect_evidence` only, no history search: a small model
-given one fishes with it instead of reading the evidence in front of it. `inspect_evidence` on a
-waypoint id (bare or `node:<id>`) returns the saved entry; an unknown reference is an error result for
-the model to correct, never a failed operation.
+`src/trail/record.ts` checks each answer against the session and the trail as they are (every ref is an entry on
+the current branch; links name known entries of the right kind) and appends it to `.trail`: waypoints and steps
+(`<job>:w<n>`), titles (`:t<n>`), revised copies (`:r<n>`) and strikes (`:s<n>`), where the job names the tool call,
+so a replayed call writes nothing twice. An item of the same kind citing a source the trail already holds is that
+entry, never a repeat. Its result names the ids it saved, so the watcher can link to them later.
 
 ## Prompt (TRAIL_PROMPT, abridged)
 
@@ -255,77 +213,38 @@ exactly as supplied.
 ## Lead surfaces
 
 - `path` tool gains `trail: { line?, query?, before?, open?, evolution?, limit? }` returning projection text.
-- `/path trail [query]`, `/path before`, `/path open`, `/path evolution`.
-- `/path mark <kind> <caption>` appends a user waypoint citing the latest lead entry on the branch.
-- `/path strike <waypoint-id> [reason]`.
-- `/path reindex` — repair the trail from its own entries in one operation (see Repair). Seconds to a minute.
-- `/path reindex full` — index the branch's trail again from the start by re-reading the transcript: every entry Path
-  wrote is struck (records stay; the user's marks are kept), and a trail-track coverage record restarts from
-  `{ parent: null, workers: [] }` with skipped ranges retired. The next update catches up live first and backfills
-  behind it; struck entries are off the trail, so nothing aliases to them. One model call per chapter or twelve user
-  turns: slow on a long session. Refused while Path is updating or paused; the repair instead waits behind a run
-  in progress.
 
-### Commands that start a run
+The user's commands are `/path` (the view: F1 Overview, F2 Trail, F3 Status, F4 Settings), `/path on`, `/path off`,
+`/path refresh` and `/path settings`. Path alone keeps the trail; the lead reads it with the tool.
 
-`/path refresh` catches up on new activity now (and retries a failed run); `/path reindex` fixes the entries
-already on the trail. Each says at once that it started, or which run it is queued behind, and reports how its run
-ended: the entries it added, or the failure. While a run is going the widget's spinner names it (`reading`,
-`titling`, `repairing` or `backfilling`, from the status op's `task`) and, past a minute, how long it has run.
+### Refresh
 
-### Repair
+`/path refresh` (or R in the view) sends the watcher one message: `TRAIL_REFRESH_TASK` with the trail as it stands
+below it, one JSON line per entry (id, kind, line, title, caption, links, step flag; a set_out, detour or reframed
+also carries `said`, the user's words that started it). It answers with one `record_waypoints { waypoints: [],
+revise: [...] }` call: per entry that needs a change, a `title`, `kind`, `from`, `closes` (null removes a link) or a
+`drop` with a reason. The command says at once that it started and reports how it ended. A trail with untitled
+entries gets the same refresh once, automatically.
 
-A trail relabel with `repair: true` (TRAIL_REPAIR_TASK). Its body shows `trail.entries`, the whole trail (newest
-200) with kinds, links and step flags, and no evidence. Path answers `record_waypoints { waypoints: [], revise }`,
-one revision per entry that needs a change: `title`, `kind`, `from`, `closes` (null removes a link) or `drop` with a
-reason. `revise` is refused in any other operation. `planRepair` (src/trail/repair.ts) turns it into records: a
-title alone is a title record; any other change strikes the entry and appends a revised copy (`<job>:r<n>`, same
-refs, anchor and time, so it keeps its place); an entry linking to a copy is copied too with the link moved; a drop
-is a strike. User-marked entries are never revised. Links are checked as in an update (a `returned` closes a
-detour; a `closed` or `dead_end` an open).
+`planRepair` (src/trail/repair.ts) turns revisions into records: a title alone is a title record; any other change
+strikes the entry and appends a revised copy (same refs, anchor and time, so it keeps its place); an entry linking to
+a copy is copied too with the link moved; a drop is a strike. Entries a user marked are never revised.
 
-### The steering gate
-
-With a decision model configured (`decider`), each trail batch's user turns are read by it first, as a System One
-score question (ordered levels, answered as the expected level): how much does this message steer the work? None
-(status, acknowledgement, go on, a correction of how the same task is done), minor (a detail of the task under way),
-clear (a choice, a new task, parking or finishing something), major (a new goal, other work, a return). Each turn is
-judged with the lead's last words before it in the state ("go" and "proceed" approve whatever was just proposed).
-When every turn scores below `STEER_CUTOFF` (0.9), the batch is routine. The cutoff is calibrated on a real
-session's 57 turns: 0.9 skipped 4 of 27 routine turns and lost none of 30 steering ones; without the assistant
-context no cutoff separated them. A kind choice per turn was tried as a hint for the update model and agreed with
-the recorded kinds on 23 of 57 turns: too often wrong to hint with, so it is not used. When the gate skips a batch, its coverage (and backfill
-progress) is saved and the update model is not called. A batch with no user turn, a request, a retry or a recovery
-always runs; a decision model that cannot answer counts as not routine.
+While the watcher works, the widget's spinner says `reading` or `refreshing` and, past a minute, for how long.
 
 - Path panel: a **Trail** tab (F2 replaces the Map tab in trail mode) with the standing view on top and the chronological trail below; Steps are listed there too, dimmed and one level deeper. Enter on any entry opens its first ref (existing source reader).
 - Widget: in trail mode the Path section shows the first lines of `renderStanding`.
 
 ## Implementation notes
 
-- **Coverage lives in `.mom`, not `.trail`.** Accepting a trail operation appends the existing
-  "coverage without a new map" record (`{ base: null, cut, failure: null, trail: true }`), which
-  `loadState` accepts with no checkpoint. Each mode family has its own coverage track: in trail mode
-  `loadState` ignores the coverage of unmarked (graph) records, so a session switched from a graph
-  mode indexes its whole history into the trail (bootstrap digest), and switching back leaves the
-  graph's coverage as it was. Records written before the marker (no snapshots, unmarked cursors)
-  count for the trail.
-- **Retry idempotency.** Waypoint ids are `<job>:w<n>`; the store returns an existing id unchanged,
-  so a retried job after a crash between the waypoint and coverage writes records nothing twice.
-- **Ref repair.** A near-miss ref is canonicalized with `sourceSuggestion` before validation; the
-  repairs are reported after "Trail saved." in the tool result rather than in a record.
 - **Standing after compaction.** The standing's key includes the latest compaction entry on the
   branch, and only messages after it count as delivered, so the lead gets the standing again once a
   compaction has dropped it.
-- **`/path mark`** cites the latest lead entry on the branch that is evidence (not one of Path's own
-  hidden `pi-tether.*` messages) and lands on the current line unless a line is named.
 - **Line status precedence** is dead_end > returned > landed > open > quiet, judged on the latest
   non-superseded waypoint of the line. `landing()` matches line names first and falls back to
   captions only when no line matches.
-- **In trail mode Path skips** the decision model and spec, compaction thread-map audits, the
-  continuity window, and the process-health advisor; `/path relabel` runs the repair and `/path rebuild`
-  is refused with a clear error. The post-compaction anchor is still queued but records "skipped" since there
-  is no map; the standing covers that case.
+- **Map modes are separate.** Path's map modes (commit_graph, v2) keep their own operation (`mom_begin`,
+  `src/mom/engine.ts`); the trail uses none of it.
 
 ## Switching a session to the trail
 
@@ -333,10 +252,9 @@ always runs; a decision model that cannot answer counts as not routine.
 2. Oven caches extension modules, so after installing this version restart it once:
    `node ../oven/bin/oven.mjs stop && node ../oven/bin/oven.mjs start`. Until then the client
    reports "mode trail requires missing tool record_waypoints".
-3. On a session with history, the first operation is a cold catch-up over the chapter digest and
-   writes the opening waypoints; live increments follow per settled turn.
-4. Read it with `/path trail`, `/path before`, `/path open`, `/path evolution`, or the `path` tool's
-   `trail` option; the panel's F2 tab becomes **Trail**.
+3. On a session with history, the watcher reads it from the start in pieces of 200 entries, then follows
+   each turn.
+4. Read it with the `path` tool's `trail` option; the panel's F2 tab becomes **Trail**.
 
 ## Files
 

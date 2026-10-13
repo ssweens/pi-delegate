@@ -69,16 +69,6 @@ export function momModelSelector(ctx: ExtensionContext, tui: unknown, current: s
 	return modelSelector(ctx, tui, configuredMomModel(ctx, current, fallback), scopedModels(ctx), onDone);
 }
 
-/**
- * Open Pi's model selector for Path as its own overlay (the `/path model` command). Returns
- * `provider/id`, or undefined when cancelled. The pick is written to Path's durable `model` control
- * by the caller, never to Pi's settings.
- */
-export async function pickMomModel(ctx: ExtensionContext, current: string | null | undefined, fallback: string): Promise<string | undefined> {
-	return ctx.ui.custom<string | undefined>((tui, _theme, _keybindings, done) =>
-		momModelSelector(ctx, tui, current, fallback, done) as never);
-}
-
 /** Classifier models Pi knows — the decision models a decider may be. Mirrors yono's
  *  registryClassifierModels(): the registry's classifier catalog, which includes what
  *  pi-dynamic-models registers (models whose output modality is `decisions`). Path's direct client

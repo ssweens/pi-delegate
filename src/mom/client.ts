@@ -23,14 +23,15 @@ import { ANCHOR } from "./anchor.ts";
 import { WINDOW_CORRECTION } from "./window.ts";
 import { projectWork, type WorkProjection } from "../work/projection.ts";
 import { acceptRebuiltMap, rebuildMap, type RebuiltMap } from "./rebuild.ts";
-import { emptyTrail, trailEntries, type Strike, type Trail, type Waypoint, type WaypointKind } from "../trail/types.ts";
+import { emptyTrail, trailEntries, type Trail } from "../trail/types.ts";
 import { TrailStore, trailFor } from "../trail/store.ts";
-import { beforeLastDetour, evolution, glance, landing, openItems, renderBefore, renderEvolution, renderLanding, renderOpen, renderStanding, renderTrail, untitledEntries, whereWeAre } from "../trail/projection.ts";
-import { UNTITLED_PER_CALL } from "../trail/prompt.ts";
+import { beforeLastDetour, evolution, glance, landing, openItems, renderBefore, renderEvolution, renderLanding, renderOpen, renderStanding, renderTrail, untitledEntries } from "../trail/projection.ts";
+import { TRAIL_REFRESH_TASK, UNTITLED_PER_CALL } from "../trail/prompt.ts";
+import { trailBriefing } from "../trail/record.ts";
+import { parseRef } from "../util/ref.ts";
 import { plainTrailRows } from "../ui/trail-view.ts";
 import { clockTime, formatDuration } from "../util/format.ts";
-import { makeRef } from "../util/ref.ts";
-import { errorMessage, flatten } from "../util/text.ts";
+import { errorMessage } from "../util/text.ts";
 
 /** Path's slice in oven, as the Status tab shows it. */
 export interface SliceHost { pid: number; slice: string; state: string; startedAt: number; sampledAt: number }
@@ -48,16 +49,12 @@ export interface Snapshot {
 export type ControlChange = { enabled: boolean } | { inject: boolean } | { hush: boolean } | { nudgedClasses: ProcessRiskClass[] } | { mode: string } | { model: string } | { decider: string };
 export type Command =
 	| { kind: "refresh" }
-	| { kind: "relabel" }
 	| { kind: "graph"; options: { nodes?: string[]; depth?: number; checkpoint?: string } }
 	| { kind: "source"; ref: string; offset?: number; limit?: number }
-	| { kind: "log" } | { kind: "controls"; change: ControlChange }
+	| { kind: "controls"; change: ControlChange }
 	| { kind: "finding"; action: FindingRequest; finding: string }
 	| { kind: "status" }
-	| { kind: "trail"; options: TrailOptions }
-	| { kind: "mark"; waypoint: { kind: WaypointKind; caption: string; line?: string } }
-	| { kind: "strike"; target: string; reason?: string }
-	| { kind: "reindex"; full?: boolean };
+	| { kind: "trail"; options: TrailOptions };
 export interface TrailOptions { line?: string; query?: string; before?: boolean; open?: boolean; evolution?: boolean; limit?: number }
 export interface Publication { customType: string; content: string; details: { key: string } }
 /** The hidden message carrying Path's standing (where we are on the trail) into the lead's context. */
@@ -121,6 +118,9 @@ export class MomClient {
 	#trail?: Trail;
 	#trailSkipped = 0;
 	#trailError?: string;
+	/** Trail: when its watcher started its current turn, and whether that turn is a refresh. */
+	#runningSince?: number;
+	#refreshing = false;
 
 	constructor(private context: ExtensionContext, private readonly options: {
 		flags: Record<string, string | boolean | undefined>; changed(): void; publish(message: Publication): void;
@@ -164,7 +164,14 @@ export class MomClient {
 			this.#warnedDecider = decider.ref;
 			this.options.notify(`Path's decision model ${decider.ref} is not available: Pi has no local System One classifier by that name. Path runs without it: v2 sends every update to its model. Choose another in /path settings.`, "warning");
 		}
-		const create = { key: this.key, cwd: this.identity.cwd, copy: "none", config: momConfiguration(this.identity, flags, this.context.modelRegistry) };
+		// The trail's watcher resumes after the last entry the trail covers, and is briefed with the trail when it is made.
+		const trail = String(flags["mom-mode"] ?? "") === TRAIL_MODE;
+		// The watcher is a different slice from a map mode's: its own key, and the other one stops so only one follows.
+		const key = this.sliceKey(trail);
+		await this.stopSlice(this.sliceKey(!trail));
+		const create = { key, cwd: this.identity.cwd, copy: "none",
+			config: momConfiguration(this.identity, flags, this.context.modelRegistry, trail ? { after: this.coveredThrough() } : {}),
+			...(trail ? { task: `Path trail watcher\n${await trailBriefing(this.identity.sessionFile)}` } : {}) };
 		let slice = await oven("create", create);
 		// It is nearly always running, so a changed model or mode would never land: end its current operation,
 		// configure the now idle slice, and have it pick the work up again.
@@ -177,7 +184,7 @@ export class MomClient {
 		assertSliceSupportsMode(String(flags["mom-mode"] ?? ""), slice.missingTools ?? []);
 		this.slice = slice;
 		this.sliceUrl = ovenSliceUrl(slice.id);
-		if (stale) await this.send({ kind: "refresh" });
+		if (stale && !trail) await this.send({ kind: "refresh" });
 		this.error = undefined;
 		this.options.changed();
 	}
@@ -205,6 +212,10 @@ export class MomClient {
 	private event(event: any): void {
 		if (this.#closed) return;
 		this.error = undefined;
+		if (event.slice) {
+			if (event.slice.state === "running") this.#runningSince ??= Date.now();
+			else { this.#runningSince = undefined; this.#refreshing = false; }
+		}
 		if (event.type === "snapshot") {
 			this.slice = event.slice;
 			if (event.docs?.[STATUS_DOC]) this.status = event.docs[STATUS_DOC];
@@ -262,13 +273,13 @@ export class MomClient {
 		const failure = this.slice?.stage === "failed" && this.slice?.conversation ? `${this.slice.id}:${this.slice.detail}` : undefined;
 		if (failure && failure !== this.#notifiedFailure && this.state?.enabled !== false) {
 			this.#notifiedFailure = failure;
-			this.options.notify(`Path needs you: ${updateErrorSummary(this.slice.detail ?? "")} It retried ${this.slice.retryDelays?.length ?? 3} times. /path refresh tries again; /path detail has the full error.`, "warning");
+			this.options.notify(`Path needs you: ${updateErrorSummary(this.slice.detail ?? "")} It retried ${this.slice.retryDelays?.length ?? 3} times. /path refresh tries again; open /path for the full error.`, "warning");
 		}
 		// Records it could not read are skipped, not fatal; say so once for each new count.
 		const skipped = this.state?.skipped?.length ?? 0;
 		if (skipped > this.#notifiedSkipped) {
 			this.#notifiedSkipped = skipped;
-			this.options.notify(`Path skipped ${skipped} unreadable record${skipped === 1 ? "" : "s"} in its saved notes and carried on from the last good map. /path detail lists them.`, "warning");
+			this.options.notify(`Path skipped ${skipped} unreadable record${skipped === 1 ? "" : "s"} in its saved notes and carried on from the last good map. open /path to see them.`, "warning");
 		}
 		// A model whose notes keep being rejected needs the user too (once, until a map is accepted).
 		if (!this.rejecting) this.#notifiedRejection = false;
@@ -288,14 +299,15 @@ export class MomClient {
 	#titled?: string;
 
 	private drain(): void {
+		// The trail's watcher follows the session itself: the client never starts its runs.
+		if (this.trailMode) { this.retitle(); return; }
 		if (this.#closed || this.#draining || !this.state || !this.slice || this.busy || this.paused || this.retrying || this.needsYou || this.rejecting || this.problem()) return;
 		if (this.slice.state !== "idle" || this.slice.stage !== "idle") return;
 		// A round that failed is not repeated at once: new activity, its retries or /path refresh go on from there.
 		if (this.status?.lastError) return;
 		const more = Boolean(this.status?.more), ranges = this.state.gaps.length > 0;
-		if (!more && !ranges) { this.#drained = undefined; this.retitle(); return; }
-		// Trail coverage and backfill progress count too: each backfill operation moves `backfill.next`, not the cut.
-		const progress = `${(this.state.coverageCut ?? this.state.checkpoint?.cut)?.parent}|${this.state.backfill?.next ?? ""}|${this.state.gaps.map(gap => gap.id).join(",")}|${this.status?.more}`;
+		if (!more && !ranges) { this.#drained = undefined; return; }
+		const progress = `${(this.state.coverageCut ?? this.state.checkpoint?.cut)?.parent}|${this.state.gaps.map(gap => gap.id).join(",")}|${this.status?.more}`;
 		if (progress === this.#drained) return;
 		this.#drained = progress;
 		this.#draining = true;
@@ -307,15 +319,32 @@ export class MomClient {
 	}
 
 	/**
-	 * Caught up, the trail's entries without a title (recorded before titles existed) get a titling pass, the ones
-	 * the widget shows first. A pass that titles nothing leaves the same set, which is never asked for again.
+	 * Caught up, the trail's entries without a title (recorded before titles existed) get a refresh, which titles the
+	 * ones the widget shows first. One that titles nothing leaves the same set, which is never asked for again.
 	 */
 	private retitle(): void {
-		if (!this.trailMode || !this.state?.coverageCut || !this.#trail || this.status?.lastError) return;
+		if (!this.#trail || !this.slice || this.busy || this.paused || this.needsYou) return;
 		const untitled = untitledEntries(this.#trail).slice(0, UNTITLED_PER_CALL).map(entry => entry.id).join(",");
 		if (!untitled || untitled === this.#titled) return;
 		this.#titled = untitled;
-		this.send({ kind: "relabel" }).catch(error => { this.error = errorMessage(error); this.options.changed(); });
+		this.refreshTrail().catch(error => { this.error = errorMessage(error); this.options.changed(); });
+	}
+
+	/** Ask the trail's watcher to revise the trail: one message, the trail as it stands below it. */
+	private async refreshTrail(): Promise<void> {
+		if (!this.slice) await this.ensure();
+		if (!this.slice) throw new Error("Path is off.");
+		this.#refreshing = true;
+		this.slice = await oven("send", { slice: this.slice.id, text: `${TRAIL_REFRESH_TASK}\n\n${await trailBriefing(this.identity.sessionFile)}`, requestId: randomUUID() });
+		this.options.changed();
+	}
+
+	/** The last lead entry the trail covers: its old coverage cursor, or the newest entry a trail record points at. */
+	private coveredThrough(): string | undefined {
+		const order = new Map(this.branch().map((entry, index) => [entry.id, index]));
+		const cited = trailEntries(this.#trail ?? emptyTrail()).flatMap(entry => [entry.anchor, ...entry.refs.map(ref => parseRef(ref)?.entryId)]);
+		const candidates = [this.state?.coverageCut?.parent, ...cited].filter((id): id is string => typeof id === "string" && order.has(id));
+		return candidates.sort((a, b) => order.get(b)! - order.get(a)!)[0];
 	}
 
 	/** Its continuity corrections reach the lead once each, as before. */
@@ -330,14 +359,19 @@ export class MomClient {
 		}
 	}
 
-	private get busy(): boolean { return Boolean(this.slice && this.slice.state === "running" && this.status?.op); }
+	private get busy(): boolean { return Boolean(this.slice && this.slice.state === "running" && (this.trailMode || this.status?.op)); }
+	/** What it is doing now: its status document's operation, or for the trail's watcher, its turn. */
+	private get op(): { startedAt: number; task?: string; activity?: string } | undefined {
+		if (!this.busy) return undefined;
+		return this.trailMode ? { startedAt: this.#runningSince ?? Date.now(), task: this.#refreshing ? "refreshing" : "reading" } : this.status!.op!;
+	}
 	private get paused(): boolean { return Boolean(this.slice?.stopped) || this.state?.enabled === false; }
 	private get retrying(): boolean { return this.slice?.stage === "retrying" && Boolean(this.slice?.retry); }
 	private get needsYou(): boolean { return Boolean(this.#openingError || this.status?.openingError || (this.slice?.stage === "failed" && this.slice?.conversation)); }
 	private get rejecting(): boolean { return (this.status?.rejectedStreak ?? 0) >= 3 && !this.busy; }
-	private rejectionText() { return `Path's model produced notes it had to reject for ${this.status?.rejectedStreak} history ranges in a row: ${updateErrorSummary(this.status?.lastRejection ?? "")} Check --path-model; /path detail has the full error.`; }
+	private rejectionText() { return `Path's model produced notes it had to reject for ${this.status?.rejectedStreak} history ranges in a row: ${updateErrorSummary(this.status?.lastRejection ?? "")} Check --path-model; open /path for the full error.`; }
 	/** How the slice's last run ended: its error, or undefined when it succeeded. Read after `settle`. */
-	get runError(): string | undefined { return this.status?.lastError; }
+	get runError(): string | undefined { return this.trailMode ? (this.slice?.stage === "failed" ? this.slice.detail : undefined) : this.status?.lastError; }
 	private problem(): string | undefined {
 		return this.#openingError ?? this.status?.openingError ?? this.status?.blocked ?? (["failed", "retrying"].includes(this.slice?.stage) && this.slice?.conversation ? this.slice.detail : undefined)
 			?? this.state?.error ?? this.state?.failure?.error;
@@ -346,8 +380,9 @@ export class MomClient {
 	private coverage() { return coverageProgress(this.branch(), this.state?.coverageCut?.parent ?? this.state?.checkpoint?.cut.parent ?? null); }
 	/** Its coverage reaches the last lead entry it reads (its own hints and bookkeeping don't count). */
 	private complete(): boolean {
-		// The trail has no checkpoint: its coverage cursor alone says what it has read.
-		if (!this.state || (!this.state.checkpoint && !this.trailMode) || this.busy || this.problem() || this.state.gaps.length || this.state.failure || this.status?.more) return false;
+		// The trail's watcher is up to date when it is idle with nothing waiting.
+		if (this.trailMode) return Boolean(this.state) && !this.busy && !this.problem() && !this.slice?.followed?.waiting && !this.slice?.followed?.draining;
+		if (!this.state || !this.state.checkpoint || this.busy || this.problem() || this.state.gaps.length || this.state.failure || this.status?.more) return false;
 		const branch = this.branch(), cut = this.state.coverageCut?.parent ?? this.state.checkpoint?.cut.parent ?? null;
 		const at = cut === null ? -1 : branch.findIndex(entry => entry.id === cut);
 		if (cut !== null && at < 0) return false;
@@ -364,17 +399,20 @@ export class MomClient {
 	private activity(): string {
 		if (!this.busy) return "idle";
 		if (this.#saving) return "saving";
-		return this.status?.op?.activity ?? "thinking";
+		return this.op?.activity ?? "thinking";
 	}
 
 	view(explicit: boolean, elapsed = true): PanelView {
 		if (this.error && !this.state) return { status: "reconnecting", summary: WAITING_FOR_VIEW, error: updateErrorSummary(this.error) };
 		if (!this.state) return { status: this.#openingError ? "needs you" : "connecting", summary: WAITING_FOR_VIEW,
-			...(this.#openingError ? { error: `Path couldn't open its saved notes: ${updateErrorSummary(this.#openingError)} /path detail has the full error.` } : {}) };
+			...(this.#openingError ? { error: `Path couldn't open its saved notes: ${updateErrorSummary(this.#openingError)} open /path for the full error.` } : {}) };
 		const state = this.state, reason = this.problem(), done = this.complete();
 		const progress = done || state.gaps.length ? undefined : this.coverage();
 		let status: string;
-		if (this.busy) {
+		if (this.busy && this.trailMode) {
+			status = this.op!.task!;
+			if (elapsed) status += ` ${formatDuration(Date.now() - this.op!.startedAt)}`;
+		} else if (this.busy) {
 			const op = this.status!.op!, target = op.target !== undefined ? coverageProgress(this.branch(), op.target ?? null) : undefined;
 			const toward = progress && target && target.percent > progress.percent ? ` → ${target.percent}%` : "";
 			const reviewing = !explicit ? "" : op.recovering ? " · reviewing earlier activity" : state.gaps.length ? " · earlier activity pending" : "";
@@ -401,15 +439,15 @@ export class MomClient {
 		return { status, complete: done, compact: false, work, summary: trail ? plainTrailRows(trail.glance).join("\n") : summaryText(work), coverage: progress, sliceUrl: this.sliceUrl,
 			...(trail ? { trail } : {}), note: showFinding ? finding.text : undefined, noteTag: finding?.riskClass === "worth_considering" ? "Worth considering" : "Heads up",
 			error: this.busy ? undefined : this.error ? updateErrorSummary(this.error) : this.rejecting && !this.needsYou ? this.rejectionText() : !reason ? undefined
-				: this.#openingError || this.status?.openingError ? `Path couldn't open its saved notes: ${updateErrorSummary(reason)} /path detail has the full error.`
-					: this.needsYou ? `${updateErrorSummary(reason)} Retried ${this.slice?.retryDelays?.length ?? 3} times. /path refresh tries again; /path detail has the full error.`
+				: this.#openingError || this.status?.openingError ? `Path couldn't open its saved notes: ${updateErrorSummary(reason)} open /path for the full error.`
+					: this.needsYou ? `${updateErrorSummary(reason)} Retried ${this.slice?.retryDelays?.length ?? 3} times. /path refresh tries again; open /path for the full error.`
 						: `Last attempt: ${updateErrorSummary(reason)}` };
 	}
 
 	/** The widget's and panel's trail block: where we are at a glance, and what Path is doing when it is busy. */
 	private trailView(): NonNullable<PanelView["trail"]> {
 		const trail = this.#trail ?? emptyTrail();
-		const op = this.busy ? this.status!.op! : undefined;
+		const op = this.op;
 		return { glance: glance(trail), count: trail.waypoints.length, ...(op ? { stage: this.activity(), since: op.startedAt, ...(op.task ? { task: op.task } : {}) } : {}) };
 	}
 
@@ -467,7 +505,7 @@ export class MomClient {
 		const anchor = state.reservedAnchor && controls.enabled && state.inject && !this.hush ? { key: state.reservedAnchor.key, content: state.reservedAnchor.content, at: state.reservedAnchor.at } : undefined;
 		return { passive: this.view(false), explicit: this.view(true), diagnostics: this.diagnostics(), usage: structuredClone(state.usage ?? emptyUsage()), controls,
 			...(this.#work ? { work: structuredClone(this.#work) } : {}),
-			...(this.busy ? { startedAt: this.status!.op!.startedAt } : {}), ...(anchor ? { preparedAnchor: anchor } : {}),
+			...(this.op ? { startedAt: this.op.startedAt } : {}), ...(anchor ? { preparedAnchor: anchor } : {}),
 			telemetry: { model: this.slice?.model ?? String(this.options.flags["mom-model"] ?? ""), activity: this.activity(),
 				...(state.checkpoint ? { lastSavedAt: state.checkpoint.at } : this.trailMode && this.#trail?.waypoints.length ? { lastSavedAt: this.#trail.waypoints.at(-1)!.at } : {}), pendingRanges: state.gaps.length, unavailableSources: this.status?.unavailable?.length ?? 0,
 				...(this.status?.operationTiming ? { timing: { ...this.status.operationTiming } } : {}) },
@@ -521,19 +559,11 @@ export class MomClient {
 
 	async request(command: Command, signal?: AbortSignal): Promise<unknown> {
 		switch (command.kind) {
-			case "relabel": {
-				// On the trail a titling pass is part of the repair, which does it and more.
-				if (this.trailMode) return this.repair(signal);
-				if (this.paused) throw new Error("Path is paused.");
-				await this.send({ kind: "relabel" });
-				await this.settle(signal);
-				return undefined;
-			}
 			case "refresh": {
 				if (this.paused) throw new Error("Path is paused.");
 				// A refresh is explicit: it ends a wait it is in the middle of (for a running worker or a screen).
 				if (this.slice && (this.status?.waitingForWorkers || this.status?.deferredUntil)) await oven("halt", { slice: this.slice.id });
-				await this.send({ kind: "refresh" });
+				if (this.trailMode) await this.refreshTrail(); else await this.send({ kind: "refresh" });
 				await this.settle(signal);
 				return undefined;
 			}
@@ -548,11 +578,6 @@ export class MomClient {
 				for (const observation of this.state?.observations ?? []) feed.observe(observation);
 				if (!feed.byRef.has(command.ref)) await feed.capture(Infinity);
 				return { ...await feed.lookup(command.ref, command.offset ?? 0, command.limit), pairedRef: feed.pairedSource(command.ref) };
-			}
-			case "log": {
-				await this.reload();
-				const ids = new Set(this.branch().map(entry => entry.id));
-				return this.#records.filter(record => (record.type === "notice" || record.type === "injection") && (record.data.parent === null || ids.has(record.data.parent)));
 			}
 			case "controls": return this.controls(command.change);
 			case "finding": {
@@ -569,86 +594,7 @@ export class MomClient {
 				if (this.#trailError) throw new Error(this.#trailError);
 				return trailText(this.#trail ?? emptyTrail(), command.options);
 			}
-			case "mark": return this.mark(command.waypoint);
-			case "strike": return this.strike(command.target, command.reason);
-			case "reindex": return command.full ? this.reindex() : this.repair(signal);
 		}
-	}
-
-	private trailStore(): TrailStore { return new TrailStore(() => this.identity.sessionFile, this.identity.sessionId); }
-
-	/** The latest lead entry on the branch that is evidence (its own hints are not), as the waypoint's ref. */
-	private latestLeadRef(): { leaf: string; ref: string } {
-		const branch = this.branch(), leaf = this.context.sessionManager.getLeafId();
-		if (!leaf || !branch.length) throw new Error("There is nothing on this branch to mark yet.");
-		const cited = [...branch].reverse().find(entry => extractEvents({ key: this.identity.sessionId, actor: "lead" }, entry).length)?.id ?? leaf;
-		return { leaf, ref: makeRef(this.identity.sessionId, cited) };
-	}
-
-	/** `/path mark`: the user's own waypoint, citing the latest lead entry, on the current line unless one is named. */
-	private async mark(input: { kind: WaypointKind; caption: string; line?: string }): Promise<Waypoint> {
-		const caption = flatten(input.caption);
-		if (!caption) throw new Error("A waypoint needs a caption.");
-		const { leaf, ref } = this.latestLeadRef();
-		const trail = this.#trail ?? emptyTrail();
-		const line = (input.line && flatten(input.line)) || whereWeAre(trail).currentLine || "session";
-		const waypoint: Waypoint = { id: `user:${randomUUID()}`, sessionId: this.identity.sessionId, at: Date.now(), kind: input.kind, line, refs: [ref], caption, parent: leaf, by: "user" };
-		const written = await this.trailStore().appendWaypoint(waypoint);
-		await this.reload();
-		return written;
-	}
-
-	/** `/path strike`: a wrong waypoint stays in the file but leaves this branch's trail. */
-	private async strike(target: string, reason?: string): Promise<Strike> {
-		const trail = this.#trail ?? emptyTrail();
-		if (trail.struck.some(item => item.waypoint.id === target)) throw new Error(`Waypoint ${target} is already struck.`);
-		if (!trail.waypoints.some(waypoint => waypoint.id === target)) throw new Error(`No waypoint ${target} is on this branch's trail.`);
-		const text = reason && flatten(reason);
-		const strike: Strike = { id: `strike:${randomUUID()}`, sessionId: this.identity.sessionId, at: Date.now(), target, ...(text ? { reason: text } : {}), parent: this.context.sessionManager.getLeafId() };
-		const written = await this.trailStore().appendStrike(strike);
-		await this.reload();
-		return written;
-	}
-
-	/**
-	 * `/path reindex`: one repair pass over the trail's own entries (titles, links, kinds, drops) under the current
-	 * rules, without reading the transcript again. Seconds to a minute, where a full re-index re-reads everything.
-	 */
-	private async repair(signal?: AbortSignal): Promise<{ repaired: true }> {
-		if (!this.trailMode) throw new Error("Repair applies to the trail; Path is in a map mode.");
-		// A run in progress is not refused: the repair waits behind it in oven, and reads the trail when it starts.
-		if (this.paused) throw new Error("Path is paused; resume it first.");
-		await this.reload(); // its tools in oven append to the trail; read what is there now
-		if (!trailEntries(this.#trail ?? emptyTrail()).length) throw new Error("Nothing on the trail to repair yet.");
-		await this.send({ kind: "relabel", repair: true });
-		await this.settle(signal);
-		return { repaired: true };
-	}
-
-	/**
-	 * `/path reindex full`: index this branch's trail again from the start under the current rules. Every entry Path wrote
-	 * is struck (the records stay; the user's own marks are kept), and the trail's coverage restarts from the
-	 * session's first entry with its skipped ranges retired, so the next update catches up live first and backfills
-	 * the rest. Struck entries are off the trail, so the re-index writes fresh ones instead of aliasing to them.
-	 */
-	private async reindex(): Promise<{ struck: number }> {
-		if (!this.trailMode) throw new Error("Re-indexing applies to the trail; Path is in a map mode.");
-		// Its strikes must not race a run still appending to the trail.
-		if (this.busy) throw new Error(`Path is ${this.status?.op?.task ?? "updating"}; run /path reindex full once it finishes.`);
-		if (this.paused) throw new Error("Path is paused; resume it first.");
-		await this.reload(); // strike what is on the trail now, not what this client last read
-		const trail = this.#trail ?? emptyTrail(), leaf = this.context.sessionManager.getLeafId(), at = Date.now();
-		const targets = trailEntries(trail).filter(entry => entry.by !== "user");
-		const trailStore = this.trailStore();
-		for (const target of targets)
-			await trailStore.appendStrike({ id: `strike:${randomUUID()}`, sessionId: this.identity.sessionId, at, target: target.id, reason: "re-indexed", parent: leaf });
-		const store = new SidecarStore(() => this.identity.sessionFile, this.identity.sessionId);
-		store.track = "trail";
-		await store.append("map", { base: null, cut: { parent: null, workers: [] }, failure: null, backfill: null,
-			...(this.state?.gaps.length ? { resolvedGaps: this.state.gaps.map(gap => gap.id) } : {}) }, `reindex:${randomUUID()}`);
-		await this.reload();
-		await this.send({ kind: "refresh" });
-		return { struck: targets.length };
 	}
 
 	/** Persist a setting locally, then apply slice lifecycle/configuration changes off the UI path. */
@@ -672,14 +618,14 @@ export class MomClient {
 		if (pausing) { await this.release(); this.options.changed(); return; }
 		if (resuming) { this.#resume?.(); this.#resume = undefined; }
 		if (reconfiguring || resuming) await this.ensure(reconfiguring);
-		if (resuming) await this.send({ kind: "refresh" });
+		if (resuming && !this.trailMode) await this.send({ kind: "refresh" });
 		// Suggestions and continuity are read from globals on the next operation; they need no slice round trip.
 	}
 
 	/** Its slice in oven, read when Status is refreshed. */
 	private async sliceHost(): Promise<SliceHost | undefined> {
 		const [health, slices] = await Promise.all([ovenHealth(), oven<any[]>("list", {})]);
-		const slice = slices.find(s => s.key === this.key);
+		const slice = slices.find(s => s.key === this.sliceKey(this.trailMode));
 		return slice ? { pid: health.pid, slice: slice.id, state: slice.stage ?? slice.state, startedAt: slice.createdAt, sampledAt: Date.now() } : undefined;
 	}
 
@@ -701,8 +647,17 @@ export class MomClient {
 
 	/** Pausing ends its slice: halt what runs, stop it, and let Oven retire it. Also finds a slice left by an earlier client. */
 	private async release(): Promise<void> {
-		const id = this.slice?.id ?? (await oven<any[]>("list", {}).catch(() => [])).find(slice => slice.key === this.key && !slice.stopped)?.id;
+		const id = this.slice?.id;
 		this.slice = undefined;
+		await this.stopSlice(this.sliceKey(this.trailMode), id);
+	}
+
+	/** Its slice's key: the trail's watcher and a map mode's operations are different slices of this session. */
+	private sliceKey(trail: boolean): string { return trail ? `${this.key}-trail` : this.key; }
+
+	/** Stop the running slice with this key (or this id), if there is one. */
+	private async stopSlice(key: string, id?: string): Promise<void> {
+		id ??= (await oven<any[]>("list", {}).catch(() => [])).find(slice => slice.key === key && !slice.stopped)?.id;
 		if (!id) return;
 		try { await oven("halt", { slice: id }); await oven("stop", { slice: id }); }
 		catch (error) { if (!/No slice/.test(String(error))) throw error; }

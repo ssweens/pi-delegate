@@ -1,9 +1,10 @@
 /**
- * The trail's repair pass: Path revises the entries it already wrote from the trail alone (no transcript), so an
- * older trail gets titles, links and kinds under the current rules in one model call instead of a full re-index.
+ * A refresh's revisions: beside any new activity, Path revises the entries it already wrote from the trail alone
+ * (captions and the user's words, no transcript), so an older trail gets titles, links and kinds under the current
+ * rules in the same model call.
  * Records are never edited: a title alone becomes a title record; any other change strikes the entry and appends a
  * revised copy (same refs, anchor and time, so it keeps its place). An entry linking to a copied one is copied too,
- * with the link moved, so nothing points at a struck id. See docs/trail.md "Repair".
+ * with the link moved, so nothing points at a struck id. See docs/trail.md "Revision".
  */
 import { STEP_KINDS, trailEntries, type Revision, type Trail, type Waypoint, type WaypointKind } from "./types.ts";
 import { flatten } from "../util/text.ts";
@@ -22,7 +23,7 @@ export interface RepairPlan {
 
 const CLOSES: Partial<Record<WaypointKind, WaypointKind[]>> = { returned: ["detour"], closed: ["open"], dead_end: ["open"] };
 
-/** Plans one repair call against `trail` (struck entries excluded). `idFor(n)` names the n-th copy. */
+/** Plans one refresh's revisions against `trail` (struck entries excluded). `idFor(n)` names the n-th copy. */
 export function planRepair(trail: Trail, revisions: readonly Revision[], idFor: (index: number) => string): RepairPlan {
 	const entries = trailEntries(trail), byId = new Map(entries.map(w => [w.id, w]));
 	const defects: string[] = [];
@@ -33,6 +34,8 @@ export function planRepair(trail: Trail, revisions: readonly Revision[], idFor: 
 		if (!entry) { defects.push(`${where} names unknown entry ${revision.id}`); return; }
 		if (entry.by === "user") { defects.push(`${where}: ${revision.id} was marked by the user; leave it`); return; }
 		if (wanted.has(revision.id)) { defects.push(`${where} repeats ${revision.id}`); return; }
+		// A goal is where the user set out: never dropped. A wrong one is retitled or reframed instead.
+		if (revision.drop && entry.kind === "set_out") { defects.push(`${where}: ${revision.id} is a goal the user set (set_out); a goal is never dropped, give it a better title instead`); return; }
 		const kind = revision.kind ?? entry.kind;
 		for (const field of ["from", "closes"] as const) {
 			const target = revision[field];

@@ -9,7 +9,7 @@ import { flatten } from "../util/text.ts";
 import { GLYPH, TREE } from "./glyphs.ts";
 import { chordLabel, graphHints, hint, joinHints, keyLabel } from "./hints.ts";
 import { navKeys } from "./keys.ts";
-import { PagedText, Scroller } from "./scroll.ts";
+import { Scroller } from "./scroll.ts";
 import { fit, fitPad, sideBySide } from "./text.ts";
 import { isFinished, isWaiting, kindClass, kindWord, stateWord } from "./vocabulary.ts";
 import { GraphBrowser } from "./graph-browser.ts";
@@ -36,12 +36,17 @@ export interface PanelSource {
 	view(): PanelView;
 	diagnostics?(): PanelDiagnostics;
 	copy?(text: string): Promise<void>;
-	retry?(): Promise<void>;
 	findingAction?(action: FindingDisposition, finding: string): void | Promise<void>;
 	prepareLeadDraft?(finding: string): void | Promise<void>;
 	status?(): WorkspaceStatus;
 	refreshStatus?(): Promise<void>;
 	setEnabled?(enabled: boolean): Promise<void>;
+	/** Run Path's refresh; resolves to the outcome to show, rejects with why it failed. */
+	refresh?(): Promise<string>;
+	/** The F4 Settings tab's component; `done` returns to Overview. Undefined when Path is not connected. */
+	settings?(done: () => void): Component | undefined;
+	/** Graph modes: start (or review) the map rebuild; the caller closes the view. */
+	rebuild?(): void;
 	readSource?(ref: string, offset: number): Promise<SourcePage>;
 	draftForLead?(text: string): void | Promise<void>;
 	/** Trail mode: the branch's trail for the Trail tab. */
@@ -245,7 +250,7 @@ export function momToolPreview(view: PanelView, trail?: string): string {
 export function momSectionLines(view: PanelView, theme: Theme, width: number): string[] {
 	const w = Math.max(0, Math.floor(width));
 	// In trail mode Path's state is a symbol (a spinner while it works) beside the title; the long status and the
-	// slice links live in /path detail.
+	// slice links live in the view (F3 Status).
 	const title = theme.bold(theme.fg("accent", "Path"));
 	const header = view.trail ? titleWithSlot(title, statusSlot(view, theme, view.trail.glance.last)) : title + theme.fg("muted", ` · ${view.status}`);
 	const inner = Math.max(0, w - 4);
@@ -298,8 +303,8 @@ function compactLine(view: PanelView, theme: Theme, width: number): string {
 	return primary + fit(status, Math.max(0, width - visibleWidth(primary)));
 }
 
-/** Path's full-viewport view: its saved map, its original sources, and its status. It owns neither the
- *  lead editor nor lead messages. It shows what it saved; R reads it again and T retries its update. */
+/** Path's full-viewport view: its saved map, its original sources, its status and its settings. It owns neither the
+ *  lead editor nor lead messages. It shows what it saved; R runs Path's refresh and reads it again. */
 export class MomView implements Component {
 	private notice = "";
 	private readonly scroller = new Scroller();
@@ -309,9 +314,11 @@ export class MomView implements Component {
 	private diagnostics?: PanelDiagnostics;
 	private status?: WorkspaceStatus;
 	private headerSignature = "";
-	private tab: "Overview" | "Map" | "Status" = "Overview";
+	private tab: "Overview" | "Map" | "Status" | "Settings" = "Overview";
+	private settingsPanel?: Component;
 	private browser: GraphBrowser;
 	private trailBrowser: TrailBrowser;
+	private shownTrail?: Trail;
 	private mapPane: "tree" | "details" | "source" = "tree";
 	private sourceRead?: { kind: "loading" } | { kind: "loaded"; page: SourcePage } | { kind: "failed"; error: string };
 	private sourceIndex = 0;
@@ -325,32 +332,39 @@ export class MomView implements Component {
 		this.diagnostics = structuredClone(source.diagnostics?.());
 		this.status = structuredClone(source.status?.());
 		this.browser = new GraphBrowser(this.snapshot.work);
-		this.trailBrowser = new TrailBrowser(source.trail?.());
+		this.trailBrowser = new TrailBrowser(this.shownTrail = source.trail?.());
 	}
 
 	/** Trail mode: F2 is the Trail tab (where we are, then every entry) instead of the Map. */
 	private get trailMode(): boolean { return Boolean(this.snapshot.trail); }
 	private get mapLabel(): string { return this.trailMode ? "Trail" : "Map"; }
 
-	/** Show its latest saved view; with `retry`, run the failed update again first. */
-	private async refresh(retry = false): Promise<void> {
+	/** Show its latest saved view, then `notice`. */
+	private async reread(notice: string): Promise<void> {
 		try {
-			if (retry) {
-				if (!this.source.retry) throw new Error("Retry is unavailable in this view.");
-				this.notice = "Retrying the update…"; this.tui.requestRender();
-				await this.source.retry();
-			}
 			await this.source.refreshStatus?.();
 			this.snapshot = structuredClone(this.source.view());
 			this.diagnostics = structuredClone(this.source.diagnostics?.());
 			this.status = structuredClone(this.source.status?.());
 			this.browser.update(this.snapshot.work);
-			this.trailBrowser.update(this.source.trail?.());
+			this.trailBrowser.update(this.shownTrail = this.source.trail?.());
 			this.sourceRequest++; this.sourceRead = undefined; this.sourceOffsets = []; this.sourceIndex = 0;
 			if (this.mapPane === "source") this.mapPane = this.trailMode ? "tree" : "details";
-			this.notice = "Showing the latest saved view.";
+			this.notice = notice;
 		} catch (error) { this.notice = updateErrorSummary(String(error)); }
 		this.tui.requestRender();
+	}
+
+	/** R: run Path's refresh, then show what it saved. */
+	private async refresh(): Promise<void> {
+		if (this.pendingAction) return;
+		this.pendingAction = true;
+		try {
+			if (!this.source.refresh) throw new Error("Refresh is unavailable in this view.");
+			this.notice = "Refreshing…"; this.tui.requestRender();
+			await this.reread(await this.source.refresh());
+		} catch (error) { this.notice = updateErrorSummary(String(error)); this.tui.requestRender(); }
+		finally { this.pendingAction = false; }
 	}
 
 	private async copy(): Promise<void> {
@@ -366,9 +380,11 @@ export class MomView implements Component {
 	}
 
 	handleInput(data: string): void {
-		for (const [key, tab] of ([["f1", "Overview"], ["f2", "Map"], ["f3", "Status"]] as const)) {
+		for (const [key, tab] of ([["f1", "Overview"], ["f2", "Map"], ["f3", "Status"], ["f4", "Settings"]] as const)) {
 			if (functionKey(data, key)) { this.switchTab(tab); this.tui.requestRender(); return; }
 		}
+		// Settings has type-to-search: every other key is its own.
+		if (this.tab === "Settings") { this.settingsPanel?.handleInput?.(data); this.tui.requestRender(); return; }
 		const nav = navKeys(data);
 		if (nav === "cancel" && this.tab === "Map" && this.mapPane !== "tree") {
 			this.mapPane = this.mapPane === "source" && !this.trailMode ? "details" : "tree"; this.sourceRequest++; this.scroller.top = 0; this.tui.requestRender(); return;
@@ -382,12 +398,13 @@ export class MomView implements Component {
 		else if (finding && actions && matchesKey(data, "alt+l")) void this.prepareLeadDraft(finding);
 		else if (this.tab === "Map" && (this.trailMode ? this.trailInput(data) : this.mapInput(data))) {
 			// Map or trail navigation consumed the key.
-		} else if (this.tab === "Status" && data === "p") {
+		} else if (this.tab === "Status" && data === "v") this.raw = !this.raw;
+		else if (this.tab === "Status" && data === "b" && !this.trailMode && this.source.rebuild) this.source.rebuild();
+		else if (data === "r") void this.refresh();
+		else if (data === "o") {
 			const enabled = this.source.status?.().enabled;
 			if (enabled !== undefined) void this.control(!enabled);
-		} else if (this.tab === "Status" && data === "t") void this.refresh(true);
-		else if (this.tab === "Status" && data === "v") this.raw = !this.raw;
-		else if (data === "r") void this.refresh();
+		}
 		else if (data === "c") void this.copy();
 		else this.scroller.handle(nav, this.pageRows, this.total);
 		this.tui.requestRender();
@@ -397,6 +414,7 @@ export class MomView implements Component {
 		this.sourceRequest++;
 		if (this.mapPane === "source" && this.sourceRead?.kind !== "loaded") this.mapPane = this.trailMode ? "tree" : "details";
 		this.tab = tab; this.scroller.top = 0; this.notice = "";
+		this.settingsPanel = tab === "Settings" ? this.source.settings?.(() => { this.switchTab("Overview"); this.tui.requestRender(); }) : undefined;
 	}
 
 	/** Trail tab: ↑↓ select an entry, Enter shows it in the transcript, [ ] its other sources, N/B page through it. */
@@ -461,11 +479,11 @@ export class MomView implements Component {
 
 	private async control(enabled: boolean): Promise<void> {
 		if (!this.source.setEnabled || this.pendingAction) return;
-		this.pendingAction = true; this.notice = enabled ? "Resuming tracking…" : "Pausing tracking…"; this.tui.requestRender();
+		this.pendingAction = true; this.notice = enabled ? "Turning Path on…" : "Turning Path off…"; this.tui.requestRender();
 		try {
 			await this.source.setEnabled(enabled); await this.source.refreshStatus?.();
 			this.status = structuredClone(this.source.status?.());
-			this.notice = enabled ? "Tracking resumed." : "Tracking paused.";
+			this.notice = enabled ? "Path on." : "Path off.";
 		}
 		catch (error) { this.notice = updateErrorSummary(String(error)); }
 		finally { this.pendingAction = false; this.tui.requestRender(); }
@@ -493,25 +511,26 @@ export class MomView implements Component {
 		const view = this.snapshot;
 		const wrap = (text: string) => wrapTextWithAnsi(text, Math.max(1, width)).map(line => fit(line, width));
 		const lines: string[] = [];
+		if (this.tab === "Settings") return (this.settingsPanel?.render(width) ?? wrap("Path is not connected; settings are unavailable."));
 		if (this.tab === "Map") return (this.trailMode && this.mapPane !== "source" ? this.trailBrowser.render(this.theme, width, Number.MAX_SAFE_INTEGER, this.slot()) : this.mapDetails()).flatMap(wrap);
 		if (this.tab === "Status") {
 			const status = this.status, host = status?.host, telemetry = status?.telemetry, usage = status?.usage;
 			if (status) {
-				lines.push(...wrap(`Connection: ${status.connection} · Tracking: ${status.enabled === undefined ? "unavailable" : status.enabled ? "on" : "paused"}`),
+				lines.push(...wrap(`Connection: ${status.connection} · Path: ${status.enabled === undefined ? "unavailable" : status.enabled ? "on" : "off"}`),
 					...wrap(`Project: ${status.project}`));
 				if (status.sliceUrl) lines.push(...wrap(`Slice: ${status.sliceUrl}`));
 				const live = this.source.view();
 				if (live.rebuild) lines.push(...wrap(live.rebuild));
 				if (live.rebuildUrl) lines.push(...wrap(`Rebuild slice: ${live.rebuildUrl}`));
 				if (host) lines.push(...wrap(`oven PID ${host.pid} · slice ${host.slice} (${host.state}) · Age ${formatDuration(host.sampledAt - host.startedAt)}`),
-					...wrap(`Sampled ${new Date(host.sampledAt).toLocaleTimeString()} · R refresh status`));
-				else lines.push(...wrap("Path's slice in oven has not been read yet. R refreshes status."));
+					...wrap(`Sampled ${new Date(host.sampledAt).toLocaleTimeString()}`));
+				else lines.push(...wrap("Path's slice in oven has not been read yet."));
 				if (telemetry) lines.push(...wrap(`Model: ${telemetry.model}`), ...wrap(`Activity: ${telemetry.activity}`),
 					...wrap(`Awaiting review: ${telemetry.pendingRanges} ranges · Unavailable sources: ${telemetry.unavailableSources}`));
 				if (telemetry?.lastSavedAt) lines.push(...wrap(`Last saved: ${new Date(telemetry.lastSavedAt).toLocaleString()}`));
 				if (telemetry?.timing) lines.push(...wrap(`Last operation: ${formatTiming(telemetry.timing)}`));
 				if (usage) lines.push(...formatUsage(usage).split("\n").flatMap(wrap));
-				lines.push(...wrap("P pause/resume · T retry update · V raw records"), "");
+				lines.push("");
 			}
 			for (const section of this.diagnostics?.sections ?? []) {
 				lines.push(...wrap(this.theme.bold(this.theme.fg("accent", section.title))),
@@ -529,7 +548,7 @@ export class MomView implements Component {
 			if (view.error) lines.push(...wrap(this.theme.fg("warning", view.error)),
 				...wrap(this.theme.fg("muted", view.status === "reconnecting"
 					? "Path must reconnect before updates can run."
-					: "T on F3 Status retries the update. Saved notes are unchanged.")), "");
+					: "R refreshes and retries the update. Saved notes are unchanged.")), "");
 			if (view.trail) lines.push(...trailWidgetRows(view, this.theme, width));
 			else if (view.work?.endeavors.length) lines.push(...hierarchy(view.work, this.theme, width, false));
 			else lines.push(...wrap(this.theme.fg("muted", fallback(view.summary) ||
@@ -567,6 +586,9 @@ export class MomView implements Component {
 	statusChanged(): void {
 		const status = this.source.status?.();
 		const live = this.source.view();
+		// The watcher saves while the view is open: its new entries show without a refresh, the selection kept.
+		const trail = this.source.trail?.();
+		if (trail !== this.shownTrail) { this.shownTrail = trail; this.trailBrowser.update(trail); this.tui.requestRender(); }
 		const signature = JSON.stringify([status?.connection, status?.telemetry?.model, status?.telemetry?.activity, status?.host?.pid,
 			status?.sliceUrl, live.rebuild, live.rebuildUrl]);
 		if (signature === this.headerSignature) return;
@@ -579,7 +601,7 @@ export class MomView implements Component {
 		const divider = this.theme.fg("dim", " │ ");
 		const status = this.source.status?.();
 		const heading = this.theme.bold(this.theme.fg("accent", "Path")) + this.theme.fg("dim", ` · ${this.tab === "Status" ? "diagnostics" : this.snapshot.status}`);
-		const tabs = (["Overview", "Map", "Status"] as const).map((tab, index) => tab === this.tab
+		const tabs = (["Overview", "Map", "Status", "Settings"] as const).map((tab, index) => tab === this.tab
 			? this.theme.bg("selectedBg", this.theme.bold(this.theme.fg("accent", ` F${index + 1} ${tab === "Map" ? this.mapLabel : tab} `))) : ` F${index + 1} ${tab === "Map" ? this.mapLabel : tab} `);
 		const header = [fit(heading + (status ? ` · ${status.project.split("/").at(-1)} · ${status.connection}` : ""), w),
 			...(status?.telemetry ? [fit(`${status.telemetry.model} · ${status.telemetry.activity}${status.host ? ` · PID ${status.host.pid}` : ""}`, w)] : []),
@@ -588,12 +610,13 @@ export class MomView implements Component {
 			: "Alt+U understood · Alt+D dismiss · Alt+I incorrect · Alt+L discuss with lead";
 		const navigation = this.tab === "Map" && this.trailMode ? (this.mapPane === "tree" ? joinHints(hint.move("move"), hint.enter("show in transcript")) : joinHints("[ ] source", "N/B page", hint.cancel("trail")))
 			: this.tab === "Map" ? joinHints(this.mapPane === "tree" && hint.move("select"), this.mapPane === "tree" && hint.enter("inspect"), "S source", "D draft")
-			: this.tab === "Status" ? "P pause/resume · T retry · V raw" : "";
+			: this.tab === "Status" ? joinHints("V raw", !this.trailMode && this.source.rebuild && "B rebuild map")
+				: this.tab === "Settings" ? "F1–F3 other tabs" : "";
 		const footer = [
 			...(this.notice ? [fit(this.theme.fg("dim", this.notice), w)] : []),
 			...(this.snapshot.note && (this.source.findingAction || this.source.prepareLeadDraft)
 				? wrapTextWithAnsi(this.theme.fg("dim", findingKeys), w) : []),
-			...wrapTextWithAnsi(this.theme.fg("dim", joinHints(navigation, "R refresh", "C copy", hint.cancel("back"), hint.scroll(), "View held steady until R")), w),
+			...wrapTextWithAnsi(this.theme.fg("dim", this.tab === "Settings" ? navigation : joinHints(navigation, "R refresh", "O on/off", "F4 settings", "C copy", hint.cancel("back"), hint.scroll())), w),
 		];
 		const available = Math.max(1, height - footer.length - header.length);
 		this.pageRows = Math.max(1, available - 1);
@@ -629,45 +652,4 @@ export class MomView implements Component {
 
 	invalidate(): void {}
 	dispose(): void { this.sourceRequest++; }
-}
-
-/** Scrollable version of the same cached hierarchy, not a separately maintained map. */
-export class MomPanel implements Component {
-	private width = -1;
-	private text = "";
-	private lines: string[] = [];
-	private readonly page: PagedText;
-	constructor(private source: () => PanelView, private theme: Theme, private height: () => number, private done: () => void) {
-		this.page = new PagedText({
-			lines: width => this.content(width),
-			rows: () => Math.max(1, Math.max(3, this.height()) - 2),
-			chrome: width => ({ foot: ["", fit(this.theme.fg("dim", joinHints(hint.move("scroll"), hint.cancel("close"), "/path correct <text>", "/path detail for sources")), width)] }),
-			onKey: data => {
-				if (!(navKeys(data) === "cancel" || matchesKey(data, FOCUS_KEY))) return false;
-				this.done();
-				return true;
-			},
-		});
-	}
-
-	handleInput(data: string): void { this.page.handleInput(data); }
-
-	private content(w: number): string[] {
-		const view = this.source(), text = JSON.stringify(view);
-		if (w !== this.width || text !== this.text) {
-			const wrap = (value: string) => w > 0 ? wrapTextWithAnsi(value, w).map(line => fit(line, w)) : [""];
-			this.lines = [fit(this.theme.bold(this.theme.fg("accent", "Path")) + this.theme.fg("dim", ` · ${view.status}`), w)];
-			if (view.error) this.lines.push(...wrap(this.theme.fg("warning", view.error)), "");
-			if (view.trail) this.lines.push("", ...trailWidgetRows(view, this.theme, w));
-			else if (view.work?.endeavors.length) this.lines.push(...hierarchy(view.work, this.theme, w, true));
-			else this.lines.push("", ...wrap(fallback(view.summary) || "Nothing saved yet."));
-			if (view.work?.orientation) this.lines.push("", ...wrap(this.theme.fg("muted", view.work.orientation)));
-			if (view.note) this.lines.push("", ...wrap(this.theme.fg("accent", noteLine(view))));
-			this.width = w; this.text = text;
-		}
-		return this.lines;
-	}
-
-	render(width: number): string[] { return this.page.render(Math.max(0, Math.floor(width))); }
-	invalidate(): void { this.width = -1; }
 }

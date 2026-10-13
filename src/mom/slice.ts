@@ -8,6 +8,7 @@ import { settingsLine, type MomSettings } from "./engine.ts";
 import { endpoint } from "./advisor.ts";
 import { DEFAULT_MODEL, thinkingFor } from "./mother.ts";
 import { modeFor, modeInstructions } from "./modes.ts";
+import { TRAIL_OPERATION, TRAIL_PROMPT, WATCHER_EXTENSION, watcherLine } from "../trail/prompt.ts";
 
 export interface SessionIdentity { cwd: string; sessionFile: string; sessionId: string }
 
@@ -73,12 +74,26 @@ export function assertSliceSupportsMode(modeName: string | undefined, missingToo
 	if (missingTools.includes(mode.finalizer)) throw new Error(`Path's Oven extension is stale: mode ${mode.name} requires missing tool ${mode.finalizer}. Restart Oven to load the current Path tools.`);
 }
 
-export function momConfiguration(identity: SessionIdentity, flags: Record<string, string | boolean | undefined>, registry?: ClassifierRegistry) {
+/** Entries one delivery to the trail watcher holds: a long backlog arrives in pieces of this many. */
+export const WATCHER_BATCH = 200;
+
+export function momConfiguration(identity: SessionIdentity, flags: Record<string, string | boolean | undefined>, registry?: ClassifierRegistry, watch: { after?: string } = {}) {
 	const model = String(flags["mom-model"] || DEFAULT_MODEL);
 	// The mode is resolved here, at configuration time, so a bad --path-mode fails loudly at start
 	// rather than silently running the default. Unconfigured is byte-identical to before modes.
 	const mode = modeFor(String(flags["mom-mode"] ?? ""));
 	const retries = String(flags["mom-retry-ms"] ?? "5000,60000,300000").split(",").map(Number);
+	const retry = retries.length && retries.every(value => Number.isFinite(value) && value >= 0) ? retries : [5000, 60000, 300000];
+	const turns = { maxWaitMs: number(flags["mom-max-wait-ms"], 1800000), userWindowMs: number(flags["mom-user-window-ms"], 120000) };
+	// The trail: a watcher with its own memory of the session (src/trail/watcher.ts). It reads every delivery as is,
+	// keeps what it saw (no fresh context per delivery) and has one tool.
+	if (mode.name === "trail") return {
+		name: "path", description: "Path: watches the lead session and keeps its trail.", model, thinking: thinkingFor(model), context: false,
+		instructions: `${TRAIL_PROMPT.trim()}\n\n${TRAIL_OPERATION.trim()}\n\n${watcherLine(identity.sessionFile)}`,
+		extensions: [WATCHER_EXTENSION], tools: ["record_waypoints"],
+		follow: { session: identity.sessionFile, minIntervalMs: number(flags["mom-interval-ms"], 0), maxBatch: WATCHER_BATCH, turns, ...(watch.after ? { after: watch.after } : {}) },
+		retry,
+	};
 	const chapters = Number(flags["mom-bootstrap-chapters"] ?? DEFAULT_BOOTSTRAP_POLICY.maxChapters);
 	const chars = Number(flags["mom-bootstrap-chars"] ?? DEFAULT_BOOTSTRAP_POLICY.maxDigestChars);
 	const advisorUrl = String(flags["mom-advisor-url"] ?? "").trim();
@@ -100,7 +115,7 @@ export function momConfiguration(identity: SessionIdentity, flags: Record<string
 		extensions: ["mom"],
 		tools: [...MOM_TOOLS],
 		follow: { session: identity.sessionFile, minIntervalMs: number(flags["mom-interval-ms"], 0), maxBatch: 2000, fresh: true,
-			turns: { maxWaitMs: number(flags["mom-max-wait-ms"], 1800000) } },
-		retry: retries.length && retries.every(value => Number.isFinite(value) && value >= 0) ? retries : [5000, 60000, 300000],
+			turns },
+		retry,
 	};
 }

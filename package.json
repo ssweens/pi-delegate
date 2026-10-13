@@ -39,7 +39,8 @@
   },
   "oven": {
     "extensions": {
-      "mom": "./src/mom/mom-tools.ts"
+      "mom": "./src/mom/mom-tools.ts",
+      "path-trail": "./src/trail/watcher.ts"
     }
   },
   "peerDependencies": {

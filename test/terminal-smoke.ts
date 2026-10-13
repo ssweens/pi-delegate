@@ -57,13 +57,18 @@ try {
 		assert.doesNotMatch(capture(), /\[Extension issues\]/);
 		assert.doesNotMatch(capture(), /shortcut conflict/);
 		await command("/fixture-mom-settings");
-		await expect(/SETTING HELP/);
+		await expect(/Path settings/);
 		assert.match(capture(), /Background tracking/);
 		assert.match(capture(), /work map in the background/);
 		save(`${mode}-mom-settings`);
-		key("Down"); await expect(/eligible findings from Mom's map/);
+		key("Down"); await expect(/eligible findings from Path's map/);
 		save(`${mode}-mom-settings-suggestions`);
-		key("Escape"); await expect(/Mom settings/, true);
+		// A chooser takes the screen: the list and the setting's help give way to it.
+		key("Down"); key("Down"); key("Down"); key("Enter"); await expect(/Enter to select/);
+		assert.doesNotMatch(capture(), /Choose how Path keeps its notes|Background tracking/);
+		save(`${mode}-mom-settings-chooser`);
+		key("Escape"); await expect(/Choose how Path keeps its notes/);
+		key("Escape"); await expect(/Path settings/, true);
 		await command("/fixture-spawn Native detail");
 		await expect(/Agents.*1 active/);
 		text("PARENT-DRAFT"); key("C-j"); key("Enter");

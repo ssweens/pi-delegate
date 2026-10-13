@@ -67,7 +67,7 @@ export function statusSlot(state: MomState, theme: Theme, last?: Waypoint, now =
 	if (status.startsWith("retrying") || status.startsWith("re-reviewing")) return { symbol: theme.fg("warning", GLYPH.alert), word: theme.fg("warning", "retrying") };
 	if (spinning(status)) {
 		const frame = SPINNER[Math.floor(now / SPIN_MS) % SPINNER.length]!;
-		// A busy trail names its run (reading, titling, repairing, backfilling) and, past a minute, how long it has run.
+		// A busy trail names its run (reading, refreshing, backfilling) and, past a minute, how long it has run.
 		const running = state.trail?.since !== undefined && now - state.trail.since >= 60_000 ? ` ${formatAge(state.trail.since, now)}` : "";
 		const word = status.startsWith("updating") ? `${state.trail?.task ?? stageWord(state) ?? ""}${running}` : status === "update starting" ? "starting" : status;
 		return { symbol: theme.fg("accent", frame), word: theme.fg("dim", word) };
@@ -163,7 +163,7 @@ export function titleWithSlot(title: string, slot: StatusSlot | undefined): stri
 	return `${title} ${slot.word ? `${slot.symbol} ${slot.word}` : slot.symbol}`;
 }
 
-/** The same rows without colour, for text surfaces (tool previews, `/path overview` outside the TUI). */
+/** The same rows without colour, for text surfaces (tool previews, the non-TUI /path). */
 export function plainTrailRows(view: Glance, width = 100): string[] {
 	const plain = { fg: (_c: string, text: string) => text, bold: (text: string) => text, bg: (_c: string, text: string) => text } as unknown as Theme;
 	return trailRows(view, plain, width);

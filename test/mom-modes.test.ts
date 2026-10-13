@@ -13,7 +13,8 @@ import { join } from "node:path";
 import { MOM_TOOLS, OPERATION_PROMPT, assertSliceSupportsMode, deciderFor, momConfiguration, type SessionIdentity } from "../src/mom/slice.ts";
 import { COMMIT_GRAPH_MODE, DEFAULT_MODE, MODES, TRAIL_MODE, V2_MODE, assertRunnable, modeFor, modeInstructions, modeNames, type MapMode } from "../src/mom/modes.ts";
 import { commitV2Tool } from "../src/mom/v2.ts";
-import { TRAIL_DIGEST_TASK, TRAIL_UPDATE_TASK, recordWaypointsTool, trailBody } from "../src/trail/prompt.ts";
+import { recordWaypointsTool, watchedSession, WATCHER_EXTENSION } from "../src/trail/prompt.ts";
+import watcherExtension from "../src/trail/watcher.ts";
 import { RecordWaypoints, emptyTrail } from "../src/trail/types.ts";
 import { updateErrorSummary } from "../src/mom/status.ts";
 
@@ -117,7 +118,7 @@ test("M5: the transaction mode needs no apply; a non-transaction mode does", () 
 	}
 });
 
-test("trail: selectable, its finalizer is record_waypoints, and its body shows an empty trail as empty", () => {
+test("trail: selectable, kept by its own watcher with one tool and its own memory", () => {
 	const mode = modeFor("trail");
 	assert.equal(mode, TRAIL_MODE);
 	assert.equal(mode.finalizer, "record_waypoints");
@@ -127,15 +128,13 @@ test("trail: selectable, its finalizer is record_waypoints, and its body shows a
 	assert.equal(tool.name, "record_waypoints");
 	assert.equal(tool.parameters, RecordWaypoints, "the finalizer validates exactly the shared schema");
 	assert.ok(Check(tool.parameters, { waypoints: [] }), "an empty list is a valid 'nothing worth finding again'");
-	const update = trailBody({ task: TRAIL_UPDATE_TASK, newEvents: "events", trail: emptyTrail() });
-	assert.deepEqual(update, { task: TRAIL_UPDATE_TASK, trail: { lines: [], recent: [], open: [] }, newEvents: "events" });
-	const digest = trailBody({ task: TRAIL_DIGEST_TASK, newEvents: "digest", trail: emptyTrail(), newUserDirections: [], guidance: " " });
-	assert.equal(digest.task, TRAIL_DIGEST_TASK);
-	assert.equal(digest.guidance, undefined, "blank guidance is omitted");
-	assert.equal(digest.newUserDirections, undefined, "an empty direction list is omitted");
-	const configured = momConfiguration(identity, { ...flags, "mom-mode": "trail" });
+	const configured = momConfiguration(identity, { ...flags, "mom-mode": "trail" }, undefined, { after: "e7" });
 	assert.ok(configured.instructions.startsWith(TRAIL_MODE.prompt) && configured.instructions.includes("record_waypoints"));
-	assert.deepEqual(configured.tools, [...MOM_TOOLS]);
+	assert.ok(!configured.instructions.includes("mom_begin"), "no handshake");
+	assert.equal(watchedSession(configured.instructions), identity.sessionFile, "the watcher's instructions name its session");
+	assert.deepEqual([configured.extensions, configured.tools], [[WATCHER_EXTENSION], ["record_waypoints"]]);
+	assert.equal((configured.follow as { fresh?: boolean }).fresh, undefined, "every delivery joins its memory: no fresh context");
+	assert.equal((configured.follow as { after?: string }).after, "e7", "it resumes after what the trail covers");
 });
 
 test("the current mode's prompt is exactly MOM_PROMPT, with no mode-specific drift", () => {
@@ -277,7 +276,6 @@ test("the model control is durable and scoped to Mom, never to Pi", async () => 
 	// The picker is scoped: selecting must not touch Pi's default. That is why it takes an inert
 	// persist callback on the legacy path (src/model-picker.ts).
 	const picker = await import("../src/mom/model-picker.ts");
-	assert.equal(typeof picker.pickMomModel, "function");
 	assert.equal(typeof picker.configuredMomModel, "function");
 	assert.equal(typeof picker.getModelRuntime, "function");
 });
@@ -321,7 +319,9 @@ test("all Mom finalizers decode JSON-string lists before tool validation", () =>
 	const label = { id: "ship", label: "Ship" };
 	assert.deepEqual(prepare("commit_labels", { labels: JSON.stringify([label]), retired: "null" }).labels, [label]);
 	const waypoint = { kind: "set_out", line: "Ship", refs: ["s:u1"], caption: "Set out to ship the release." };
-	assert.deepEqual(prepare("record_waypoints", { waypoints: JSON.stringify([waypoint]) }).waypoints, [waypoint]);
+	const watcher = watcherExtension(durable as never) as unknown as { tools: { name: string; prepareArguments: (args: unknown) => any }[] };
+	assert.deepEqual(watcher.tools.map(tool => tool.name), ["record_waypoints"]);
+	assert.deepEqual(watcher.tools[0]!.prepareArguments({ waypoints: JSON.stringify([waypoint]) }).waypoints, [waypoint]);
 	assert.equal(prepare("record_thread_map", { states: `${JSON.stringify([chapter])}}` }).states[0].chapter, "",
 		"a malformed list is not silently repaired into an accepted audit");
 });
@@ -495,4 +495,9 @@ test("the persisted decision-model control survives sidecar loading, including a
 		await rm(file, { force: true });
 		if (Object.keys(saved).length) await writeMomGlobals(saved, file);
 	}
+});
+
+test("the watcher updates when an assistant turn ends, and on a user message only within the window", () => {
+	assert.deepEqual(momConfiguration(identity, flags).follow.turns, { maxWaitMs: 1800000, userWindowMs: 120000 });
+	assert.equal(momConfiguration(identity, { ...flags, "mom-user-window-ms": "30000" }).follow.turns.userWindowMs, 30000);
 });

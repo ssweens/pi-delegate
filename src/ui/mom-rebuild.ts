@@ -74,7 +74,7 @@ export class MomRebuildPanel implements Component {
 		const fit = (line: string) => fitPad(line, width);
 		const wrap = (text: string) => wrapTextWithAnsi(text, Math.max(1, width)).map(fit);
 		const lines = [fit(this.theme.bold(this.theme.fg("accent", "Path · rebuild from transcript"))), "", ...wrap(this.message).slice(0, 3), ""];
-		if (this.phase === "failed") lines.push(...wrap(this.theme.fg("warning", `Saved map unchanged. ${keyLabel("tui.select.cancel")} closes this modal; run /path rebuild to try again.`)));
+		if (this.phase === "failed") lines.push(...wrap(this.theme.fg("warning", `Saved map unchanged. ${keyLabel("tui.select.cancel")} closes this modal; press B on F3 Status in /path to try again.`)));
 		else if (this.browser) {
 			const browser = this.showingSaved ? this.savedBrowser! : this.browser;
 			lines.push(fit(this.theme.bold(this.showingSaved ? "Current saved map (before rebuild)" : "Rebuilt map (not yet saved)")));

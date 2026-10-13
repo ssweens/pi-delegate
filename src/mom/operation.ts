@@ -20,8 +20,6 @@ export interface OperationHeader {
 	digest?: boolean;
 	/** This request repairs existing model labels without changing graph structure or evidence. */
 	relabel?: boolean;
-	/** A trail relabel that revises the whole trail from its own entries (`/path reindex`), not just titles. */
-	repair?: boolean;
 	session: { file: string; id: string; cwd: string; leaf: string | null };
 	/** Evidence boundary: the feed its tools rebuild, and the coverage an accepted map records. */
 	cut?: Cut;
@@ -31,10 +29,6 @@ export interface OperationHeader {
 	more?: boolean;
 	gaps?: number;
 	retryGap?: { id: string; remaining: string[] };
-	/** Trail: the backfill range acceptance writes (new, advanced, or null when done). */
-	backfill?: { id: string; next: string; through: string } | null;
-	/** Trail: this operation indexes older history, not the live frontier. */
-	backfilling?: boolean;
 	/** A compaction review: its trigger is known evidence beyond the session's own entries. */
 	trigger?: FeedEvent;
 	auditedGaps?: string[];
@@ -74,7 +68,7 @@ export type MomRequest =
 	| { kind: "update" }
 	| { kind: "refresh" }
 	| { kind: "rebuild" }
-	| { kind: "relabel"; repair?: boolean }
+	| { kind: "relabel" }
 	| { kind: "resume" }
 	| { kind: "controls"; id: string; change: { inject: boolean } | { nudgedClasses: string[] } | { enabled: boolean } | { mode: string } | { model: string } | { decider: string } }
 	| { kind: "finding"; action: FindingRequest; finding: string };

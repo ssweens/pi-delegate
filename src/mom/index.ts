@@ -1,25 +1,23 @@
 /** Path runs in oven (its slice follows this session); the lead shows its state, sends the user's requests and adds its hints. */
 import { copyToClipboard, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Text, matchesKey, isKittyProtocolActive, type TUI } from "@earendil-works/pi-tui";
+import { Text, type TUI } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { MomClient, TRAIL_STANDING, type Command, type Snapshot, type SourcePage, type TrailOptions } from "./client.ts";
-import { WAYPOINT_KINDS, type WaypointKind } from "../trail/types.ts";
+import { MomClient, TRAIL_STANDING, type Command, type SourcePage, type TrailOptions } from "./client.ts";
 import { pathRows } from "./settings.ts";
 import { SettingsPanel } from "../ui/settings-panel.ts";
 import { FULLSCREEN } from "../ui/overlay.ts";
 import { chordLabel } from "../ui/hints.ts";
 import { ANCHOR } from "./anchor.ts";
 import type { FindingRequest } from "./operation.ts";
-import { CORRECTION } from "./feed.ts";
-import { COMPACT_KEY, FOCUS_KEY, MomPanel, MomView, momToolPreview, type PanelDiagnostics, type PanelView } from "../ui/panel.ts";
+import { COMPACT_KEY, FOCUS_KEY, MomView, momToolPreview, type PanelDiagnostics, type PanelView } from "../ui/panel.ts";
 import { activityFor } from "../ui/activity.ts";
 import { formatUsage, updateErrorSummary, WAITING_FOR_VIEW } from "./status.ts";
 import { presentGraph, readText, summaryText } from "../ui/presentation.ts";
 import { DEFAULT_MODE, modeNames } from "./modes.ts";
-import { momDeciderSelector, momModelSelector, pickMomModel } from "./model-picker.ts";
+import { momDeciderSelector, momModelSelector } from "./model-picker.ts";
 import { MomRebuildPanel } from "../ui/mom-rebuild.ts";
 import type { RebuiltMap } from "./rebuild.ts";
-import { clockTime, formatDuration } from "../util/format.ts";
+import { formatDuration } from "../util/format.ts";
 import { errorMessage, textOf } from "../util/text.ts";
 
 const FLAGS = {
@@ -27,6 +25,7 @@ const FLAGS = {
 	"mom-mode": [`Map-maintenance mode (${modeNames().join(", ")}); see docs/map-modes.md`, DEFAULT_MODE],
 	"mom-interval-ms": ["Minimum spacing between background Path updates in milliseconds", "0"],
 	"mom-max-wait-ms": ["Longest Path waits for a turn to end before updating anyway, in milliseconds", "1800000"],
+	"mom-user-window-ms": ["Path updates when an assistant turn ends, and when a user message arrives sent within this many milliseconds (a live message, not history)", "120000"],
 	"mom-retry-ms": ["Automatic retry delays after a failed update, comma-separated milliseconds", "5000,60000,300000"],
 	"mom-advisor-url": ["Optional System One endpoint. Empty disables it", ""],
 	"mom-decider": ["Pi classifier model (local System One) for Path's decisions: the v2 change check before its model reads a batch. Required: with none, every update fails until one is set.", ""],
@@ -76,8 +75,8 @@ export function installMom(pi: ExtensionAPI) {
 		};
 		const shown = client?.error ?? (explicit || !client ? readError : undefined);
 		const rebuild = rebuilding?.owner === client ? rebuilding : undefined;
-		const rebuildStatus = rebuild?.candidate ? "Rebuild ready · /path rebuild to review" : rebuild?.error
-			? `Rebuild failed · ${updateErrorSummary(rebuild.error)} · /path rebuild to retry` : rebuild?.message;
+		const rebuildStatus = rebuild?.candidate ? "Rebuild ready · B on F3 Status to review" : rebuild?.error
+			? `Rebuild failed · ${updateErrorSummary(rebuild.error)} · B on F3 Status to retry` : rebuild?.message;
 		return { ...saved, compact: compact(), ...(shown ? { error: updateErrorSummary(shown) } : {}),
 			...(rebuildStatus ? { rebuild: rebuildStatus, rebuildUrl: !rebuild?.candidate && !rebuild?.error ? rebuild?.sliceUrl : undefined } : {}),
 			status: client?.error ? "reconnecting" : saved.status };
@@ -120,7 +119,6 @@ export function installMom(pi: ExtensionAPI) {
 		if (token !== epoch || !client) throw new Error(readError ?? "Path session changed or is unavailable.");
 		return client.request(command, signal);
 	}
-	async function refresh(): Promise<void> { await request({ kind: "refresh" }); }
 	/**
 	 * A command that starts a run says so at once (or what it waits behind), and says how the run ended:
 	 * the widget's spinner is the only other sign, and a run can take minutes.
@@ -131,11 +129,17 @@ export function installMom(pi: ExtensionAPI) {
 		const current = snapshot?.startedAt === undefined ? undefined : `${snapshot.passive.trail?.task ?? "updating"}, ${formatDuration(Date.now() - snapshot.startedAt)} in`;
 		context.ui.notify(current ? `Path: ${label} — queued behind the run in progress (${current}).` : `Path: ${label}…`, "info");
 		await request(command);
+		const done = outcome(before, ended);
+		if (done.error) context.ui.notify(`Path: ${label} failed: ${done.error} Open /path for the full error.`, "error");
+		else context.ui.notify(`Path: ${done.text}`, "info");
+	}
+	/** How a run ended: its error, or what it added to the trail since `before`. */
+	function outcome(before: number, ended: (added: number) => string): { error?: string; text: string } {
 		const failed = client?.runError;
-		if (failed) { context.ui.notify(`Path: ${label} failed: ${updateErrorSummary(failed)} /path detail has the full error.`, "error"); return; }
-		context.ui.notify(`Path: ${ended((client?.snapshot?.passive.trail?.count ?? before) - before)}`, "info");
+		return failed ? { error: updateErrorSummary(failed), text: "" } : { text: ended((client?.snapshot?.passive.trail?.count ?? before) - before) };
 	}
 	const added = (count: number) => count > 0 ? `${count} new entr${count === 1 ? "y" : "ies"} on the trail` : "nothing new for the trail";
+	const refreshed = (count: number) => client?.snapshot?.passive.trail ? `refreshed — ${added(count)}.` : "caught up.";
 	async function findingAction(action: FindingRequest, finding: string) { await request({ kind: "finding", action, finding }); }
 	pi.on("session_start", (_event, context) => reset(context));
 	// A new branch: its work on the old one is stopped in oven, and it follows the selected branch.
@@ -163,10 +167,6 @@ export function installMom(pi: ExtensionAPI) {
 		const saved = client?.snapshot?.diagnostics ?? { sections: [], raw: "{}" }, error = client?.error ?? readError;
 		return error ? { ...saved, sections: [...saved.sections, { title: "Last problem", text: updateErrorSummary(error) }] } : saved;
 	}
-	async function show(context: ExtensionContext) {
-		if (context.mode !== "tui") { context.ui.notify(cached(), "info"); return; }
-		await context.ui.custom<void>((tui, theme, _keys, done) => new MomPanel(() => view(true), theme, () => Math.max(5, tui.terminal.rows - 6), () => done()));
-	}
 	async function open(context: ExtensionContext) {
 		if (context.mode !== "tui") {
 			const error = view(true).error;
@@ -176,7 +176,11 @@ export function installMom(pi: ExtensionAPI) {
 		viewOpen = true; const held = heldWidget = structuredClone(view(false, false));
 		try {
 			await context.ui.custom<void>((tui, theme, _keys, done) => { closeView = () => done(); return momView = new MomView({
-				view: () => view(true, false), findingAction, copy: copyToClipboard, retry: refresh, diagnostics,
+				view: () => view(true, false), trail: () => client?.trail, findingAction, copy: copyToClipboard, diagnostics,
+				refresh: async () => { const before = client?.snapshot?.passive.trail?.count ?? 0; await request({ kind: "refresh" });
+					const done = outcome(before, refreshed); if (done.error) throw new Error(done.error); return `${done.text[0]!.toUpperCase()}${done.text.slice(1)}`; },
+				settings: finished => settingsPanel(context, tui, finished),
+				rebuild: () => { closeView?.(); void rebuild(context).catch(error => context.ui.notify(`Path rebuild failed: ${errorMessage(error)}`, "error")); },
 				status: () => ({ connection: client?.error ? "disconnected" : client?.snapshot ? "connected" : "connecting", project: context.cwd,
 					sliceUrl: client?.sliceUrl, host: client?.snapshot?.host, telemetry: client?.snapshot?.telemetry,
 					usage: client?.snapshot?.usage, enabled: client?.snapshot?.controls.enabled }),
@@ -204,7 +208,7 @@ export function installMom(pi: ExtensionAPI) {
 	}
 	activity.setMomRows(settingsRows);
 	async function rebuild(context: ExtensionContext) {
-		if (context.mode !== "tui") throw new Error("/path rebuild requires an interactive terminal.");
+		if (context.mode !== "tui") throw new Error("Rebuild requires an interactive terminal.");
 		await ready;
 		const owner = client, sessionEpoch = epoch;
 		if (!owner || !owner.snapshot) throw new Error(readError ?? "Path is not connected.");
@@ -214,7 +218,7 @@ export function installMom(pi: ExtensionAPI) {
 			sync();
 			void owner.rebuild((message, sliceUrl) => { if (rebuilding === job) { job.message = message; job.sliceUrl = sliceUrl; sync(); } }, job.abort.signal)
 				.then(candidate => { if (rebuilding !== job || job.abort.signal.aborted) return;
-					job.candidate = candidate; sync(); context.ui.notify("Path's rebuilt map is ready. /path rebuild opens the review.", "info"); })
+					job.candidate = candidate; sync(); context.ui.notify("Path's rebuilt map is ready. B on F3 Status opens the review.", "info"); })
 				.catch(error => { if (rebuilding !== job || job.abort.signal.aborted) return;
 					job.error = errorMessage(error); sync();
 					context.ui.notify(`Path's rebuild failed: ${job.error}`, "error"); });
@@ -232,30 +236,16 @@ export function installMom(pi: ExtensionAPI) {
 		if (rebuilding?.candidate === candidate) { rebuilding = undefined; sync(); }
 		if (result === "saved") context.ui.notify("Path's rebuilt map is saved. Earlier checkpoints remain available.", "info");
 	}
+	/** Path's settings panel: /path settings shows it alone, and the view's F4 tab holds the same one. */
+	function settingsPanel(context: ExtensionContext, tui: TUI, done: () => void): SettingsPanel | undefined {
+		const rows = settingsRows(context, tui);
+		return rows && new SettingsPanel("Path settings", rows, () => tui.requestRender(), done, Math.max(3, Math.min(12, tui.terminal.rows - 9)));
+	}
 	async function showSettings(context: ExtensionContext) {
 		if (context.mode !== "tui") throw new Error("Path settings requires interactive mode.");
 		await ready;
 		if (!client?.snapshot?.controls) throw new Error(readError ?? "Path is not connected.");
-		await context.ui.custom<void>((tui, _theme, _keys, done) =>
-			new SettingsPanel("Path settings", settingsRows(context, tui)!, () => tui.requestRender(), () => done(), Math.max(3, Math.min(12, tui.terminal.rows - 9))));
-	}
-	async function checkKeys(context: ExtensionContext) {
-		if (context.mode !== "tui") throw new Error("The key check requires an interactive terminal.");
-		let unsubscribe: (() => void) | undefined;
-		try { await context.ui.custom<void>((tui, theme, _keys, done) => {
-			const events: string[] = [];
-			unsubscribe = context.ui.onTerminalInput(data => {
-				const key = matchesKey(data, FOCUS_KEY) ? chordLabel(FOCUS_KEY) : matchesKey(data, COMPACT_KEY) ? chordLabel(COMPACT_KEY) : "neither Path shortcut";
-				const legacy = tui.terminal.kittyProtocolActive && /^\x1b[jk]$/.test(data);
-				events.push(`${JSON.stringify(data).slice(0, 80)} → ${legacy ? "legacy Alt; enhanced host mode rejects this encoding" : key}`);
-				if (events.length > 6) events.shift(); tui.requestRender(); return undefined;
-			});
-			return { render: width => new Text([theme.bold("Path · key check"), "", `Press ${chordLabel(FOCUS_KEY)} once, then ${chordLabel(COMPACT_KEY)} once. Press Enter to close.`,
-				"Escape is recorded here so split Alt sequences remain visible.", "Nothing is saved or sent to a model. Only press test keys here.", "",
-				`Enhanced keyboard: host=${tui.terminal.kittyProtocolActive ? "on" : "off"}, Path parser=${isKittyProtocolActive() ? "on" : "off"}`,
-				...(events.length ? events : ["Waiting for a key event…"])].join("\n"), 1, 1).render(width),
-				handleInput: data => { if (matchesKey(data, "enter")) done(); }, invalidate() {} };
-		}, FULLSCREEN); } finally { unsubscribe?.(); }
+		await context.ui.custom<void>((tui, _theme, _keys, done) => settingsPanel(context, tui, () => done())!);
 	}
 	pi.registerShortcut(FOCUS_KEY, { description: `Open Path's view (Esc or ${chordLabel(FOCUS_KEY)} returns)`, handler: open });
 	pi.registerShortcut(COMPACT_KEY, { description: "Toggle Path's widget between full and one line", handler: async context => { ctx = context; toggleCompact(); } });
@@ -296,107 +286,30 @@ export function installMom(pi: ExtensionAPI) {
 				return { content: [{ type: "text" as const, text }], details: { overview, preview, expandable, data, at: client?.snapshot?.explicit.work?.at } };
 			} catch (error) {
 				failure(error);
-				throw new Error("Path couldn't read that saved view or source. Its last saved notes are unchanged. Use an ID from a previous Path read; /path detail shows the reason.");
+				throw new Error("Path couldn't read that saved view or source. Its last saved notes are unchanged. Use an ID from a previous Path read; open /path for the reason.");
 			}
 		},
 	});
-	/** The trail's projections as text, for the non-TUI and /path paths alike. */
-	async function trailRead(options: TrailOptions): Promise<string> { return (await request({ kind: "trail", options }) as { text: string }).text; }
-	pi.registerCommand("path", { description: "Open Path · rebuild · compact · overview · status · map|graph [endeavor] [depth] · trail [query] · before · open [line] · evolution · mark <kind> <caption> · strike <id> [reason] · reindex [full] (fix the trail's entries) · detail · keys · correct <text> · source <id> [offset] · log · refresh (catch up now) · relabel · pause · resume · settings · model",
+	const USAGE = "Use /path, /path on, /path off, /path refresh, or /path settings.";
+	pi.registerCommand("path", { description: "Open Path · on · off · refresh · settings",
 		handler: async (args, context) => {
 			ctx = context;
 			const commandEpoch = epoch;
-			const [command, ...parts] = args.trim().split(/\s+/), text = parts.join(" ");
+			const [command, ...parts] = args.trim().split(/\s+/);
 			try {
-				if (!command || command === "detail") return await open(context);
-				if (command === "overview") return await show(context);
-				if (command === "rebuild") { if (parts.length) throw new Error("Use /path rebuild; everything happens in its modal."); return await rebuild(context); }
-				if (command === "compact") { toggleCompact(); return; }
-				if (command === "status") { context.ui.notify(cached(), "info"); return; }
-				if (command === "keys") return await checkKeys(context);
-				if (command === "settings") { if (parts.length) throw new Error("Use /path settings to open the interactive controls."); return await showSettings(context); }
-				if (command === "model") {
-					if (context.mode !== "tui") throw new Error("Path's model switcher requires interactive mode.");
-					await ready;
-					const controls = client?.snapshot?.controls;
-					if (!controls) throw new Error(readError ?? "Path is not connected.");
-					// The pick is scoped to Path: it never becomes Pi's default model.
-					const picked = await pickMomModel(context, controls.model, String(flag("mom-model")));
-					if (!picked) return;
-					await request({ kind: "controls", change: { model: picked } });
-					context.ui.notify(`Path will use ${picked}. Saved; its slice reconfigures when idle.`, "info");
-					return;
+				if (!command) return await open(context);
+				if (parts.length) throw new Error(USAGE);
+				if (command === "settings") return await showSettings(context);
+				if (command === "on" || command === "off") {
+					await request({ kind: "controls", change: { enabled: command === "on" } });
+					context.ui.notify(`Path ${command}.`, "info"); return;
 				}
-				if (command === "pause" || command === "resume") {
-					await request({ kind: "controls", change: { enabled: command === "resume" } });
-					context.ui.notify(`Path ${command === "pause" ? "paused" : "resumed"}.`, "info"); return;
-				}
-				if (command === "correct") {
-					if (!text) throw new Error("Use /path correct <your correction>.");
-					// The correction is in the lead's session: oven delivers it to Path like any new entry.
-					pi.sendMessage({ customType: CORRECTION, content: args.slice(args.indexOf(command) + command.length).trim(), display: true, details: { origin: "user-command" } }, { triggerTurn: false });
-					return;
-				}
-				if (command === "graph" || command === "map") {
-					const data = await request({ kind: "graph", options: { nodes: parts[0] ? [parts[0]] : undefined, depth: parts[1] ? Number(parts[1]) : undefined } });
-					context.ui.notify(readText(presentGraph(data), Boolean(parts[0])), "info"); return;
-				}
-				if (command === "trail") { context.ui.notify(await trailRead(text ? { query: text } : {}), "info"); return; }
-				if (command === "before") { context.ui.notify(await trailRead({ before: true }), "info"); return; }
-				if (command === "open") { context.ui.notify(await trailRead({ open: true, ...(text ? { line: text } : {}) }), "info"); return; }
-				if (command === "evolution") { context.ui.notify(await trailRead({ evolution: true }), "info"); return; }
-				if (command === "mark") {
-					const [kind, ...rest] = parts;
-					if (!kind || !(WAYPOINT_KINDS as readonly string[]).includes(kind) || !rest.length) throw new Error(`Use /path mark <kind> <caption>, where kind is one of ${WAYPOINT_KINDS.join(", ")}.`);
-					const waypoint = await request({ kind: "mark", waypoint: { kind: kind as WaypointKind, caption: rest.join(" ") } }) as { id: string; line: string };
-					context.ui.notify(`Marked ${kind} on “${waypoint.line}” as ${waypoint.id}. /path strike ${waypoint.id} removes it from the trail.`, "info"); return;
-				}
-				if (command === "strike") {
-					const [target, ...rest] = parts;
-					if (!target) throw new Error("Use /path strike <waypoint-id> [reason].");
-					await request({ kind: "strike", target, ...(rest.length ? { reason: rest.join(" ") } : {}) });
-					context.ui.notify(`Struck ${target}. The record stays in the file; the trail no longer shows it.`, "info"); return;
-				}
-				if ((command === "reindex" && parts[0] !== "full") || (command === "relabel" && client?.snapshot?.passive.trail)) {
-					await act(context, "repairing the trail's titles, links and kinds from its own entries", { kind: "reindex" },
-						() => "trail repaired. /path reindex full re-reads the whole transcript instead (slow)."); return;
-				}
-				if (command === "reindex") {
-					const { struck } = await request({ kind: "reindex", full: true }) as { struck: number };
-					context.ui.notify(`Re-indexing the trail from the start: ${struck} entr${struck === 1 ? "y" : "ies"} Path wrote are struck (your marks are kept). Where you are now shows first; history fills in behind it.`, "info"); return;
-				}
-				if (command === "source") {
-					if (!parts[0]) throw new Error("Use /path source <source-id> [offset].");
-					context.ui.notify(`Original recorded evidence, not new work:\n${JSON.stringify(await request({ kind: "source", ref: parts[0], offset: Number(parts[1] ?? 0) }), null, 2)}`, "info"); return;
-				}
-				if (command === "log") {
-					const records = await request({ kind: "log" }) as { at: number; type: string; data: Record<string, any> }[];
-					const lines = records.map(record => {
-						const time = clockTime(record.at), d = record.data;
-						if (record.type === "notice") return `${time} finding (${d.key}) — ${d.action}: ${d.note?.text ?? ""}`;
-						if (d.kind === "window") {
-							if (d.action === "opened") return `${time} window after compact ${d.compaction} — opened (watching the first settled turns)`;
-							if (d.action === "checked") return `${time} window after compact ${d.compaction} — watched turn ${d.turns}/3`
-								+ `${d.flagged ? `, flagged: ${d.flagged.map((flag: { class: string; label: string; matched: string[] }) => `${flag.class} “${flag.label}” (${flag.matched.join(", ")})`).join("; ")}` : ""}`
-								+ `${d.checks ? `, model check ${d.checks}/3` : ""}${d.error ? `, check failed: ${d.error}` : ""}`;
-							if (d.action === "corrected") return `${time} window after compact ${d.compaction} — corrected:\n${d.content}`;
-							const reason = d.reason === "user-message" ? "the user's next message" : d.reason === "turns" ? "three settled turns" : d.reason === "correction" ? "the correction" : "a new compaction";
-							return `${time} window after compact ${d.compaction} — closed (${reason})${d.held ? ", continuity held" : ""}`;
-						}
-						if (d.action === "delivered") return `${time} anchor after compact ${d.compaction} — delivered:\n${d.content}`;
-						if (d.action === "pending") return `${time} anchor after compact ${d.compaction} — queued (not yet delivered)`;
-						if (d.action === "reserved") return `${time} anchor after compact ${d.compaction} — prepared (delivery not confirmed)`;
-						return `${time} anchor after compact ${d.compaction} — skipped: ${d.reason}`;
-					});
-					context.ui.notify(lines.length ? `Path findings and continuity events (oldest first):\n${lines.join("\n")}` : "Path has not recorded findings or continuity events yet.", "info"); return;
-				}
-				if (command === "refresh") { await act(context, "catching up on new activity", { kind: "refresh" }, count => client?.snapshot?.passive.trail ? `caught up — ${added(count)}.` : "caught up."); return; }
-				if (command === "relabel") { await act(context, "relabelling the work map", { kind: "relabel" }, () => "work map relabelled."); return; }
-				throw new Error("Use /path, rebuild, overview, status, map, graph, trail, before, open, evolution, mark, strike, reindex, detail, correct, source, log, refresh, relabel, pause, or resume.");
+				if (command === "refresh") { await act(context, client?.snapshot?.passive.trail ? "refreshing the trail (new activity, then titles, links and kinds)" : "catching up on new activity", { kind: "refresh" }, refreshed); return; }
+				throw new Error(USAGE);
 			} catch (error) {
 				if (commandEpoch === epoch) {
 					failure(error);
-					context.ui.notify(`Path request failed: ${updateErrorSummary(String(error))}. The saved map is unchanged; /path detail has full diagnostics.`, "error");
+					context.ui.notify(`Path request failed: ${updateErrorSummary(String(error)).replace(/\.$/, "")}. The saved map is unchanged; open /path for full diagnostics.`, "error");
 				}
 			}
 		},

@@ -75,7 +75,7 @@ export interface Strike {
 	parent: string | null;
 }
 
-/** A title given later to a waypoint (a titling or repair pass). The latest for a target wins over its own; the waypoint is unchanged. */
+/** A title given later to a waypoint (a refresh). The latest for a target wins over its own; the waypoint is unchanged. */
 export interface Retitle {
 	id: string;
 	sessionId: string;
@@ -92,7 +92,7 @@ export interface Trail {
 	waypoints: Waypoint[];
 	/** Waypoints and steps together in transcript order, for the detail page; absent means there are no steps. */
 	entries?: Waypoint[];
-	/** Struck waypoints, kept for the log and for `/path strike` undo decisions. */
+	/** Struck waypoints: what a refresh replaced or dropped, kept for the log. */
 	struck: { waypoint: Waypoint; strike: Strike }[];
 }
 
@@ -100,7 +100,7 @@ export const emptyTrail = (): Trail => ({ waypoints: [], struck: [] });
 export const trailEntries = (trail: Trail): Waypoint[] => trail.entries ?? trail.waypoints;
 
 /** The finalizer's whole argument. An empty list means nothing worth finding again happened. */
-/** One revision of an existing entry in a repair pass (src/trail/repair.ts applies it). */
+/** One revision of an existing entry in a refresh (src/trail/repair.ts applies it). */
 export const Revision = Type.Object({
 	id: Type.String({ minLength: 1, description: "Id of the trail entry to revise (trail.entries)." }),
 	title: Type.Optional(Type.String({ minLength: 1, maxLength: TITLE_CHARS, description: "Its title: two to five words naming the task or thing." })),
@@ -119,7 +119,7 @@ const TitleInput = Type.Object({
 export const RecordWaypoints = Type.Object({
 	waypoints: Type.Array(WaypointInput, { maxItems: 24 }),
 	titles: Type.Optional(Type.Array(TitleInput, { maxItems: 40, description: "Titles for trail waypoints you were shown without one (trail.untitled). Optional." })),
-	revise: Type.Optional(Type.Array(Revision, { maxItems: 200, description: "Repair pass only: revisions of existing trail entries (trail.entries). Leave out in every other operation." })),
+	revise: Type.Optional(Type.Array(Revision, { maxItems: 200, description: "Refresh only: revisions of existing trail entries (trail.entries). Leave out in every other operation." })),
 }, { additionalProperties: false });
 export type RecordWaypoints = Static<typeof RecordWaypoints>;
 

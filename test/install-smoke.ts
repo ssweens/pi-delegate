@@ -12,14 +12,14 @@ const cli = join(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-c
 const env = { ...process.env, HOME: root, PI_CODING_AGENT_DIR: join(root, "agent"), PI_OFFLINE: "1", PI_TELEMETRY: "0" };
 const manifest = JSON.parse(readFileSync(join(repo, "package.json"), "utf8"));
 assert.equal(manifest.private, true, "local-only package must not be publishable");
-assert.deepEqual(manifest.oven?.extensions, { mom: "./src/mom/mom-tools.ts" });
+assert.deepEqual(manifest.oven?.extensions, { mom: "./src/mom/mom-tools.ts", "path-trail": "./src/trail/watcher.ts" });
 const peerRange: string = manifest.peerDependencies["@earendil-works/pi-coding-agent"];
 const runtimeBinaries = ["dist/pi-acp.js", "dist/amp-acp.js"];
 const runtimeModule = "dist/acpx-runtime/runtime.js";
 const required = [
 	"package.json", "README.md", "LICENSE", "NOTICE.md", "vendor/acpx/LICENSE", "vendor/pi-acp/LICENSE",
 	"src/index.ts", "src/inspector.ts", "src/transcript.ts", "src/todo-ext.ts", "src/todo-render.ts", "src/todo.ts",
-	"src/mom/index.ts", "src/mom/mom-tools.ts", "src/mom/modes.ts", "src/mom/v2.ts", "src/mom/classify.ts", "src/mom/model-picker.ts", "src/ui/activity.ts", "src/ui/panel.ts", "src/work/projection.ts",
+	"src/mom/index.ts", "src/mom/mom-tools.ts", "src/trail/watcher.ts", "src/trail/record.ts", "src/mom/modes.ts", "src/mom/v2.ts", "src/mom/classify.ts", "src/mom/model-picker.ts", "src/ui/activity.ts", "src/ui/panel.ts", "src/work/projection.ts",
 	"src/acp-backend.ts", "src/acp/runtime/acpx-runtime.ts", "src/acp/domain/types.ts",
 	...runtimeBinaries, runtimeModule,
 	"skills/delegation/SKILL.md", "roles/scout.md", "roles/worker.md", "roles/reviewer.md", "docs/ARCHITECTURE.md",

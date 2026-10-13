@@ -153,7 +153,7 @@ export function trailFor(records: readonly TrailRecord[], branch: ReadonlySet<st
 		previous = positionOf(waypoint) ?? previous;
 		position.set(record.id, previous);
 	}
-	// A later title record names a waypoint anew (a titling or repair pass); the latest wins over its own title.
+	// A later title record names a waypoint anew (a refresh); the latest wins over its own title.
 	for (const record of onBranch) {
 		if (record.type !== "title") continue;
 		const target = waypoints.get(record.target);
