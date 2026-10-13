@@ -147,10 +147,11 @@ export class MomClient {
 		void this.follow();
 	}
 
-	async ensure(reconfigure = false): Promise<void> {
+	/** Ensure its slice; true when it asked the slice to pick its work up again. */
+	async ensure(reconfigure = false): Promise<boolean> {
 		// A paused Path holds no slice. Oven retires a stopped ephemeral slice as soon as its last operation ends, so
 		// creating one only to stop it again loops (create, stop, retire, "No slice", create…) every reconnect.
-		if (this.state?.enabled === false) { await this.release(); return; }
+		if (this.state?.enabled === false) { await this.release(); return false; }
 		// Saved settings override startup flags. Each operation pins its configured mode at begin.
 		// `create` is create-or-get: an idle slice takes this configuration; a running one is returned unchanged.
 		const flags = { ...this.options.flags, ...(this.state?.mode ? { "mom-mode": this.state.mode } : {}), ...(this.state?.model ? { "mom-model": this.state.model } : {}),
@@ -184,9 +185,15 @@ export class MomClient {
 		assertSliceSupportsMode(String(flags["mom-mode"] ?? ""), slice.missingTools ?? []);
 		this.slice = slice;
 		this.sliceUrl = ovenSliceUrl(slice.id);
-		if (stale && !trail) await this.send({ kind: "refresh" });
+		// Two slices take no work by themselves: one a pause stopped (this client's open watch keeps Oven from retiring
+		// it, so resuming gets it back stopped), and one whose last turn failed under the old configuration (it waits
+		// out its retries, then for the next delivery). Ask either to pick the work up now, as /path refresh does.
+		const asleep = slice.stopped || (reconfigure && ["failed", "retrying"].includes(slice.stage));
+		const wake = asleep || (stale && !trail);
+		if (wake) await (trail ? this.refreshTrail() : this.send({ kind: "refresh" }));
 		this.error = undefined;
 		this.options.changed();
+		return wake;
 	}
 
 	/** Follow its slice: its state, its status document, and its `.mom` file after each change. */
@@ -617,8 +624,8 @@ export class MomClient {
 		const reconfiguring = "mode" in change || "model" in change || "decider" in change;
 		if (pausing) { await this.release(); this.options.changed(); return; }
 		if (resuming) { this.#resume?.(); this.#resume = undefined; }
-		if (reconfiguring || resuming) await this.ensure(reconfiguring);
-		if (resuming && !this.trailMode) await this.send({ kind: "refresh" });
+		const woke = (reconfiguring || resuming) && await this.ensure(reconfiguring);
+		if (resuming && !woke && !this.trailMode) await this.send({ kind: "refresh" });
 		// Suggestions and continuity are read from globals on the next operation; they need no slice round trip.
 	}
 

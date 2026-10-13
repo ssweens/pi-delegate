@@ -1,6 +1,7 @@
 import "./setup.ts";
 import assert from "node:assert/strict";
-import { rmSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { test } from "node:test";
 import { provider, sandbox, harness, OVEN_AVAILABLE, startOven } from "./fixture.ts";
 
@@ -88,5 +89,50 @@ test("the trail watcher reads each batch as delivered, answers with one record_w
 		assert.deepEqual(api.errors, []);
 	} finally {
 		await h?.runtime.dispose(); await daemon.stop(); await api.close(); rmSync(box.root, { recursive: true, force: true });
+	}
+});
+
+test("a watcher that failed on one model picks the work up on the next, and a paused one wakes on resume", { timeout: 60000, skip }, async () => {
+	const api = await provider(), box = sandbox(api.url);
+	// A second model: the one the user switches to after the first keeps failing.
+	const models = JSON.parse(readFileSync(join(box.agentDir, "models.json"), "utf8"));
+	models.providers.fixture.models.push({ ...models.providers.fixture.models[0], id: "fixture-b", name: "Second fixture" });
+	writeFileSync(join(box.agentDir, "models.json"), JSON.stringify(models));
+	const daemon = await startOven(box.root, box.agentDir);
+	const { SessionManager } = await import("@earendil-works/pi-coding-agent");
+	const { MomClient } = await import("../src/mom/client.ts");
+	const { oven } = await import("../src/mom/oven.ts");
+	const answered: string[] = [];
+	api.onUnscripted(request => {
+		if (request.model === "fixture") return { error: 400 };
+		answered.push(textOf(request.messages.findLast((message: any) => message.role === "user")?.content).split("\n")[0]!);
+		return { tool: { name: "record_waypoints", arguments: { waypoints: [] } } };
+	});
+	let manager = SessionManager.create(box.cwd, join(box.root, "parents"));
+	writeFileSync(manager.getSessionFile()!, JSON.stringify(manager.getHeader()) + "\n");
+	manager = SessionManager.open(manager.getSessionFile()!);
+	const client = new MomClient({ cwd: box.cwd, sessionManager: manager } as never, { flags: FLAGS, changed() {}, publish() {}, notify() {} });
+	const slice = async () => (await oven<any[]>("list", {})).find(s => s.key === `${client.key}-trail`);
+	const context = () => ({ slice: client.slice && { state: client.slice.state, stage: client.slice.stage, stopped: client.slice.stopped, model: client.slice.model, detail: client.slice.detail }, answered, errors: api.errors });
+	try {
+		await client.connect();
+		// Its briefing fails on every attempt: the retries are used up and it needs the user.
+		await until("the failed watcher", async () => { const s = await slice(); return s?.stage === "failed" ? s : undefined; }, context);
+		assert.equal(client.view(false).status, "needs you");
+
+		await client.controls({ model: "fixture/fixture-b" });
+		await until("the new model's answer", async () => { const s = await slice(); return answered.length && s?.stage === "idle" ? s : undefined; }, context);
+		assert.equal((await slice())!.model, "fixture/fixture-b");
+		await until("the view to move on", async () => client.view(false).status !== "needs you" || undefined, context);
+
+		await client.controls({ enabled: false });
+		await until("the paused watcher", async () => (await slice())?.stopped || undefined, context);
+		const before = answered.length;
+		await client.controls({ enabled: true });
+		await until("the resumed watcher", async () => { const s = await slice(); return s && !s.stopped && s.stage === "idle" && answered.length > before ? s : undefined; }, context);
+		await until("the view to resume", async () => client.view(false).status !== "paused" || undefined, context);
+		assert.deepEqual(api.errors, []);
+	} finally {
+		client.close(); await daemon.stop(); await api.close(); rmSync(box.root, { recursive: true, force: true });
 	}
 });

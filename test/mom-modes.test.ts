@@ -151,7 +151,7 @@ test("local settings save returns while Mom's runtime reconfiguration is still p
 	let release!: () => void, entered!: () => void;
 	const pending = new Promise<void>(resolve => { release = resolve; }), startedApplying = new Promise<void>(resolve => { entered = resolve; });
 	class SlowClient extends MomClient {
-		override async ensure() { entered(); await pending; }
+		override async ensure() { entered(); await pending; return false; }
 	}
 	const client = new SlowClient({ cwd: dir, sessionManager: { getCwd: () => dir, getSessionFile: () => session, getSessionId: () => "fast-setting" } } as never,
 		{ flags: {}, changed() {}, publish() {}, notify() {} });
