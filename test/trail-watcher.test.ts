@@ -27,6 +27,9 @@ test("the trail watcher reads each batch as delivered, answers with one record_w
 		api.script(first, { text: "Yes: Dune, their agent framework." });
 		api.script(second, { text: "Dune's primitives are Feature, registry and host." });
 		api.onUnscripted(request => {
+			if (textOf(request.messages.find((message: any) => message.role === "system")?.content).includes("The user stepped away")) {
+				return { text: "Analyzing Dune\'s primitives. Next, inspect the registry and host." };
+			}
 			const tools: string[] = (request.tools ?? []).map((tool: any) => tool.function?.name);
 			const users = (request.messages ?? []).filter((message: any) => message.role === "user").map((message: any) => textOf(message.content));
 			const last: string = users.at(-1) ?? "";
@@ -62,6 +65,13 @@ test("the trail watcher reads each batch as delivered, answers with one record_w
 
 		const notifications: string[] = [];
 		const interactive = { ...h.ctx(), ui: { ...h.ctx().ui, notify: (text: string) => { notifications.push(text); } } };
+		await until("fresh Path recap anchor", async () => {
+			await h!.commands.get("recap").handler("test", interactive);
+			const request = api.requests.at(-1), packet = textOf(request?.messages.findLast((message: any) => message.role === "user")?.content);
+			return packet.startsWith("## Task anchor\nPath\'s trail") ? packet : undefined;
+		}, context);
+		assert.match(notifications.at(-1)!, /Success! Recap shown in Activity/);
+
 		const before = calls.length;
 		await h.commands.get("path").handler("refresh", interactive);
 		const refreshes = calls.slice(before).filter(call => call.last.startsWith("Refresh"));

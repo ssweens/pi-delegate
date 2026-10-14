@@ -4,10 +4,11 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 import { AgentsPanel, type LiveSource } from "../src/inspector.ts";
 import type { RunView } from "../src/render.ts";
-import { delegateRows, todoRows } from "../src/ui/delegate-settings.ts";
+import { delegateRows, recapRows, todoRows } from "../src/ui/delegate-settings.ts";
 import { SettingsPanel } from "../src/ui/settings-panel.ts";
 import { DEFAULT_DELEGATE_SETTINGS, type DelegateSettings } from "../src/delegate-settings.ts";
 import { DEFAULT_TODO_SETTINGS, type TodoSettings } from "../src/todo-settings.ts";
+import { DEFAULT_RECAP_SETTINGS, type RecapSettings } from "../src/recap-settings.ts";
 
 const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as unknown as Theme;
 const plain = (lines: string[]) => lines.join("\n").replace(/\x1b\[[0-9;]*m/g, "");
@@ -130,4 +131,21 @@ test("todo reminder settings are off by default and save On", async () => {
 	await new Promise((resolve) => setImmediate(resolve));
 	assert.deepEqual(saved, [{ reminders: true }]);
 	assert.match(plain(panel.render(120)), /Reminders\s+On ●/);
+});
+
+test("recap settings use the shared SettingsPanel and expose the persisted controls", async () => {
+	const { initTheme } = await import("@earendil-works/pi-coding-agent");
+	initTheme();
+	let settings: RecapSettings = { ...DEFAULT_RECAP_SETTINGS };
+	const saved: Partial<RecapSettings>[] = [];
+	const panel = new SettingsPanel("Delegate settings", recapRows(() => settings, async (change) => { saved.push(change); settings = { ...settings, ...change }; }), () => {}, () => {});
+	assert.match(plain(panel.render(120)), /Away summaries\s+On/);
+	assert.match(plain(panel.render(120)), /Idle threshold\s+5m/);
+	panel.handleInput(ENTER);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(saved, [{ enabled: false }]);
+	assert.match(plain(panel.render(120)), /Away summaries\s+Off ●/);
+	assert.match(plain(panel.render(120)), /away recap after settled work has been idle/);
+	panel.handleInput(DOWN);
+	assert.match(plain(panel.render(120)), /waits after parent and delegate work settle/);
 });

@@ -3,6 +3,7 @@
  *
  *   delegate  — delegation's controls: mode, depth and concurrency limits, model picking (delegate-settings.ts)
  *   todo      — todo controls: automatic incomplete-work reminders (todo-settings.ts)
+ *   recap     — away recap controls: enabled and idle threshold (recap-settings.ts)
  *   path      — Path's controls: mode, model, decision model, tracking, continuity, suggestion classes
  *   mom       — Path's former section name: still read (and merged under `path`), never written
  *   defaults  — the approved default model per role, with the catalog it was approved against
@@ -37,6 +38,8 @@ export interface SettingsFile {
 	path?: Record<string, unknown>;
 	/** Todo controls, validated by todo-settings.ts. */
 	todo?: Record<string, unknown>;
+	/** Away recap controls, validated by recap-settings.ts. */
+	recap?: Record<string, unknown>;
 	defaults?: { approved?: Record<string, ApprovedDefault>; catalogAtApproval?: string[] };
 	ratings?: { updatedAt?: number; entries?: Record<string, RatingEntry> };
 }
@@ -58,6 +61,7 @@ export function readSettings(file: string = settingsFile()): SettingsFile {
 			...(isRecord(value.mom) ? { mom: value.mom } : {}),
 			...(isRecord(value.path) ? { path: value.path } : {}),
 			...(isRecord(value.todo) ? { todo: value.todo } : {}),
+			...(isRecord(value.recap) ? { recap: value.recap } : {}),
 			...(isRecord(value.defaults) ? { defaults: value.defaults as SettingsFile["defaults"] } : {}),
 			...(isRecord(value.ratings) ? { ratings: value.ratings as SettingsFile["ratings"] } : {}),
 		};
@@ -79,6 +83,7 @@ export function mergeSettings(current: SettingsFile, patch: SettingsFile): Setti
 	if (patch.mom) next.mom = { ...current.mom, ...patch.mom };
 	if (patch.path) next.path = { ...current.path, ...patch.path };
 	if (patch.todo) next.todo = { ...current.todo, ...patch.todo };
+	if (patch.recap) next.recap = { ...current.recap, ...patch.recap };
 	if (patch.defaults) next.defaults = { ...current.defaults, ...patch.defaults,
 		approved: { ...current.defaults?.approved, ...patch.defaults.approved },
 		...(patch.defaults.catalogAtApproval ? { catalogAtApproval: patch.defaults.catalogAtApproval } : {}) };
@@ -109,10 +114,10 @@ export async function writeSettings(patch: SettingsFile, file: string = settings
 }
 
 /**
- * A validated section (`delegate`, `todo`): `read` normalizes what the file holds; `save` validates a change
+ * A validated section (`delegate`, `todo`, `recap`): `read` normalizes what the file holds; `save` validates a change
  * against `normalize` before writing, so the file never holds a value the module would ignore.
  */
-export function defineSection<T extends object>(name: "delegate" | "todo", normalize: (value: unknown) => T) {
+export function defineSection<T extends object>(name: "delegate" | "todo" | "recap", normalize: (value: unknown) => T) {
 	const read = (file: string = settingsFile()): T => normalize(readSettings(file)[name]);
 	const save = async (change: Partial<T>, file: string = settingsFile()): Promise<T> => {
 		const next = normalize({ ...read(file), ...change });

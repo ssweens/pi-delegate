@@ -2,7 +2,7 @@
 
 Install from a local checkout with `pi install ./pi-delegate`. This private package is not published to npm. During the tether compatibility window, use this package instead of `pi-tether`; do not list both packages in Pi or Oven settings because both declare Path. The delegation tools, phased todo tool, `delegation` skill, and default roles all ship in the package. Nothing is copied to `~/.agents`.
 
-Requires Pi 0.99.1 or newer, below 2.0.0. Minimal delegation for pi: durable child runs, role files, fork context, steer, honest run log, a stock-Pi phased todo list, and Path's unified activity view. Path's trail (the append-only index of waypoints into the transcript, mode `trail`) is documented in [`docs/trail.md`](docs/trail.md); the older work-graph modes are in [`docs/map-modes.md`](docs/map-modes.md). Replaces pi-subagents (125 schema params, 14.8k lines, 11 tools in context) and pi-strings.
+Requires Pi 0.99.1 or newer, below 2.0.0. Minimal delegation for pi: durable child runs, role files, fork context, steer, honest run log, a stock-Pi phased todo list, Path's unified activity view, and an away recap after idle. Path's trail (the append-only index of waypoints into the transcript, mode `trail`) is documented in [`docs/trail.md`](docs/trail.md); the older work-graph modes are in [`docs/map-modes.md`](docs/map-modes.md). Replaces pi-subagents (125 schema params, 14.8k lines, 11 tools in context) and pi-strings.
 
 One tool pair, two backends:
 
@@ -272,6 +272,14 @@ The ACP Coordinator still keeps its state under `~/.pi/agent/pi-strings/` (each 
 The `todo` tool and `/todo` command are owned by pi-delegate. They provide OMP-style phased tasks with immutable state transitions, session/branch restoration, an above-editor widget, compact/expanded tool rendering, and `TODO.md` import/export.
 
 Todo state writes use the `pi_delegate.todo` session-entry namespace. Existing `pi_omp.todo` entries are read-only migration input, so installing or reloading pi-delegate does not discard an existing plan. Automatic reminders are disabled by default. Enable them with `/delegate settings` → **Todo reminders** or set `{"todo":{"reminders":true}}` in `~/.pi/agent/pi-delegate.json`. When enabled, reminders are bounded and suppressed when the turn was aborted, the assistant is asking a question, a prior reminder is awaiting progress, or an unsettled delegate child will wake the parent.
+
+## Away recap
+
+After settled work has been idle for five minutes by default, `/recap` summarizes the current work in the shared Activity widget. It requires three user turns and two new messages since the last recap, an empty draft, and no active or pending parent or delegate work.
+
+The side call has an approximate 2,000-token input budget, including the prompt, with up to 500 tokens for a task anchor. It uses Path\'s standing only when its saved trail covers the latest user request. Otherwise it uses the latest compaction or branch summary, or the opening request when no summary exists. Path remains optional. The rest of the packet contains the newest complete user/assistant exchanges in chronological order. Only an oversized anchor or newest exchange is clipped. Tool traffic and previous recaps are excluded. Recent explicit user corrections take precedence over older task state. Without Path or a saved summary, the opening-request fallback cannot retain every older decision.
+
+Returning to the terminal, new input or work, model changes, and session changes cancel generation. A changed snapshot cannot publish a stale recap. The displayed recap remains capped at 40 words. Use `/recap test`, `/recap on|off`, `/recap status`, `/recap debug`, or `/recap 30s`/`/recap 5m` to control it. `/recap test` bypasses the idle and message-count gates, but still requires settled work. `/delegate settings` persists the enabled state and idle threshold in `pi-delegate.json`.
 
 ## Waiting for an existing child
 

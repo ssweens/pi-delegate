@@ -19,6 +19,7 @@ import { MomRebuildPanel } from "../ui/mom-rebuild.ts";
 import type { RebuiltMap } from "./rebuild.ts";
 import { formatDuration } from "../util/format.ts";
 import { errorMessage, textOf } from "../util/text.ts";
+import { isPiStringsWorkerProcess } from "../util/process.ts";
 
 const FLAGS = {
 	"mom-model": ["Exact provider/model for Path; never inherits the lead model", "openai-codex/gpt-5.6-sol"],
@@ -45,12 +46,12 @@ export function resolveFlag(name: keyof typeof FLAGS, get: (key: string) => unkn
 	return path !== undefined && path !== fallback ? path : get(name) ?? fallback;
 }
 
-const installedIn = new WeakSet<object>();
+const installedIn = new WeakMap<object, () => string | undefined>();
 
 export function installMom(pi: ExtensionAPI) {
-	if (installedIn.has(pi)) return;
-	installedIn.add(pi);
-	if (process.env.PI_STRINGS_WORKER === "1" || process.env.PI_STRINGS_OPENED === "1") return;
+	const installed = installedIn.get(pi);
+	if (installed) return installed;
+	if (isPiStringsWorkerProcess()) return;
 	// `--path-*` are the documented flags; `--mom-*` keep working as deprecated aliases (internal keys stay `mom-*`).
 	for (const [name, [description, value]] of Object.entries(FLAGS)) {
 		pi.registerFlag(name.replace(/^mom-/, "path-"), { description, type: "string", default: value });
@@ -59,15 +60,16 @@ export function installMom(pi: ExtensionAPI) {
 	/** A flag's value: the `path-*` one when it differs from its default, else the deprecated `mom-*` one. */
 	const flag = (name: keyof typeof FLAGS) => resolveFlag(name, key => pi.getFlag(key));
 	let ctx: ExtensionContext | undefined, client: MomClient | undefined;
+	const recapAnchor = () => client?.recapAnchor();
+	installedIn.set(pi, recapAnchor);
 	let ready: Promise<void> = Promise.resolve(), epoch = 0, readError: string | undefined;
 	let widgetSignature: string | undefined;
 	let heldWidget: PanelView | undefined;
 	let viewOpen = false, closeView: (() => void) | undefined, momView: MomView | undefined;
 	let rebuilding: { owner: MomClient; abort: AbortController; message: string; sliceUrl?: string; candidate?: RebuiltMap; error?: string } | undefined;
 	const sentAnchors = new Set<string>(), sentStandings = new Set<string>();
-	const COMPACT = Symbol.for("@ssweens/pi-tether/compact");
-	const compact = () => Reflect.get(globalThis, COMPACT) === true;
-	const toggleCompact = () => { Reflect.set(globalThis, COMPACT, !compact()); sync(); };
+	const activity = activityFor(pi);
+	const toggleCompact = () => { activity.toggleCompact(); sync(); };
 	function view(explicit = false, elapsed = true): PanelView {
 		const error = client?.error ?? readError;
 		const saved: PanelView = client?.state ? client.view(explicit, elapsed) : {
@@ -77,11 +79,10 @@ export function installMom(pi: ExtensionAPI) {
 		const rebuild = rebuilding?.owner === client ? rebuilding : undefined;
 		const rebuildStatus = rebuild?.candidate ? "Rebuild ready · B on F3 Status to review" : rebuild?.error
 			? `Rebuild failed · ${updateErrorSummary(rebuild.error)} · B on F3 Status to retry` : rebuild?.message;
-		return { ...saved, compact: compact(), ...(shown ? { error: updateErrorSummary(shown) } : {}),
+		return { ...saved, compact: activity.isCompact(), ...(shown ? { error: updateErrorSummary(shown) } : {}),
 			...(rebuildStatus ? { rebuild: rebuildStatus, rebuildUrl: !rebuild?.candidate && !rebuild?.error ? rebuild?.sliceUrl : undefined } : {}),
 			status: client?.error ? "reconnecting" : saved.status };
 	}
-	const activity = activityFor(pi);
 	function sync() {
 		momView?.statusChanged();
 		const signature = JSON.stringify(view(false, false));
@@ -248,7 +249,7 @@ export function installMom(pi: ExtensionAPI) {
 		await context.ui.custom<void>((tui, _theme, _keys, done) => settingsPanel(context, tui, () => done())!);
 	}
 	pi.registerShortcut(FOCUS_KEY, { description: `Open Path's view (Esc or ${chordLabel(FOCUS_KEY)} returns)`, handler: open });
-	pi.registerShortcut(COMPACT_KEY, { description: "Toggle Path's widget between full and one line", handler: async context => { ctx = context; toggleCompact(); } });
+	pi.registerShortcut(COMPACT_KEY, { description: "Toggle the Activity widget between full and compact", handler: async context => { ctx = context; toggleCompact(); } });
 	const TRAIL_DESCRIPTION = "Read Path's trail: where we are and the waypoints into the transcript. query finds where a line landed; before shows what we were doing before the last detour; open lists unfinished steps and questions; evolution shows how the goal changed.";
 	pi.registerTool({ name: "path", label: "Path", description: "Read Path's saved story map, its trail, selected records, or original evidence without a model call. The widget already shows your current place; use this for more detail. Read-only: working agents never maintain Path's notes. Choose at most one of graph, source, trail.",
 		parameters: Type.Object({ graph: Type.Optional(Type.Object({
@@ -314,6 +315,7 @@ export function installMom(pi: ExtensionAPI) {
 			}
 		},
 	});
+	return recapAnchor;
 }
 
 export default installMom;

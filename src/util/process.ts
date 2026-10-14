@@ -15,6 +15,11 @@ export interface ProcessIdentity { pid: number; host: string; token: string; sta
  * for equality with this process's own.
  */
 const IDENTITY = Symbol.for("@ssweens/pi-delegate/acp-process/1");
+/** ACP worker and opened-session processes must not install root-only interactive extensions. */
+export function isPiStringsWorkerProcess(): boolean {
+	return process.env.PI_STRINGS_WORKER === "1" || process.env.PI_STRINGS_OPENED === "1";
+}
+
 export function processIdentity(): ProcessIdentity {
 	const g = globalThis as typeof globalThis & { [IDENTITY]?: ProcessIdentity };
 	return g[IDENTITY] ??= { pid: process.pid, host: hostname(), token: randomUUID().replaceAll("-", "").slice(0, 12), startedAt: new Date().toISOString() };

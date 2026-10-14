@@ -136,6 +136,16 @@ export class MomClient {
 	get trail(): Trail | undefined { return this.#trail; }
 	get trailSkipped(): number { return this.#trailSkipped; }
 	get trailError(): string | undefined { return this.#trailError; }
+
+	recapAnchor(): string | undefined {
+		const trail = this.#trail;
+		if (!this.trailMode || !trail?.waypoints.length || this.paused || this.error || this.#trailError) return;
+		const branch = this.branch(), covered = this.coveredThrough();
+		const latestUser = branch.findLastIndex(entry => entry.type === "message" && entry.message.role === "user");
+		if (latestUser < 0 || branch.findIndex(entry => entry.id === covered) < latestUser) return;
+		return renderStanding(trail);
+	}
+
 	/** The mode in force, as its slice resolves it: a saved mode (global, then this session's), else the startup flag. */
 	private get mapMode(): string { return this.state?.mode || String(this.options.flags["mom-mode"] ?? ""); }
 	private get trailMode(): boolean { return this.mapMode === TRAIL_MODE; }

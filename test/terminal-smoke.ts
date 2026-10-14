@@ -6,6 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
 import { provider, sandbox, deferred } from "./fixture.ts";
+import { textOf } from "../src/util/text.ts";
 
 const api = await provider(), box = sandbox(api.url);
 const socket = `delegate-qc-${process.pid}`;
@@ -56,6 +57,44 @@ try {
 		// one evening while this suite kept passing; never again.
 		assert.doesNotMatch(capture(), /\[Extension issues\]/);
 		assert.doesNotMatch(capture(), /shortcut conflict/);
+		const opening = "RECAP-OPEN: build persistent background agent management.";
+		api.script(opening, { text: "RECAP-OPEN-ACK. Preserve native session references." });
+		await command(opening); await expect(/RECAP-OPEN-ACK/);
+		for (let i = 0; i < 12; i++) {
+			const prompt = `RECAP-MIDDLE-${i}: retain the session tree. ${"older detail ".repeat(80)}`.trimEnd();
+			api.script(prompt, { text: `RECAP-ACK-${i}. ${"recorded outcome ".repeat(20)}` });
+			await command(prompt); await expect(new RegExp(`RECAP-ACK-${i}\\.`));
+		}
+		const current = "RECAP-CURRENT: recap uses a task anchor and recent dialogue. Next, verify cancellation.";
+		api.script(current, { text: "RECAP-CURRENT-ACK. Keep the five-minute default." });
+		await command(current); await expect(/RECAP-CURRENT-ACK/);
+		let heldRecap: ReturnType<typeof deferred<void>> | undefined;
+		api.onUnscripted(request => {
+			const system = textOf(request.messages.find((message: any) => message.role === "system")?.content);
+			assert.match(system, /The user stepped away/);
+			const packet = textOf(request.messages.at(-1).content);
+			assert.ok(system.length + packet.length <= 8000, "recap input stays bounded in the real provider request");
+			assert.match(packet, /RECAP-OPEN/);
+			assert.match(packet, /RECAP-CURRENT/);
+			assert.doesNotMatch(packet, /RECAP-MIDDLE-0:/);
+			return heldRecap ? { text: "STALE-LIVE-RECAP", gate: heldRecap }
+				: { text: "Building persistent agent management with bounded away recaps. Next, verify cancellation when you return." };
+		});
+		await command("/recap test");
+		await expect(/※ recap: Building persistent agent/);
+		save(`${mode}-recap-bounded`);
+		heldRecap = deferred<void>();
+		const requested = api.requests.length;
+		await command("/recap test");
+		for (const deadline = Date.now() + 15000; api.requests.length === requested && Date.now() < deadline; await sleep(25)) {}
+		assert.equal(api.requests.length, requested + 1);
+		text("RECAP-RETURN-DRAFT"); await expect(/RECAP-RETURN-DRAFT/);
+		await expect(/FAILED: Recap (?:snapshot became stale|was cancelled)/);
+		heldRecap.resolve();
+		assert.doesNotMatch(capture(), /※ recap: STALE-LIVE-RECAP/);
+		save(`${mode}-recap-cancelled`);
+		key("C-u");
+		api.onUnscripted(undefined);
 		await command("/fixture-mom-settings");
 		await expect(/Path settings/);
 		assert.match(capture(), /Background tracking/);
@@ -177,7 +216,7 @@ try {
 		assert.equal(new Set(outcomes.map((e) => e.details.sessionFile)).size, 1);
 	}
 	assert.deepEqual(api.errors, []);
-	console.log(`PASS real Pi regular/fullscreen: clean startup, native collapsed/expanded tools, streaming latest, paused scrolling, narrow resize, drafts, same-ID revival, hidden finished frame.\nEvidence: ${box.root}`);
+	console.log(`PASS real Pi regular/fullscreen: bounded recap input, visible recap, cancellation on return, clean startup, native collapsed/expanded tools, streaming latest, paused scrolling, narrow resize, drafts, same-ID revival, hidden finished frame.\nEvidence: ${box.root}`);
 } catch (error) {
 	try { save("failure"); } catch { /* process may already have exited */ }
 	console.error(`Evidence: ${box.root}`); throw error;

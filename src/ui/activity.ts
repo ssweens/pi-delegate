@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
-import { type Component, type Focusable, type TUI } from "@earendil-works/pi-tui";
+import { type Component, type Focusable, type TUI, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { AgentsPanel, type LiveSource } from "../inspector.js";
 import { frame, withLegend } from "../render.js";
 import { renderTodoSectionLines } from "../todo-render.js";
@@ -11,6 +11,19 @@ import { SPIN_MS, spinning } from "./trail-view.ts";
 import type { SettingsRow } from "./settings-panel.ts";
 
 export const ACTIVITY_WIDGET_KEY = "pi-delegate.activity";
+// Keep the existing cross-extension key so a reload or a separately loaded Path host preserves the mode.
+const COMPACT_STATE = Symbol.for("@ssweens/pi-tether/compact");
+
+/** Recap is another unframed section; the coordinator supplies the outer Activity frame. */
+export function renderRecapSectionLines(recap: string, theme: Theme, width: number, compact = false): string[] {
+	const inner = Math.max(1, Math.floor(width) - 4);
+	const maxLine = Math.max(1, inner - 2);
+	const lines = wrapTextWithAnsi(recap, maxLine);
+	const body = compact ? [truncateToWidth(lines.join(" "), maxLine, "…")] : lines.slice(0, 2);
+	if (!compact && lines.length > 2) body[1] = `${truncateToWidth(body[1]!, Math.max(0, inner - 3), "")}…`;
+	return [theme.bold(theme.fg("accent", "Recap")), ...body.map(line => `  ${line}`)];
+}
+
 /** Path's settings panel, built for a submenu: `close` returns to the panel that opened it. Undefined until it is connected. */
 /** Path's rows of the settings panel; undefined until Path is connected. */
 export type MomRowsFactory = (context: ExtensionContext, tui: TUI) => SettingsRow[] | undefined;
@@ -47,6 +60,8 @@ export class ActivityCoordinator {
 	private live?: LiveSource;
 	private openChild?: (id: string) => Promise<void>;
 	private todos?: TodoState;
+	private recap?: string;
+	private compact = Reflect.get(globalThis, COMPACT_STATE) === true;
 	private mom?: () => PanelView;
 	private panel?: AgentsPanel;
 	private widget?: ActivityWidget;
@@ -87,6 +102,20 @@ export class ActivityCoordinator {
 		this.tui?.requestRender();
 	}
 
+	setRecap(recap: string | undefined): void {
+		this.recap = recap;
+		this.tui?.requestRender();
+	}
+
+	setCompact(compact: boolean): void {
+		this.compact = compact;
+		Reflect.set(globalThis, COMPACT_STATE, compact);
+		this.tui?.requestRender();
+	}
+
+	isCompact(): boolean { return this.compact; }
+	toggleCompact(): void { this.setCompact(!this.compact); }
+
 	setMom(view: () => PanelView): void {
 		this.mom = view;
 		this.tui?.requestRender();
@@ -124,6 +153,8 @@ export class ActivityCoordinator {
 		this.panel?.dispose();
 		this.panel = undefined;
 		this.widget = undefined;
+		this.recap = undefined;
+		this.setCompact(false);
 		if (this.tui && this.clearOnShrink !== undefined) this.tui.setClearOnShrink(this.clearOnShrink);
 		this.clearOnShrink = undefined;
 		if (this.context?.mode === "tui") this.context.ui.setWidget(ACTIVITY_WIDGET_KEY, undefined);
@@ -139,11 +170,12 @@ export class ActivityCoordinator {
 		const outer = Math.max(0, Math.min(Math.floor(width), terminalWidth));
 		const inner = Math.max(1, outer - 4);
 		const sections: string[][] = [];
-		if (this.panel) sections.push(this.panel.renderSection(inner + 4));
-		if (this.todos) sections.push(renderTodoSectionLines(this.todos, theme, inner + 4));
 		const mom = this.mom?.();
+		if (this.panel) sections.push(this.panel.renderSection(inner + 4, this.compact));
+		if (this.todos) sections.push(renderTodoSectionLines(this.todos, theme, inner + 4, this.compact));
 		this.spin(Boolean(mom?.trail && spinning(mom.status)));
-		if (mom) sections.push(momSectionLines(mom, theme, inner + 4));
+		if (mom) sections.push(momSectionLines(mom, theme, inner + 4, this.compact));
+		if (this.recap) sections.push(renderRecapSectionLines(this.recap, theme, inner + 4, this.compact));
 		return renderActivityLines(sections, theme, outer, Boolean(this.panel?.focused)).map(line => cut(line, outer));
 	}
 }

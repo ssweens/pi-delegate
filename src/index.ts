@@ -34,11 +34,14 @@ import { dealEligible, formatPercent, selectDeals, type DealsDetails } from "./d
 import { DealSheet } from "./deals-sheet.js";
 import { resolveChildTrust, type ChildTrust } from "./project-trust.js";
 import { processOwner } from "./storage.js";
+import { isPiStringsWorkerProcess } from "./util/process.ts";
 import { installMom } from "./mom/index.js";
 import { activityFor } from "./ui/activity.js";
+import { installRecap } from "./recap.ts";
 import { DEFAULT_DELEGATE_SETTINGS, pickModel, readDelegateSettings, saveDelegateSettings } from "./delegate-settings.ts";
 import { DEFAULT_TODO_SETTINGS, readTodoSettings, saveTodoSettings } from "./todo-settings.ts";
-import { delegateRows, todoRows } from "./ui/delegate-settings.ts";
+import { DEFAULT_RECAP_SETTINGS, formatRecapThreshold, readRecapSettings, saveRecapSettings } from "./recap-settings.ts";
+import { delegateRows, recapRows, todoRows } from "./ui/delegate-settings.ts";
 import { SettingsPanel, textPage, type SettingsRow } from "./ui/settings-panel.ts";
 import { FULLSCREEN } from "./ui/overlay.ts";
 import { AGENT_DIR, SETTINGS_PATH } from "./agent-dir.ts";
@@ -595,7 +598,7 @@ function defaultsReport({ approved, drift }: ModelsDetails["defaults"]): string 
 /** A child whose tools allow either delegation tool runs its own pi-delegate. Revival reads that from the run. */
 const delegating = (run: Run) => DELEGATION_TOOLS.some(allowlist(run).allows);
 /** The delegation tools inside a delegating child's own session, as an inline extension of that session. */
-const nestedExtension = (run: Run) => ({ name: "pi-delegate", factory: (pi: ExtensionAPI) => installDelegate(pi, run) });
+const nestedExtension = (run: Run) => ({ name: "pi-delegate", factory: (pi: ExtensionAPI) => { installDelegate(pi, run); } });
 /**
  * What a child's session takes from the session that started it. Pi caches each extension module's factory
  * for the folder it last loaded extensions for (the root session's), so a child whose loader loads from that
@@ -663,7 +666,10 @@ function childLoader(run: Run, settingsManager: SettingsManager, reopen: boolean
 			: { agentsFilesOverride: () => ({ agentsFiles: loadProjectContextFiles({ cwd: run.cwd, agentDir: AGENT_DIR }) }) }),
 	});
 }
-export default function (pi: ExtensionAPI) { installDelegate(pi); installMom(pi); }
+export default function (pi: ExtensionAPI) {
+	const work = installDelegate(pi), anchor = installMom(pi);
+	installRecap(pi, activityFor(pi), { work, anchor });
+}
 
 /**
  * The delegation tools for one session. At the root, that is the parent's session. With `nesting`,
@@ -676,7 +682,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 	const depth = nesting?.depth ?? 0;
 	// ACP Pi workers (pi-acp) are full Pi processes that load installed extensions. They must not
 	// receive `delegate`, or a worker could start its own orchestration and recurse.
-	if (process.env.PI_STRINGS_WORKER === "1" || process.env.PI_STRINGS_OPENED === "1") return;
+	if (isPiStringsWorkerProcess()) return;
 	// Trust answers given "for this session only" and dismissals, and one trust question at a time: a
 	// second child bound for the same folder waits for the first answer instead of asking again. An
 	// aborted delegate call closes its question, which releases the queue.
@@ -1467,16 +1473,18 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 	}
 	async function openSettings(ctx: ExtensionContext) {
 		if (ctx.mode !== "tui") {
-			const d = readDelegateSettings(SETTINGS_PATH), t = readTodoSettings(SETTINGS_PATH);
-			ctx.ui.notify(`delegate settings: mode ${d.mode} · max depth ${d.maxDepth} · max running ${d.maxConcurrent || "no limit"} · model picking ${d.modelPicking} · todo reminders ${t.reminders ? "on" : "off"} (${SETTINGS_PATH})`, "info");
+			const d = readDelegateSettings(SETTINGS_PATH), t = readTodoSettings(SETTINGS_PATH), r = readRecapSettings(SETTINGS_PATH);
+			ctx.ui.notify(`delegate settings: mode ${d.mode} · max depth ${d.maxDepth} · max running ${d.maxConcurrent || "no limit"} · model picking ${d.modelPicking} · todo reminders ${t.reminders ? "on" : "off"} · recap ${r.enabled ? "on" : "off"} after ${formatRecapThreshold(r.idleThresholdMs)} (${SETTINGS_PATH})`, "info");
 			return;
 		}
 		let settings = readDelegateSettings(SETTINGS_PATH);
 		let todoSettings = readTodoSettings(SETTINGS_PATH);
+		let recapSettings = readRecapSettings(SETTINGS_PATH);
 		await ctx.ui.custom<void>((tui, _theme, _keys, done) => {
 			const rows: SettingsRow[] = [
 				...delegateRows(() => settings, async (change) => { settings = await saveDelegateSettings(change, SETTINGS_PATH); if ("mode" in change) syncMode(ctx); }),
 				...todoRows(() => todoSettings, async (change) => { todoSettings = await saveTodoSettings(change, SETTINGS_PATH); }),
+				...recapRows(() => recapSettings, async (change) => { recapSettings = await saveRecapSettings(change, SETTINGS_PATH); }),
 				{ id: "roles", section: "Agents", label: "Roles", value: () => `${loadRoles(ctx.cwd, ctx.isProjectTrusted(), AGENT_DIR).size} roles`,
 					help: "Each role's model list, the model a delegate call without model: runs on right now, and the file it comes from.",
 					submenu: (close) => textPage("Roles", () => roleLines(ctx), close, Math.max(6, tui.terminal.rows - 12)) },
@@ -1484,10 +1492,11 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 				...(activity?.momRows(ctx, tui) ?? [{ id: "mom", section: "Path", label: "Path", value: () => "not connected",
 					help: "Path is not connected yet. Its settings are listed here once its saved view has loaded." }]),
 				{ id: "restore", section: "Reset", label: "Restore defaults", value: () => "",
-					help: "Set delegation and todo settings above back to their defaults. Path's settings, approved role models and ratings are kept.",
+					help: "Set delegation, todo, and recap settings above back to their defaults. Path's settings, approved role models and ratings are kept.",
 					action: async () => {
 						settings = await saveDelegateSettings({ ...DEFAULT_DELEGATE_SETTINGS }, SETTINGS_PATH);
 						todoSettings = await saveTodoSettings({ ...DEFAULT_TODO_SETTINGS }, SETTINGS_PATH);
+						recapSettings = await saveRecapSettings({ ...DEFAULT_RECAP_SETTINGS }, SETTINGS_PATH);
 						syncMode(ctx);
 					} },
 			];
@@ -1641,4 +1650,5 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 	}
 	// A nested instance gets this too: closeSession emits it before disposing a child's session.
 	pi.on("session_shutdown", async (event) => { await shutdown(event.reason); });
+	return liveSource;
 }

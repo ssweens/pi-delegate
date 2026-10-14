@@ -134,7 +134,7 @@ export class AgentsPanel implements Component, Focusable {
 		this.tui.requestRender();
 	}
 
-	private section(width: number): { header: string; body: string[]; hint: string } | undefined {
+	private section(width: number, compact = false): { header: string; body: string[]; hint: string } | undefined {
 		const rows = this.rows();
 		if (!rows.length) return undefined;
 		const index = Math.max(0, rows.findIndex((r) => r.id === this.selectedId));
@@ -176,13 +176,20 @@ export class AgentsPanel implements Component, Focusable {
 		const joined = rows.some((v) => v.joinedWaiters);
 		const active = rows.filter((v) => !v.settled).length, done = rows.length - active;
 		const counts = [active ? `${active} active` : "", done ? `${done} done` : ""].filter(Boolean).join(" · ");
-		const header = this.theme.bold("Agents") + this.theme.fg("muted", ` · ${counts}${range}`)
+		const header = this.theme.bold(this.theme.fg("accent", "Agents")) + this.theme.fg("muted", ` · ${counts}${range}`)
 			+ (joined ? this.theme.fg("warning", " · parent blocked in wait") : "");
+		if (compact) {
+			const current = rows.find((v) => !v.settled) ?? rows[0];
+			const summary = current
+				? `  ${icon(current, this.theme)} ${this.theme.fg(current.settled ? "muted" : "text", runTitle(current))}${rows.length > 1 ? this.theme.fg("dim", ` · +${rows.length - 1} more`) : ""}`
+			: "";
+			return { header, body: summary ? [fit(summary, inner)] : [], hint: this.focused ? agentListHint() : joinHints(hint.left("agents"), "/agents history") };
+		}
 		return { header, body: body.map((l) => fit(l, inner)), hint: this.focused ? agentListHint() : joinHints(hint.left("agents"), "/agents history") };
 	}
 
-	renderSection(width: number): string[] {
-		const section = this.section(width);
+	renderSection(width: number, compact = false): string[] {
+		const section = this.section(width, compact);
 		return section ? [section.header, ...section.body] : [];
 	}
 

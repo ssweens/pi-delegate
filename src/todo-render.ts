@@ -449,7 +449,7 @@ function renderFramedBlock(
  * border — and the nested tree of phases — the active phase's open tasks as
  * inner `├─`/`└─` continuation lines — as the framed body.
  */
-export function renderTodoSectionLines(state: TodoState, theme: TodoStyler, width: number): string[] {
+export function renderTodoSectionLines(state: TodoState, theme: TodoStyler, width: number, compact = false): string[] {
 	const phases = state.phases.filter((phase) => phase.tasks.length > 0);
 	const allTasks = phases.flatMap((phase) => phase.tasks);
 	const open = countOpen(allTasks);
@@ -458,6 +458,11 @@ export function renderTodoSectionLines(state: TodoState, theme: TodoStyler, widt
 	// Agents-panel header shape: bold-accent "Todos" + muted " · done/total".
 	const done = allTasks.filter((task) => task.status === "completed").length;
 	const header = theme.bold(theme.fg("accent", "Todos")) + theme.fg("muted", ` · ${done}/${allTasks.length}`);
+	if (compact) {
+		const current = allTasks.find((task) => task.status === "in_progress")
+			?? allTasks.find((task) => task.status === "pending" || task.status === "blocked");
+		return current ? [header, fit(`  ${renderTodoTaskLine(current, theme, Math.max(0, width - 2))}`, Math.max(0, width - 4))] : [header];
+	}
 	const tree = renderNestedTree(state, theme, Math.max(0, width - 4), false, true);
 	return [header, ...tree];
 }

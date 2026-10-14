@@ -3,6 +3,7 @@ import {
 	DEFAULT_DELEGATE_SETTINGS, MAX_DEPTH_RANGE, type DelegateSettings, type DelegationMode, type ModelPicking,
 } from "../delegate-settings.ts";
 import { DEFAULT_TODO_SETTINGS, type TodoSettings } from "../todo-settings.ts";
+import { DEFAULT_RECAP_SETTINGS, formatRecapThreshold, RECAP_THRESHOLD_OPTIONS, type RecapSettings } from "../recap-settings.ts";
 import type { SettingOption, SettingsRow } from "./settings-panel.ts";
 
 const MODES: Record<DelegationMode, Omit<SettingOption, "value">> = {
@@ -63,4 +64,25 @@ export function todoRows(current: () => TodoSettings, save: (change: Partial<Tod
 		help: "Whether pi-delegate sends automatic follow-ups for incomplete todos. The todo tool, command, and widget are unaffected.",
 		options: () => ([false, true] as const).map((enabled) => ({ value: enabled ? "on" : "off", ...(enabled ? TODO_REMINDERS.on : TODO_REMINDERS.off) })),
 		choose: (value) => save({ reminders: value === "on" }) }];
+}
+
+const RECAP_ENABLED: Record<"on" | "off", Omit<SettingOption, "value">> = {
+	off: { label: "Off", summary: "no away summaries", help: "Do not generate an away recap. The /recap command and Activity section remain available." },
+	on: { label: "On", summary: "show after idle", help: "Generate a recap from a bounded task anchor and recent dialogue after the idle threshold. Parent and delegate work must be settled. Tool traffic is excluded. This is the default." },
+};
+
+export function recapRows(current: () => RecapSettings, save: (change: Partial<RecapSettings>) => Promise<void>): SettingsRow[] {
+	const d = DEFAULT_RECAP_SETTINGS;
+	return [
+		{ id: "recapEnabled", section: "Recap", label: "Away summaries", value: () => current().enabled ? RECAP_ENABLED.on.label : RECAP_ENABLED.off.label,
+			isDefault: () => current().enabled === d.enabled,
+			help: "Whether pi-delegate shows an away recap after settled work has been idle. /recap test still works when this is off.",
+			options: () => ([false, true] as const).map((enabled) => ({ value: enabled ? "on" : "off", ...(enabled ? RECAP_ENABLED.on : RECAP_ENABLED.off) })),
+			choose: (value) => save({ enabled: value === "on" }) },
+		{ id: "recapIdleThreshold", section: "Recap", label: "Idle threshold", value: () => formatRecapThreshold(current().idleThresholdMs),
+			isDefault: () => current().idleThresholdMs === d.idleThresholdMs,
+			help: "How long the session waits after parent and delegate work settle before generating an away recap.",
+			options: () => RECAP_THRESHOLD_OPTIONS.map((milliseconds) => ({ value: String(milliseconds), label: formatRecapThreshold(milliseconds), summary: `wait ${formatRecapThreshold(milliseconds)}`, help: `Generate after ${formatRecapThreshold(milliseconds)} of idle.` })),
+			choose: (value) => save({ idleThresholdMs: Number(value) }) },
+	];
 }

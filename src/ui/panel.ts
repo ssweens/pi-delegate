@@ -247,7 +247,7 @@ export function momToolPreview(view: PanelView, trail?: string): string {
  * its muted status in the top border, the tree (or fallback summary, note, error)
  * as the framed body, and the focus hint in the bottom border's legend.
  */
-export function momSectionLines(view: PanelView, theme: Theme, width: number): string[] {
+export function momSectionLines(view: PanelView, theme: Theme, width: number, compact = Boolean(view.compact)): string[] {
 	const w = Math.max(0, Math.floor(width));
 	// In trail mode Path's state is a symbol (a spinner while it works) beside the title; the long status and the
 	// slice links live in the view (F3 Status).
@@ -258,7 +258,7 @@ export function momSectionLines(view: PanelView, theme: Theme, width: number): s
 		...(view.sliceUrl ? [fit(theme.fg("dim", `Slice: ${view.sliceUrl}`), inner)] : []),
 		...(view.rebuildUrl ? [fit(theme.fg("dim", `Rebuild slice: ${view.rebuildUrl}`), inner)] : []),
 	];
-	if (view.compact) return [header, compactLine(view, theme, w), ...(view.rebuild ? [fit(theme.fg("accent", view.rebuild), inner)] : []), ...links];
+	if (compact) return [header, compactLine(view, theme, w), ...(view.rebuild ? [fit(theme.fg("accent", view.rebuild), inner)] : []), ...links];
 	const body: string[] = [];
 	if (view.trail) body.push(...trailWidgetRows(view, theme, inner));
 	else if (view.work?.endeavors.length) body.push(...hierarchy(view.work, theme, inner, false));

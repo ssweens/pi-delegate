@@ -1,5 +1,5 @@
 /**
- * Every pi-delegate settings screen (Delegate, Todos, Path) is this one panel: Pi's own SettingsList, the component
+ * Every pi-delegate settings screen (Delegate, Todos, Recap, Path) is this one panel: Pi's own SettingsList, the component
  * behind Pi's /settings, with its type-to-search. A row's help is its description under the list; a two-way row
  * cycles on Enter/Space as Pi's toggles do; a longer choice opens a list of its options, each with its own help; a
  * row may instead open its own component (a model picker, the role list). A choice saves at once.

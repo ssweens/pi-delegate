@@ -18,7 +18,7 @@ const runtimeBinaries = ["dist/pi-acp.js", "dist/amp-acp.js"];
 const runtimeModule = "dist/acpx-runtime/runtime.js";
 const required = [
 	"package.json", "README.md", "LICENSE", "NOTICE.md", "vendor/acpx/LICENSE", "vendor/pi-acp/LICENSE",
-	"src/index.ts", "src/inspector.ts", "src/transcript.ts", "src/todo-ext.ts", "src/todo-render.ts", "src/todo.ts",
+	"src/index.ts", "src/inspector.ts", "src/recap.ts", "src/transcript.ts", "src/todo-ext.ts", "src/todo-render.ts", "src/todo.ts",
 	"src/mom/index.ts", "src/mom/mom-tools.ts", "src/trail/watcher.ts", "src/trail/record.ts", "src/mom/modes.ts", "src/mom/v2.ts", "src/mom/classify.ts", "src/mom/model-picker.ts", "src/ui/activity.ts", "src/ui/panel.ts", "src/work/projection.ts",
 	"src/acp-backend.ts", "src/acp/runtime/acpx-runtime.ts", "src/acp/domain/types.ts",
 	...runtimeBinaries, runtimeModule,
