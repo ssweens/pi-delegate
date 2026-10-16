@@ -22,7 +22,7 @@ import { clipText, errorMessage, textOf } from "./util/text.ts";
 import { ageDays, formatDuration } from "./util/format.ts";
 import { tildify } from "./util/path.ts";
 import { readLegacySection, readSettings, writeSettings } from "./settings-file.ts";
-import { AgentHistory, ChildView, type LiveSource } from "./inspector.js";
+import type { LiveSource } from "./inspector.js";
 import { type AAIndices, acpRowView, asRunView, empty, framed, type LiveFacts, type ModelRow, type ModelsDetails, resultLines, resultView, type RunView } from "./render.js";
 import { type AcpRunView, type LifecycleAction, type PiStartInput, PI_CAPABILITIES, requireAction, validateStartInput, validateSteer } from "./backend.js";
 import { ACP_JOIN_LOST, AcpBackend, acpModelsText, acpResultText, acpStatusText, acpSummary, DelegateError, sessionLabel, unwrap } from "./acp-backend.js";
@@ -30,8 +30,7 @@ import { type Join, type JoinOutcome, joinRuns, waitCancelled } from "./wait.ts"
 import { shutdownAcpCoordinator } from "./acp/instance.js";
 import { DELEGATION_TOOLS, droppedTools, EVERY_TOOL, loadRoles, roleSourcesText, toolAllowlist, WRITE_TOOLS } from "./roles.js";
 import { installTodo } from "./todo-ext.js";
-import { dealEligible, formatPercent, selectDeals, type DealsDetails } from "./deals.js";
-import { DealSheet } from "./deals-sheet.js";
+import type { DealsDetails } from "./deals.js";
 import { resolveChildTrust, type ChildTrust } from "./project-trust.js";
 import { processOwner } from "./storage.js";
 import { isPiStringsWorkerProcess } from "./util/process.ts";
@@ -41,8 +40,7 @@ import { installRecap } from "./recap.ts";
 import { DEFAULT_DELEGATE_SETTINGS, pickModel, readDelegateSettings, saveDelegateSettings } from "./delegate-settings.ts";
 import { DEFAULT_TODO_SETTINGS, readTodoSettings, saveTodoSettings } from "./todo-settings.ts";
 import { DEFAULT_RECAP_SETTINGS, formatRecapThreshold, readRecapSettings, saveRecapSettings } from "./recap-settings.ts";
-import { delegateRows, recapRows, todoRows } from "./ui/delegate-settings.ts";
-import { SettingsPanel, textPage, type SettingsRow } from "./ui/settings-panel.ts";
+import type { SettingsRow } from "./ui/settings-panel.ts";
 import { FULLSCREEN } from "./ui/overlay.ts";
 import { AGENT_DIR, SETTINGS_PATH } from "./agent-dir.ts";
 import {
@@ -420,6 +418,7 @@ async function fetchEndpoints(id: string, force = false): Promise<LiveEndpoints>
 }
 
 async function discoverDeals(ctx: ExtensionContext, filter = "", signal?: AbortSignal, force = false): Promise<DealsDetails> {
+	const { dealEligible, selectDeals } = await import("./deals.js");
 	const live = await fetchOpenRouter(force);
 	if (live.error) throw new Error(`OpenRouter deal discovery unavailable: ${live.error}. Cached data was not used.`);
 	const term = filter.toLowerCase();
@@ -437,7 +436,8 @@ async function discoverDeals(ctx: ExtensionContext, filter = "", signal?: AbortS
 	return selectDeals(catalog, endpoints, configured, new Date(), term ? universe : catalog);
 }
 
-function dealsReport(d: DealsDetails): string {
+async function dealsReport(d: DealsDetails): Promise<string> {
+	const { formatPercent } = await import("./deals.js");
 	const row = (r: DealsDetails["discounts"][number]) => `  ${r.id}  ${r.provider ?? "model rate"}  ${r.price}  ${r.discount !== undefined ? formatPercent(r.discount) : r.saving !== undefined ? `${formatPercent(r.saving)} vs peak · ${r.reason}${r.currentPrice ? ` (current ${r.currentPrice})` : ""}` : ""}  AA intel ${r.quality ?? "—"} coding ${r.coding ?? "—"}  ${r.configured ? "configured" : "not configured"}`;
 	const section = (title: string, rows: DealsDetails["discounts"], cap: number) => `${title} (${rows.length} offers)\n${rows.length ? rows.slice(0, cap).map(row).join("\n") : "  none with available evidence"}${rows.length > cap ? `\n  … ${rows.length - cap} more; /deals opens the sortable sheet` : ""}`;
 	const partial = d.endpointFailures ? `; ${d.endpointFailures} endpoint lookups failed (promotions incomplete)` : "";
@@ -1202,7 +1202,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			if (p.action === "deals") {
 				try {
 					const details = await discoverDeals(ctx, p.message, signal);
-					return { content: [{ type: "text", text: dealsReport(details) }], details };
+					return { content: [{ type: "text", text: await dealsReport(details) }], details };
 				} catch (e) {
 					return { content: [{ type: "text", text: String(e) }], details: undefined, isError: true };
 				}
@@ -1477,6 +1477,10 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			ctx.ui.notify(`delegate settings: mode ${d.mode} · max depth ${d.maxDepth} · max running ${d.maxConcurrent || "no limit"} · model picking ${d.modelPicking} · todo reminders ${t.reminders ? "on" : "off"} · recap ${r.enabled ? "on" : "off"} after ${formatRecapThreshold(r.idleThresholdMs)} (${SETTINGS_PATH})`, "info");
 			return;
 		}
+		const [{ delegateRows, recapRows, todoRows }, { SettingsPanel, textPage }] = await Promise.all([
+			import("./ui/delegate-settings.ts"),
+			import("./ui/settings-panel.ts"),
+		]);
 		let settings = readDelegateSettings(SETTINGS_PATH);
 		let todoSettings = readTodoSettings(SETTINGS_PATH);
 		let recapSettings = readRecapSettings(SETTINGS_PATH);
@@ -1507,6 +1511,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		if (navigationOpen) return;
 		navigationOpen = true;
 		try {
+			const { ChildView } = await import("./inspector.js");
 			await ctx.ui.custom<undefined>(
 				(childTui, childTheme, kb, done) => new ChildView(id, liveSource, childTheme, childTui, kb, SettingsManager.create(ctx.cwd, AGENT_DIR), () => done(undefined), childDrafts.get(id) ?? "", (draft) => { childDrafts.set(id, draft); }),
 				FULLSCREEN,
@@ -1521,6 +1526,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		navigationOpen = true;
 		let id: string | undefined;
 		try {
+			const { AgentHistory } = await import("./inspector.js");
 			id = await ctx.ui.custom<string | undefined>(
 				(tui, theme, _kb, done) => new AgentHistory(finished, theme, tui, done),
 				{ overlay: true, overlayOptions: { width: "90%", maxHeight: "100%", anchor: "center", margin: 1 } },
@@ -1567,6 +1573,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 					const filter = args.trim();
 					let details = await discoverDeals(ctx, filter);
 					if (ctx.mode === "tui") {
+						const { DealSheet } = await import("./deals-sheet.js");
 						details = await ctx.ui.custom<DealsDetails>((tui, theme, _keys, done) =>
 							new DealSheet(details, filter, theme, tui, done, () => discoverDeals(ctx, filter, undefined, true)),
 							FULLSCREEN);
