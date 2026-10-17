@@ -366,16 +366,14 @@ test("real SDK delegation lifecycle (loopback provider, no credentials)", { time
 			assert.equal(done.details.output, "RESUMED");
 			assert.ok(done.details.durationMs < 60000, `settled task duration was ${done.details.durationMs}`);
 		});
-		await t.test("a running child's time budget can be extended, and a spent one is refused", async () => {
+		await t.test("a running child's time budget can be extended from now", async () => {
 			const gate = deferred(), arrived = api.script("Budget work", { text: "WORKING", gate });
 			api.script("Keep going", { text: "FINISHED-WITH-MORE-TIME" });
 			const { details: { id } } = await h.launch("Budget work", { timeoutMs: 1500 });
 			await arrived;
 			const extended = await h.ctl("steer", id, { message: "Keep going", timeoutMs: 60000 });
-			assert.match(extended.content[0].text, /Budget now 1 min for this and later segments/);
-			assert.equal(JSON.parse(readFileSync(state().runs.get(id).recordPath, "utf8")).timeoutMs, 60000);
-			await assert.rejects(h.ctl("steer", id, { message: "Too little", timeoutMs: 1 }), /budget is already spent/);
-			assert.equal(state().runs.get(id).timeoutMs, 60000, "a refused budget leaves the working one armed");
+			assert.match(extended.content[0].text, /Adds 1 min from now: ends \d\d:\d\d \(\d min left\)/);
+			assert.ok(JSON.parse(readFileSync(state().runs.get(id).recordPath, "utf8")).timeoutMs >= 60000, "the grant counts from now");
 			const wait = h.ctl("wait", id);
 			// Past the original 1.5s budget: without the extension this child would already be dead.
 			await sleep(1800);

@@ -23,7 +23,8 @@ import { ageDays, formatDuration } from "./util/format.ts";
 import { tildify } from "./util/path.ts";
 import { readLegacySection, readSettings, writeSettings } from "./settings-file.ts";
 import type { LiveSource } from "./inspector.js";
-import { type AAIndices, acpRowView, asRunView, empty, framed, type LiveFacts, type ModelRow, type ModelsDetails, resultLines, resultView, type RunView } from "./render.js";
+import { budgetText, runHealth } from "./health.js";
+import { type AAIndices, acpRowView, asRunView, boardLine, empty, framed, type LiveFacts, type ModelRow, type ModelsDetails, onBoard, resultLines, resultView, type RunView } from "./render.js";
 import { type AcpRunView, type LifecycleAction, type PiStartInput, PI_CAPABILITIES, requireAction, validateStartInput, validateSteer } from "./backend.js";
 import { ACP_JOIN_LOST, AcpBackend, acpModelsText, acpResultText, acpStatusText, acpSummary, DelegateError, sessionLabel, unwrap } from "./acp-backend.js";
 import { type Join, type JoinOutcome, joinRuns, waitCancelled } from "./wait.ts";
@@ -63,7 +64,7 @@ const mode = () => readDelegateSettings(SETTINGS_PATH).mode;
  * is on: a description is in every turn's loadout, including turns a completion starts, which a
  * before_agent_start prompt section is not; and it changes only when the mode does.
  */
-const ORCHESTRATOR_PROMPT = ` Delegation mode: orchestrator (the user's setting). You coordinate; children execute. Hand every task the user gives you to a child with delegate, in the background, and stay free to keep talking with the user while children run. Do not block on delegate_ctl wait unless the user asks for a result now or your reply cannot be written without it. Read only what you need to write a good brief, and report each child's result when its completion arrives. You cannot edit or write files yourself in this mode: those calls are refused. This overrides the delegate tool's own advice on when to delegate.`;
+const ORCHESTRATOR_PROMPT = ` Delegation mode: orchestrator (the user's setting). You coordinate; children execute. Hand every task the user gives you to a child with delegate, in the background, and stay free to keep talking with the user while children run. Do not block on delegate_ctl wait unless the user asks for a result now or your reply cannot be written without it. Read only what you need to write a good brief, and report each child's result when its completion arrives. Report to the user in at most 5 lines: what is moving, what is stuck, and the one thing you need from them. Keep briefs small: one deliverable per child, with FIRST DELIVERABLE, STOP WHEN and KNOWN FACTS lines; for implementation ask for one commit-sized unit, then the next. Watch with delegate_ctl status (one verdict per run), not transcripts, and act on exceptions only: slow or silent, steer once (interrupt: true in a long think); looping, interrupt with the missing fact; no-artifact, interrupt and demand the first deliverable; still stuck after one interrupt, cancel and relaunch smaller. Extend a child's budget only on evidence (moving verdict, or it asked with EXTEND:), by delegate_ctl steer timeoutMs=<milliseconds from now, e.g. 600000 for 10 min>; never extend a silent, looping or no-artifact run. You cannot edit or write files yourself in this mode: those calls are refused. This overrides the delegate tool's own advice on when to delegate.`;
 const SKILL_PATH = join(dirname(fileURLToPath(import.meta.url)), "..", "skills", "delegation", "SKILL.md");
 const contractFooter = (delegates: boolean, atDepthCap = false, cap = MAX_DELEGATION_DEPTH) => `
 
@@ -711,6 +712,8 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		return decided;
 	};
 	let owner: Owner | undefined;
+	/** When the person last prompted: the status board drops acknowledged runs that settled before it. */
+	let promptAt = 0;
 	let attachError: string | undefined;
 	// The acp backend (acp-backend.ts) over the process's one Coordinator. Its runs belong to a
 	// parent as pi runs do, and a turn that settles with no wait joined wakes that parent the same way.
@@ -955,6 +958,10 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 
 	// What a start and a steer tell the model, either backend: the completion wakes it; wait joins it.
 	const START_HINT = "Completion will wake you; use delegate_ctl wait with this runId when dependent work needs the result.";
+	/** Warn-only: a long budget with no early deliverable or stop line tends to go silent. */
+	const briefWarning = (timeoutMs: number, task: string | undefined) =>
+		timeoutMs > 30 * 60_000 && !/FIRST DELIVERABLE/.test(task ?? "") && !/STOP WHEN/.test(task ?? "")
+			? " Warning: a long budget with no FIRST DELIVERABLE / STOP WHEN line in the brief; long open-ended runs tend to go silent. Consider adding them." : "";
 	const STEER_HINT = "Completion will wake you; use wait to join.";
 	// --- acp results. A failure is reported by its code; it never becomes a different action.
 	const failed = (error: unknown, details?: AcpRunView) => {
@@ -1050,7 +1057,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		catch (error) { throw new DelegateError("MODEL_UNAVAILABLE", errorMessage(error), "model"); }
 		const { model, thinking: specThinking, pick: modelPick } = resolved;
 		if (!model) throw new DelegateError("MODEL_UNAVAILABLE", "no model available for child", "model");
-		const thinking = String(specThinking ?? (p.model ? undefined : approved && parseModelSpec(approved.spec).thinking) ?? role.thinking ?? ctx.thinkingLevel ?? "");
+		const thinking = String(specThinking ?? (p.model ? undefined : approved && parseModelSpec(approved.spec).thinking) ?? role.thinking ?? "medium");
 		const timeoutMs = p.timeoutMs ?? role.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 		// A child at the cap could only fail its delegate calls, so it gets no delegation tools at all.
 		const atDepthCap = depth + 1 >= cap;
@@ -1138,7 +1145,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			try {
 				const v = await piBackend.start(start.value, signal, { ctx, onUpdate });
 				const run = runs.get(v.id)!;
-				return { content: [{ type: "text", text: `${run.id} running (${run.runtime === "oven" ? "oven slice" : run.context}, ${run.model}). ${START_HINT}` }], details: recordedView(run) };
+				return { content: [{ type: "text", text: `${run.id} running (${run.runtime === "oven" ? "oven slice" : run.context}, ${run.model}), ${budgetText(runHealth(run))}. ${START_HINT}${briefWarning(run.timeoutMs, run.task)}` }], details: recordedView(run) };
 			} catch (error) { return failed(error); }
 		},
 	};
@@ -1152,7 +1159,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		description:
 			"Before using this tool, read skills/delegation/SKILL.md if you have not read it in this session. models without runId: every offering across all enabled providers, verbatim from the registry (provider/id, reasoning, context, $/M), plus live OpenRouter pricing, tiered rates, expirations and Artificial Analysis indices, your cached ratings, approved defaults and drift \u2014 call before the first delegate of a session. models with an ACP runId list that agent's current model and selectable native/fallback IDs with labels and descriptions. One-run status/result show the same catalog compactly. deals: read-only OpenRouter promotion and price/quality shortlist for frontier and light work; does not choose or approve a model. " +
 			"rate: store quality ratings you researched, per exact offering (provider/id), so choices are grounded; stale after 14 days. approve: record a role's default model after the user agreed in conversation. " +
-			"roles: list roles. status: one run or all \u2014 a nonblocking progress read: status, current tool, tool calls so far, elapsed, remaining time budget. result: current report without waiting. wait: join an existing runId; returns its final report, immediately if finished. If queued messages arrive while waiting it returns early with the child still running — answer them, then wait again to rejoin. If the child stops without reporting completion it returns an error report instead of blocking until the run budget. Cancelling wait only detaches; the child keeps running. An attached waiter receives completion instead of a separate wake-up. steer: queue a correction or resume a finished child in the background, keeping its context; returns immediately. Use wait to join the resumed work. Saved children are restored on parent reopen without running; steer revives them with their original configuration unless you pass model:, which moves that child to another offering from the next segment on \u2014 propose it in conversation first, including when the saved offering is exhausted or gone. Explicitly stopped children require restart:true and the user's request. cancel: stop the child and prevent automatic revival. " +
+			"roles: list roles. status: one run or all \u2014 a nonblocking progress read: status, current tool, tool calls so far, elapsed, remaining time budget. result: current report without waiting. wait: join an existing runId; returns its final report, immediately if finished. If queued messages arrive while waiting it returns early with the child still running — answer them, then wait again to rejoin. If the child stops without reporting completion it returns an error report instead of blocking until the run budget. Cancelling wait only detaches; the child keeps running. An attached waiter receives completion instead of a separate wake-up. steer: queue a correction or resume a finished child in the background, keeping its context; returns immediately. A running child reads a plain steer only at its next turn boundary (status shows `steer pending` until it does); with interrupt: true the current turn is aborted and the message becomes its next prompt, same run and budget — use that when a child is silent, looping or in a long think. Use wait to join the resumed work. Saved children are restored on parent reopen without running; steer revives them with their original configuration unless you pass model:, which moves that child to another offering from the next segment on \u2014 propose it in conversation first, including when the saved offering is exhausted or gone. Explicitly stopped children require restart:true and the user's request. cancel: stop the child and prevent automatic revival. " +
 			"wait with runIds joins several runs of either backend at once and returns when the first settles by default; pass mode=\"all\" when every result is required. timeoutMs only ends that wait, never the runs. " +
 			"Runs started with backend acp take the same runId actions: status and result read the session and its latest turn; wait joins it; steer sends the next turn, queued behind another attachment's active Amp turn when needed; cancel stops only a turn this run started; close releases the session \u2014 a created one is disposed, an opened one only disconnected, never archived or deleted. close is acp only and final. " +
 			"When the parent exits, its acp runs are parked, not closed: their sessions are released and their records stay readable after a restart; steer reopens one (an opened run by its native ID, a created run by native resume, else RUN_NOT_RESUMABLE). " +
@@ -1168,7 +1175,8 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			force: Type.Optional(Type.Boolean({ description: "close: cancel an active turn first instead of refusing" })),
 			discardPersistentState: Type.Optional(Type.Boolean({ description: "close, created acp sessions only: do not keep the session resumable" })),
 			restart: Type.Optional(Type.Boolean({ description: "steer only: restart an explicitly stopped child, only when the user requested it" })),
-			timeoutMs: Type.Optional(Type.Number({ description: "steer: give the child this time budget instead of its saved one \u2014 re-armed at once on a running child, applied to the next segment of an inactive one. wait: stop waiting after this many ms; the runs keep going" })),
+			interrupt: Type.Optional(Type.Boolean({ description: "steer only, a running in-process pi child: abort its current turn now and give it message as its next prompt, in the same run and budget. Without it a steer waits for the child's next turn boundary, which can be many minutes in a long think. Use it when the child is silent, looping or deep in a long think and that wait is unacceptable. Refused for a settled child (a plain steer resumes it), an oven run, and acp runs" })),
+			timeoutMs: Type.Optional(Type.Number({ description: "steer: adds this much time from now to the child (ms) \u2014 on a running child the clock is re-armed at once and ends this long from now; an inactive child gets it as the budget of its next segment. wait: stop waiting after this many ms; the runs keep going" })),
 			message: Type.Optional(Type.String({ description: "steer: the correction. global models/deals: substring filter. approve: one-line reason the user agreed to" })),
 			ratings: Type.Optional(
 				Type.Array(
@@ -1336,7 +1344,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			if (p.action === "status" && !p.runId) {
 				const owned = ownedRuns(owner);
 				const external = acp.owned(owner.key);
-				const lines = [...owned.map((r) => `${summary(r).split("\n")[0]}${r.status === "running" && r.lastTool ? `  last: ${r.lastTool}` : ""}`), ...external.map((v) => acpSummary(v).split("\n")[0])];
+				const lines = [...owned.filter((r) => onBoard(r, promptAt)).map((r) => boardLine({ ...r, durationMs: (r.status === "running" ? Date.now() : (r.endedAt ?? Date.now())) - r.segmentStartedAt })), ...external.map((v) => acpSummary(v).split("\n")[0])];
 				return { content: [{ type: "text", text: lines.join("\n") || "no runs" }], details: { kind: "runs", rows: [...owned.map(recordedView), ...external] } };
 			}
 			// One wait for one run or several, of either backend (waitRuns).
@@ -1404,9 +1412,9 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 					const previous = `${run.model}${run.thinking ? `:${run.thinking}` : ""}`;
 					await piBackend.steer(run.id, request, { ctx });
 					const moved = request.model ? ` Model changed from ${previous} to ${run.model}${run.thinking ? `:${run.thinking}` : ""} for this and later segments; its earlier work keeps the model it ran on.` : "";
-					const retimed = request.timeoutMs !== undefined ? ` Budget now ${Math.round(run.timeoutMs / 60000)} min for this and later segments.` : "";
+					const retimed = request.timeoutMs !== undefined ? ` Adds ${Math.round(request.timeoutMs / 60000)} min from now: ${budgetText(runHealth(run))}.` : "";
 					const trust = run.projectTrustUnknown ? ` Note: ${TRUST_UNKNOWN}.` : "";
-					return { content: [{ type: "text", text: `${run.id}: ${running ? "steer queued" : "resumed in the background"}.${moved}${retimed}${trust} ${STEER_HINT}` }], details: recordedView(run) };
+					return { content: [{ type: "text", text: `${run.id}: ${!running ? "resumed in the background" : request.interrupt ? "interrupted the current turn; the message is its next prompt, same run and budget" : "steer queued; read at the child's next turn boundary (status shows steer pending/read)"}.${moved}${retimed}${trust} ${STEER_HINT}` }], details: recordedView(run) };
 				}
 			}
 			return { content: [{ type: "text", text: "unreachable" }], isError: true, details: undefined };
@@ -1563,7 +1571,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		});
 		pi.on("agent_settled", () => { if (owner?.binding?.pi === pi) redeliver(owner, aborted); });
 		// The person's prompt starts a new stretch of work: the Agents frame stops showing runs that settled before it.
-		pi.on("input", (event) => { if (event.source === "interactive") activity?.markPrompt(); });
+		pi.on("input", (event) => { if (event.source === "interactive") { promptAt = Date.now(); activity?.markPrompt(); } });
 		pi.registerEntryRenderer<DealsDetails>("pi-delegate.deals", (entry, opts, theme) =>
 			framed((width) => resultView("OpenRouter", "deals", "", { content: [], details: entry.data }, opts, theme, width)));
 		pi.registerCommand("deals", {

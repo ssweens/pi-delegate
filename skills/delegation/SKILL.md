@@ -138,7 +138,40 @@ INTERFACES     settled signatures, constraints, non-goals
 VERIFICATION   exact commands or flows and what success looks like
 RETURN         STATUS / CHANGES / VERIFIED / GAPS
 ```
-Omit nothing above; add nothing else.
+Omit nothing above. Keep briefs small: one deliverable per delegate. For implementation ask for ONE commit-sized unit, then steer or launch the next; never hand a multi-part task to one child with a multi-hour budget. Give exact commands and paths when you have them, and say what NOT to read (large style skills, API dumps, logs you already digested). Add three lines, always for a budget over 30 minutes, or the child tends to go silent:
+
+```
+FIRST DELIVERABLE  the first thing it must produce, and by when
+STOP WHEN          the condition that ends the work, so it does not keep exploring
+KNOWN FACTS        what you already established (ids, paths, causes, model names), so it does not rediscover them
+```
+`delegate` warns (never refuses) when a budget over 30 minutes has neither a `FIRST DELIVERABLE` nor a `STOP WHEN` line.
+
+Choose the reasoning level per task. A `high`/`xhigh` turn can be silent for 5+ minutes and a steer is not read mid-turn. Use `medium` for fixture, run and edit work; reserve `high` for design questions with a short budget.
+
+### Watching a long run
+Read `delegate_ctl status`: one line per active run (plus runs that settled since the user's last prompt or are unacknowledged) with a verdict. Do not read transcripts or write scripts to judge progress, and do not poll on a timer. Act on exceptions only. Oven runs report progress and get the same verdicts.
+
+- `moving`: tool or message activity within 6 minutes. Leave it.
+- `slow`: one assistant turn open over 3 minutes (a long think or a stuck provider).
+- `silent`: no activity for 6 minutes or more.
+- `retrying`: waiting on a provider retry. Fix or change the offering; do not extend.
+- `looping`: repeating the same calls. 
+- `no-artifact`: time spent, no file or commit yet.
+
+### Acting on a verdict
+- `slow`/`silent`: steer once with a concrete instruction. Add `interrupt: true` if the child is in a long think; a plain steer waits for the turn boundary. The status line shows `steer pending Nm` or `steer read HH:MM`.
+- `looping`: interrupt with the exact fact it is missing.
+- `no-artifact`: interrupt and demand the first deliverable.
+- Still no movement after one interrupt: cancel and relaunch smaller with the facts in the brief. Do not re-steer repeatedly.
+- Stay the orchestrator. Do not write the child's fixtures or code yourself; if the brief was the problem, fix the brief and relaunch. Do not forward a child's own diagnosis back to it as new information.
+- One writer per tree (`WRITER_CWD_OWNED`): give parallel writers their own `cwd` or worktree up front.
+
+### Budgets
+Extending is yours to grant, on evidence only: a `moving` verdict, or the child asked with `EXTEND: <min> - <reason>` at the wrap-up notice (status shows `asks +N min: reason`). Use `delegate_ctl steer timeoutMs=<milliseconds from now>`, e.g. 600000 for 10 min; it adds time from now, not a new total. Never extend a `silent`, `looping` or `no-artifact` run: fix direction first. Expect a wrap-up notice 3 minutes before the hard timeout and a salvage summary if it times out; resume with the Resume line it prints. Reply budget text reads `ends HH:MM (N min left)`.
+
+### Reporting to the user
+At most 5 lines: what is moving, what is stuck, the single thing you need from them. Ask for a decision as one yes/no question. No tables of everything.
 
 ## Your job after the child returns
 

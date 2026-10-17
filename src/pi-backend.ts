@@ -26,7 +26,8 @@ import { ownedElsewhereError, processOwner, readRecord, releaseOwner, RunStore, 
 import type { ActiveTool, ChildActivity } from "./transcript.js";
 import { formatDuration, formatTokens } from "./util/format.ts";
 import { gitSync } from "./util/git.ts";
-import { errorMessage, textOf } from "./util/text.ts";
+import { errorMessage, oneLine, textOf } from "./util/text.ts";
+import { budgetText, NO_ARTIFACT_SHARE, runHealth, type Verdict, WRAP_UP_MIN_MS } from "./health.js";
 import { type Join, joinRuns, WAIT_POLL_MS } from "./wait.ts";
 
 const LOG_FILE = join(AGENT_DIR, "delegate-runs.jsonl");
@@ -117,6 +118,16 @@ export interface Run {
 	writer: boolean;
 	dirtyBefore?: Map<string, number>;
 	timer?: ReturnType<typeof setTimeout>;
+	/** Fires the wrap-up steer ahead of `timer` (armTimeout). */
+	wrapTimer?: ReturnType<typeof setTimeout>;
+	/** Last tool start/end or message end; a segment start counts as one (health.ts). */
+	lastProgressAt?: number;
+	/** When the open assistant message began; unset between messages. */
+	turnStartedAt?: number;
+	/** The child's last `EXTEND:` line, until a steer changes its budget or a segment starts. */
+	extendRequest?: { minutes: number; reason: string; at: number };
+	/** The verdicts the watchdog alerted on since the run last moved; cleared when it is moving again. */
+	alerted?: Verdict[];
 	sessionFile?: string;
 	// Per-run ownership (see storage.ts). A run owned by another live process is read-only here.
 	ownerPid?: number;
@@ -152,6 +163,29 @@ export interface Run {
 	projectTrustUnknown?: true;
 	/** Set by stopTree: once this segment settles its session closes, since its children's owner is gone. */
 	closeOnSettle?: boolean;
+	/** Read receipts of its last STEER_RECEIPTS delegate_ctl steers: queued when, read by its session when. */
+	steers?: SteerReceipt[];
+}
+
+/** One delegate_ctl steer: when it was queued, and when the child's session took the message in (its user message started). */
+export interface SteerReceipt { queuedAt: number; readAt?: number; interrupt?: true }
+const STEER_RECEIPTS = 5;
+/** Each unread receipt's message, matched against the user messages the child's session starts. In memory only. */
+const steerTexts = new WeakMap<SteerReceipt, string>();
+/** An interrupting steer's message, by run id: launch sends it as the next prompt once the aborted turn's prompt returns. */
+const interrupts = new Map<string, string>();
+function noteSteer(run: Run, message: string, interrupt?: boolean): SteerReceipt {
+	const receipt: SteerReceipt = { queuedAt: Date.now(), ...(interrupt ? { interrupt: true as const } : {}) };
+	steerTexts.set(receipt, message);
+	run.steers = [...(run.steers ?? []), receipt].slice(-STEER_RECEIPTS);
+	return receipt;
+}
+/** A user message the child's session started: every unread steer it carries is read now (an interrupt may join two). */
+function readSteers(run: Run, text: string) {
+	for (const receipt of run.steers ?? []) {
+		const message = steerTexts.get(receipt);
+		if (receipt.readAt === undefined && message !== undefined && text.includes(message)) { receipt.readAt = Date.now(); steerTexts.delete(receipt); }
+	}
 }
 
 /** A parent's in-process binding. There is no parent-level lock: runs carry their own ownership. */
@@ -429,8 +463,75 @@ export function notify(owner: Owner, notice: Notice): void {
 /** A run's completion notice, either backend's: its report, and its details for the renderer and the receipt. */
 export const finishedNotice = (report: string, details: unknown): Notice => ({ customType: "delegate", content: `delegate finished\n${report}`, display: true, details });
 
+/**
+ * An exception about a running run, told to its owner as one short notice by the completion path (notify). Advisory:
+ * an owner between bindings, or a delegating child that is not mid-turn, goes without it, so an alert never revives one.
+ */
+function alert(run: Run, kind: "extend-request" | "watchdog", content: string) {
+	const owner = state.owners.get(run.ownerKey);
+	if (!owner?.binding || owner.closed || run.foreign) return;
+	if (owner.parentRun && !takesFollowUp(owner.parentRun)) return;
+	notify(owner, { customType: "delegate", display: true, content: `delegate alert: ${content}`,
+		details: { kind, runId: run.id, ...(run.userStarted ? { userStarted: true } : {}) } });
+}
+
+/** The line a child ends its message with to ask for more time (the wrap-up steer tells it how). */
+const EXTEND_LINE = /^EXTEND:\s*(\d+)\s*[-—:]?\s*(.*)$/m;
+const MAX_EXTEND_MIN = 60;
+
+/** Progress for health.ts from a child's session events, and an `EXTEND:` request in an assistant message, told to its owner. */
+export function trackProgress(run: Run, ev: any, now = Date.now()) {
+	if (ev.type === "tool_execution_start" || ev.type === "tool_execution_end") run.lastProgressAt = now;
+	const assistant = ev.message?.role === "assistant";
+	if (ev.type === "message_start" && assistant) run.turnStartedAt ??= now;
+	if (ev.type !== "message_end") return;
+	run.lastProgressAt = now;
+	if (!assistant) return;
+	run.turnStartedAt = undefined;
+	const ask = EXTEND_LINE.exec(textOf(ev.message.content));
+	const minutes = Math.min(MAX_EXTEND_MIN, Number(ask?.[1] ?? 0));
+	if (!ask || !minutes || run.status !== "running") return;
+	const reason = oneLine(ask[2] ?? "", 200);
+	run.extendRequest = { minutes, reason, at: now };
+	alert(run, "extend-request", `${run.id} asks +${minutes} min${reason ? `: ${reason}` : ""}. Grant with delegate_ctl steer runId=${run.id} timeoutMs=${minutes * 60_000} (time from now), or let it end.`);
+}
+
+const mins = (ms: number) => `${Math.round(ms / 60_000)}m`;
+/**
+ * The watchdog's look at one run: a notice when it stops moving (retrying, looping, silent, no-artifact or slow), once
+ * per verdict until it moves again. Exception-only: a moving run is never reported.
+ */
+export function healthAlert(run: Run, now = Date.now()) {
+	const health = runHealth(run, now);
+	if (health.verdict === "moving" || health.verdict === "settled") { run.alerted = undefined; return; }
+	if (run.alerted?.includes(health.verdict)) return;
+	(run.alerted ??= []).push(health.verdict);
+	const facts = [
+		health.loop ? `same \`${health.loop.name}\` call ${health.loop.count}x` : "",
+		health.verdict === "no-artifact" ? `no files written after ${Math.round(NO_ARTIFACT_SHARE * 100)}% of budget` : "",
+		health.verdict === "looping" || health.verdict === "no-artifact" ? "" : `no output for ${mins(health.sinceProgressMs ?? now - run.segmentStartedAt)}`,
+		health.turnMs ? `turn open ${mins(health.turnMs)}` : "",
+		run.providerRetry ? `provider retry ${run.providerRetry.attempt}/${run.providerRetry.maxAttempts} (${oneLine(run.providerRetry.errorMessage, 120)})` : "",
+		budgetText(health),
+	].filter(Boolean);
+	alert(run, "watchdog", `${run.id} ${health.verdict}: ${facts.join(", ")}. Check it or steer.`);
+}
+
+const WATCH_MS = 30_000;
+let watchdog: ReturnType<typeof setInterval> | undefined;
+/** One interval for every running run of this process (healthAlert); it stops when none is running. Oven runs' progress comes from their watch (trackOven). */
+function watch() {
+	if (watchdog) return;
+	watchdog = setInterval(() => {
+		const live = [...runs.values()].filter((r) => r.status === "running" && !r.completion.settled && !r.foreign);
+		if (!live.length) { clearInterval(watchdog); watchdog = undefined; return; }
+		for (const run of live) healthAlert(run);
+	}, WATCH_MS);
+	watchdog.unref?.();
+}
+
 /** A pi run's saved fields: the run without what lives only in this process. */
-export type RunRecord = Omit<Run, "completion" | "session" | "timer" | "streamingMessage" | "activeTools" | "activityCache" | "dirtyBefore" | "ready" | "preparing" | "acknowledged" | "foreign" | "offered" | "closeOnSettle">;
+export type RunRecord = Omit<Run, "completion" | "session" | "timer" | "wrapTimer" | "alerted" | "streamingMessage" | "activeTools" | "activityCache" | "dirtyBefore" | "ready" | "preparing" | "acknowledged" | "foreign" | "offered" | "closeOnSettle">;
 /** Pi run records: each in the subsession directory of its working directory, found through its parent's pointers. */
 const piStore = new RunStore<Run, RunRecord>({
 	valid: (record) => typeof record.systemPrompt === "string" && Array.isArray(record.contextFiles) && Array.isArray(record.appendSystemPrompt) && Array.isArray(record.tools) &&
@@ -467,7 +568,7 @@ const piStore = new RunStore<Run, RunRecord>({
 			: "The previous process ended before this execution settled. Inspect its saved work; send a message to continue.";
 	},
 	persisted: (run) => {
-		const { completion, session, timer, streamingMessage, activeTools, activityCache, dirtyBefore, ready, preparing, acknowledged, foreign, offered, closeOnSettle, ...record } = run;
+		const { completion, session, timer, wrapTimer, alerted, streamingMessage, activeTools, activityCache, dirtyBefore, ready, preparing, acknowledged, foreign, offered, closeOnSettle, ...record } = run;
 		return record satisfies RunRecord;
 	},
 	foreignSave: "throw",
@@ -676,7 +777,7 @@ export function resultText(run: Run): string {
 function log(run: Run) {
 	try {
 		mkdirSync(dirname(LOG_FILE), { recursive: true });
-		const { session: _s, timer: _t, activityCache: _a, streamingMessage: _m, activeTools: _tools, completion: _completion, ready: _ready, systemPrompt: _prompt, contextFiles: _context, appendSystemPrompt: _append, offered: _offered, closeOnSettle: _close, ...rest } = run;
+		const { session: _s, timer: _t, wrapTimer: _w, activityCache: _a, streamingMessage: _m, activeTools: _tools, completion: _completion, ready: _ready, systemPrompt: _prompt, contextFiles: _context, appendSystemPrompt: _append, offered: _offered, closeOnSettle: _close, ...rest } = run;
 		appendFileSync(LOG_FILE, `${JSON.stringify({ ...rest, output: run.output.slice(0, 2000), ts: Date.now() })}\n`);
 	} catch {
 		/* logging must never fail the run */
@@ -696,14 +797,33 @@ function retire(keep: Run) {
 	}
 }
 
+/** What a timed-out run left, read off the run without a model call: its last words, changes, last tools, and how to resume it. */
+export function salvage(run: Run): string {
+	const said = run.output || textOf(run.streamingMessage?.content);
+	const arg = (args: Record<string, unknown>) => oneLine(String(args.command ?? args.path ?? args.file_path ?? args.pattern ?? Object.values(args).find((v) => typeof v === "string") ?? ""), 80);
+	return [
+		"Salvage:",
+		said.trim() ? `last words: ${said.trim().slice(0, 600)}` : "last words: (none)",
+		run.changedFiles.length ? `changed: ${run.changedFiles.join(", ")}` : "",
+		run.toolCalls.length ? `last tools: ${run.toolCalls.slice(-5).map((call) => `${call.name} ${arg(call.args)}`.trim()).join("; ")}` : "",
+		`Resume: delegate_ctl steer runId=${run.id} timeoutMs=<ms from now> message=<what remains>`,
+	].filter(Boolean).join("\n");
+}
+
+function disarm(run: Run) {
+	clearTimeout(run.timer);
+	clearTimeout(run.wrapTimer);
+	run.timer = run.wrapTimer = undefined;
+}
+
 function finish(run: Run, status: Status, error?: string) {
 	if (run.completion.settled) return;
-	if (run.timer) clearTimeout(run.timer);
+	disarm(run);
 	if (run.providerRetry) {
 		run.providerRetryMs += Math.max(0, Date.now() - run.providerRetry.startedAt);
 		run.providerRetry = undefined;
 	}
-	run.timer = undefined;
+	run.turnStartedAt = undefined;
 	run.endedAt = Date.now();
 	run.status = status;
 	if (error) run.error = error;
@@ -713,7 +833,8 @@ function finish(run: Run, status: Status, error?: string) {
 		run.error = `Stopped after its ${Math.round(run.timeoutMs / 60000)} min budget (timeoutMs, default ${DEFAULT_TIMEOUT_MS / 60000} min). Its work up to that point stands and is not rolled back.`
 			+ (run.segmentFailedAttempts
 				? ` Most of this segment's budget went to ${run.segmentFailedAttempts} failed provider attempt${run.segmentFailedAttempts === 1 ? "" : "s"} and retries (last: ${run.lastAttemptError}), not to the work \u2014 investigate that provider or choose another offering before granting more time.`
-				: ` Give it a larger timeoutMs only if the work genuinely needs longer.`);
+				: ` Give it a larger timeoutMs only if the work genuinely needs longer.`)
+			+ `\n${salvage(run)}`;
 	}
 	run.activeTools.clear();
 	run.streamingMessage = undefined;
@@ -749,6 +870,59 @@ async function haltSlice(run: Run) {
 const ovenWatches = new Map<string, AbortController>();
 
 /**
+ * Progress for health.ts from one oven_watch event, as trackProgress reads an in-process child's session events: a
+ * streaming answer opens a turn, a finished message closes it (and may carry an `EXTEND:` line), a tool call's start and
+ * end count as progress and its start is recorded as a tool call. A successful edit or write adds its path to
+ * changedFiles (a path in the slice's copy). A snapshot or state event carries the slice's turn count.
+ */
+export function trackOven(run: Run, event: any, now = Date.now()) {
+	if (run.status !== "running" || !event) return;
+	switch (event.type) {
+		case "snapshot":
+		case "state":
+			if (Number.isInteger(event.slice?.turns)) run.turns = event.slice.turns;
+			if (event.type === "snapshot") {
+				if (event.partial) trackProgress(run, { type: "message_start", message: { role: "assistant" } }, now);
+				const open = (event.tools ?? []).filter((t: any) => t.status === "running");
+				for (const t of open) run.activeTools.set(t.callId, { name: t.name, args: t.args ?? {} });
+				if (open.length) run.lastTool = open.at(-1).name;
+			}
+			break;
+		case "partial":
+			if (run.turnStartedAt !== undefined) return; // The answer streaming on: nothing new for health.
+			trackProgress(run, { type: "message_start", message: { role: "assistant" } }, now);
+			break;
+		case "message":
+			trackProgress(run, { type: "message_end", message: event.message ?? {} }, now);
+			if (event.message?.role === "assistant") run.turns++;
+			break;
+		case "tool": {
+			const tool = event.tool;
+			if (!tool?.callId) return;
+			if (tool.status === "running") {
+				if (run.activeTools.has(tool.callId)) return; // Its output printing on.
+				const args = (tool.args ?? {}) as Record<string, unknown>;
+				run.activeTools.set(tool.callId, { name: tool.name, args });
+				run.lastTool = tool.name;
+				{ run.toolCalls.push({ name: tool.name, args, at: now }); if (run.toolCalls.length > MAX_TOOL_CALLS) run.toolCalls.shift(); }
+				trackProgress(run, { type: "tool_execution_start" }, now);
+			} else {
+				const args = (run.activeTools.get(tool.callId)?.args ?? tool.args ?? {}) as Record<string, unknown>;
+				run.activeTools.delete(tool.callId);
+				const path = args.path ?? args.file_path;
+				if (!tool.isError && (tool.name === "edit" || tool.name === "write") && typeof path === "string" && !run.changedFiles.includes(path))
+					run.changedFiles = [...run.changedFiles, path].sort();
+				trackProgress(run, { type: "tool_execution_end" }, now);
+			}
+			break;
+		}
+		default: return;
+	}
+	run.revision++;
+	changed();
+}
+
+/**
  * Follow an oven run's slice until it settles: oven_watch, whose result is the settled event the moment the
  * slice is done. When the call drops (oven restarted, network), it is made again after a short pause, for as
  * long as the run is running; a cancel or the run's timeout (armTimeout) ends it.
@@ -758,7 +932,7 @@ async function settleOven(run: Run): Promise<SliceView> {
 		const abort = new AbortController();
 		ovenWatches.set(run.id, abort);
 		try {
-			const settled = await ovenCall<Settled>("watch", { slice: run.sliceId! }, { signal: abort.signal });
+			const settled = await ovenCall<Settled>("watch", { slice: run.sliceId! }, { signal: abort.signal, onEvent: (event) => trackOven(run, event) });
 			return { ...settled.slice, output: settled.output };
 		} catch (error) {
 			if (run.status !== "running") throw error;
@@ -778,8 +952,7 @@ const failure = (slice: SliceView) => `oven slice ${slice.id} ${slice.state}${sl
 async function launchOven(run: Run, task: string) {
 	try {
 		milestone(run, { kind: "started", task: task.slice(0, 600) });
-		run.segmentStartedAt = Date.now();
-		armTimeout(run);
+		beginSegment(run);
 		if (!run.sliceId) {
 			const config = { name: run.role, instructions: run.systemPrompt, model: run.model, ...(run.thinking ? { thinking: run.thinking } : {}),
 				...(run.extensions?.length ? { extensions: run.extensions } : {}), ...(run.tools.includes("*") ? {} : { tools: run.tools }) };
@@ -925,13 +1098,39 @@ export function admit(): void {
 export const activeWriter = (cwd: string, except?: Run): Run | undefined =>
 	[...runs.values()].find((r) => r !== except && !r.completion.settled && r.writer && r.cwd === cwd);
 
-/** Reserve a segment before awaiting setup: concurrent steers cannot create duplicate sessions. */
-function armTimeout(run: Run) {
-	if (run.timer) clearTimeout(run.timer);
+/** The steer a child gets when `leftMs` of its budget remain. */
+export const wrapUpMessage = (leftMs: number) => `${Math.round(leftMs / 60_000)} min left in your budget. Stop starting new work, restore anything you changed temporarily, and write your final report now. If you genuinely need more time, end your message with one line: EXTEND: <minutes> - <reason>.`;
+
+/** Put a message into a running run's live work: its session's turn, or its oven slice's running work. */
+async function steerLive(run: Run, message: string) {
+	if (run.runtime === "oven") await ovenCall("send", { slice: run.sliceId!, text: message, steer: true, requestId: `pi-delegate:${run.id}:steer:${randomUUID()}` });
+	else await run.session?.steer(message);
+}
+
+/** A segment's clock starts: its budget, and its progress for the watchdog, count from now. */
+function beginSegment(run: Run) {
+	run.segmentStartedAt = run.lastProgressAt = Date.now();
+	run.turnStartedAt = run.alerted = run.extendRequest = undefined;
+	armTimeout(run);
+}
+
+/**
+ * Arm the current segment's hard timeout, and ahead of it the wrap-up steer: WRAP_UP_MIN_MS or 15% of the budget
+ * before the end, whichever is larger, unless the budget is shorter than that lead or the run is past it.
+ */
+export function armTimeout(run: Run) {
+	disarm(run);
 	const spent = Date.now() - run.segmentStartedAt;
 	if (spent >= run.timeoutMs) throw new Error(`${run.id} has already run ${Math.round(spent / 60000)} min of this segment; a ${Math.round(run.timeoutMs / 60000)} min budget is already spent. Pass a larger timeoutMs.`);
 	// The explanation is composed in finish(), after harvesting can say where the budget went.
 	run.timer = setTimeout(() => { run.status = "timeout"; void stopTree(run); void run.session?.abort(); }, run.timeoutMs - spent);
+	const lead = Math.max(WRAP_UP_MIN_MS, run.timeoutMs * 0.15);
+	const wrapIn = run.timeoutMs - spent - lead;
+	if (lead < run.timeoutMs && wrapIn > 0) run.wrapTimer = setTimeout(() => {
+		run.wrapTimer = undefined;
+		if (run.status === "running" && !run.completion.settled) steerLive(run, wrapUpMessage(lead)).catch(() => {});
+	}, wrapIn);
+	watch();
 }
 
 export type Replacement = { model?: string; thinking?: string; contextWindow?: number; timeoutMs?: number };
@@ -1145,6 +1344,8 @@ export class PiBackend implements DelegateBackend<"pi"> {
 				if (ev.message?.role === "assistant") run.streamingMessage = ev.message;
 			}
 			if (ev.type === "message_end") run.streamingMessage = undefined;
+			// A queued steer drains at a turn boundary, an interrupt's as the next prompt: either starts a user message.
+			if (ev.type === "message_start" && ev.message?.role === "user" && run.steers?.length) readSteers(run, textOf(ev.message.content, ""));
 			if (ev.type === "auto_retry_start") {
 				// Retry events can arrive before the failed assistant message is persisted;
 				// retain the current-segment attribution for an ensuing timeout.
@@ -1172,7 +1373,7 @@ export class PiBackend implements DelegateBackend<"pi"> {
 			if (ev.type === "tool_execution_start") {
 				run.lastTool = ev.toolName;
 				run.activeTools.set(ev.toolCallId, { name: ev.toolName, args: ev.args ?? {} });
-				if (run.toolCalls.length < MAX_TOOL_CALLS) run.toolCalls.push({ name: ev.toolName, args: (ev.args ?? {}) as Record<string, unknown>, at: Date.now() });
+				{ run.toolCalls.push({ name: ev.toolName, args: (ev.args ?? {}) as Record<string, unknown>, at: Date.now() }); if (run.toolCalls.length > MAX_TOOL_CALLS) run.toolCalls.shift(); }
 				if (this.hooks.serves(run)) onUpdate?.({ content: [{ type: "text", text: `${run.id}: ${ev.toolName}` }], details: view(run) });
 			}
 			if (ev.type === "tool_execution_update") {
@@ -1180,6 +1381,7 @@ export class PiBackend implements DelegateBackend<"pi"> {
 				if (active) active.result = { ...ev.partialResult, isError: false };
 			}
 			if (ev.type === "tool_execution_end") run.activeTools.delete(ev.toolCallId);
+			trackProgress(run, ev);
 			run.revision++;
 			if (ev.type === "message_end") {
 				if (ev.message?.role === "assistant") {
@@ -1218,32 +1420,47 @@ export class PiBackend implements DelegateBackend<"pi"> {
 			if (run.status === "running") {
 				milestone(run, { kind: "started", task: task.slice(0, 600) });
 				run.dirtyBefore = snapshotDirty(run.cwd);
-				run.segmentStartedAt = Date.now();
-				armTimeout(run);
-				await run.session.prompt(task, { preflightResult: (accepted: boolean) => {
-					// Pi abort() cannot cancel prompt preflight while its agent is still idle.
-					// Recheck at the SDK's dispatch boundary, before it starts the agent loop.
-					if (accepted && run.status !== "running") throw new Error("Child stopped before prompt dispatch.");
-				} });
-				// Provider failures are assistant messages, not rejected prompt promises.
-				const last = messagesOf(run).findLast((message) => message.role === "assistant");
-				if (run.status === "running" && last?.stopReason === "error") throw new Error(last.errorMessage ?? "Child provider failed.");
+				beginSegment(run);
+				for (let prompt: string | undefined = task; prompt !== undefined;) {
+					await run.session.prompt(prompt, { preflightResult: (accepted: boolean) => {
+						// Pi abort() cannot cancel prompt preflight while its agent is still idle.
+						// Recheck at the SDK's dispatch boundary, before it starts the agent loop.
+						if (accepted && run.status !== "running") throw new Error("Child stopped before prompt dispatch.");
+					} });
+					// An interrupting steer aborted that prompt (steerRun): its message is the next prompt, in this
+					// segment and budget. The prompt returns only after Pi settled, so this one is not deferred.
+					prompt = run.status === "running" ? interrupts.get(run.id) : undefined;
+					interrupts.delete(run.id);
+					if (prompt !== undefined) {
+						run.turnStartedAt = run.streamingMessage = run.alerted = undefined;
+						run.activeTools.clear();
+						run.lastProgressAt = Date.now();
+						run.revision++;
+						changed();
+						continue;
+					}
+					// Provider failures are assistant messages, not rejected prompt promises.
+					const last = messagesOf(run).findLast((message) => message.role === "assistant");
+					if (run.status === "running" && last?.stopReason === "error") throw new Error(last.errorMessage ?? "Child provider failed.");
+				}
 			}
 			finish(run, run.status === "running" ? "complete" : run.status);
 		} catch (e: any) {
 			finish(run, run.status === "running" ? "error" : run.status, run.error ?? errorMessage(e));
-		} finally { run.ready = undefined; run.preparing = undefined; }
+		} finally { run.ready = undefined; run.preparing = undefined; interrupts.delete(run.id); }
 	}
 
 	/**
 	 * Steer a run: a running one takes the message into its live turn (an oven slice into its running work), a
 	 * settled one resumes in the background with a fresh segment, on `replacement`'s offering or budget when given.
+	 * `interrupt` (a running in-process run only) aborts its current turn and sends the message as the next prompt.
 	 */
-	async steerRun(run: Run, message: string, restart = false, replacement?: Replacement): Promise<void> {
+	async steerRun(run: Run, message: string, restart = false, replacement?: Replacement, interrupt = false): Promise<void> {
 		this.hooks.owner();
 		if (run.foreign) throw ownedElsewhereError(run);
+		if (interrupt) this.refuseInterrupt(run);
 		// A running oven slice takes the message into its running work, as a live session's steer does.
-		if (run.runtime === "oven" && run.status === "running" && run.sliceId) { await ovenCall("send", { slice: run.sliceId, text: message, steer: true, requestId: `pi-delegate:${run.id}:steer:${randomUUID()}` }); return; }
+		if (run.runtime === "oven" && run.status === "running" && run.sliceId) { await steerLive(run, message); return; }
 		if (run.status === "running") {
 			await run.preparing;
 			await run.ready;
@@ -1251,17 +1468,28 @@ export class PiBackend implements DelegateBackend<"pi"> {
 				// A live turn is already bound to its model. Never swap it underneath running work.
 				if (replacement?.model) throw new Error(`${run.id} is running on ${run.model}; a different offering applies to its next segment. Wait for it or cancel it, then steer with model.`);
 				if (replacement?.timeoutMs !== undefined) {
-					// More time is the one change a live segment can take: re-arm its own budget.
-					const previous = run.timeoutMs;
-					run.timeoutMs = replacement.timeoutMs;
-					try { armTimeout(run); }
-					catch (error) { run.timeoutMs = previous; armTimeout(run); throw error; }
+					// More time is the one change a live segment can take: it ends `timeoutMs` from now, re-armed at once.
+					run.timeoutMs = Date.now() - run.segmentStartedAt + replacement.timeoutMs;
+					run.extendRequest = undefined;
+					armTimeout(run);
 					saveRun(run);
 					changed();
 				}
-				await run.session.steer(message); return;
+				if (interrupt) {
+					// launch() sees the message once the aborted prompt returns and sends it as the next prompt; the
+					// run never settles in between. A second interrupt before then joins the first.
+					const pending = interrupts.get(run.id);
+					interrupts.set(run.id, pending === undefined ? message : `${pending}\n\n${message}`);
+					// Abort ends the turn's model stream and signals its running tools. Not stopTree: the run goes on,
+					// and its delegated children report into it.
+					await run.session.abort();
+					return;
+				}
+				await steerLive(run, message); return;
 			}
 		}
+		// It settled while this steer waited for its session.
+		if (interrupt) this.refuseInterrupt(run);
 		const nested = childOwner(run);
 		if (nested && rebinds(run, replacement)) {
 			// A new offering reopens the session its own children report into.
@@ -1271,6 +1499,12 @@ export class PiBackend implements DelegateBackend<"pi"> {
 		beginResume(run, restart, replacement);
 		const completion = run.completion;
 		void this.launch(run, message).then(() => publish(completion));
+	}
+
+	/** An interrupt needs a turn to abort: a running in-process run's. A settled run resumes with a plain steer. */
+	private refuseInterrupt(run: Run) {
+		if (run.runtime === "oven") throw new DelegateError("INPUT_INVALID", `${run.id} runs as an oven slice; interrupt applies only to an in-process run. Steer without interrupt.`, "interrupt");
+		if (run.status !== "running" || run.completion.settled) throw new DelegateError("INPUT_INVALID", `${run.id} is ${run.status}, so there is no turn to interrupt. Steer without interrupt to resume it.`, "interrupt");
 	}
 
 	async start(input: PiStartInput, signal?: AbortSignal, call?: PiCall): Promise<PiRunView> {
@@ -1370,7 +1604,11 @@ export class PiBackend implements DelegateBackend<"pi"> {
 		if (input.timeoutMs !== undefined) replacement = { ...replacement, timeoutMs: input.timeoutMs };
 		// The model steered it: its completion wakes the model, whoever started it.
 		if (run.userStarted) { run.userStarted = undefined; saveRun(run); }
-		await this.steerRun(run, input.message, input.restart, replacement);
+		// Its receipt exists before the message can reach the session; an oven slice reports no message events.
+		const receipt = run.runtime === "oven" ? undefined : noteSteer(run, input.message, input.interrupt);
+		try { await this.steerRun(run, input.message, input.restart, replacement, input.interrupt); }
+		catch (error) { if (receipt) run.steers = run.steers?.filter((r) => r !== receipt); throw error; }
+		if (receipt && !run.foreign) { try { saveRun(run); } catch { /* the receipt stays in memory */ } }
 		return piView(run);
 	}
 

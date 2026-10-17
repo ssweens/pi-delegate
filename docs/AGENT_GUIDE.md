@@ -6,6 +6,8 @@ This is the operating manual for a parent Pi that runs ACP agents through `deleg
 
 Delegate only when independent context, parallelism, a specific external agent, or adversarial review is worth the coordination cost. Keep small local edits in the parent. Give each run one decision-shaped assignment with its scope, evidence, constraints, verification and return shape. An ACP agent never sees your conversation, so the brief must stand alone.
 
+Keep briefs small, one deliverable per run. For a run with a budget over 30 minutes the brief also carries `FIRST DELIVERABLE`, `STOP WHEN` and `KNOWN FACTS` (what you already established, so the agent does not rediscover it). Read `delegate_ctl status` for one verdict per run (`moving`, `slow`, `silent`, `retrying`, `looping`, `no-artifact`) and act on exceptions only. Extend a budget only on a `moving` verdict or an `EXTEND: <minutes> <reason>` request, with `delegate_ctl steer timeoutMs=<milliseconds from now>`. The [delegation skill](../skills/delegation/SKILL.md#watching-a-long-run) has the verdict actions: steer once (`interrupt: true` in a long think), then cancel and relaunch smaller.
+
 ## 2. Tool calls
 
 List your runs before starting new ones:

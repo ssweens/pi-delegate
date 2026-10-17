@@ -98,6 +98,11 @@ export interface SteerRequest {
 	timeoutMs?: number;
 	/** pi only: restart an explicitly stopped child. */
 	restart?: boolean;
+	/**
+	 * pi in-process runs only, while running: abort the current turn and deliver `message` as the next prompt,
+	 * in the same segment and budget. Without it a running child reads a steer at its next turn boundary.
+	 */
+	interrupt?: boolean;
 }
 
 /** delegate_ctl wait. A timeout ends the wait only. It never cancels a run. */
@@ -550,6 +555,11 @@ export function validateSteer(run: { backend: BackendName; origin?: SessionOrigi
 		if (run.backend !== "pi") return fail("FIELD_NOT_ON_ACP", "restart is pi-only", "restart");
 		if (typeof raw.restart !== "boolean") return fail("INPUT_INVALID", "restart must be a boolean", "restart");
 		value.restart = raw.restart;
+	}
+	if (raw.interrupt !== undefined) {
+		if (run.backend !== "pi") return fail("FIELD_NOT_ON_ACP", "interrupt is pi-only; an ACP turn is stopped with cancel, then steered", "interrupt");
+		if (typeof raw.interrupt !== "boolean") return fail("INPUT_INVALID", "interrupt must be a boolean", "interrupt");
+		if (raw.interrupt) value.interrupt = true;
 	}
 	if (raw.model !== undefined) {
 		if (run.backend === "acp" && run.origin === "opened") return fail("OPEN_OVERRIDE_FORBIDDEN", "an opened session keeps its native model", "model");

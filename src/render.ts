@@ -2,7 +2,8 @@ import type { Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme, keyHint } from "@earendil-works/pi-coding-agent";
 import { formatPercent, type DealsDetails, type DealRow } from "./deals.js";
 import { type Component, Markdown, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
-import { formatDuration } from "./util/format.ts";
+import { formatDuration, formatTokens } from "./util/format.ts";
+import { budgetText, runHealth, type Health } from "./health.ts";
 import { textOf } from "./util/text.ts";
 import { BOX, GLYPH } from "./ui/glyphs.ts";
 import { cut, fit, fitAlign, fitPad } from "./ui/text.ts";
@@ -158,6 +159,43 @@ export function runLine(v: RunView, theme: Theme, width: number, now = Date.now(
 	const title = fit(runTitle(v), Math.max(4, width - 2 - visibleWidth(suffix)));
 	void now;
 	return fit(`${theme.fg(color, glyph)} ${theme.bold(title)}${suffix}`, width);
+}
+
+/** What a board line reads off a Pi run; Run satisfies it, and the optional ones are the live-progress facts. */
+export type BoardRun = Pick<RunView, "id" | "task" | "role" | "status" | "durationMs" | "changedFiles" | "tokens" | "lastTool"> & {
+	segmentStartedAt?: number; timeoutMs?: number; providerRetry?: RunView["providerRetry"]; lastProgressAt?: number; turnStartedAt?: number; runtime?: "oven";
+	extendRequest?: { minutes?: number; reason?: string; at?: number };
+	/** delegate_ctl steers' read receipts, oldest first. */
+	steers?: { queuedAt: number; readAt?: number; interrupt?: true }[];
+};
+
+/** The latest steer's receipt: pending for how long while the child has not taken it in, else the local time it did. */
+function steerReceipt(steers: BoardRun["steers"], now: number): string {
+	const last = steers?.at(-1);
+	if (!last) return "";
+	if (last.readAt === undefined) return `steer pending ${Math.floor(Math.max(0, now - last.queuedAt) / 60_000)}m`;
+	const at = new Date(last.readAt);
+	return `steer read ${String(at.getHours()).padStart(2, "0")}:${String(at.getMinutes()).padStart(2, "0")}`;
+}
+
+/** True when the status board should list this run: still going, unacknowledged, or settled since the person's last prompt. */
+export const onBoard = (r: { status: string; acknowledged?: boolean; endedAt?: number }, promptAt: number): boolean =>
+	r.status === "running" || !r.acknowledged || (r.endedAt ?? 0) >= promptAt;
+
+/** One run on one plain-text line for the model: title, verdict, budget, progress facts. Settled runs are terse. */
+export function boardLine(r: BoardRun, now = Date.now()): string {
+	const files = `${r.changedFiles.length} file${r.changedFiles.length === 1 ? "" : "s"}`;
+	if (r.status !== "running") return `${runTitle(r)} · ${r.status} · ${formatDuration(r.durationMs)} · ${files} · id ${r.id}`;
+	// A Run passed here also carries toolCalls and writer, which the looping and no-artifact verdicts read.
+	const h: Health = r.segmentStartedAt !== undefined && r.timeoutMs !== undefined ? runHealth({ ...r, status: "running", segmentStartedAt: r.segmentStartedAt, timeoutMs: r.timeoutMs }, now) : { verdict: "moving", turnMs: 0 };
+	const budget = h.budgetLeftMs !== undefined && r.timeoutMs !== undefined ? `${Math.round((r.timeoutMs - h.budgetLeftMs) / 60_000)}m/${Math.round(r.timeoutMs / 60_000)}m (${budgetText(h).split(" (")[0]})` : "";
+	const ask = r.extendRequest ? `asks +${r.extendRequest.minutes ?? "?"} min${r.extendRequest.reason ? `: ${r.extendRequest.reason}` : ""}` : "";
+	return [
+		runTitle(r), h.verdict, budget,
+		h.sinceProgressMs !== undefined ? `last output ${formatDuration(h.sinceProgressMs)} ago` : "",
+		h.turnMs ? `turn ${formatDuration(h.turnMs)}` : "",
+		files, `out ${formatTokens(r.tokens.output)}`, r.lastTool ? `last: ${r.lastTool}` : "", ask, steerReceipt(r.steers, now), `id ${r.id}`,
+	].filter(Boolean).join(" · ");
 }
 
 export function resultLines(v: RunView, expanded: boolean, theme: Theme, width: number): string[] {
