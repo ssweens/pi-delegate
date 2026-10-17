@@ -45,7 +45,7 @@ import type { SettingsRow } from "./ui/settings-panel.ts";
 import { FULLSCREEN } from "./ui/overlay.ts";
 import { AGENT_DIR, SETTINGS_PATH } from "./agent-dir.ts";
 import {
-	acknowledge, activeWriter, activityOf, admit, allowlist, finishedNotice, PI_BUILTIN_TOOLS, notify, PiBackend, type PiCall, type PiRunSpec, cancelRun, capacityError, changed, CHILD_SETTLED_PROMPT, childOwner, closeOwner, closingChildren, DEFAULT_TIMEOUT_MS, departed, finalResult, findDeparted, FORK_BRIDGE, harvest, inFlight, listeners, maxDepth, noticeKey, ownedRuns, type Owner, ownerPath, pointerDir, publish, recordedView, redeliver, restoreRun, resultText, type Run, runRecordPaths, runs, saveRun, state, summary, TRUST_UNKNOWN, view, type WaitRow,
+	acknowledge, activeWriter, activityOf, admit, progressAt, allowlist, finishedNotice, PI_BUILTIN_TOOLS, notify, PiBackend, type PiCall, type PiRunSpec, cancelRun, capacityError, changed, CHILD_SETTLED_PROMPT, childOwner, closeOwner, closingChildren, DEFAULT_TIMEOUT_MS, departed, finalResult, findDeparted, FORK_BRIDGE, harvest, inFlight, listeners, maxDepth, noticeKey, ownedRuns, type Owner, ownerPath, pointerDir, publish, recordedView, redeliver, restoreRun, resultText, type Run, runRecordPaths, runs, saveRun, state, summary, TRUST_UNKNOWN, view, type WaitRow,
 } from "./pi-backend.ts";
 
 export { AGENT_DIR };
@@ -1350,7 +1350,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			if (p.action === "status" && !p.runId) {
 				const owned = ownedRuns(owner);
 				const external = acp.owned(owner.key);
-				const lines = [...owned.filter((r) => onBoard(r, promptAt)).map((r) => boardLine({ ...r, durationMs: (r.status === "running" ? Date.now() : (r.endedAt ?? Date.now())) - r.segmentStartedAt })), ...external.map((v) => acpSummary(v).split("\n")[0])];
+				const lines = [...owned.filter((r) => onBoard(r, promptAt)).map((r) => boardLine({ ...r, lastProgressAt: progressAt(r), durationMs: (r.status === "running" ? Date.now() : (r.endedAt ?? Date.now())) - r.segmentStartedAt })), ...external.map((v) => acpSummary(v).split("\n")[0])];
 				return { content: [{ type: "text", text: lines.join("\n") || "no runs" }], details: { kind: "runs", rows: [...owned.map(recordedView), ...external] } };
 			}
 			// One wait for one run or several, of either backend (waitRuns).

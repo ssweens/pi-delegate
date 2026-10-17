@@ -500,11 +500,21 @@ export function trackProgress(run: Run, ev: any, now = Date.now()) {
 
 const mins = (ms: number) => `${Math.round(ms / 60_000)}m`;
 /**
+ * When the child last showed life: its own events, or its session file being written. The file covers a run restored
+ * after a reload (no events reach this process) and any gap in the events; it is what a person checks by hand.
+ */
+export function progressAt(run: Pick<Run, "lastProgressAt" | "sessionFile">): number | undefined {
+	let at = run.lastProgressAt;
+	try { if (run.sessionFile) at = Math.max(at ?? 0, statSync(run.sessionFile).mtimeMs); } catch { /* not written yet */ }
+	return at;
+}
+
+/**
  * The watchdog's look at one run: a notice when it stops moving (retrying, looping, silent, no-artifact, browsing or
  * slow), once per verdict until it moves again. Exception-only: a moving run is never reported.
  */
 export function healthAlert(run: Run, now = Date.now()) {
-	const health = runHealth(run, now);
+	const health = runHealth({ ...run, lastProgressAt: progressAt(run) }, now);
 	if (health.verdict === "moving" || health.verdict === "settled") { run.alerted = undefined; return; }
 	if (run.alerted?.includes(health.verdict)) return;
 	(run.alerted ??= []).push(health.verdict);

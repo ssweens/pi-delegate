@@ -7,6 +7,8 @@ import { WRITE_TOOLS } from "./roles.js";
 
 /** No tool call or message for this long: the child is silent. */
 export const SILENT_MS = 6 * 60_000;
+/** ...but while a tool call is executing (a build, a test run) the child is working, so silence is only called after this long. */
+export const TOOL_SILENT_MS = 15 * 60_000;
 /** One assistant turn open this long: the child is slow (a long think, or a stuck provider). */
 export const SLOW_TURN_MS = 3 * 60_000;
 /** The wrap-up notice goes out this long before the hard timeout, or at 15% of the budget when that is larger. */
@@ -43,7 +45,7 @@ export interface Health {
 /** What runHealth reads; the looping, no-artifact and browsing facts are optional, so a caller without them gets the other verdicts. */
 export type HealthInput = Pick<Run, "status" | "segmentStartedAt" | "timeoutMs" | "providerRetry"> & {
 	lastProgressAt?: number; turnStartedAt?: number;
-	toolCalls?: Run["toolCalls"]; changedFiles?: string[]; writer?: boolean; runtime?: "oven"; tools?: string[]; firstDeliverableMin?: number;
+	toolCalls?: Run["toolCalls"]; changedFiles?: string[]; writer?: boolean; runtime?: "oven"; tools?: string[]; activeTools?: { size: number }; firstDeliverableMin?: number;
 };
 
 /**
@@ -105,7 +107,7 @@ export function runHealth(run: HealthInput, now = Date.now()): Health {
 	if (run.providerRetry) return { verdict: "retrying", ...base };
 	const loop = findLoop(calls, run.segmentStartedAt);
 	if (loop) return { verdict: "looping", ...base, loop };
-	if ((since ?? now - run.segmentStartedAt) > SILENT_MS) return { verdict: "silent", ...base };
+	if ((since ?? now - run.segmentStartedAt) > (run.activeTools?.size ? TOOL_SILENT_MS : SILENT_MS)) return { verdict: "silent", ...base };
 	if (owesFiles(run) && dueAt !== undefined && now >= dueAt) return { verdict: "no-artifact", ...base };
 	// Before its first edit of the segment and its deadline a writer is expected to read; after either, BROWSE_CALLS
 	// calls in a row without an edit is browsing.

@@ -140,3 +140,22 @@ test("salvage reads last words, changes, last five tools, and how to resume", ()
 	assert.match(text, /last tools: bash echo two; read three\.ts; bash echo four; read five\.ts; bash echo six/);
 	assert.match(text, /Resume: delegate_ctl steer runId=salvage-a timeoutMs=<ms from now> message=<what remains>$/);
 });
+
+test("progressAt: a session file written after the last event counts as life, so a run without events is not silent", async () => {
+	const { mkdtempSync, writeFileSync, utimesSync, rmSync } = await import("node:fs");
+	const { tmpdir } = await import("node:os");
+	const { join } = await import("node:path");
+	const { progressAt } = await import("../src/pi-backend.ts");
+	const dir = mkdtempSync(join(tmpdir(), "progress-"));
+	try {
+		const file = join(dir, "s.jsonl");
+		writeFileSync(file, "x");
+		const t = Date.now() - 20 * 60_000;
+		assert.equal(progressAt({ lastProgressAt: t, sessionFile: undefined }), t, "no file: the events");
+		assert.ok(progressAt({ lastProgressAt: t, sessionFile: file })! > Date.now() - 5000, "a fresh file beats a stale event");
+		assert.ok(progressAt({ lastProgressAt: undefined, sessionFile: file })! > Date.now() - 5000, "restored run with no events");
+		utimesSync(file, new Date(t - 60_000), new Date(t - 60_000));
+		assert.equal(progressAt({ lastProgressAt: t, sessionFile: file }), t, "an older file does not beat newer events");
+		assert.equal(progressAt({ lastProgressAt: t, sessionFile: join(dir, "missing") }), t, "a missing file is ignored");
+	} finally { rmSync(dir, { recursive: true, force: true }); }
+});

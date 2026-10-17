@@ -167,3 +167,11 @@ test("an oven slice owes files when its tools can write, though it is not a writ
 	assert.equal(runHealth({ ...slice, tools: ["read", "grep"] }, at).verdict, "moving", "a read-only slice owes none");
 	assert.equal(firstDeliverableAt({ segmentStartedAt: start, timeoutMs: 20 * min, runtime: "oven", tools: ["write"] }), start + 6 * min);
 });
+
+test("silence: a child with a tool executing is working, so it is silent only after the longer limit", () => {
+	const min = 60_000;
+	const run = input({ writer: false, lastProgressAt: start, toolCalls: calls(read("a")) });
+	assert.equal(runHealth({ ...run, activeTools: { size: 0 } }, start + 8 * min).verdict, "silent");
+	assert.equal(runHealth({ ...run, activeTools: { size: 1 } }, start + 8 * min).verdict, "moving", "a build or test run is in flight");
+	assert.equal(runHealth({ ...run, activeTools: { size: 1 } }, start + 16 * min).verdict, "silent");
+});
