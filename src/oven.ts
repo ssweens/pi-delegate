@@ -37,7 +37,11 @@ export class OvenUnreachable extends Error {
 }
 
 /** What oven reports for a slice. */
-export interface SliceView { id: string; state: "running" | "idle" | "failed" | "stopped"; stage?: string; reason?: string; turns: number; detail?: string; output?: string; cwd?: string }
+export interface SliceView { id: string; state: "running" | "idle" | "failed" | "stopped"; stage?: string; reason?: string; turns: number; detail?: string; output?: string; cwd?: string;
+	/** A slice waiting to retry stays running with stage "retrying" (newer oven; absent from older ones). */
+	retry?: { attempt: number; of: number; at: number; error?: string };
+	usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; cost?: number };
+	changedFiles?: string[] }
 export interface Settled { type: "settled"; slice: SliceView; output: string }
 
 /** Call `oven_<tool>` with delegate-specific configuration and error wording. */

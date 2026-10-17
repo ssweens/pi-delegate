@@ -875,12 +875,27 @@ const ovenWatches = new Map<string, AbortController>();
  * end count as progress and its start is recorded as a tool call. A successful edit or write adds its path to
  * changedFiles (a path in the slice's copy). A snapshot or state event carries the slice's turn count.
  */
+/** What a slice view carries beyond its turn count, when this oven reports it: a pending retry, token usage, changed files. */
+export function applySlice(run: Run, slice: SliceView | undefined, now = Date.now()) {
+	if (!slice) return;
+	if (Number.isInteger(slice.turns)) run.turns = slice.turns;
+	if (slice.stage === "retrying" && slice.retry) {
+		const { attempt, of, at, error } = slice.retry;
+		run.providerRetry = { attempt, maxAttempts: of, delayMs: Math.max(0, at - now), errorMessage: error ?? slice.detail ?? "retrying", startedAt: run.providerRetry?.startedAt ?? now };
+	} else if (run.providerRetry) run.providerRetry = undefined;
+	if (slice.usage) {
+		run.tokens = { input: slice.usage.input ?? run.tokens.input, output: slice.usage.output ?? run.tokens.output, cacheRead: slice.usage.cacheRead ?? run.tokens.cacheRead, cacheWrite: slice.usage.cacheWrite ?? run.tokens.cacheWrite };
+		if (slice.usage.cost !== undefined) run.cost = slice.usage.cost;
+	}
+	if (slice.changedFiles) run.changedFiles = [...new Set([...run.changedFiles, ...slice.changedFiles])].sort();
+}
+
 export function trackOven(run: Run, event: any, now = Date.now()) {
 	if (run.status !== "running" || !event) return;
 	switch (event.type) {
 		case "snapshot":
 		case "state":
-			if (Number.isInteger(event.slice?.turns)) run.turns = event.slice.turns;
+			applySlice(run, event.slice, now);
 			if (event.type === "snapshot") {
 				if (event.partial) trackProgress(run, { type: "message_start", message: { role: "assistant" } }, now);
 				const open = (event.tools ?? []).filter((t: any) => t.status === "running");
@@ -894,7 +909,8 @@ export function trackOven(run: Run, event: any, now = Date.now()) {
 			break;
 		case "message":
 			trackProgress(run, { type: "message_end", message: event.message ?? {} }, now);
-			if (event.message?.role === "assistant") run.turns++;
+			if (Number.isInteger(event.turns)) run.turns = event.turns;
+			else if (event.message?.role === "assistant") run.turns++;
 			break;
 		case "tool": {
 			const tool = event.tool;
@@ -963,7 +979,7 @@ async function launchOven(run: Run, task: string) {
 		} else await ovenCall("send", { slice: run.sliceId, text: task, requestId: `pi-delegate:${run.id}:${run.segment}` });
 		const slice = await settleOven(run);
 		if (run.status !== "running") { await haltSlice(run); finish(run, run.status); return; }
-		run.turns = slice.turns;
+		applySlice(run, slice);
 		run.output = `${slice.output ?? ""}\n\n(oven slice ${run.sliceId}; its changes are in its copy, ${slice.cwd})`;
 		finish(run, slice.state === "idle" ? "complete" : "error", slice.state === "idle" ? undefined : failure(slice));
 	} catch (e: any) {

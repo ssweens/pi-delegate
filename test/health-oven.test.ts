@@ -13,7 +13,7 @@ function fixture(id: string) {
 	state.owners.set(key, { key, dir: "", queued: new Set(), closed: false,
 		binding: { pi: { sendMessage: (message: any) => sent.push(message), events: { emit() {} } }, ctx: {} } as any });
 	const run = { id, ownerKey: key, runtime: "oven", sliceId: "s1", status: "running", completion: new RunCompletion(), segment: 1, segmentStartedAt: start, timeoutMs: 20 * 60_000,
-		lastProgressAt: start, turns: 0, revision: 0, output: "", changedFiles: [], toolCalls: [], activeTools: new Map(), writer: true } as unknown as Run;
+		lastProgressAt: start, turns: 0, tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, cost: 0, revision: 0, output: "", changedFiles: [], toolCalls: [], activeTools: new Map(), writer: true } as unknown as Run;
 	return { run, sent, done() { state.owners.delete(key); runs.delete(id); } };
 }
 
@@ -73,4 +73,20 @@ test("a settled oven run ignores late events", (t) => {
 	run.status = "complete";
 	trackOven(run, tool("x", "read", {}, "running"), start + 1000);
 	assert.equal(run.toolCalls.length, 0);
+});
+
+test("a retrying slice reads as retrying, not failed; usage, changed files and message turns come through when oven reports them", (t) => {
+	const { run, done } = fixture("oven-b");
+	t.after(done);
+	trackOven(run, { type: "state", slice: { id: "s1", state: "running", stage: "retrying", turns: 3, retry: { attempt: 1, of: 2, at: start + 30_000, error: "overloaded" } } }, start + 10_000);
+	assert.equal(run.providerRetry?.attempt, 1);
+	assert.equal(run.providerRetry?.delayMs, 20_000);
+	assert.equal(runHealth(run, start + 12_000).verdict, "retrying");
+	trackOven(run, { type: "state", slice: { id: "s1", state: "running", turns: 3, usage: { input: 900, output: 120, cost: 0.01 }, changedFiles: ["b.ts", "a.ts"] } }, start + 40_000);
+	assert.equal(run.providerRetry, undefined, "leaving retrying clears it");
+	assert.deepEqual(run.tokens.output, 120);
+	assert.equal(run.cost, 0.01);
+	assert.deepEqual(run.changedFiles, ["a.ts", "b.ts"]);
+	trackOven(run, { type: "message", message: { role: "assistant", content: [] }, turns: 7 }, start + 41_000);
+	assert.equal(run.turns, 7, "the event's own turn count wins over counting messages");
 });
