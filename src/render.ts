@@ -163,7 +163,7 @@ export function runLine(v: RunView, theme: Theme, width: number, now = Date.now(
 
 /** What a board line reads off a Pi run; Run satisfies it, and the optional ones are the live-progress facts. */
 export type BoardRun = Pick<RunView, "id" | "task" | "role" | "status" | "durationMs" | "changedFiles" | "tokens" | "lastTool"> & {
-	segmentStartedAt?: number; timeoutMs?: number; providerRetry?: RunView["providerRetry"]; lastProgressAt?: number; turnStartedAt?: number; runtime?: "oven";
+	segmentStartedAt?: number; timeoutMs?: number; providerRetry?: RunView["providerRetry"]; lastProgressAt?: number; turnStartedAt?: number; runtime?: "oven"; tools?: string[]; writer?: boolean;
 	extendRequest?: { minutes?: number; reason?: string; at?: number };
 	/** delegate_ctl steers' read receipts, oldest first. */
 	steers?: { queuedAt: number; readAt?: number; interrupt?: true }[];

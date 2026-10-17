@@ -157,3 +157,13 @@ test("the watchdog says browsing once, naming the cause and the action", (t) => 
 	healthAlert(run, start + 100_000);
 	assert.equal(run.alerted, undefined, "an edit moves it again");
 });
+
+test("an oven slice owes files when its tools can write, though it is not a writer for the one-writer-per-tree lock", () => {
+	const min = 60_000;
+	const slice = { ...input({ writer: false, changedFiles: [], toolCalls: calls(read("a")), lastProgressAt: start + 6 * min }), runtime: "oven" as const };
+	const at = start + 7 * min;
+	assert.equal(runHealth({ ...slice, tools: ["read", "edit"] }, at).verdict, "no-artifact");
+	assert.equal(runHealth({ ...slice, tools: ["*"] }, at).verdict, "no-artifact");
+	assert.equal(runHealth({ ...slice, tools: ["read", "grep"] }, at).verdict, "moving", "a read-only slice owes none");
+	assert.equal(firstDeliverableAt({ segmentStartedAt: start, timeoutMs: 20 * min, runtime: "oven", tools: ["write"] }), start + 6 * min);
+});
