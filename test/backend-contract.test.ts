@@ -13,6 +13,8 @@ import {
 	checkCancel,
 	checkClose,
 	type DelegateBackend,
+	FIRST_DELIVERABLE_MAX_MIN,
+	firstDeliverableError,
 	type DelegateRunView,
 	LIFECYCLE_ACTIONS,
 	PI_CAPABILITIES,
@@ -67,6 +69,22 @@ test("pi keeps today's fields and requires a role name and a task", () => {
 	assert.equal(errorOf(validateStartInput({ role: "scout" })).field, "task");
 	assert.equal(errorOf(validateStartInput({ role: "scout", task: "t", context: "shared" })).field, "context");
 	assert.equal(errorOf(validateStartInput({ role: "scout", task: "t", timeoutMs: -1 })).field, "timeoutMs");
+});
+
+test("firstDeliverableMin: positive minutes, at most the cap, before the timeout; pi only", () => {
+	assert.deepEqual(validateStartInput({ role: "worker", task: "t", timeoutMs: 60 * 60_000, firstDeliverableMin: 10 }),
+		{ ok: true, value: { backend: "pi", role: "worker", task: "t", timeoutMs: 60 * 60_000, firstDeliverableMin: 10 } });
+	assert.equal((validateStartInput({ role: "worker", task: "t", firstDeliverableMin: 2.5 }) as any).value.firstDeliverableMin, 2.5, "no timeoutMs: the launch checks the role's budget");
+	for (const bad of [0, -5, Number.NaN, Number.POSITIVE_INFINITY, "10", null]) {
+		const error = errorOf(validateStartInput({ role: "worker", task: "t", firstDeliverableMin: bad }));
+		assert.deepEqual(error, { code: "INPUT_INVALID", message: "firstDeliverableMin must be a positive number of minutes", field: "firstDeliverableMin" });
+	}
+	assert.equal(errorOf(validateStartInput({ role: "worker", task: "t", firstDeliverableMin: FIRST_DELIVERABLE_MAX_MIN + 1 })).message, `firstDeliverableMin is at most ${FIRST_DELIVERABLE_MAX_MIN} minutes`);
+	assert.equal(errorOf(validateStartInput({ role: "worker", task: "t", timeoutMs: 20 * 60_000, firstDeliverableMin: 20 })).message, "firstDeliverableMin (20 min) must be before the timeout (20 min)");
+	assert.equal(errorOf(validateStartInput({ role: "worker", task: "t", timeoutMs: 20 * 60_000, firstDeliverableMin: 30 })).field, "firstDeliverableMin");
+	assert.equal(firstDeliverableError(19, 20 * 60_000), undefined);
+	const acp = errorOf(validateStartInput({ backend: "acp", agent: "amp", task: "t", executionEnvironment: "local", firstDeliverableMin: 5 }));
+	assert.deepEqual([acp.code, acp.field], ["FIELD_NOT_ON_ACP", "firstDeliverableMin"]);
 });
 
 // --- acp backend -------------------------------------------------------------------------

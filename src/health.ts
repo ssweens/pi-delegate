@@ -14,10 +14,15 @@ export const WRAP_UP_MIN_MS = 3 * 60_000;
 /** The same call (tool and arguments) this many times among the last LOOP_WINDOW calls of the segment: looping. */
 export const LOOP_REPEATS = 4;
 export const LOOP_WINDOW = 8;
-/** A writer that has written nothing once this share of its budget is spent: no-artifact. */
-export const NO_ARTIFACT_SHARE = 0.4;
+/** A writer's first deliverable is due this long into a segment, or at FIRST_DELIVERABLE_SHARE of its budget when that is sooner. */
+export const FIRST_DELIVERABLE_MS = 15 * 60_000;
+export const FIRST_DELIVERABLE_SHARE = 0.25;
+/** ...but never sooner than this (a short budget still needs time to read), nor later than half the budget. */
+export const FIRST_DELIVERABLE_FLOOR_MS = 6 * 60_000;
+/** A writer's last this many calls of the segment without an edit or write, once it owes a deliverable: browsing. */
+export const BROWSE_CALLS = 25;
 
-export type Verdict = "moving" | "slow" | "silent" | "retrying" | "looping" | "no-artifact" | "settled";
+export type Verdict = "moving" | "slow" | "silent" | "retrying" | "looping" | "no-artifact" | "browsing" | "settled";
 
 export interface Health {
 	verdict: Verdict;
@@ -31,13 +36,29 @@ export interface Health {
 	endsAt?: number;
 	/** looping: the repeated call's tool and how many times it appears in the window. */
 	loop?: { name: string; count: number };
+	/** When the first deliverable is due, while the run has a deadline and has written nothing yet. */
+	dueAt?: number;
 }
 
-/** What runHealth reads; the looping and no-artifact facts are optional, so a caller without them gets the other verdicts. */
+/** What runHealth reads; the looping, no-artifact and browsing facts are optional, so a caller without them gets the other verdicts. */
 export type HealthInput = Pick<Run, "status" | "segmentStartedAt" | "timeoutMs" | "providerRetry"> & {
 	lastProgressAt?: number; turnStartedAt?: number;
-	toolCalls?: Run["toolCalls"]; changedFiles?: string[]; writer?: boolean;
+	toolCalls?: Run["toolCalls"]; changedFiles?: string[]; writer?: boolean; firstDeliverableMin?: number;
 };
+
+/**
+ * When the current segment's first deliverable is due: `firstDeliverableMin` from the segment's start when the call set
+ * it, else for a writer FIRST_DELIVERABLE_SHARE of the budget (at least FIRST_DELIVERABLE_FLOOR_MS, at most FIRST_DELIVERABLE_MS and half the budget). A
+ * non-writer has no deadline unless the call set one.
+ */
+export function firstDeliverableAt(run: Pick<HealthInput, "segmentStartedAt" | "timeoutMs" | "writer" | "firstDeliverableMin">): number | undefined {
+	if (run.firstDeliverableMin !== undefined) return run.segmentStartedAt + run.firstDeliverableMin * 60_000;
+	if (!run.writer) return undefined;
+	return run.segmentStartedAt + Math.min(run.timeoutMs / 2, FIRST_DELIVERABLE_MS, Math.max(FIRST_DELIVERABLE_FLOOR_MS, run.timeoutMs * FIRST_DELIVERABLE_SHARE));
+}
+
+/** Local wall-clock HH:MM. */
+export const clock = (at: number) => new Date(at).toTimeString().slice(0, 5);
 
 const writes = (name: string) => WRITE_TOOLS.includes(name);
 const callKey = (call: { name: string; args: unknown }) => `${call.name}\0${stable(call.args)}`;
@@ -72,14 +93,20 @@ export function runHealth(run: HealthInput, now = Date.now()): Health {
 	const endsAt = run.segmentStartedAt + run.timeoutMs;
 	const since = run.lastProgressAt === undefined ? undefined : now - run.lastProgressAt;
 	const turnMs = run.turnStartedAt === undefined ? 0 : now - run.turnStartedAt;
-	const base = { sinceProgressMs: since, turnMs, budgetLeftMs: endsAt - now, endsAt };
-	const calls = run.toolCalls ?? [];
+	const calls = (run.toolCalls ?? []).filter((c) => c.at >= run.segmentStartedAt);
+	const edited = calls.some((c) => writes(c.name));
+	const deadline = firstDeliverableAt(run);
+	const dueAt = edited || run.changedFiles?.length ? undefined : deadline;
+	const base = { sinceProgressMs: since, turnMs, budgetLeftMs: endsAt - now, endsAt, ...(dueAt !== undefined ? { dueAt } : {}) };
 	if (run.providerRetry) return { verdict: "retrying", ...base };
 	const loop = findLoop(calls, run.segmentStartedAt);
 	if (loop) return { verdict: "looping", ...base, loop };
 	if ((since ?? now - run.segmentStartedAt) > SILENT_MS) return { verdict: "silent", ...base };
-	if (run.writer && !run.changedFiles?.length && now - run.segmentStartedAt >= run.timeoutMs * NO_ARTIFACT_SHARE
-		&& !calls.some((c) => c.at >= run.segmentStartedAt && writes(c.name))) return { verdict: "no-artifact", ...base };
+	if (run.writer && dueAt !== undefined && now >= dueAt) return { verdict: "no-artifact", ...base };
+	// Before its first edit of the segment and its deadline a writer is expected to read; after either, BROWSE_CALLS
+	// calls in a row without an edit is browsing.
+	if (run.writer && (edited || (deadline !== undefined && now >= deadline)) && calls.length >= BROWSE_CALLS
+		&& !calls.slice(-BROWSE_CALLS).some((c) => writes(c.name))) return { verdict: "browsing", ...base };
 	if (turnMs > SLOW_TURN_MS) return { verdict: "slow", ...base };
 	return { verdict: "moving", ...base };
 }
@@ -87,6 +114,5 @@ export function runHealth(run: HealthInput, now = Date.now()): Health {
 /** "ends 18:51 (7 min left)" for a running segment; empty once settled. */
 export function budgetText(h: Health): string {
 	if (h.endsAt === undefined || h.budgetLeftMs === undefined) return "";
-	const at = new Date(h.endsAt).toTimeString().slice(0, 5);
-	return `ends ${at} (${Math.max(0, Math.round(h.budgetLeftMs / 60_000))} min left)`;
+	return `ends ${clock(h.endsAt)} (${Math.max(0, Math.round(h.budgetLeftMs / 60_000))} min left)`;
 }

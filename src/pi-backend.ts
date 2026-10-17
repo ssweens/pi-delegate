@@ -27,7 +27,7 @@ import type { ActiveTool, ChildActivity } from "./transcript.js";
 import { formatDuration, formatTokens } from "./util/format.ts";
 import { gitSync } from "./util/git.ts";
 import { errorMessage, oneLine, textOf } from "./util/text.ts";
-import { budgetText, NO_ARTIFACT_SHARE, runHealth, type Verdict, WRAP_UP_MIN_MS } from "./health.js";
+import { BROWSE_CALLS, budgetText, clock, runHealth, type Verdict, WRAP_UP_MIN_MS } from "./health.js";
 import { type Join, joinRuns, WAIT_POLL_MS } from "./wait.ts";
 
 const LOG_FILE = join(AGENT_DIR, "delegate-runs.jsonl");
@@ -116,6 +116,8 @@ export interface Run {
 	segmentStartedAt: number;
 	forkedMessages?: number;
 	writer: boolean;
+	/** The delegate call's firstDeliverableMin: minutes from each segment's start (health.ts firstDeliverableAt). */
+	firstDeliverableMin?: number;
 	dirtyBefore?: Map<string, number>;
 	timer?: ReturnType<typeof setTimeout>;
 	/** Fires the wrap-up steer ahead of `timer` (armTimeout). */
@@ -498,17 +500,21 @@ export function trackProgress(run: Run, ev: any, now = Date.now()) {
 
 const mins = (ms: number) => `${Math.round(ms / 60_000)}m`;
 /**
- * The watchdog's look at one run: a notice when it stops moving (retrying, looping, silent, no-artifact or slow), once
- * per verdict until it moves again. Exception-only: a moving run is never reported.
+ * The watchdog's look at one run: a notice when it stops moving (retrying, looping, silent, no-artifact, browsing or
+ * slow), once per verdict until it moves again. Exception-only: a moving run is never reported.
  */
 export function healthAlert(run: Run, now = Date.now()) {
 	const health = runHealth(run, now);
 	if (health.verdict === "moving" || health.verdict === "settled") { run.alerted = undefined; return; }
 	if (run.alerted?.includes(health.verdict)) return;
 	(run.alerted ??= []).push(health.verdict);
+	if (health.verdict === "browsing") {
+		alert(run, "watchdog", `${run.id} browsing: ${BROWSE_CALLS} calls without an edit; send it the fact it is missing or ask for the deliverable now. Run ${budgetText(health)}.`);
+		return;
+	}
 	const facts = [
 		health.loop ? `same \`${health.loop.name}\` call ${health.loop.count}x` : "",
-		health.verdict === "no-artifact" ? `no files written after ${Math.round(NO_ARTIFACT_SHARE * 100)}% of budget` : "",
+		health.verdict === "no-artifact" && health.dueAt !== undefined ? `no files written; first deliverable was due ${clock(health.dueAt)}` : "",
 		health.verdict === "looping" || health.verdict === "no-artifact" ? "" : `no output for ${mins(health.sinceProgressMs ?? now - run.segmentStartedAt)}`,
 		health.turnMs ? `turn open ${mins(health.turnMs)}` : "",
 		run.providerRetry ? `provider retry ${run.providerRetry.attempt}/${run.providerRetry.maxAttempts} (${oneLine(run.providerRetry.errorMessage, 120)})` : "",
@@ -1248,6 +1254,7 @@ export interface PiRunSpec {
 	withheld?: string[];
 	writer: boolean;
 	timeoutMs: number;
+	firstDeliverableMin?: number;
 	depth: number;
 	parentRunId?: string;
 	runtime?: "oven";

@@ -37,7 +37,7 @@ So waiting is never your job:
 
 - Other work available → do it. Completion wakes you.
 - Nothing can proceed without the result → `wait`. It blocks without polling and costs nothing while it waits.
-- Someone asks how it is going, or you need to decide whether to let it continue → one `status` read. It reports the current tool, tool calls so far, elapsed time and remaining budget. One read is not a poll loop; repeating it on a timer is.
+- Someone asks how it is going, or you need to decide whether to let it continue → one `status` read. It reports the current tool, tool calls so far, elapsed time and remaining budget. One read is not a poll loop; repeating it on a timer is. Never schedule check-in prompts or cron jobs that re-read child transcripts: they double-fire, name dead run ids and burn your context. The watchdog pushes an alert only on an exception, so wait for the alert or the completion, and read `status` when you need the board.
 
 Never promise to sit idle and report back later, and never tell the user that progress is unavailable.
 
@@ -147,6 +147,8 @@ KNOWN FACTS        what you already established (ids, paths, causes, model names
 ```
 `delegate` warns (never refuses) when a budget over 30 minutes has neither a `FIRST DELIVERABLE` nor a `STOP WHEN` line.
 
+Set `firstDeliverableMin` (minutes) on every writer brief: 10-15 for a one-commit unit. Left unset, a writer's default is 25% of its budget, at least 6 and at most 15 minutes. The launch reply shows `first deliverable due HH:MM`. When a unit's brief says to read a big file, give the facts instead; a child sent to read does not write.
+
 Choose the reasoning level per task. A `high`/`xhigh` turn can be silent for 5+ minutes and a steer is not read mid-turn. Use `medium` for fixture, run and edit work; reserve `high` for design questions with a short budget.
 
 ### Watching a long run
@@ -157,18 +159,20 @@ Read `delegate_ctl status`: one line per active run (plus runs that settled sinc
 - `silent`: no activity for 6 minutes or more.
 - `retrying`: waiting on a provider retry. Fix or change the offering; do not extend.
 - `looping`: repeating the same calls. 
-- `no-artifact`: time spent, no file or commit yet.
+- `no-artifact`: a writer with no files written once its first-deliverable deadline has passed.
+- `browsing`: a writer with 25 tool calls in a row and no edit since its first edit or the deadline.
 
 ### Acting on a verdict
 - `slow`/`silent`: steer once with a concrete instruction. Add `interrupt: true` if the child is in a long think; a plain steer waits for the turn boundary. The status line shows `steer pending Nm` or `steer read HH:MM`.
 - `looping`: interrupt with the exact fact it is missing.
 - `no-artifact`: interrupt and demand the first deliverable.
+- `browsing`: interrupt with the fact it is missing, or demand the deliverable now.
 - Still no movement after one interrupt: cancel and relaunch smaller with the facts in the brief. Do not re-steer repeatedly.
 - Stay the orchestrator. Do not write the child's fixtures or code yourself; if the brief was the problem, fix the brief and relaunch. Do not forward a child's own diagnosis back to it as new information.
 - One writer per tree (`WRITER_CWD_OWNED`): give parallel writers their own `cwd` or worktree up front.
 
 ### Budgets
-Extending is yours to grant, on evidence only: a `moving` verdict, or the child asked with `EXTEND: <min> - <reason>` at the wrap-up notice (status shows `asks +N min: reason`). Use `delegate_ctl steer timeoutMs=<milliseconds from now>`, e.g. 600000 for 10 min; it adds time from now, not a new total. Never extend a `silent`, `looping` or `no-artifact` run: fix direction first. Expect a wrap-up notice 3 minutes before the hard timeout and a salvage summary if it times out; resume with the Resume line it prints. Reply budget text reads `ends HH:MM (N min left)`.
+Extending is yours to grant, on evidence only: a `moving` verdict, or the child asked with `EXTEND: <min> - <reason>` at the wrap-up notice (status shows `asks +N min: reason`). Use `delegate_ctl steer timeoutMs=<milliseconds from now>`, e.g. 600000 for 10 min; it adds time from now, not a new total. Never extend a `silent`, `looping`, `browsing` or `no-artifact` run: fix direction first. Expect a wrap-up notice 3 minutes before the hard timeout and a salvage summary if it times out; resume with the Resume line it prints. Reply budget text reads `ends HH:MM (N min left)`.
 
 ### Reporting to the user
 At most 5 lines: what is moving, what is stuck, the single thing you need from them. Ask for a decision as one yes/no question. No tables of everything.

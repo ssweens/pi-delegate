@@ -23,9 +23,9 @@ import { ageDays, formatDuration } from "./util/format.ts";
 import { tildify } from "./util/path.ts";
 import { readLegacySection, readSettings, writeSettings } from "./settings-file.ts";
 import type { LiveSource } from "./inspector.js";
-import { budgetText, runHealth } from "./health.js";
+import { budgetText, clock, firstDeliverableAt, runHealth } from "./health.js";
 import { type AAIndices, acpRowView, asRunView, boardLine, empty, framed, type LiveFacts, type ModelRow, type ModelsDetails, onBoard, resultLines, resultView, type RunView } from "./render.js";
-import { type AcpRunView, type LifecycleAction, type PiStartInput, PI_CAPABILITIES, requireAction, validateStartInput, validateSteer } from "./backend.js";
+import { type AcpRunView, firstDeliverableError, type LifecycleAction, type PiStartInput, PI_CAPABILITIES, requireAction, validateStartInput, validateSteer } from "./backend.js";
 import { ACP_JOIN_LOST, AcpBackend, acpModelsText, acpResultText, acpStatusText, acpSummary, DelegateError, sessionLabel, unwrap } from "./acp-backend.js";
 import { type Join, type JoinOutcome, joinRuns, waitCancelled } from "./wait.ts";
 import { shutdownAcpCoordinator } from "./acp/instance.js";
@@ -64,7 +64,7 @@ const mode = () => readDelegateSettings(SETTINGS_PATH).mode;
  * is on: a description is in every turn's loadout, including turns a completion starts, which a
  * before_agent_start prompt section is not; and it changes only when the mode does.
  */
-const ORCHESTRATOR_PROMPT = ` Delegation mode: orchestrator (the user's setting). You coordinate; children execute. Hand every task the user gives you to a child with delegate, in the background, and stay free to keep talking with the user while children run. Do not block on delegate_ctl wait unless the user asks for a result now or your reply cannot be written without it. Read only what you need to write a good brief, and report each child's result when its completion arrives. Report to the user in at most 5 lines: what is moving, what is stuck, and the one thing you need from them. Keep briefs small: one deliverable per child, with FIRST DELIVERABLE, STOP WHEN and KNOWN FACTS lines; for implementation ask for one commit-sized unit, then the next. Watch with delegate_ctl status (one verdict per run), not transcripts, and act on exceptions only: slow or silent, steer once (interrupt: true in a long think); looping, interrupt with the missing fact; no-artifact, interrupt and demand the first deliverable; still stuck after one interrupt, cancel and relaunch smaller. Extend a child's budget only on evidence (moving verdict, or it asked with EXTEND:), by delegate_ctl steer timeoutMs=<milliseconds from now, e.g. 600000 for 10 min>; never extend a silent, looping or no-artifact run. You cannot edit or write files yourself in this mode: those calls are refused. This overrides the delegate tool's own advice on when to delegate.`;
+const ORCHESTRATOR_PROMPT = ` Delegation mode: orchestrator (the user's setting). You coordinate; children execute. Hand every task the user gives you to a child with delegate, in the background, and stay free to keep talking with the user while children run. Do not block on delegate_ctl wait unless the user asks for a result now or your reply cannot be written without it. Read only what you need to write a good brief, and report each child's result when its completion arrives. Report to the user in at most 5 lines: what is moving, what is stuck, and the one thing you need from them. Keep briefs small: one deliverable per child, with firstDeliverableMin set on every writer (10-15 for a one-commit unit) and FIRST DELIVERABLE, STOP WHEN and KNOWN FACTS lines; for implementation ask for one commit-sized unit, then the next. When a brief would say to read a big file, give the facts instead. Watch with delegate_ctl status (one verdict per run), not transcripts, and never run timed check-in prompts or cron jobs that re-read child transcripts (they double-fire, name dead run ids and burn context; the watchdog pushes alerts only on exceptions, so wait for the alert or completion), and act on exceptions only: slow or silent, steer once (interrupt: true in a long think); looping or browsing, interrupt with the missing fact; no-artifact, interrupt and demand the first deliverable; still stuck after one interrupt, cancel and relaunch smaller. Extend a child's budget only on evidence (moving verdict, or it asked with EXTEND:), by delegate_ctl steer timeoutMs=<milliseconds from now, e.g. 600000 for 10 min>; never extend a silent, looping or no-artifact run. You cannot edit or write files yourself in this mode: those calls are refused. This overrides the delegate tool's own advice on when to delegate.`;
 const SKILL_PATH = join(dirname(fileURLToPath(import.meta.url)), "..", "skills", "delegation", "SKILL.md");
 const contractFooter = (delegates: boolean, atDepthCap = false, cap = MAX_DELEGATION_DEPTH) => `
 
@@ -961,7 +961,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 	/** Warn-only: a long budget with no early deliverable or stop line tends to go silent. */
 	const briefWarning = (timeoutMs: number, task: string | undefined) =>
 		timeoutMs > 30 * 60_000 && !/FIRST DELIVERABLE/.test(task ?? "") && !/STOP WHEN/.test(task ?? "")
-			? " Warning: a long budget with no FIRST DELIVERABLE / STOP WHEN line in the brief; long open-ended runs tend to go silent. Consider adding them." : "";
+			? " Warning: a long budget with no FIRST DELIVERABLE / STOP WHEN line in the brief; long open-ended runs tend to go silent. Consider adding them, and pass firstDeliverableMin (minutes until the first file is due)." : "";
 	const STEER_HINT = "Completion will wake you; use wait to join.";
 	// --- acp results. A failure is reported by its code; it never becomes a different action.
 	const failed = (error: unknown, details?: AcpRunView) => {
@@ -1059,6 +1059,9 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		if (!model) throw new DelegateError("MODEL_UNAVAILABLE", "no model available for child", "model");
 		const thinking = String(specThinking ?? (p.model ? undefined : approved && parseModelSpec(approved.spec).thinking) ?? role.thinking ?? "medium");
 		const timeoutMs = p.timeoutMs ?? role.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+		// Validated against the call's own timeoutMs already; the role's or the default budget is known only here.
+		const late = p.firstDeliverableMin !== undefined ? firstDeliverableError(p.firstDeliverableMin, timeoutMs) : undefined;
+		if (late) throw new DelegateError("INPUT_INVALID", late, "firstDeliverableMin");
 		// A child at the cap could only fail its delegate calls, so it gets no delegation tools at all.
 		const atDepthCap = depth + 1 >= cap;
 		const tools = [...(role.tools ?? EVERY_TOOL)];
@@ -1080,6 +1083,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		return {
 			role: role.name, task: p.task, cwd, model: modelKey(model), thinking, contextWindow: model.contextWindow, ...(modelPick ? { modelPick } : {}),
 			systemPrompt, context, tools, ...(withheld ? { withheld } : {}), writer: isWriter && runtime !== "oven", timeoutMs,
+			...(p.firstDeliverableMin !== undefined ? { firstDeliverableMin: p.firstDeliverableMin } : {}),
 			depth: depth + 1, ...(nesting ? { parentRunId: nesting.id } : {}),
 			...(runtime === "oven" ? { runtime: "oven" as const, extensions: role.extensions ?? [] } : {}),
 			projectTrusted, projectTrustSource,
@@ -1110,6 +1114,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			runtime: Type.Optional(StringEnum(["in-process", "oven"] as const, { description: 'pi only: where the child runs. Default: the role\'s runtime line, else "in-process". "oven" runs it as an oven slice in a copy of cwd that outlives this session; it never receives your conversation' })),
 			cwd: Type.Optional(Type.String()),
 			timeoutMs: Type.Optional(Type.Number({ description: `abort the child after this many ms; default ${DEFAULT_TIMEOUT_MS / 60000} min. Size it to the work: a build, suite, or training run that takes hours needs hours here, or it is killed mid-flight` })),
+			firstDeliverableMin: Type.Optional(Type.Number({ description: "pi only: minutes from the start of each segment by which the child should have written its first file; must be under the timeout. Past it with nothing written the run reads no-artifact. Default for a writer: 15 min or 25% of the budget, whichever is sooner; a read-only child has none unless set" })),
 			reason: Type.Optional(Type.String({ description: "one line: why this model for this role; recorded in the run log" })),
 			agent: Type.Optional(Type.String({ description: "acp only: the ACP agent to run, e.g. pi, amp, codex, claude" })),
 			sessionId: Type.Optional(Type.String({ description: "acp only: open this exact provider-native session (e.g. an Amp T-ID) instead of creating one" })),
@@ -1145,7 +1150,8 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			try {
 				const v = await piBackend.start(start.value, signal, { ctx, onUpdate });
 				const run = runs.get(v.id)!;
-				return { content: [{ type: "text", text: `${run.id} running (${run.runtime === "oven" ? "oven slice" : run.context}, ${run.model}), ${budgetText(runHealth(run))}. ${START_HINT}${briefWarning(run.timeoutMs, run.task)}` }], details: recordedView(run) };
+				const due = firstDeliverableAt(run);
+				return { content: [{ type: "text", text: `${run.id} running (${run.runtime === "oven" ? "oven slice" : run.context}, ${run.model}), ${budgetText(runHealth(run))}${due !== undefined ? `, first deliverable due ${clock(due)}` : ""}. ${START_HINT}${briefWarning(run.timeoutMs, run.task)}` }], details: recordedView(run) };
 			} catch (error) { return failed(error); }
 		},
 	};

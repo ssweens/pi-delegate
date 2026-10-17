@@ -3,7 +3,7 @@ import { getMarkdownTheme, keyHint } from "@earendil-works/pi-coding-agent";
 import { formatPercent, type DealsDetails, type DealRow } from "./deals.js";
 import { type Component, Markdown, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { formatDuration, formatTokens } from "./util/format.ts";
-import { budgetText, runHealth, type Health } from "./health.ts";
+import { BROWSE_CALLS, budgetText, clock, runHealth, type Health } from "./health.ts";
 import { textOf } from "./util/text.ts";
 import { BOX, GLYPH } from "./ui/glyphs.ts";
 import { cut, fit, fitAlign, fitPad } from "./ui/text.ts";
@@ -186,12 +186,14 @@ export const onBoard = (r: { status: string; acknowledged?: boolean; endedAt?: n
 export function boardLine(r: BoardRun, now = Date.now()): string {
 	const files = `${r.changedFiles.length} file${r.changedFiles.length === 1 ? "" : "s"}`;
 	if (r.status !== "running") return `${runTitle(r)} · ${r.status} · ${formatDuration(r.durationMs)} · ${files} · id ${r.id}`;
-	// A Run passed here also carries toolCalls and writer, which the looping and no-artifact verdicts read.
+	// A Run passed here also carries toolCalls, writer and firstDeliverableMin, which the looping, no-artifact and browsing verdicts read.
 	const h: Health = r.segmentStartedAt !== undefined && r.timeoutMs !== undefined ? runHealth({ ...r, status: "running", segmentStartedAt: r.segmentStartedAt, timeoutMs: r.timeoutMs }, now) : { verdict: "moving", turnMs: 0 };
 	const budget = h.budgetLeftMs !== undefined && r.timeoutMs !== undefined ? `${Math.round((r.timeoutMs - h.budgetLeftMs) / 60_000)}m/${Math.round(r.timeoutMs / 60_000)}m (${budgetText(h).split(" (")[0]})` : "";
 	const ask = r.extendRequest ? `asks +${r.extendRequest.minutes ?? "?"} min${r.extendRequest.reason ? `: ${r.extendRequest.reason}` : ""}` : "";
+	const due = h.verdict === "browsing" ? `${BROWSE_CALLS} calls without an edit`
+		: h.dueAt === undefined ? "" : `first deliverable ${h.verdict === "no-artifact" ? "was due" : "due"} ${clock(h.dueAt)}`;
 	return [
-		runTitle(r), h.verdict, budget,
+		runTitle(r), h.verdict, budget, due,
 		h.sinceProgressMs !== undefined ? `last output ${formatDuration(h.sinceProgressMs)} ago` : "",
 		h.turnMs ? `turn ${formatDuration(h.turnMs)}` : "",
 		files, `out ${formatTokens(r.tokens.output)}`, r.lastTool ? `last: ${r.lastTool}` : "", ask, steerReceipt(r.steers, now), `id ${r.id}`,

@@ -53,6 +53,8 @@ export interface PiStartInput extends CommonStartInput {
 	context?: "fork" | "fresh";
 	/** Overrides the role's runtime: an in-process Pi child, or an oven slice. */
 	runtime?: "in-process" | "oven";
+	/** Minutes from each segment's start by which the first file should be written (health.ts firstDeliverableAt). */
+	firstDeliverableMin?: number;
 }
 
 /** `delegate` on acp without `sessionId`: create a Coordinator worker and send `task` as its first turn. */
@@ -435,6 +437,21 @@ function commonFields(raw: Record<string, unknown>): Validated<CommonStartInput>
 	return { ok: true, value: out };
 }
 
+/** The largest firstDeliverableMin a delegate call may set. */
+export const FIRST_DELIVERABLE_MAX_MIN = 8 * 60;
+
+/**
+ * Why a firstDeliverableMin is unusable, or undefined when it is fine: a positive number of minutes, at most
+ * FIRST_DELIVERABLE_MAX_MIN, and before the budget ends. `timeoutMs` is the run's budget when known; the launch checks
+ * it again against the role's default budget.
+ */
+export function firstDeliverableError(minutes: unknown, timeoutMs: number | undefined): string | undefined {
+	if (typeof minutes !== "number" || !Number.isFinite(minutes) || minutes <= 0) return "firstDeliverableMin must be a positive number of minutes";
+	if (minutes > FIRST_DELIVERABLE_MAX_MIN) return `firstDeliverableMin is at most ${FIRST_DELIVERABLE_MAX_MIN} minutes`;
+	if (timeoutMs !== undefined && minutes * 60_000 >= timeoutMs) return `firstDeliverableMin (${minutes} min) must be before the timeout (${Math.round(timeoutMs / 60_000 * 10) / 10} min)`;
+	return undefined;
+}
+
 /** Read `backend`. Omitted means pi. Anything that is not exactly "pi" or "acp" is an error. */
 export function selectBackend(raw: Record<string, unknown>): Validated<BackendName> {
 	if (raw.backend === undefined) return { ok: true, value: DEFAULT_BACKEND };
@@ -468,12 +485,18 @@ export function validateStartInput(raw: Record<string, unknown>): Validated<Star
 			if (raw.context !== "fork" && raw.context !== "fresh") return fail("INPUT_INVALID", 'context must be "fork" or "fresh"', "context");
 			value.context = raw.context;
 		}
+		if (raw.firstDeliverableMin !== undefined) {
+			const due = firstDeliverableError(raw.firstDeliverableMin, value.timeoutMs);
+			if (due) return fail("INPUT_INVALID", due, "firstDeliverableMin");
+			value.firstDeliverableMin = raw.firstDeliverableMin as number;
+		}
 		return { ok: true, value };
 	}
 
 	for (const field of PI_ONLY_FIELDS) {
 		if (raw[field] !== undefined) return fail("FIELD_NOT_ON_ACP", `${field} is pi-only; an ACP child cannot receive the parent conversation`, field);
 	}
+	if (raw.firstDeliverableMin !== undefined) return fail("FIELD_NOT_ON_ACP", "firstDeliverableMin is pi-only; ACP runs have no first-deliverable watch", "firstDeliverableMin");
 	if (!isNonEmptyString(raw.agent)) return fail("INPUT_INVALID", "agent is required with backend \"acp\"", "agent");
 	const agent = acpAgentName(raw.agent);
 	if (agent !== "amp") {
