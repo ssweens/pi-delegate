@@ -36,7 +36,7 @@ Launching never blocks your turn. Resource preparation also runs after the durab
 So waiting is never your job:
 
 - Other work available → do it. Completion wakes you.
-- Nothing can proceed without the result → `wait`. It blocks without polling and costs nothing while it waits.
+- Nothing can proceed without the result → `wait`. It blocks without polling and costs no tokens, but it holds your session: only the user's typed messages end it early, and messages from peer sessions (intercom) and other extensions wait until it returns. With nothing else to do, end your turn instead; the completion wakes you.
 - Someone asks how it is going, or you need to decide whether to let it continue → one `status` read. It reports the current tool, tool calls so far, elapsed time and remaining budget. The watchdog pushes an alert on an exception. A timed check-in is also fine: one schedule per session with a fixed cron expression (not an interval, which can double-fire), updated rather than recreated, removed when the work ends, and reading live runs from `status` instead of naming run ids.
 
 Never promise to sit idle and report back later, and never tell the user that progress is unavailable.
