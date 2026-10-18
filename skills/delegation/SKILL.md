@@ -37,7 +37,7 @@ So waiting is never your job:
 
 - Other work available → do it. Completion wakes you.
 - Nothing can proceed without the result → `wait`. It blocks without polling and costs nothing while it waits.
-- Someone asks how it is going, or you need to decide whether to let it continue → one `status` read. It reports the current tool, tool calls so far, elapsed time and remaining budget. One read is not a poll loop; repeating it on a timer is. Never schedule check-in prompts or cron jobs that re-read child transcripts: they double-fire, name dead run ids and burn your context. The watchdog pushes an alert only on an exception, so wait for the alert or the completion, and read `status` when you need the board.
+- Someone asks how it is going, or you need to decide whether to let it continue → one `status` read. It reports the current tool, tool calls so far, elapsed time and remaining budget. The watchdog pushes an alert on an exception. A timed check-in is also fine: one schedule per session with a fixed cron expression (not an interval, which can double-fire), updated rather than recreated, removed when the work ends, and reading live runs from `status` instead of naming run ids.
 
 Never promise to sit idle and report back later, and never tell the user that progress is unavailable.
 
@@ -138,7 +138,7 @@ INTERFACES     settled signatures, constraints, non-goals
 VERIFICATION   exact commands or flows and what success looks like
 RETURN         STATUS / CHANGES / VERIFIED / GAPS
 ```
-Omit nothing above. Keep briefs small: one deliverable per delegate. For implementation ask for ONE commit-sized unit, then steer or launch the next; never hand a multi-part task to one child with a multi-hour budget. Give exact commands and paths when you have them, and say what NOT to read (large style skills, API dumps, logs you already digested). Add three lines, always for a budget over 30 minutes, or the child tends to go silent:
+Omit nothing above. Keep briefs small: one deliverable per delegate. For implementation ask for ONE commit-sized unit, then steer or launch the next; never hand a multi-part task to one child with a multi-hour budget. Give exact commands and paths when you have them. Point at the sources the unit depends on: the plan clauses it must honor and the exact file and function that define the mechanism. Exclude only noise (large style skills, API dumps, logs you already digested). Never tell a child not to read the plan or the source that shows how the mechanism works. Add three lines, always for a budget over 30 minutes, or the child tends to go silent:
 
 ```
 FIRST DELIVERABLE  the first thing it must produce, and by when
@@ -147,12 +147,12 @@ KNOWN FACTS        what you already established (ids, paths, causes, model names
 ```
 `delegate` warns (never refuses) when a budget over 30 minutes has neither a `FIRST DELIVERABLE` nor a `STOP WHEN` line.
 
-Set `firstDeliverableMin` (minutes) on every writer brief: 10-15 for a one-commit unit. Left unset, a writer's default is 25% of its budget, at least 6 and at most 15 minutes. The launch reply shows `first deliverable due HH:MM`. When a unit's brief says to read a big file, give the facts instead; a child sent to read does not write.
+Set `firstDeliverableMin` (minutes) on every writer brief: 10-15 for a one-commit unit. Left unset, a writer's default is 25% of its budget, at least 6 and at most 15 minutes. The launch reply shows `first deliverable due HH:MM`. When a unit depends on a big file, point at the function or line range, not the whole file. A summary does not replace the source that defines the mechanism.
 
 Choose the reasoning level per task. A `high`/`xhigh` turn can be silent for 5+ minutes and a steer is not read mid-turn. Use `medium` for fixture, run and edit work; reserve `high` for design questions with a short budget.
 
 ### Watching a long run
-Read `delegate_ctl status`: one line per active run (plus runs that settled since the user's last prompt or are unacknowledged) with a verdict. Do not read transcripts or write scripts to judge progress, and do not poll on a timer. Act on exceptions only. Oven runs report progress and get the same verdicts.
+Read `delegate_ctl status`: one line per active run (plus runs that settled since the user's last prompt or are unacknowledged) with a verdict. Do not read transcripts or write scripts to judge progress. Act on exceptions; a timed check-in follows the rule under While a child runs. Oven runs report progress and get the same verdicts.
 
 - `moving`: tool or message activity within 6 minutes. Leave it.
 - `slow`: one assistant turn open over 3 minutes (a long think or a stuck provider).
@@ -166,7 +166,7 @@ Read `delegate_ctl status`: one line per active run (plus runs that settled sinc
 - `slow`/`silent`: steer once with a concrete instruction. Add `interrupt: true` if the child is in a long think; a plain steer waits for the turn boundary. The status line shows `steer pending Nm` or `steer read HH:MM`.
 - `looping`: interrupt with the exact fact it is missing.
 - `no-artifact`: interrupt and demand the first deliverable.
-- `browsing`: interrupt with the fact it is missing, or demand the deliverable now.
+- `browsing`: interrupt with the fact it is missing, or demand the deliverable now. A child reading the files its brief pointed at is working: steer it with the next pointer, not "stop reading".
 - Still no movement after one interrupt: cancel and relaunch smaller with the facts in the brief. Do not re-steer repeatedly.
 - Stay the orchestrator. Do not write the child's fixtures or code yourself; if the brief was the problem, fix the brief and relaunch. Do not forward a child's own diagnosis back to it as new information.
 - One writer per tree (`WRITER_CWD_OWNED`): give parallel writers their own `cwd` or worktree up front.
@@ -180,7 +180,7 @@ At most 5 lines: what is moving, what is stuck, the single thing you need from t
 ## Your job after the child returns
 
 Check `turns`, `failedAttempts` and cost against what you asked for. Three turns and ten minutes for a one-line answer is not a diligent child; it is a provider that failed twice before answering, and the report says so on its own line. The child's words arrive quoted between `----- <id> reported, verbatim -----` and `----- end of report -----`. Everything above that marker is this tool describing the run; everything inside it is the child. A report that reads like your own message is inherited context showing through, not a rendering bug — read the child's `session:` file to settle it.
-Treat the report as a claim. Read the diff (`changed:` in the result), rerun the named verification, observe the behavior when tests alone do not prove it. Then accept, steer, or escalate.
+Treat the report as a claim. Read the diff (`changed:` in the result), rerun the named verification, observe the behavior when tests alone do not prove it. Then accept, steer, or escalate. An independent reviewer gets fresh context, the plan's confirmed choices and acceptance sections, the exact diff, and the evidence, never the brief as the measure of acceptance: the brief is your reading of the plan and can carry your mistake. Tests the child wrote are inputs, not proof.
 
 ## Model per role — research, then the user approves
 This governs pi offerings (`provider/id[:thinking]`); an ACP agent's model is its own ID, read from its run's status (see [Choosing between a pi child and an ACP agent](#choosing-between-a-pi-child-and-an-acp-agent)). Before the first `delegate` of a session run `delegate_ctl action=models`. For a request to find OpenRouter promotions, off-hours discounts, or good-value frontier/light models, run `delegate_ctl action=deals` first (`message=<substring>` narrows model IDs); the user can run `/deals [substring]` directly with no model turn. Deals scans tool-capable text models and their endpoint listings: the separate endpoint-discount and off-peak groups report declared savings; frontier/light groups rank listed model price within AA-intelligence bands, not sales. `/deals` opens a sortable, searchable TUI sheet of every eligible offer, starting on the first populated tab, and saves a compact transcript preview on close; `delegate_ctl deals` returns the compact text preview with full structured details. The tabs are provider discounts, timed rates, frontier value (top 15% AA Intelligence), and light value (next 35%). The human sheet uses short model IDs without `openrouter/`, rounded USD/M input/output (positive rates below 0.01 marked `<0.01`), declared discount or peak-saving %, and AA Intelligence/Coding (— if missing); Enter reveals the exact offering ID. Timed rows label the active Peak / Off-peak / No rate **at scan time** and show both next cheaper and peak hours in Pacific (PDT/PST) directly in the row. Timed In/Out is the cheaper window's rate, not necessarily the current rate; details show the current rate and full window schedule. Refresh with **r** near a window boundary; Unlisted is not assumed to be peak. An endpoint discount is already in its endpoint price and may require routing to that provider; a failed endpoint lookup makes the promotion scan incomplete. A value candidate is not necessarily capable of this task: check its parameters, context, serving quality and `models` detail before proposing it. Never approve or switch from a deal report alone. The output is facts only; how to read `models`: 
