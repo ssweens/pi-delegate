@@ -101,6 +101,28 @@ test("real SDK delegation lifecycle (loopback provider, no credentials)", { time
 			assert.equal(done.details.status, "complete");
 			assert.equal(done.details.output, "WAKE-OK");
 		});
+		await t.test("a message another extension steers in ends the parent's wait as a typed one does", async () => {
+			const gate = deferred();
+			const arrived = api.script("Steered wait child", { text: "STEERED-CHILD-DONE", gate });
+			const id = (await h.launch("Steered wait child")).details.id;
+			await arrived;
+			const parentArrived = api.script("Parent waits on child", { tools: [{ name: "delegate_ctl", arguments: { action: "wait", runId: id } }] });
+			api.onUnscripted(() => ({ text: "PARENT-READ-PEER" }));
+			const parentWork = h.runtime.session.prompt("Parent waits on child");
+			await parentArrived;
+			const sent = h.sendMessage({ customType: "intercom_message", content: "**From peer**\n\nreport ready", display: true, details: { source: "pi-intercom-test" } }, { deliverAs: "steer" });
+			assert.equal(sent, undefined);
+			await parentWork;
+			await h.runtime.session.agent.waitForIdle();
+			const messages: any[] = h.runtime.session.agent.state.messages;
+			const waited = messages.findLast((m: any) => m.role === "toolResult" && m.toolName === "delegate_ctl");
+			assert.match(JSON.stringify(waited?.content), /wait interrupted — queued messages are waiting/);
+			assert.ok(messages.some((m: any) => m.role === "custom" && m.customType === "intercom_message"), "the peer's message reached the parent's model");
+			assert.equal(state().runs.get(id).status, "running", "the wait only detached; the child keeps going");
+			api.onUnscripted();
+			gate.resolve();
+			assert.equal((await h.ctl("wait", id)).details.output, "STEERED-CHILD-DONE");
+		});
 		await t.test("a parent follow-up message runs while a delegate child is still executing", async () => {
 			const gate = deferred();
 			const arrived = api.script("Intercom child", { text: "CHILD-DONE", gate });

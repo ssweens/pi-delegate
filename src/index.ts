@@ -44,6 +44,7 @@ import { DEFAULT_RECAP_SETTINGS, formatRecapThreshold, readRecapSettings, saveRe
 import type { SettingsRow } from "./ui/settings-panel.ts";
 import { FULLSCREEN } from "./ui/overlay.ts";
 import { AGENT_DIR, SETTINGS_PATH } from "./agent-dir.ts";
+import { messagesQueued } from "./queued.ts";
 import {
 	acknowledge, activeWriter, activityOf, admit, progressAt, allowlist, finishedNotice, PI_BUILTIN_TOOLS, notify, PiBackend, type PiCall, type PiRunSpec, cancelRun, capacityError, changed, CHILD_SETTLED_PROMPT, childOwner, closeOwner, closingChildren, DEFAULT_TIMEOUT_MS, departed, finalResult, findDeparted, FORK_BRIDGE, harvest, inFlight, listeners, maxDepth, noticeKey, ownedRuns, type Owner, ownerPath, pointerDir, publish, recordedView, redeliver, restoreRun, resultText, type Run, runRecordPaths, runs, saveRun, state, summary, TRUST_UNKNOWN, view, type WaitRow,
 } from "./pi-backend.ts";
@@ -1033,7 +1034,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		if (piIds.length) joins.push(piBackend.join(piIds));
 		const outcome = await joinRuns(joins, ids, mode, {
 			...(signal ? { signal } : {}), ...(timeoutMs !== undefined ? { timeoutMs } : {}),
-			interrupted: () => ctx.hasPendingMessages() || noticePending(), lost: ACP_JOIN_LOST,
+			interrupted: () => messagesQueued(ctx) || noticePending(), lost: ACP_JOIN_LOST,
 		});
 		const row = (v: WaitRow | AcpRunView, settled: boolean): WaitRow => (v as AcpRunView).backend === "acp" ? acpRow(v as AcpRunView, settled) : v as WaitRow;
 		return waitResult(outcome, [...outcome.settled.map((v) => row(v, true)), ...outcome.pending.map((v) => row(v, false))], ids, timeoutMs);
