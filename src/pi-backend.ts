@@ -1553,7 +1553,10 @@ export class PiBackend implements DelegateBackend<"pi"> {
 		const owner = this.hooks.owner();
 		const { inherited, ...fields } = spec;
 		// Freeze the runtime inputs before advertising a run, including project instructions.
-		const dir = storageDir(spec.cwd);
+		// The record and session live with the parent's, never in the child's cwd: that is often a
+		// workspace another tool needs clean (Werkit refuses to archive one holding ignored files).
+		// Owner pointers hold absolute record paths, so restore finds them from the parent's side.
+		const dir = storageDir(ctx.sessionManager.getCwd());
 		const created = SessionManager.create(spec.cwd, dir);
 		const sessionFile = created.getSessionFile()!;
 		// Pi normally defers the first disk write until an assistant replies. Establish its own
