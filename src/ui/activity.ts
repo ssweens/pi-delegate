@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
-import { type Component, type Focusable, type TUI, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { type Component, type Focusable, type TUI, type TuiMouseEvent, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { AgentsPanel, type LiveSource } from "../inspector.js";
 import { frame, withLegend } from "../render.js";
 import { renderTodoSectionLines } from "../todo-render.js";
@@ -50,6 +50,12 @@ class ActivityWidget implements Component, Focusable {
 	get focused(): boolean { return Boolean(this.panel?.focused); }
 	set focused(value: boolean) { if (this.panel) this.panel.focused = value; }
 	handleInput(data: string): void { this.panel?.handleInput(data); }
+	/** A click anywhere on the box expands or collapses it, like a tool result. */
+	handleMouse(event: TuiMouseEvent): { handled: true } | undefined {
+		if (event.type !== "click" || event.button !== "left") return undefined;
+		this.owner.toggleCompact();
+		return { handled: true };
+	}
 	render(width: number): string[] { return this.owner.renderWidget(width); }
 	invalidate(): void {}
 }
@@ -175,7 +181,14 @@ export class ActivityCoordinator {
 		if (this.todos) sections.push(renderTodoSectionLines(this.todos, theme, inner + 4, this.compact));
 		this.spin(Boolean(mom?.trail && spinning(mom.status)));
 		if (mom) sections.push(momSectionLines(mom, theme, inner + 4, this.compact));
-		if (this.recap) sections.push(renderRecapSectionLines(this.recap, theme, inner + 4, this.compact));
+		if (this.recap && !this.compact) sections.push(renderRecapSectionLines(this.recap, theme, inner + 4, this.compact));
+		if (this.compact) {
+			// One line: each section's title and count, side by side.
+			const parts = sections.filter(section => section.length).map(section => section[0]!);
+			if (this.recap) parts.push(theme.fg("muted", this.recap.replace(/\s+/g, " ")));
+			sections.length = 0;
+			if (parts.length) sections.push([cut(parts.join(theme.fg("dim", " │ ")), inner)]);
+		}
 		return renderActivityLines(sections, theme, outer, Boolean(this.panel?.focused)).map(line => cut(line, outer));
 	}
 }

@@ -178,13 +178,8 @@ export class AgentsPanel implements Component, Focusable {
 		const counts = [active ? `${active} active` : "", done ? `${done} done` : ""].filter(Boolean).join(" · ");
 		const header = this.theme.bold(this.theme.fg("accent", "Agents")) + this.theme.fg("muted", ` · ${counts}${range}`)
 			+ (joined ? this.theme.fg("warning", " · parent blocked in wait") : "");
-		if (compact) {
-			const current = rows.find((v) => !v.settled) ?? rows[0];
-			const summary = current
-				? `  ${icon(current, this.theme)} ${this.theme.fg(current.settled ? "muted" : "text", runTitle(current))}${rows.length > 1 ? this.theme.fg("dim", ` · +${rows.length - 1} more`) : ""}`
-			: "";
-			return { header, body: summary ? [fit(summary, inner)] : [], hint: this.focused ? agentListHint() : joinHints(hint.left("agents"), "/agents history") };
-		}
+		// Compact is one line shared with the other sections: just the title and active/total.
+		if (compact) return { header: this.theme.bold(this.theme.fg("accent", "Agents")) + this.theme.fg("muted", ` · ${active}/${rows.length}`), body: [], hint: this.focused ? agentListHint() : joinHints(hint.left("agents"), "/agents history") };
 		return { header, body: body.map((l) => fit(l, inner)), hint: this.focused ? agentListHint() : joinHints(hint.left("agents"), "/agents history") };
 	}
 
