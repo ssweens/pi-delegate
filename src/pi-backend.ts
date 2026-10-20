@@ -1078,7 +1078,8 @@ async function launchTui(run: Run, task: string) {
 		run.output = `${output ?? ""}\n\n(oven ${run.tui} slice ${run.sliceId}; its changes are in its copy, ${view.cwd}; oven attach ${run.sliceId} shows its terminal)`;
 		finish(run, failed ? "error" : "complete", failed ? `oven ${run.tui} slice ${run.sliceId}: ${failed}` : undefined);
 	} catch (e: any) {
-		if (run.sliceId) await ovenCall("stop", { slice: run.sliceId }).catch(() => {});
+		// A real failure stops the agent; a cancel (the aborted watch lands here too) leaves that to haltSlice, which halts first.
+		if (run.sliceId && run.status === "running") await ovenCall("stop", { slice: run.sliceId }).catch(() => {});
 		finish(run, run.status === "running" ? "error" : run.status, run.error ?? errorMessage(e));
 	}
 }

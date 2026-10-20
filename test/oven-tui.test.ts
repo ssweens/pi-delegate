@@ -4,6 +4,7 @@ import { test } from "node:test";
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createServer } from "node:net";
+import { createServer as createHttpServer, request as httpRequest } from "node:http";
 import { join } from "node:path";
 import { provider, sandbox, harness } from "./fixture.ts";
 import { tuiTemplate } from "../src/tui-template.ts";
@@ -102,15 +103,46 @@ test("a tui child runs the agent's own TUI in oven: created from the role in a c
 			assert.equal(slices[0].launches, 2, "relaunched on its session");
 		});
 
-		await t.test("cancel halts a running tui child and stops it", async () => {
-			const started = await h.launch("Bake slow", { role: "tui-baker" });
-			await waitFor(async () => (await tuiSlices()).some((s) => s.status?.state === "working"));
-			const cancelled = await h.ctl("cancel", started.details.id);
-			assert.equal(cancelled.isError, undefined, cancelled.content[0].text);
-			assert.equal((await h.ctl("wait", started.details.id)).details.status, "cancelled");
-			// Well inside the stand-in's 6 s slow turn, which would otherwise end by itself.
-			await waitFor(async () => (await tuiSlices()).every((s) => s.status?.state !== "working"), 3000);
-			await waitFor(async () => (await tuiSlices()).every((s) => s.state === "stopped"), 3000);
+		await t.test("cancel halts a running tui child, then stops it", async () => {
+			// pi-delegate's oven calls go through a recording proxy, so the order of halt and stop is visible.
+			const upstream = new URL(process.env.OVEN_URL!);
+			const calls: { tool: string; slice?: string; sent: number; answered?: number }[] = [];
+			const proxy = createHttpServer((req, res) => {
+				const chunks: Buffer[] = [];
+				req.on("data", (chunk) => chunks.push(chunk));
+				req.on("end", () => {
+					const body = Buffer.concat(chunks);
+					let call: (typeof calls)[number] | undefined;
+					try { const rpc = JSON.parse(body.toString()); if (rpc.method === "tools/call") calls.push(call = { tool: rpc.params.name, slice: rpc.params.arguments?.slice, sent: performance.now() }); } catch { /* not JSON-RPC */ }
+					const forward = httpRequest({ host: upstream.hostname, port: upstream.port, path: req.url, method: req.method, headers: req.headers }, (answer) => {
+						res.writeHead(answer.statusCode!, answer.headers);
+						answer.pipe(res);
+						answer.on("end", () => { if (call) call.answered = performance.now(); });
+					});
+					forward.on("error", () => res.destroy());
+					forward.end(body);
+				});
+			});
+			await new Promise<void>((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+			process.env.OVEN_URL = `http://127.0.0.1:${(proxy.address() as { port: number }).port}`;
+			try {
+				const started = await h.launch("Bake slow", { role: "tui-baker" });
+				await waitFor(async () => (await tuiSlices()).some((s) => s.status?.state === "working"));
+				const cancelled = await h.ctl("cancel", started.details.id);
+				assert.equal(cancelled.isError, undefined, cancelled.content[0].text);
+				assert.equal((await h.ctl("wait", started.details.id)).details.status, "cancelled");
+				// Well inside the stand-in's 6 s slow turn, which would otherwise end by itself.
+				await waitFor(async () => (await tuiSlices()).every((s) => s.status?.state !== "working"), 3000);
+				await waitFor(async () => (await tuiSlices()).every((s) => s.state === "stopped"), 3000);
+				const mine = calls.filter((c) => c.slice); // this run's slice is the only one made while the proxy is up
+				const halt = mine.find((c) => c.tool === "oven_halt"), stop = mine.find((c) => c.tool === "oven_stop");
+				assert.ok(halt, `the agent is interrupted: ${JSON.stringify(mine.map((c) => c.tool))}`);
+				assert.ok(stop, "and stopped");
+				assert.ok(halt.answered !== undefined && stop.sent >= halt.answered, "the stop is sent only after the halt is answered, so it can't cut the interrupt short");
+			} finally {
+				process.env.OVEN_URL = upstream.toString().replace(/\/$/, "");
+				await new Promise((resolve) => proxy.close(resolve));
+			}
 		});
 
 		await t.test("steer on a running tui child interrupts its turn and answers the steer, in the same session", async () => {
@@ -131,7 +163,8 @@ test("a tui child runs the agent's own TUI in oven: created from the role in a c
 			const before = (await tuiSlices()).length;
 			const missing = await h.ctl("wait", (await h.launch("Keep one", { role: "tui-keeper" })).details.id);
 			assert.equal(missing.details.status, "error");
-			assert.match(missing.content[0].text, /FAKE_AGENT_SECRET/);
+			assert.match(missing.content[0].text, /FAKE_AGENT_SECRET, not set in this session's environment/, "pi-delegate refuses it");
+			assert.doesNotMatch(missing.content[0].text, /missing-secret/, "before oven would");
 			assert.equal((await tuiSlices()).length, before, "no slice was made");
 			const value = `s3cret-${Math.random().toString(36).slice(2)}`;
 			process.env.FAKE_AGENT_SECRET = value;
