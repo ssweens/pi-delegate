@@ -23,8 +23,8 @@ export interface RunView {
 	context: "fork" | "fresh";
 	forkedMessages?: number;
 	contextWindow?: number;
-	/** idle: an opened ACP session with no turn of its own yet. Pi runs are never idle. */
-	status: "running" | "complete" | "error" | "cancelled" | "timeout" | "interrupted" | "idle";
+	/** idle: an opened ACP session with no turn of its own yet. Pi runs are never idle. expired: an oven run's slice expired (OVEN_EXPIRES). */
+	status: "running" | "complete" | "error" | "cancelled" | "timeout" | "interrupted" | "idle" | "expired";
 	task: string;
 	output: string;
 	turns: number;

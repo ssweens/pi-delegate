@@ -10,6 +10,7 @@
 import { randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { createAgentSession, type DefaultResourceLoader, type ExtensionAPI, type ExtensionContext, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { AGENT_DIR, SETTINGS_PATH } from "./agent-dir.ts";
 import { type AcpBackend, runningAcpRuns } from "./acp-backend.js";
@@ -17,7 +18,7 @@ import { type AcpRunView, type BackendCapabilities, type CancelRequest, type Clo
 import { RunCompletion } from "./completion.js";
 import { readDelegateSettings } from "./delegate-settings.ts";
 import type { LiveSource } from "./inspector.js";
-import { ovenCall, type Settled, type SliceView } from "./oven.js";
+import { expiredEvent, OVEN_EXPIRES, ovenCall, ovenUrl, SliceExpired, SliceGone, type Settled, type SliceView } from "./oven.js";
 import type { TrustSource } from "./project-trust.js";
 import type { RunView } from "./render.js";
 import { droppedTools, toolAllowlist } from "./roles.js";
@@ -144,6 +145,8 @@ export interface Run {
 	extensions?: string[];
 	/** oven: the slice this run drives; set once oven created it. */
 	sliceId?: string;
+	/** oven: the last heartbeat (oven_expires) that failed, until one succeeds again. */
+	heartbeatError?: string;
 	/** oven tui: the agent whose own TUI oven hosts for this run (a tui slice), and the agent template it was made from. */
 	tui?: "pi" | "claude" | "amp";
 	template?: Record<string, unknown>;
@@ -587,7 +590,7 @@ const piStore = new RunStore<Run, RunRecord>({
 		run.status = "interrupted";
 		run.endedAt = savedAt;
 		run.error = run.runtime === "oven"
-			? `The previous process ended before this execution settled. Its oven slice ${run.sliceId ?? "(not created yet)"} keeps running in oven; steer to rejoin it.`
+			? `The previous process ended before this execution settled. Its oven slice ${run.sliceId ?? "(not created yet)"} keeps running in oven, renewed while this session has the run (it expires ${OVEN_EXPIRES.idle} after the last call); steer to rejoin it.`
 			: "The previous process ended before this execution settled. Inspect its saved work; send a message to continue.";
 	},
 	persisted: (run) => {
@@ -623,6 +626,8 @@ export function restoreRun(path: string, owner: Owner): Run {
 		saveRun(run);
 	}
 	run.completion.settle(finalResult(run));
+	// Its parent has it again: its oven slice is renewed from now on.
+	if (!run.foreign && run.runtime === "oven" && run.sliceId) beatOven();
 	return run;
 }
 
@@ -779,6 +784,7 @@ export function summary(run: Run): string {
 	}
 	if (run.providerRetryMs) s += `\nprovider retry wall ${formatDuration(run.providerRetryMs)}; separate from task and tool time.`;
 	if (run.failedAttempts) s += `\n${run.failedAttempts} provider attempt${run.failedAttempts === 1 ? "" : "s"} failed and were retried before this (last: ${run.lastAttemptError}) — that wall clock and any tokens are included above.`;
+	if (run.heartbeatError) s += `\noven heartbeat failed: ${run.heartbeatError}`;
 	if (run.modelPick) s += `\nmodel picked: ${run.modelPick}`;
 	if (run.sessionFile) s += `\nsession: ${run.sessionFile}`;
 	s += `\nproject ${run.projectTrusted ? "trusted" : "untrusted"} (trust source: ${run.projectTrustSource})`;
@@ -903,6 +909,64 @@ function tuiSecrets(run: Run): Record<string, string> | undefined {
 /** The watch call each oven run is following, so a cancel ends it. */
 const ovenWatches = new Map<string, AbortController>();
 
+/** How often oven runs renew their slices, well inside OVEN_EXPIRES. A test may shorten it before its first oven run. */
+export const ovenHeartbeat = { everyMs: 10 * 60_000 };
+let heartbeat: ReturnType<typeof setInterval> | undefined;
+/** The oven runs this process keeps alive: its own, with a slice, neither cancelled nor expired, running or settled. */
+const kept = (run: Run) => run.runtime === "oven" && !!run.sliceId && !run.foreign && !run.stopped && run.status !== "expired";
+/**
+ * One interval for every oven run this process keeps: each beat is oven_expires with no expires, which starts the slice's
+ * idle window again, so a settled run (a stopped tui agent between segments) is still there for its next steer. A run
+ * stops being renewed when it is cancelled or expires, or its parent closes it (closeOwner) or dies, and then its slice
+ * expires on its own. A failed beat is noted on the run (status shows it), never fatal; an expired slice expires the run.
+ */
+function beatOven() {
+	if (heartbeat) return;
+	heartbeat = setInterval(() => {
+		const live = [...runs.values()].filter(kept);
+		if (!live.length) { clearInterval(heartbeat); heartbeat = undefined; return; }
+		for (const run of live) {
+			ovenCall("expires", { slice: run.sliceId! }).then(() => { run.heartbeatError = undefined; }, (error) => {
+				if (error instanceof SliceExpired) { if (kept(run)) expireRun(run, error); return; }
+				run.heartbeatError = `${new Date().toISOString()}: ${errorMessage(error)}`;
+			});
+		}
+	}, ovenHeartbeat.everyMs);
+	heartbeat.unref?.();
+}
+
+/**
+ * The run's slice expired. A running run's segment ends as expired, with oven's words, once its watch is let go; a
+ * settled run is marked expired at once.
+ */
+function expireRun(run: Run, error: SliceExpired) {
+	run.status = "expired";
+	run.error = expiredText(run, error);
+	if (!run.completion.settled) { ovenWatches.get(run.id)?.abort(); return; }
+	run.revision++;
+	try { saveRun(run); } catch { /* the record keeps its last outcome; this process knows */ }
+	changed();
+}
+const expiredText = (run: Run, error: SliceExpired) =>
+	`${run.id}: its oven slice expired, so it cannot continue; start a new run for more work. oven: ${error.message}`;
+
+/**
+ * The slice oven just made must keep pi-delegate's expiry. An oven older than slice expiry ignores `expires`, and its
+ * slice would never expire: it is stopped and retired, and the run fails saying which oven needs updating.
+ */
+async function requireExpiry(run: Run, slice: { id: string; expires?: unknown }) {
+	if (isDeepStrictEqual(slice.expires, OVEN_EXPIRES)) return;
+	const cleanup = await ovenCall("stop", { slice: slice.id }).then(() => ovenCall("retire", { slices: [slice.id] })).then(
+		() => {
+			// Gone: nothing is renewed or sent to it again, and a steer starts over with a create.
+			run.sliceId = undefined;
+			saveRun(run);
+			return `its slice ${slice.id} was stopped and retired`;
+		},
+		(error) => `stopping and retiring its slice ${slice.id} failed (${errorMessage(error)}); retire it with \`oven retire ${slice.id}\``);
+	throw new Error(`oven at ${ovenUrl()} did not keep expires ${JSON.stringify(OVEN_EXPIRES)} (it answered ${slice.expires === undefined ? "no expires" : JSON.stringify(slice.expires)}): it predates slice expiry and needs updating, or its slices never expire. ${cleanup}.`);
+}
+
 /**
  * Progress for health.ts from one oven_watch event, as trackProgress reads an in-process child's session events: a
  * streaming answer opens a turn, a finished message closes it (and may carry an `EXTEND:` line), a tool call's start and
@@ -983,9 +1047,12 @@ async function settleOven(run: Run): Promise<SliceView> {
 		ovenWatches.set(run.id, abort);
 		try {
 			const settled = await ovenCall<Settled>("watch", { slice: run.sliceId! }, { signal: abort.signal, onEvent: (event) => trackOven(run, event) });
+			const expired = expiredEvent(run.sliceId!, settled);
+			if (expired) throw expired;
 			return { ...settled.slice, output: settled.output };
 		} catch (error) {
-			if (run.status !== "running") throw error;
+			// A slice that expired or is gone never comes back: no retry.
+			if (run.status !== "running" || error instanceof SliceExpired || error instanceof SliceGone) throw error;
 			await new Promise((resolve) => setTimeout(resolve, Math.min(1000 * (attempt + 1), 5000)));
 		} finally { ovenWatches.delete(run.id); }
 	}
@@ -1007,23 +1074,26 @@ async function launchOven(run: Run, task: string) {
 		if (!run.sliceId) {
 			const config = { name: run.role, instructions: run.systemPrompt, model: run.model, ...(run.thinking ? { thinking: run.thinking } : {}),
 				...(run.extensions?.length ? { extensions: run.extensions } : {}), ...(run.tools.includes("*") ? {} : { tools: run.tools }) };
-			const created = await ovenCall<SliceView>("create", { config, task, cwd: run.cwd, requestId: `pi-delegate:${run.id}` });
+			const created = await ovenCall<SliceView>("create", { config, task, cwd: run.cwd, requestId: `pi-delegate:${run.id}`, expires: OVEN_EXPIRES });
 			run.sliceId = created.id;
 			saveRun(run);
+			await requireExpiry(run, created);
 			if (created.state === "failed") { finish(run, "error", failure(created)); return; }
 		} else await ovenCall("send", { slice: run.sliceId, text: task, requestId: `pi-delegate:${run.id}:${run.segment}` });
+		beatOven();
 		const slice = await settleOven(run);
 		if (run.status !== "running") { await haltSlice(run); finish(run, run.status); return; }
 		applySlice(run, slice);
 		run.output = `${slice.output ?? ""}\n\n(oven slice ${run.sliceId}; its changes are in its copy, ${slice.cwd})`;
 		finish(run, slice.state === "idle" ? "complete" : "error", slice.state === "idle" ? undefined : failure(slice));
 	} catch (e: any) {
+		if (e instanceof SliceExpired && run.status === "running") { finish(run, "expired", expiredText(run, e)); return; }
 		finish(run, run.status === "running" ? "error" : run.status, run.error ?? errorMessage(e));
 	}
 }
 
 /** What oven reports for a tui slice. */
-interface TuiSliceView { id: string; kind: "tui"; state: "starting" | "running" | "idle" | "stopped"; status: { state: string; msg?: string }; process: { state: string; code?: number }; cwd: string; session: string; attach?: { command: string } }
+interface TuiSliceView { id: string; kind: "tui"; state: "starting" | "running" | "idle" | "stopped"; status: { state: string; msg?: string }; process: { state: string; code?: number }; cwd: string; session: string; attach?: { command: string }; expires?: unknown }
 
 /** Health progress from a tui slice's status: working opens a turn, rest after it closes one. */
 export function trackTui(run: Run, event: any, now = Date.now()) {
@@ -1043,10 +1113,12 @@ async function settleTui(run: Run): Promise<TuiSliceView> {
 		ovenWatches.set(run.id, abort);
 		try {
 			const settled = await ovenCall<{ type: "settled"; view: TuiSliceView }>("watch", { slice: run.sliceId! }, { signal: abort.signal, onEvent: (event) => trackTui(run, event) });
+			const expired = expiredEvent(run.sliceId!, settled);
+			if (expired) throw expired;
 			if (settled?.view) return settled.view;
 			return await ovenCall<TuiSliceView>("status", { slice: run.sliceId! });
 		} catch (error) {
-			if (run.status !== "running") throw error;
+			if (run.status !== "running" || error instanceof SliceExpired || error instanceof SliceGone) throw error;
 			await new Promise((resolve) => setTimeout(resolve, Math.min(1000 * (attempt + 1), 5000)));
 		} finally { ovenWatches.delete(run.id); }
 	}
@@ -1065,10 +1137,12 @@ async function launchTui(run: Run, task: string) {
 		if (!run.sliceId) {
 			const secrets = tuiSecrets(run);
 			const created = await ovenCall<TuiSliceView>("create", { agent: run.tui, template: run.template, ...(run.modelOverride ? { model: run.modelOverride } : {}), ...(secrets ? { secrets } : {}),
-				task: run.taskPrefix ? `${run.taskPrefix}\n\n---\n\n${task}` : task, cwd: run.cwd, copy: "cow", requestId: `pi-delegate:${run.id}` });
+				task: run.taskPrefix ? `${run.taskPrefix}\n\n---\n\n${task}` : task, cwd: run.cwd, copy: "cow", requestId: `pi-delegate:${run.id}`, expires: OVEN_EXPIRES });
 			run.sliceId = created.id;
 			saveRun(run);
+			await requireExpiry(run, created);
 		} else await ovenCall("send", { slice: run.sliceId, text: task, requestId: `pi-delegate:${run.id}:${run.segment}` });
+		beatOven();
 		const view = await settleTui(run);
 		if (run.status !== "running") { await haltSlice(run); finish(run, run.status); return; }
 		const output = await ovenCall<string>("result", { slice: run.sliceId! });
@@ -1078,6 +1152,8 @@ async function launchTui(run: Run, task: string) {
 		run.output = `${output ?? ""}\n\n(oven ${run.tui} slice ${run.sliceId}; its changes are in its copy, ${view.cwd}; oven attach ${run.sliceId} shows its terminal)`;
 		finish(run, failed ? "error" : "complete", failed ? `oven ${run.tui} slice ${run.sliceId}: ${failed}` : undefined);
 	} catch (e: any) {
+		// An expired slice is gone: nothing is left to stop.
+		if (e instanceof SliceExpired && run.status === "running") { finish(run, "expired", expiredText(run, e)); return; }
 		// A real failure stops the agent; a cancel (the aborted watch lands here too) leaves that to haltSlice, which halts first.
 		if (run.sliceId && run.status === "running") await ovenCall("stop", { slice: run.sliceId }).catch(() => {});
 		finish(run, run.status === "running" ? "error" : run.status, run.error ?? errorMessage(e));
@@ -1577,8 +1653,13 @@ export class PiBackend implements DelegateBackend<"pi"> {
 		this.hooks.owner();
 		if (run.foreign) throw ownedElsewhereError(run);
 		if (interrupt) this.refuseInterrupt(run);
+		if (run.status === "expired") throw new DelegateError("RUN_EXPIRED", run.error ?? `${run.id}: its oven slice expired; start a new run for more work.`);
 		// A running oven slice takes the message into its running work, as a live session's steer does.
-		if (run.runtime === "oven" && run.status === "running" && run.sliceId) { await steerLive(run, message); return; }
+		if (run.runtime === "oven" && run.status === "running" && run.sliceId) {
+			try { await steerLive(run, message); }
+			catch (error) { if (error instanceof SliceExpired) throw new DelegateError("RUN_EXPIRED", expiredText(run, error)); throw error; }
+			return;
+		}
 		if (run.status === "running") {
 			await run.preparing;
 			await run.ready;
@@ -1614,6 +1695,13 @@ export class PiBackend implements DelegateBackend<"pi"> {
 			if (nested.busy?.()) throw new Error(`${run.id} has children of its own that have not settled; a different offering reopens its session and would interrupt them. Wait for them, then steer with model.`);
 			await closeChildOwner(run);
 		}
+		// A settled oven run's slice may have expired since: the steer says so, and never makes a new slice. The check is a heartbeat.
+		// Any other failure is the send's to report, as before.
+		if (run.runtime === "oven" && run.sliceId) await ovenCall("expires", { slice: run.sliceId }).catch((error) => {
+			if (!(error instanceof SliceExpired)) return;
+			expireRun(run, error);
+			throw new DelegateError("RUN_EXPIRED", run.error!);
+		});
 		beginResume(run, restart, replacement);
 		const completion = run.completion;
 		void this.launch(run, message).then(() => publish(completion));

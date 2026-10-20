@@ -70,3 +70,21 @@ test("preserves an aborted fetch error", async () => {
 	rejectFetch(new DOMException("aborted", "AbortError"));
 	await assert.rejects(pending, error => error instanceof DOMException && error.name === "AbortError");
 });
+
+test("pi-delegate's oven calls tell an expired slice and a gone slice from other tool failures, in oven's words", async () => {
+	const { ovenCall, SliceExpired, SliceGone } = await import("../src/oven.ts");
+	const saved = { url: process.env.OVEN_URL, token: process.env.OVEN_TOKEN };
+	// Never the real Oven or its token: the fetch is stubbed, and these name a stand-in.
+	Object.assign(process.env, { OVEN_URL: "http://oven.test", OVEN_TOKEN: "stand-in" });
+	const answer = (text: string) => { globalThis.fetch = async () => jsonResponse({ result: { isError: true, content: [{ text }] } }); };
+	try {
+		answer("No slice t-1: expired (idle 1h) at 2026-10-20T07:00:00.000Z");
+		await assert.rejects(ovenCall("send", { slice: "t-1" }), (error) => error instanceof SliceExpired && error.slice === "t-1" && error.message === "No slice t-1: expired (idle 1h) at 2026-10-20T07:00:00.000Z");
+		answer("No slice t-2");
+		await assert.rejects(ovenCall("watch", { slice: "t-2" }), (error) => error instanceof SliceGone && error.slice === "t-2" && error.message === "oven: No slice t-2");
+		answer("No slices match");
+		await assert.rejects(ovenCall("status", { slice: "t-3" }), (error) => !(error instanceof SliceExpired) && !(error instanceof SliceGone) && (error as Error).message === "oven: No slices match");
+	} finally {
+		for (const [name, value] of [["OVEN_URL", saved.url], ["OVEN_TOKEN", saved.token]] as const) if (value === undefined) delete process.env[name]; else process.env[name] = value;
+	}
+});

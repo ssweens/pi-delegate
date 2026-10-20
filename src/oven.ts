@@ -5,7 +5,7 @@ import { callOven, OvenTransportError } from "./oven-client.js";
 
 /**
  * A small MCP client for oven, only for `runtime: "oven"` children. pi-delegate does not depend on oven:
- * it calls oven's MCP tools (`oven_create`, `oven_send`, `oven_watch`, `oven_halt`) with a JSON-RPC POST
+ * it calls oven's MCP tools (`oven_create`, `oven_send`, `oven_watch`, `oven_halt`, `oven_expires`) with a JSON-RPC POST
  * to OVEN_URL (else oven.json's `port`, else 6836 on 127.0.0.1) at `/mcp`, with the local token oven keeps
  * in its XDG config dir (or OVEN_TOKEN). It never starts oven.
  */
@@ -36,8 +36,34 @@ export class OvenUnreachable extends Error {
 	}
 }
 
+/**
+ * When every slice pi-delegate makes expires: an hour after the last call on it, so a child never outlives its parent
+ * by more than that. While its parent has the run, it renews it (oven_expires, pi-backend's ovenHeartbeat); an open watch holds it too.
+ */
+export const OVEN_EXPIRES = { idle: "1h" } as const;
+
+/** An oven call answered that its slice expired. The message is oven's own: `No slice <id>: expired (<why>) at <time>`. */
+export class SliceExpired extends Error {
+	constructor(readonly slice: string, message: string) {
+		super(message);
+		this.name = "SliceExpired";
+	}
+}
+/** An oven call answered plain `No slice <id>`: the slice was retired, or expired so long ago that oven forgot it. */
+export class SliceGone extends Error {
+	constructor(readonly slice: string, message: string) {
+		super(message);
+		this.name = "SliceGone";
+	}
+}
+/** A watch or wait on a slice that expired ends with this event; it says what oven's later calls on the slice answer. */
+export const expiredEvent = (slice: string, event: any): SliceExpired | undefined =>
+	event?.type === "expired" ? new SliceExpired(slice, `No slice ${slice}: expired (${event.reason}) at ${event.at}`) : undefined;
+
 /** What oven reports for a slice. */
 export interface SliceView { id: string; state: "running" | "idle" | "failed" | "stopped"; stage?: string; reason?: string; turns: number; detail?: string; output?: string; cwd?: string;
+	/** As oven keeps it; an oven older than slice expiry has none. */
+	expires?: unknown;
 	/** A slice waiting to retry stays running with stage "retrying" (newer oven; absent from older ones). */
 	retry?: { attempt: number; of: number; at: number; error?: string };
 	usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; cost?: number };
@@ -57,7 +83,13 @@ export async function ovenCall<T = any>(tool: string, args: Record<string, unkno
 			case "http": throw new Error(`oven at ${url} answered ${error.status}: ${error.message}`);
 			case "closed": throw new Error(`oven closed oven_${tool} before it answered`);
 			case "rpc":
-			case "tool":
+			case "tool": {
+				const expired = /^No slice (\S+): expired \(/.exec(error.message);
+				if (expired) throw new SliceExpired(expired[1], error.message);
+				const gone = /^No slice (\S+)$/.exec(error.message);
+				if (gone) throw new SliceGone(gone[1], `oven: ${error.message}`);
+				throw new Error(`oven: ${error.message}`);
+			}
 			case "protocol": throw new Error(`oven: ${error.message}`);
 		}
 	}

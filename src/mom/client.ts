@@ -11,7 +11,7 @@ import { STATUS_DOC, type MomStatus } from "./engine.ts";
 import { branchIds, extractEvents, LiveFeed } from "./feed.ts";
 import { readGraph } from "./mother.ts";
 import { encodeRequest, type FindingRequest, type MomRequest } from "./operation.ts";
-import { oven, ovenHealth, ovenSliceUrl, OvenUnreachable } from "./oven.ts";
+import { OVEN_EXPIRES, oven, ovenHealth, ovenSliceUrl, OvenUnreachable } from "./oven.ts";
 import type { PanelDiagnostics, PanelView } from "../ui/panel.ts";
 import { feedbackApplies, type FindingAction, type ProcessRiskClass } from "./process-health.ts";
 import { coverageProgress, presentGraph, summaryText, type WorkView } from "../ui/presentation.ts";
@@ -159,8 +159,8 @@ export class MomClient {
 
 	/** Ensure its slice; true when it asked the slice to pick its work up again. */
 	async ensure(reconfigure = false): Promise<boolean> {
-		// A paused Path holds no slice. Oven retires a stopped ephemeral slice as soon as its last operation ends, so
-		// creating one only to stop it again loops (create, stop, retire, "No slice", create…) every reconnect.
+		// A paused Path holds no slice: Oven expires a stopped slice nothing calls, and creating one only to stop it
+		// again would loop (create, stop, expire, "No slice", create…) on every reconnect.
 		if (this.state?.enabled === false) { await this.release(); return false; }
 		// Saved settings override startup flags. Each operation pins its configured mode at begin.
 		// `create` is create-or-get: an idle slice takes this configuration; a running one is returned unchanged.
@@ -180,7 +180,7 @@ export class MomClient {
 		// The watcher is a different slice from a map mode's: its own key, and the other one stops so only one follows.
 		const key = this.sliceKey(trail);
 		await this.stopSlice(this.sliceKey(!trail));
-		const create = { key, cwd: this.identity.cwd, copy: "none",
+		const create = { key, cwd: this.identity.cwd, copy: "none", expires: OVEN_EXPIRES,
 			config: momConfiguration(this.identity, flags, this.context.modelRegistry, trail ? { after: this.coveredThrough() } : {}),
 			...(trail ? { task: `Path trail watcher\n${await trailBriefing(this.identity.sessionFile)}` } : {}) };
 		let slice = await oven("create", create);

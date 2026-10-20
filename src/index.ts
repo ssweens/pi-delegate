@@ -1433,7 +1433,9 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 					const request = unwrap(validateSteer({ backend: "pi" }, p as Record<string, unknown>));
 					const running = run.status === "running";
 					const previous = `${run.model}${run.thinking ? `:${run.thinking}` : ""}`;
-					await piBackend.steer(run.id, request, { ctx });
+					// An expired oven run is refused by its code, with oven's words; nothing was sent or started.
+					try { await piBackend.steer(run.id, request, { ctx }); }
+					catch (error) { if (error instanceof DelegateError && error.code === "RUN_EXPIRED") return failed(error); throw error; }
 					const moved = request.model ? ` Model changed from ${previous} to ${run.model}${run.thinking ? `:${run.thinking}` : ""} for this and later segments; its earlier work keeps the model it ran on.` : "";
 					const retimed = request.timeoutMs !== undefined ? ` Adds ${Math.round(request.timeoutMs / 60000)} min from now: ${budgetText(runHealth(run))}.` : "";
 					const trust = run.projectTrustUnknown ? ` Note: ${TRUST_UNKNOWN}.` : "";

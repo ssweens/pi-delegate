@@ -176,7 +176,7 @@ export function extractEvents(stream: Pick<Stream, "key" | "actor">, e: Entry): 
 	if (!m) return events;
 	if (m.role === "toolResult") {
 		// A joined delegate call reports its worker's terminal outcome in the result itself: that is a receipt too.
-		const joined = m.toolName === "delegate" && typeof m.details?.id === "string" && ["complete", "failed", "error", "stopped", "cancelled", "interrupted"].includes(m.details?.status);
+		const joined = m.toolName === "delegate" && typeof m.details?.id === "string" && ["complete", "failed", "error", "stopped", "cancelled", "interrupted", "expired"].includes(m.details?.status);
 		if (joined) emit({ kind: "delegate_receipt", name: m.details.id, status: m.details.status, ...(m.details.segment !== undefined ? { segment: m.details.segment } : {}) }, 1);
 		const answer = dialogs.has(m.toolName) && !m.isError ? textOf(m.content) : "";
 		emit({ kind: answer ? "user_answer" : "tool_result", name: m.toolName, callId: m.toolCallId,

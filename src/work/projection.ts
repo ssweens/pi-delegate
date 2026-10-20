@@ -162,7 +162,7 @@ function projectDelegateEntry(entry: WorkEntry, target: WorkProjection, runByCal
 	const segment = segmentOf(details) ?? 1;
 	if (message.role === "toolResult" && message.toolName !== "delegate") return;
 	target.delegateTasks.push(taskFrom(runId, status, ref, details));
-	if (details?.completionReceipt === true || ["complete", "error", "cancelled", "timeout", "interrupted", "stopped"].includes(status)) {
+	if (details?.completionReceipt === true || ["complete", "error", "cancelled", "timeout", "interrupted", "stopped", "expired"].includes(status)) {
 		target.terminalReceipts.push(receiptFrom(runId, status, ref, details));
 	}
 }
