@@ -10,7 +10,6 @@
 import { randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { isDeepStrictEqual } from "node:util";
 import { createAgentSession, type DefaultResourceLoader, type ExtensionAPI, type ExtensionContext, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { AGENT_DIR, SETTINGS_PATH } from "./agent-dir.ts";
 import { type AcpBackend, runningAcpRuns } from "./acp-backend.js";
@@ -18,7 +17,7 @@ import { type AcpRunView, type BackendCapabilities, type CancelRequest, type Clo
 import { RunCompletion } from "./completion.js";
 import { readDelegateSettings } from "./delegate-settings.ts";
 import type { LiveSource } from "./inspector.js";
-import { expiredEvent, OVEN_EXPIRES, ovenCall, ovenUrl, SliceExpired, SliceGone, type Settled, type SliceView } from "./oven.js";
+import { expiredEvent, OVEN_EXPIRES, ovenCall, requireExpiry, SliceExpired, SliceGone, type Settled, type SliceView } from "./oven.js";
 import type { TrustSource } from "./project-trust.js";
 import type { RunView } from "./render.js";
 import { droppedTools, toolAllowlist } from "./roles.js";
@@ -545,15 +544,20 @@ export function healthAlert(run: Run, now = Date.now()) {
 
 const WATCH_MS = 30_000;
 let watchdog: ReturnType<typeof setInterval> | undefined;
+const watched = (r: Run) => r.status === "running" && !r.completion.settled && !r.foreign;
 /** One interval for every running run of this process (healthAlert); it stops when none is running. Oven runs' progress comes from their watch (trackOven). */
 function watch() {
 	if (watchdog) return;
 	watchdog = setInterval(() => {
-		const live = [...runs.values()].filter((r) => r.status === "running" && !r.completion.settled && !r.foreign);
-		if (!live.length) { clearInterval(watchdog); watchdog = undefined; return; }
-		for (const run of live) healthAlert(run);
+		if (stopWatchdogIfIdle()) return;
+		for (const run of [...runs.values()].filter(watched)) healthAlert(run);
 	}, WATCH_MS);
 	watchdog.unref?.();
+}
+/** Stop the watchdog the moment no run is running (a settle or a cancel); its tick only re-checks. True when it is stopped. */
+function stopWatchdogIfIdle(): boolean {
+	if (watchdog && ![...runs.values()].some(watched)) { clearInterval(watchdog); watchdog = undefined; }
+	return !watchdog;
 }
 
 /** A pi run's saved fields: the run without what lives only in this process. */
@@ -876,6 +880,7 @@ function finish(run: Run, status: Status, error?: string) {
 	retire(run);
 	if (run.closeOnSettle) { run.closeOnSettle = false; dropSession(run); }
 	run.completion.settle(finalResult(run));
+	stopTimersIfIdle();
 	milestone(run, { kind: "settled", status: run.status, changedFiles: run.changedFiles.slice(0, 20) });
 	changed();
 }
@@ -884,6 +889,7 @@ export async function cancelRun(run: Run) {
 	if (run.foreign) throw ownedElsewhereError(run);
 	run.stopped = true;
 	if (run.status === "running") run.status = "cancelled";
+	stopTimersIfIdle();
 	try { saveRun(run); }
 	// The subtree is marked stopped before the abort can settle this run, so nothing below revives it.
 	finally { changed(); await Promise.all([stopTree(run), run.session?.abort(), haltSlice(run)]); }
@@ -923,9 +929,8 @@ const kept = (run: Run) => run.runtime === "oven" && !!run.sliceId && !run.forei
 function beatOven() {
 	if (heartbeat) return;
 	heartbeat = setInterval(() => {
-		const live = [...runs.values()].filter(kept);
-		if (!live.length) { clearInterval(heartbeat); heartbeat = undefined; return; }
-		for (const run of live) {
+		if (stopHeartbeatIfIdle()) return;
+		for (const run of [...runs.values()].filter(kept)) {
 			ovenCall("expires", { slice: run.sliceId! }).then(() => { run.heartbeatError = undefined; }, (error) => {
 				if (error instanceof SliceExpired) { if (kept(run)) expireRun(run, error); return; }
 				run.heartbeatError = `${new Date().toISOString()}: ${errorMessage(error)}`;
@@ -933,6 +938,23 @@ function beatOven() {
 		}
 	}, ovenHeartbeat.everyMs);
 	heartbeat.unref?.();
+}
+/**
+ * Stop the heartbeat the moment no run is kept: every path that ends one (finish, cancelRun, expireRun, closeOwner, a
+ * refused create) calls it. Its tick only re-checks, as a safety net. True when it is stopped.
+ */
+function stopHeartbeatIfIdle(): boolean {
+	if (heartbeat && ![...runs.values()].some(kept)) { clearInterval(heartbeat); heartbeat = undefined; }
+	return !heartbeat;
+}
+/** A run ended, or stopped being kept: stop whichever process-wide interval has nothing left to do. */
+function stopTimersIfIdle() { stopHeartbeatIfIdle(); stopWatchdogIfIdle(); }
+
+/** The run's slice was retired (an oven that ignores expiry made it): nothing renews or sends to it again, and a steer starts over with a create. */
+function forgetSlice(run: Run) {
+	run.sliceId = undefined;
+	saveRun(run);
+	stopTimersIfIdle();
 }
 
 /**
@@ -942,6 +964,7 @@ function beatOven() {
 function expireRun(run: Run, error: SliceExpired) {
 	run.status = "expired";
 	run.error = expiredText(run, error);
+	stopTimersIfIdle();
 	if (!run.completion.settled) { ovenWatches.get(run.id)?.abort(); return; }
 	run.revision++;
 	try { saveRun(run); } catch { /* the record keeps its last outcome; this process knows */ }
@@ -949,23 +972,6 @@ function expireRun(run: Run, error: SliceExpired) {
 }
 const expiredText = (run: Run, error: SliceExpired) =>
 	`${run.id}: its oven slice expired, so it cannot continue; start a new run for more work. oven: ${error.message}`;
-
-/**
- * The slice oven just made must keep pi-delegate's expiry. An oven older than slice expiry ignores `expires`, and its
- * slice would never expire: it is stopped and retired, and the run fails saying which oven needs updating.
- */
-async function requireExpiry(run: Run, slice: { id: string; expires?: unknown }) {
-	if (isDeepStrictEqual(slice.expires, OVEN_EXPIRES)) return;
-	const cleanup = await ovenCall("stop", { slice: slice.id }).then(() => ovenCall("retire", { slices: [slice.id] })).then(
-		() => {
-			// Gone: nothing is renewed or sent to it again, and a steer starts over with a create.
-			run.sliceId = undefined;
-			saveRun(run);
-			return `its slice ${slice.id} was stopped and retired`;
-		},
-		(error) => `stopping and retiring its slice ${slice.id} failed (${errorMessage(error)}); retire it with \`oven retire ${slice.id}\``);
-	throw new Error(`oven at ${ovenUrl()} did not keep expires ${JSON.stringify(OVEN_EXPIRES)} (it answered ${slice.expires === undefined ? "no expires" : JSON.stringify(slice.expires)}): it predates slice expiry and needs updating, or its slices never expire. ${cleanup}.`);
-}
 
 /**
  * Progress for health.ts from one oven_watch event, as trackProgress reads an in-process child's session events: a
@@ -1077,7 +1083,7 @@ async function launchOven(run: Run, task: string) {
 			const created = await ovenCall<SliceView>("create", { config, task, cwd: run.cwd, requestId: `pi-delegate:${run.id}`, expires: OVEN_EXPIRES });
 			run.sliceId = created.id;
 			saveRun(run);
-			await requireExpiry(run, created);
+			await requireExpiry(created, ovenCall, () => forgetSlice(run));
 			if (created.state === "failed") { finish(run, "error", failure(created)); return; }
 		} else await ovenCall("send", { slice: run.sliceId, text: task, requestId: `pi-delegate:${run.id}:${run.segment}` });
 		beatOven();
@@ -1140,7 +1146,7 @@ async function launchTui(run: Run, task: string) {
 				task: run.taskPrefix ? `${run.taskPrefix}\n\n---\n\n${task}` : task, cwd: run.cwd, copy: "cow", requestId: `pi-delegate:${run.id}`, expires: OVEN_EXPIRES });
 			run.sliceId = created.id;
 			saveRun(run);
-			await requireExpiry(run, created);
+			await requireExpiry(created, ovenCall, () => forgetSlice(run));
 		} else await ovenCall("send", { slice: run.sliceId, text: task, requestId: `pi-delegate:${run.id}:${run.segment}` });
 		beatOven();
 		const view = await settleTui(run);
@@ -1258,6 +1264,7 @@ export async function closeOwner(owner: Owner) {
 			try { saveRun(run); } catch { /* the record stays with its last owner; a dead owner is adopted anyway */ }
 		}
 		runs.delete(run.id);
+		stopTimersIfIdle();
 	}));
 	state.owners.delete(owner.key);
 	// After its children's sessions closed (each kept its runs above): a root's tree goes with it.

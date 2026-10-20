@@ -11,7 +11,7 @@ import { STATUS_DOC, type MomStatus } from "./engine.ts";
 import { branchIds, extractEvents, LiveFeed } from "./feed.ts";
 import { readGraph } from "./mother.ts";
 import { encodeRequest, type FindingRequest, type MomRequest } from "./operation.ts";
-import { OVEN_EXPIRES, oven, ovenHealth, ovenSliceUrl, OvenUnreachable } from "./oven.ts";
+import { OVEN_EXPIRES, oven, ovenHealth, ovenSliceUrl, OvenUnreachable, requireExpiry } from "./oven.ts";
 import type { PanelDiagnostics, PanelView } from "../ui/panel.ts";
 import { feedbackApplies, type FindingAction, type ProcessRiskClass } from "./process-health.ts";
 import { coverageProgress, presentGraph, summaryText, type WorkView } from "../ui/presentation.ts";
@@ -183,13 +183,16 @@ export class MomClient {
 		const create = { key, cwd: this.identity.cwd, copy: "none", expires: OVEN_EXPIRES,
 			config: momConfiguration(this.identity, flags, this.context.modelRegistry, trail ? { after: this.coveredThrough() } : {}),
 			...(trail ? { task: `Path trail watcher\n${await trailBriefing(this.identity.sessionFile)}` } : {}) };
+		// An oven older than slice expiry would keep this slice forever: it is stopped and retired, and Path says which oven needs updating.
 		let slice = await oven("create", create);
+		await requireExpiry(slice, oven);
 		// It is nearly always running, so a changed model or mode would never land: end its current operation,
 		// configure the now idle slice, and have it pick the work up again.
 		const stale = slice.state === "running" && (reconfigure || slice.model !== create.config.model);
 		if (stale) {
 			await oven("halt", { slice: slice.id });
 			slice = await oven("create", create);
+			await requireExpiry(slice, oven);
 		}
 		if (slice.state === "failed" && !slice.conversation) throw new Error(`Path's slice in oven failed (${slice.reason}): ${slice.detail}`);
 		assertSliceSupportsMode(String(flags["mom-mode"] ?? ""), slice.missingTools ?? []);

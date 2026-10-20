@@ -1,7 +1,9 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { callOven, OvenTransportError } from "./oven-client.js";
+import { errorMessage } from "./util/text.ts";
 
 /**
  * A small MCP client for oven, only for `runtime: "oven"` children. pi-delegate does not depend on oven:
@@ -41,6 +43,27 @@ export class OvenUnreachable extends Error {
  * by more than that. While its parent has the run, it renews it (oven_expires, pi-backend's ovenHeartbeat); an open watch holds it too.
  */
 export const OVEN_EXPIRES = { idle: "1h" } as const;
+
+/** An oven older than slice expiry answered a create without the `expires` it was sent: its slices would never expire. */
+export class OvenIgnoresExpiry extends Error {
+	constructor(readonly url: string, readonly slice: string, message: string) {
+		super(message);
+		this.name = "OvenIgnoresExpiry";
+	}
+}
+
+/**
+ * The slice oven just made must keep OVEN_EXPIRES, for delegate runs and Path alike. When it doesn't, the slice is
+ * stopped and retired with `call` (`retired` runs once it is), and this throws OvenIgnoresExpiry naming the oven.
+ */
+export async function requireExpiry(slice: { id: string; expires?: unknown }, call: (tool: string, args: Record<string, unknown>) => Promise<unknown>, retired?: () => void): Promise<void> {
+	if (isDeepStrictEqual(slice.expires, OVEN_EXPIRES)) return;
+	const cleanup = await call("stop", { slice: slice.id }).then(() => call("retire", { slices: [slice.id] })).then(
+		() => { retired?.(); return `its slice ${slice.id} was stopped and retired`; },
+		(error) => `stopping and retiring its slice ${slice.id} failed (${errorMessage(error)}); retire it with \`oven retire ${slice.id}\``);
+	const url = ovenUrl();
+	throw new OvenIgnoresExpiry(url, slice.id, `oven at ${url} did not keep expires ${JSON.stringify(OVEN_EXPIRES)} (it answered ${slice.expires === undefined ? "no expires" : JSON.stringify(slice.expires)}): it predates slice expiry and needs updating, or its slices never expire. ${cleanup}.`);
+}
 
 /** An oven call answered that its slice expired. The message is oven's own: `No slice <id>: expired (<why>) at <time>`. */
 export class SliceExpired extends Error {

@@ -98,6 +98,36 @@ async function recordingProxy(upstream: URL) {
 	return { calls, strip, refuse, allow, url: `http://127.0.0.1:${(server.address() as { port: number }).port}`, close: () => new Promise((resolve) => server.close(resolve)) };
 }
 
+/**
+ * Every setInterval pi-backend's heartbeat (beatOven) and watchdog (watch) make, and how each was cleared: "eagerly" by
+ * whatever ended its last run, or "by its tick", the lazy check on its next beat.
+ */
+function trackIntervals() {
+	type Made = { by: "heartbeat" | "watchdog"; handle: unknown; cleared?: "eagerly" | "by its tick" };
+	const made: Made[] = [];
+	const { setInterval: realSet, clearInterval: realClear } = globalThis;
+	let ticking: unknown;
+	globalThis.setInterval = ((fn: (...args: any[]) => void, ms?: number, ...args: any[]) => {
+		const stack = new Error().stack ?? "";
+		const by = /\bat beatOven \(/.test(stack) ? "heartbeat" : /\bat watch \(.*pi-backend/.test(stack) ? "watchdog" : undefined;
+		if (!by) return realSet(fn, ms, ...args);
+		const entry: Made = { by, handle: undefined };
+		entry.handle = realSet((...a: any[]) => { ticking = entry.handle; try { fn(...a); } finally { ticking = undefined; } }, ms, ...args);
+		made.push(entry);
+		return entry.handle;
+	}) as typeof setInterval;
+	globalThis.clearInterval = ((handle: any) => {
+		const entry = made.find((m) => m.handle === handle && !m.cleared);
+		if (entry) entry.cleared = ticking === handle ? "by its tick" : "eagerly";
+		realClear(handle);
+	}) as typeof clearInterval;
+	return {
+		of: (by: Made["by"]) => made.filter((m) => m.by === by),
+		live: (by: Made["by"]) => made.filter((m) => m.by === by && !m.cleared),
+		restore() { Object.assign(globalThis, { setInterval: realSet, clearInterval: realClear }); },
+	};
+}
+
 test("oven slices a run makes expire when its parent stops renewing them: created with expires, kept alive by a heartbeat while their parent has them, refused on an oven that ignores expires, and an expired slice is the run's typed outcome", { timeout: 240_000, skip }, async (t) => {
 	ovenHeartbeat.everyMs = HEARTBEAT_MS;
 	const api = await provider();
@@ -122,6 +152,7 @@ test("oven slices a run makes expire when its parent stops renewing them: create
 	mkdirSync(agents, { recursive: true });
 	writeFileSync(join(agents, "baker.md"), "---\nname: baker\ndescription: Runs in oven.\nruntime: oven\ntools: read, bash\n---\n\nBake carefully.\n");
 	writeFileSync(join(agents, "tui-baker.md"), "---\nname: tui-baker\ndescription: Bakes in its own TUI.\ntui: pi\nmodel: fixture/fixture\n---\n\nBake carefully.\n");
+	const timers = trackIntervals();
 	const h = await harness(box);
 	const codeOf = (result: any) => result.details?.error?.code;
 	const creates = () => proxy.calls.filter((c) => c.tool === "oven_create");
@@ -132,6 +163,36 @@ test("oven slices a run makes expire when its parent stops renewing them: create
 	const gates: ReturnType<typeof deferred<void>>[] = [];
 	let disposed = false;
 	try {
+		await t.test("one heartbeat interval serves every kept run and is cleared the moment the last one is cancelled or expires, not on a later tick; the watchdog stops at a cancel", async () => {
+			const beats = () => timers.of("heartbeat");
+			const one = await h.launch("Beat one", { role: "tui-baker" });
+			const oneResult = await h.ctl("wait", one.details.id);
+			assert.equal(oneResult.details.status, "complete");
+			assert.equal(beats().length, 1, "the first kept run starts the heartbeat");
+			assert.equal(timers.live("heartbeat").length, 1, "and it stays on while the settled run is kept");
+			const gate = deferred<void>(); gates.push(gate);
+			const arrived = api.script("Beat two", { gate, text: "TWO" });
+			const two = await h.launch("Beat two", { role: "baker" });
+			await within(arrived);
+			assert.equal(beats().length, 1, "a second kept run shares it: beatOven never makes a second interval");
+			assert.equal(timers.live("watchdog").length, 1, "the watchdog follows the running run");
+			await h.ctl("cancel", two.details.id);
+			assert.deepEqual(timers.live("watchdog"), [], "a cancel of the only running run stops the watchdog");
+			assert.equal(timers.live("heartbeat").length, 1, "a run is still kept, so the heartbeat stays");
+			gate.resolve();
+			await h.ctl("cancel", one.details.id);
+			assert.deepEqual(timers.live("heartbeat"), [], "cancelling the last kept run stops the heartbeat at once");
+			const again = await h.launch("Beat three", { role: "tui-baker" });
+			const againResult = await h.ctl("wait", again.details.id);
+			assert.equal(againResult.details.status, "complete");
+			assert.equal(beats().length, 2, "a new kept run starts it again");
+			await oven("expires", { slice: tuiSliceOf(againResult), expires: { in: "1s" } });
+			await waitFor(async () => (await h.ctl("status", again.details.id)).details.status === "expired");
+			assert.deepEqual(timers.live("heartbeat"), [], "the last kept run's expiry stops it");
+			assert.deepEqual(beats().map((b) => b.cleared), ["eagerly", "eagerly"], "each time by what ended the run, not a later beat");
+			assert.ok(timers.of("watchdog").every((w) => w.cleared === "eagerly"), "and the watchdog by a settle or cancel");
+		});
+
 		await t.test("a durable and a tui run each create their slice with expires {idle: \"1h\"}, and oven keeps it", async () => {
 			api.script("Bake one", { text: "BAKED" });
 			const durable = await h.launch("Bake one", { role: "baker" });
@@ -292,6 +353,7 @@ test("oven slices a run makes expire when its parent stops renewing them: create
 			const slice = tuiSliceOf(result);
 			await waitFor(() => heartbeats(slice) >= 2, 5000);
 			await h.runtime.dispose(); disposed = true;
+			assert.deepEqual(timers.live("heartbeat"), [], "closing the parent stops the heartbeat at once");
 			await pause(HEARTBEAT_MS * 2);
 			const closed = heartbeats(slice);
 			await pause(HEARTBEAT_MS * 6);
@@ -302,6 +364,8 @@ test("oven slices a run makes expire when its parent stops renewing them: create
 				await waitFor(() => heartbeats(slice) >= closed + 2, 5000);
 				assert.equal((await reopened.ctl("status", run.details.id)).details.status, "complete");
 			} finally { await reopened.runtime.dispose(); }
+			assert.deepEqual(timers.live("heartbeat"), [], "and so does closing it again");
+			assert.ok(timers.of("heartbeat").every((b) => b.cleared === "eagerly"), `never left for a later beat: ${JSON.stringify(timers.of("heartbeat").map((b) => b.cleared))}`);
 			await pause(HEARTBEAT_MS * 2);
 			const reclosed = heartbeats(slice);
 			await pause(HEARTBEAT_MS * 6);
@@ -314,6 +378,7 @@ test("oven slices a run makes expire when its parent stops renewing them: create
 		process.env.OVEN_URL = ovenUrl;
 		for (const slice of await oven<any[]>("list", {}).catch(() => [])) { await oven("stop", { slice: slice.id }).catch(() => {}); await oven("retire", { slices: [slice.id] }).catch(() => {}); }
 		if (!disposed) await h.runtime.dispose();
+		timers.restore();
 		await daemon.stop();
 		await proxy.close();
 		await api.close();

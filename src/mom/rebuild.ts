@@ -8,7 +8,7 @@ import { STATUS_DOC, type MomStatus } from "./engine.ts";
 import { extractEvents } from "./feed.ts";
 import { readGraph } from "./mother.ts";
 import { encodeRequest } from "./operation.ts";
-import { OVEN_EXPIRES, oven, ovenSliceUrl } from "./oven.ts";
+import { OVEN_EXPIRES, oven, ovenSliceUrl, requireExpiry } from "./oven.ts";
 import { formatDuration } from "../util/format.ts";
 import { sessionFromFile } from "./session-file.ts";
 import { completeLines } from "../util/jsonl.ts";
@@ -62,10 +62,12 @@ export async function rebuildMap(context: ExtensionContext, identity: SessionIde
 		if (signal.aborted) throw signal.reason;
 		const config = momConfiguration({ ...identity, sessionFile: file },
 			{ ...flags, "mom-bootstrap": "1" }, context.modelRegistry);
-		const created = await oven<{ id: string; missingTools?: string[] }>("create", {
+		const created = await oven<{ id: string; expires?: unknown; missingTools?: string[] }>("create", {
 			key: `mom-rebuild-${randomUUID()}`, cwd: identity.cwd, copy: "none", expires: OVEN_EXPIRES,
 			config: { ...config, follow: undefined, retry: [] },
 		});
+		// Checked before it is this rebuild's slice: one an old oven made is stopped and retired here, not stopped again below.
+		await requireExpiry(created, oven);
 		slice = created.id;
 		if (created.missingTools?.includes("mom_begin") || created.missingTools?.includes("commit_graph"))
 			throw new Error("Oven's Path extension is stale; restart Oven before rebuilding.");
