@@ -150,6 +150,16 @@ Ask in plain words. The agent turns the request into a `delegate` or `delegate_c
 
 `runtime: "oven"` runs the child as an [oven](https://github.com/ssweens/oven) slice instead of in this process; a role's `runtime: oven` line makes it that role's default, and the call's `runtime` overrides it, as `model` does. The slice gets the role's instructions, model, `extensions` and `tools` and a copy-on-write copy of `cwd`, keeps running after this session closes, and never receives the conversation. The run keeps this tool's surface: run ID, `status`, `result`, `wait`, `steer` (sent into the slice) and `cancel` (halts it), the run log and the completion notice. pi-delegate does not depend on oven, and the default in-process runtime needs nothing. A `runtime: "oven"` child calls oven's MCP tools on an oven that is already running (launchd keeps it on): `oven_create` with the role's configuration, then `oven_watch` until the slice settles (called again if it drops), `oven_send` for a later segment or a steer, and `oven_halt` to cancel. Each create and send carries a `requestId` fixed for the run and segment, so a retry never starts a second slice or turn. It posts to `OVEN_URL`, else `http://127.0.0.1:6836` (or the `port` in oven's `oven.json`), at `/mcp`, with the local token oven keeps in `${XDG_CONFIG_HOME:-~/.config}/oven/token` (or `OVEN_TOKEN`). When nothing answers, the run fails with a message that names the URL and says to run `oven start` or use the tray app; it never starts oven. A slice oven couldn't make fails the run with oven's reason code (for example `cwd_missing` or `model_unavailable`). oven brings Pi's credentials in by itself.
 
+### A Pi, Claude or Amp TUI child in oven
+
+> "Have Claude review the parser in its own terminal, on Haiku."
+
+```json
+{"role":"reviewer","task":"Review src/parser.ts\n…","tui":"claude","model":"haiku"}
+```
+
+`tui: "pi" | "claude" | "amp"` runs the child as that agent's own TUI, hosted by oven as a `tui` slice; a role's `tui:` line makes it that role's default, and the call's `tui` overrides it. It implies `runtime: "oven"` (with `runtime: "in-process"` the call fails `INPUT_INVALID`). The role becomes the agent's oven template: a Pi child gets the role's top-level `model`, `thinking`, `tools` and its `pi:` section; Claude and Amp get only their own `claude:` / `amp:` sections, because the top-level fields are Pi's. Every agent gets the role's description, `env` and `secrets`. Claude and Pi take the instructions as a system prompt; Amp takes none, so they lead the first message. `model` is passed to oven as the agent's own model name, without Pi's model resolution. The first segment is `oven_create` in a copy-on-write copy of `cwd`, later segments and steers are `oven_send` (which wakes the same agent session), `cancel` halts the turn, and each segment waits with `oven_watch` until the agent settles, reads the answer from the agent's own session with `oven_result`, and stops the slice. The output names the slice, its copy and `oven attach <slice>`, which shows its terminal.
+
 ### An ACP worker
 
 > "Ask Codex for a read-only review of src/backend.ts."

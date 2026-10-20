@@ -144,6 +144,13 @@ export interface Run {
 	extensions?: string[];
 	/** oven: the slice this run drives; set once oven created it. */
 	sliceId?: string;
+	/** oven tui: the agent whose own TUI oven hosts for this run (a tui slice), and the agent template it was made from. */
+	tui?: "pi" | "claude" | "amp";
+	template?: Record<string, unknown>;
+	/** oven tui: instructions the agent cannot take as a system prompt (Amp), put ahead of the first message. */
+	taskPrefix?: string;
+	/** oven tui: the call's model, passed to the agent as an override of its template's. */
+	modelOverride?: string;
 	/** Set when a delegating child started this run. */
 	parentRunId?: string;
 	/** Which entry of the role's model list the run got, and why earlier entries were skipped. */
@@ -982,6 +989,7 @@ const failure = (slice: SliceView) => `oven slice ${slice.id} ${slice.state}${sl
  * an in-process child's.
  */
 async function launchOven(run: Run, task: string) {
+	if (run.tui) return launchTui(run, task);
 	try {
 		milestone(run, { kind: "started", task: task.slice(0, 600) });
 		beginSegment(run);
@@ -998,6 +1006,65 @@ async function launchOven(run: Run, task: string) {
 		applySlice(run, slice);
 		run.output = `${slice.output ?? ""}\n\n(oven slice ${run.sliceId}; its changes are in its copy, ${slice.cwd})`;
 		finish(run, slice.state === "idle" ? "complete" : "error", slice.state === "idle" ? undefined : failure(slice));
+	} catch (e: any) {
+		finish(run, run.status === "running" ? "error" : run.status, run.error ?? errorMessage(e));
+	}
+}
+
+/** What oven reports for a tui slice. */
+interface TuiSliceView { id: string; kind: "tui"; state: "starting" | "running" | "idle" | "stopped"; status: { state: string; msg?: string }; process: { state: string; code?: number }; cwd: string; session: string; attach?: { command: string } }
+
+/** Health progress from a tui slice's status: working opens a turn, rest after it closes one. */
+export function trackTui(run: Run, event: any, now = Date.now()) {
+	if (run.status !== "running" || event?.type !== "status") return;
+	const state = event.status?.state;
+	if (state === "working" || state === "blocked") { if (run.turnStartedAt !== undefined) return; trackProgress(run, { type: "message_start", message: { role: "assistant" } }, now); }
+	else if (state === "done" || state === "idle" || state === "error") { if (run.turnStartedAt === undefined) return; trackProgress(run, { type: "message_end", message: { role: "assistant" } }, now); run.turns++; }
+	else return;
+	run.revision++;
+	changed();
+}
+
+/** Follow a tui slice until it settles, as settleOven does a durable one; the call is made again when it drops. */
+async function settleTui(run: Run): Promise<TuiSliceView> {
+	for (let attempt = 0; ; attempt++) {
+		const abort = new AbortController();
+		ovenWatches.set(run.id, abort);
+		try {
+			const settled = await ovenCall<{ type: "settled"; view: TuiSliceView }>("watch", { slice: run.sliceId! }, { signal: abort.signal, onEvent: (event) => trackTui(run, event) });
+			if (settled?.view) return settled.view;
+			return await ovenCall<TuiSliceView>("status", { slice: run.sliceId! });
+		} catch (error) {
+			if (run.status !== "running") throw error;
+			await new Promise((resolve) => setTimeout(resolve, Math.min(1000 * (attempt + 1), 5000)));
+		} finally { ovenWatches.delete(run.id); }
+	}
+}
+
+/**
+ * One segment of a tui run: the first creates the agent's TUI in oven from the run's template, in a copy of
+ * its cwd; a later one sends the message, which wakes the stopped agent on the same session. Each has a
+ * requestId stable for the run and segment. When the turn settles, the answer is read from the agent's own
+ * record (oven_result) and the agent is stopped, so no idle TUI is left running between segments.
+ */
+async function launchTui(run: Run, task: string) {
+	try {
+		milestone(run, { kind: "started", task: task.slice(0, 600) });
+		beginSegment(run);
+		if (!run.sliceId) {
+			const created = await ovenCall<TuiSliceView>("create", { agent: run.tui, template: run.template, ...(run.modelOverride ? { model: run.modelOverride } : {}),
+				task: run.taskPrefix ? `${run.taskPrefix}\n\n---\n\n${task}` : task, cwd: run.cwd, copy: "cow", requestId: `pi-delegate:${run.id}` });
+			run.sliceId = created.id;
+			saveRun(run);
+		} else await ovenCall("send", { slice: run.sliceId, text: task, requestId: `pi-delegate:${run.id}:${run.segment}` });
+		const view = await settleTui(run);
+		if (run.status !== "running") { await haltSlice(run); finish(run, run.status); return; }
+		const output = await ovenCall<string>("result", { slice: run.sliceId! });
+		await ovenCall("stop", { slice: run.sliceId! }).catch(() => {});
+		const failed = view.process.state !== "running" ? `${run.tui} exited${view.process.code !== undefined ? ` (${view.process.code})` : ""}`
+			: view.status.state === "error" ? `${run.tui} reported an error${view.status.msg ? `: ${view.status.msg}` : ""}` : undefined;
+		run.output = `${output ?? ""}\n\n(oven ${run.tui} slice ${run.sliceId}; its changes are in its copy, ${view.cwd}; oven attach ${run.sliceId} shows its terminal)`;
+		finish(run, failed ? "error" : "complete", failed ? `oven ${run.tui} slice ${run.sliceId}: ${failed}` : undefined);
 	} catch (e: any) {
 		finish(run, run.status === "running" ? "error" : run.status, run.error ?? errorMessage(e));
 	}
@@ -1269,6 +1336,10 @@ export interface PiRunSpec {
 	parentRunId?: string;
 	runtime?: "oven";
 	extensions?: string[];
+	tui?: "pi" | "claude" | "amp";
+	template?: Record<string, unknown>;
+	taskPrefix?: string;
+	modelOverride?: string;
 	projectTrusted: boolean;
 	projectTrustSource: TrustSource;
 	/** The parent's conversation a forked child inherits, read when its preparation runs. */

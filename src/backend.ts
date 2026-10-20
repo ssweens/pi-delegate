@@ -31,7 +31,7 @@ export const ACP_ONLY_FIELDS = ["agent", "sessionId", "executionEnvironment", "m
 /** Accepted only with backend "acp" and agent "amp". On any other agent each one is an error. */
 export const AMP_ONLY_FIELDS = ["mode"] as const;
 /** Accepted only with backend "pi". An ACP child cannot receive the parent conversation. */
-export const PI_ONLY_FIELDS = ["context", "runtime"] as const;
+export const PI_ONLY_FIELDS = ["context", "runtime", "tui"] as const;
 /** Opening an existing native session keeps its settings: these are creation-only (Coordinator rule). */
 export const OPEN_FORBIDDEN_FIELDS = ["role", "model", "mode"] as const;
 
@@ -53,6 +53,8 @@ export interface PiStartInput extends CommonStartInput {
 	context?: "fork" | "fresh";
 	/** Overrides the role's runtime: an in-process Pi child, or an oven slice. */
 	runtime?: "in-process" | "oven";
+	/** Run the child as this agent's own TUI hosted by oven (a tui slice); implies runtime "oven". Overrides the role's `tui` line. */
+	tui?: "pi" | "claude" | "amp";
 	/** Minutes from each segment's start by which the first file should be written (health.ts firstDeliverableAt). */
 	firstDeliverableMin?: number;
 }
@@ -476,6 +478,11 @@ export function validateStartInput(raw: Record<string, unknown>): Validated<Star
 		if (raw.runtime !== undefined) {
 			if (raw.runtime !== "in-process" && raw.runtime !== "oven") return fail("INPUT_INVALID", 'runtime is "in-process" or "oven"', "runtime");
 			value.runtime = raw.runtime;
+		}
+		if (raw.tui !== undefined) {
+			if (raw.tui !== "pi" && raw.tui !== "claude" && raw.tui !== "amp") return fail("INPUT_INVALID", 'tui is "pi", "claude" or "amp"', "tui");
+			if (raw.runtime === "in-process") return fail("INPUT_INVALID", 'a tui child runs in oven; runtime "in-process" does not apply', "runtime");
+			value.tui = raw.tui;
 		}
 		if (raw.model !== undefined) {
 			if (!isNonEmptyString(raw.model)) return fail("INPUT_INVALID", "model must be a non-empty string", "model");

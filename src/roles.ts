@@ -24,8 +24,17 @@ export interface Role {
 	runtime?: "in-process" | "oven";
 	/** oven only: the Pi-package and Durable extensions the slice selects (oven's are off by default). */
 	extensions?: string[];
+	/** Run its children as this agent's own TUI hosted by oven (a tui slice) instead of a Pi Durable slice. */
+	tui?: TuiAgent;
 	source: string;
+	/** The role file, for the agent template a tui child is created from (tui-template.ts). */
+	file: string;
 }
+
+/** The agents oven hosts as tui slices. */
+export const TUI_AGENTS = ["pi", "claude", "amp"] as const;
+export type TuiAgent = (typeof TUI_AGENTS)[number];
+export const isTuiAgent = (value: unknown): value is TuiAgent => TUI_AGENTS.includes(value as TuiAgent);
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -151,7 +160,9 @@ export function loadRoles(cwd: string, projectTrusted: boolean, agentDir: string
 				timeoutMs: fm.timeoutMs ? Number(fm.timeoutMs) || undefined : undefined,
 				runtime: fm.runtime === "oven" || fm.runtime === "in-process" ? fm.runtime : undefined,
 				extensions: toolList(fm.extensions),
+				...(isTuiAgent(fm.tui) ? { tui: fm.tui } : {}),
 				source: tildify(file),
+				file,
 			});
 		}
 	}

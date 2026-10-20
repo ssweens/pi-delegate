@@ -30,6 +30,7 @@ import { ACP_JOIN_LOST, AcpBackend, acpModelsText, acpResultText, acpStatusText,
 import { type Join, type JoinOutcome, joinRuns, waitCancelled } from "./wait.ts";
 import { shutdownAcpCoordinator } from "./acp/instance.js";
 import { DELEGATION_TOOLS, droppedTools, EVERY_TOOL, loadRoles, roleSourcesText, toolAllowlist, WRITE_TOOLS } from "./roles.js";
+import { tuiTemplate } from "./tui-template.js";
 import { installTodo } from "./todo-ext.js";
 import type { DealsDetails } from "./deals.js";
 import { resolveChildTrust, type ChildTrust } from "./project-trust.js";
@@ -1057,13 +1058,19 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		const role = roles.get(p.role);
 		if (!role) throw new DelegateError("ROLE_UNKNOWN", `unknown role "${p.role}". available: ${[...roles.keys()].sort().join(", ")}`, "role");
 		// Model: explicit param, else the role's approved default, else the role's model list, else the parent's.
-		const approved = loadDefaults().approved[role.name];
-		let resolved: { model: any; thinking?: string; pick?: string };
-		try { resolved = p.model ?? approved?.spec ? resolveModel(p.model ?? approved!.spec, ctx) : resolveRoleModels(role.models, ctx); }
-		catch (error) { throw new DelegateError("MODEL_UNAVAILABLE", errorMessage(error), "model"); }
+		// A tui child is another agent's own TUI in oven: its model comes from the role's template (or the call's
+		// model, passed to oven as an override), never from this session's Pi models.
+		const tui = p.tui ?? role.tui;
+		if (tui && p.runtime === "in-process") throw new DelegateError("INPUT_INVALID", `role "${role.name}" runs as a ${tui} tui child in oven; runtime "in-process" does not apply`, "runtime");
+		const approved = tui ? undefined : loadDefaults().approved[role.name];
+		let resolved: { model: any; thinking?: string; pick?: string } = { model: undefined };
+		if (!tui) {
+			try { resolved = p.model ?? approved?.spec ? resolveModel(p.model ?? approved!.spec, ctx) : resolveRoleModels(role.models, ctx); }
+			catch (error) { throw new DelegateError("MODEL_UNAVAILABLE", errorMessage(error), "model"); }
+			if (!resolved.model) throw new DelegateError("MODEL_UNAVAILABLE", "no model available for child", "model");
+		}
 		const { model, thinking: specThinking, pick: modelPick } = resolved;
-		if (!model) throw new DelegateError("MODEL_UNAVAILABLE", "no model available for child", "model");
-		const thinking = String(specThinking ?? (p.model ? undefined : approved && parseModelSpec(approved.spec).thinking) ?? role.thinking ?? "medium");
+		const thinking = String(specThinking ?? (p.model ? undefined : approved && parseModelSpec(approved.spec).thinking) ?? role.thinking ?? (tui ? "default" : "medium"));
 		const timeoutMs = p.timeoutMs ?? role.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 		// Validated against the call's own timeoutMs already; the role's or the default budget is known only here.
 		const late = p.firstDeliverableMin !== undefined ? firstDeliverableError(p.firstDeliverableMin, timeoutMs) : undefined;
@@ -1073,10 +1080,11 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		const tools = [...(role.tools ?? EVERY_TOOL)];
 		const withheld = atDepthCap ? [...DELEGATION_TOOLS] : undefined;
 		const { allows } = toolAllowlist(tools, withheld);
-		const delegates = allows("delegate");
+		// A Claude or Amp TUI has no delegate tools; a Pi TUI loads the user's extensions, pi-delegate among them.
+		const delegates = (!tui || tui === "pi") && allows("delegate");
 		const isWriter = WRITE_TOOLS.some(allows);
 		// Like the model: the role's line is a default the call can override.
-		const runtime = p.runtime ?? role.runtime ?? "in-process";
+		const runtime = tui ? "oven" : p.runtime ?? role.runtime ?? "in-process";
 		// An oven slice runs outside this process and never receives the conversation, as an ACP child.
 		const context = runtime === "oven" ? "fresh" : p.context ?? role.context ?? "fork";
 		const systemPrompt = PLAN_CONFLICT_RULE + role.systemPrompt + (role.systemPrompt.includes("STATUS:") ? "" : contractFooter(delegates, atDepthCap && toolAllowlist(tools).allows("delegate"), cap))
@@ -1086,12 +1094,14 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			const clash = activeWriter(cwd);
 			if (clash) throw new DelegateError("WRITER_CWD_OWNED", `refused: ${clash.id} (${clash.role}) is already writing in ${cwd}. One writer per tree — wait, cancel it, or give this child its own cwd/worktree.`, "cwd");
 		}
+		const hosted = tui ? tuiTemplate(role, tui, systemPrompt) : undefined;
 		return {
-			role: role.name, task: p.task, cwd, model: modelKey(model), thinking, contextWindow: model.contextWindow, ...(modelPick ? { modelPick } : {}),
+			role: role.name, task: p.task, cwd, model: tui ? `${tui}:${p.model ?? "template"}` : modelKey(model), thinking, contextWindow: model?.contextWindow, ...(modelPick ? { modelPick } : {}),
 			systemPrompt, context, tools, ...(withheld ? { withheld } : {}), writer: isWriter && runtime !== "oven", timeoutMs,
 			...(p.firstDeliverableMin !== undefined ? { firstDeliverableMin: p.firstDeliverableMin } : {}),
 			depth: depth + 1, ...(nesting ? { parentRunId: nesting.id } : {}),
 			...(runtime === "oven" ? { runtime: "oven" as const, extensions: role.extensions ?? [] } : {}),
+			...(tui && hosted ? { tui, template: hosted.template, ...(hosted.taskPrefix ? { taskPrefix: hosted.taskPrefix } : {}), ...(p.model ? { modelOverride: p.model } : {}) } : {}),
 			projectTrusted, projectTrustSource,
 			inherited: () => context === "fork" ? convertToLlm(trimDangling(stripDelegation(buildSessionContext(ctx.sessionManager.buildContextEntries()).messages))) : [],
 		};
@@ -1117,6 +1127,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			task: Type.Optional(Type.String({ description: "the brief. Required, except acp with sessionId, where it is the first native turn when given" })),
 			model: Type.Optional(Type.String({ description: "override. pi: provider/id[:thinking]. acp: the agent's own model ID, created sessions only" })),
 			context: Type.Optional(StringEnum(["fork", "fresh"] as const)),
+			tui: Type.Optional(StringEnum(["pi", "claude", "amp"] as const, { description: 'pi only: run the child as that agent\'s own TUI hosted by oven (a tui slice), in a copy of cwd, on the role as an agent template (its claude:/amp: sections for those agents); model is passed to that agent. Default: the role\'s tui line. Implies runtime "oven"; attach with `oven attach <slice>`' })),
 			runtime: Type.Optional(StringEnum(["in-process", "oven"] as const, { description: 'pi only: where the child runs. Default: the role\'s runtime line, else "in-process". "oven" runs it as an oven slice in a copy of cwd that outlives this session; it never receives your conversation' })),
 			cwd: Type.Optional(Type.String()),
 			timeoutMs: Type.Optional(Type.Number({ description: `abort the child after this many ms; default ${DEFAULT_TIMEOUT_MS / 60000} min. Size it to the work: a build, suite, or training run that takes hours needs hours here, or it is killed mid-flight` })),
