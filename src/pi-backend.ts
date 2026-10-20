@@ -883,10 +883,21 @@ export async function cancelRun(run: Run) {
 	finally { changed(); await Promise.all([stopTree(run), run.session?.abort(), haltSlice(run)]); }
 }
 
-/** End an oven run's slice's work (oven_halt); its conversation and copy stay in oven. */
+/** End an oven run's slice's work (oven_halt); its conversation and copy stay in oven. A tui slice is also stopped, so no idle TUI is left running; a steer wakes it on the same session. */
 async function haltSlice(run: Run) {
 	ovenWatches.get(run.id)?.abort();
-	if (run.runtime === "oven" && run.sliceId) await ovenCall("halt", { slice: run.sliceId }).catch(() => {});
+	if (run.runtime !== "oven" || !run.sliceId) return;
+	await ovenCall("halt", { slice: run.sliceId }).catch(() => {});
+	if (run.tui) await ovenCall("stop", { slice: run.sliceId }).catch(() => {});
+}
+
+/** The values of a tui run's declared secrets, from this process's environment; oven keeps them out of argv and records. */
+function tuiSecrets(run: Run): Record<string, string> | undefined {
+	const names = Array.isArray(run.template?.secrets) ? run.template.secrets as string[] : [];
+	if (!names.length) return undefined;
+	const missing = names.filter((name) => !process.env[name]);
+	if (missing.length) throw new Error(`role ${run.role} declares secret${missing.length > 1 ? "s" : ""} ${missing.join(", ")}, not set in this session's environment`);
+	return Object.fromEntries(names.map((name) => [name, process.env[name]!]));
 }
 
 /** The watch call each oven run is following, so a cancel ends it. */
@@ -1052,7 +1063,8 @@ async function launchTui(run: Run, task: string) {
 		milestone(run, { kind: "started", task: task.slice(0, 600) });
 		beginSegment(run);
 		if (!run.sliceId) {
-			const created = await ovenCall<TuiSliceView>("create", { agent: run.tui, template: run.template, ...(run.modelOverride ? { model: run.modelOverride } : {}),
+			const secrets = tuiSecrets(run);
+			const created = await ovenCall<TuiSliceView>("create", { agent: run.tui, template: run.template, ...(run.modelOverride ? { model: run.modelOverride } : {}), ...(secrets ? { secrets } : {}),
 				task: run.taskPrefix ? `${run.taskPrefix}\n\n---\n\n${task}` : task, cwd: run.cwd, copy: "cow", requestId: `pi-delegate:${run.id}` });
 			run.sliceId = created.id;
 			saveRun(run);
@@ -1066,6 +1078,7 @@ async function launchTui(run: Run, task: string) {
 		run.output = `${output ?? ""}\n\n(oven ${run.tui} slice ${run.sliceId}; its changes are in its copy, ${view.cwd}; oven attach ${run.sliceId} shows its terminal)`;
 		finish(run, failed ? "error" : "complete", failed ? `oven ${run.tui} slice ${run.sliceId}: ${failed}` : undefined);
 	} catch (e: any) {
+		if (run.sliceId) await ovenCall("stop", { slice: run.sliceId }).catch(() => {});
 		finish(run, run.status === "running" ? "error" : run.status, run.error ?? errorMessage(e));
 	}
 }

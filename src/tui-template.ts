@@ -5,7 +5,7 @@ import type { Role, TuiAgent } from "./roles.ts";
 /**
  * The oven agent template a tui child is created from, built from its role file. A role's top-level model,
  * thinking and tools are Pi's (pi-delegate roles are Pi roles), so only a Pi child gets them; Claude and Amp
- * get their own `claude:` / `amp:` sections. Every agent gets the role's description, env and secrets. Amp
+ * get their own `claude:` / `amp:` sections. Every agent gets the role's description, env and secret names (their values come from the environment at create). Amp
  * takes no system prompt: its instructions lead the first message instead (`taskPrefix`). Oven validates the
  * result and refuses what an agent cannot take, so nothing is dropped silently here.
  */
