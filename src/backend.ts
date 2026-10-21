@@ -166,6 +166,12 @@ export const PI_CAPABILITIES: Readonly<BackendCapabilities> = {
 	close: { supported: false, reason: "an in-process run holds no external process or session; use cancel" },
 };
 
+/** An oven run is reported as the pi backend, but it holds an external slice: only the `close` refusal's words differ. */
+export const OVEN_CAPABILITIES: Readonly<BackendCapabilities> = {
+	...PI_CAPABILITIES,
+	close: { supported: false, reason: "an oven run's slice is ended with cancel, which halts it in oven; its conversation and copy stay there" },
+};
+
 /** The capability report for one ACP run. Cancel never reaches a turn someone else started. */
 export function acpCapabilities(run: { origin: SessionOrigin; agent: string }): BackendCapabilities {
 	const opened = run.origin === "opened";

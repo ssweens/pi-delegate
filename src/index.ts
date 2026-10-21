@@ -25,7 +25,7 @@ import { readLegacySection, readSettings, writeSettings } from "./settings-file.
 import type { LiveSource } from "./inspector.js";
 import { budgetText, clock, firstDeliverableAt, runHealth } from "./health.js";
 import { type AAIndices, acpRowView, asRunView, boardLine, empty, framed, type LiveFacts, type ModelRow, type ModelsDetails, onBoard, resultLines, resultView, type RunView } from "./render.js";
-import { type AcpRunView, firstDeliverableError, type LifecycleAction, type PiStartInput, PI_CAPABILITIES, requireAction, validateStartInput, validateSteer } from "./backend.js";
+import { type AcpRunView, firstDeliverableError, type LifecycleAction, type PiStartInput, OVEN_CAPABILITIES, PI_CAPABILITIES, requireAction, validateStartInput, validateSteer } from "./backend.js";
 import { ACP_JOIN_LOST, AcpBackend, acpModelsText, acpResultText, acpStatusText, acpSummary, DelegateError, sessionLabel, unwrap } from "./acp-backend.js";
 import { type Join, type JoinOutcome, joinRuns, waitCancelled } from "./wait.ts";
 import { shutdownAcpCoordinator } from "./acp/instance.js";
@@ -46,7 +46,7 @@ import type { SettingsRow } from "./ui/settings-panel.ts";
 import { FULLSCREEN } from "./ui/overlay.ts";
 import { AGENT_DIR, SETTINGS_PATH } from "./agent-dir.ts";
 import {
-	acknowledge, activeWriter, activityOf, admit, progressAt, allowlist, finishedNotice, PI_BUILTIN_TOOLS, notify, PiBackend, type PiCall, type PiRunSpec, cancelRun, capacityError, changed, CHILD_SETTLED_PROMPT, childOwner, closeOwner, closingChildren, DEFAULT_TIMEOUT_MS, departed, finalResult, findDeparted, FORK_BRIDGE, harvest, inFlight, listeners, maxDepth, noticeKey, ownedRuns, type Owner, ownerPath, pointerDir, publish, recordedView, redeliver, restoreRun, resultText, type Run, runRecordPaths, runs, saveRun, state, summary, TRUST_UNKNOWN, view, type WaitRow,
+	acknowledge, activeWriter, activityOf, admit, progressAt, allowlist, finishedNotice, PI_BUILTIN_TOOLS, notify, PiBackend, type PiCall, type PiRunSpec, cancelRun, cancelText, capacityError, changed, CHILD_SETTLED_PROMPT, childOwner, closeOwner, closingChildren, DEFAULT_TIMEOUT_MS, departed, finalResult, findDeparted, FORK_BRIDGE, harvest, inFlight, listeners, maxDepth, noticeKey, ownedRuns, type Owner, ownerPath, pointerDir, publish, recordedView, redeliver, restoreRun, resultText, type Run, runRecordPaths, runs, saveRun, state, summary, TRUST_UNKNOWN, view, type WaitRow,
 } from "./pi-backend.ts";
 
 export { AGENT_DIR };
@@ -1417,7 +1417,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			const run = p.runId ? runs.get(p.runId) : undefined;
 			if (!run || run.ownerKey !== owner.key) return failed(new DelegateError("RUN_NOT_FOUND", `unknown runId ${p.runId ?? "(none)"}; known: ${knownRuns(owner)}`, "runId"));
 			// The pi backend's capability report decides what it cannot do; that fails, it never becomes another action.
-			const capability = requireAction(PI_CAPABILITIES, p.action as LifecycleAction);
+			const capability = requireAction(run.runtime === "oven" ? OVEN_CAPABILITIES : PI_CAPABILITIES, p.action as LifecycleAction);
 			if (!capability.ok) return failed(new DelegateError(capability.error.code, capability.error.message));
 
 			switch (p.action) {
@@ -1428,7 +1428,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 					return run.completion.settled ? finalResult(run) : { content: [{ type: "text", text: resultText(run) }], details: recordedView(run) };
 				case "cancel":
 					await piBackend.cancel(run.id, {});
-					return { content: [{ type: "text", text: `${run.id} stopped; automatic revival is disabled.` }], details: recordedView(run) };
+					return { content: [{ type: "text", text: cancelText(run) }], details: recordedView(run) };
 				case "steer": {
 					const request = unwrap(validateSteer({ backend: "pi" }, p as Record<string, unknown>));
 					const running = run.status === "running";
