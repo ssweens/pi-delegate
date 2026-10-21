@@ -11,7 +11,7 @@ import { STATUS_DOC, type MomStatus } from "./engine.ts";
 import { branchIds, extractEvents, LiveFeed } from "./feed.ts";
 import { readGraph } from "./mother.ts";
 import { encodeRequest, type FindingRequest, type MomRequest } from "./operation.ts";
-import { OVEN_EXPIRES, oven, ovenHealth, ovenSliceUrl, OvenUnreachable, requireExpiry } from "./oven.ts";
+import { OVEN_EXPIRES, oven, ovenHeartbeat, ovenHealth, ovenSliceUrl, OvenUnreachable, requireExpiry } from "./oven.ts";
 import type { PanelDiagnostics, PanelView } from "../ui/panel.ts";
 import { feedbackApplies, type FindingAction, type ProcessRiskClass } from "./process-health.ts";
 import { coverageProgress, presentGraph, summaryText, type WorkView } from "../ui/presentation.ts";
@@ -100,6 +100,8 @@ export class MomClient {
 	#openingError?: string;
 	#closed = false;
 	#watch = new AbortController();
+	/** Renews its slice while this session lives; cleared at close. */
+	#beat?: ReturnType<typeof setInterval>;
 	/** Wakes the follow loop when a paused Path resumes (or the client closes). */
 	#resume?: () => void;
 	#steps = 0;
@@ -154,6 +156,11 @@ export class MomClient {
 	async connect(): Promise<void> {
 		await this.reload();
 		await this.ensure();
+		this.#beat ??= setInterval(() => {
+			// A failed beat is nothing to show: the watch and the next beat renew it, and an expired slice is ensure's to remake.
+			if (!this.#closed && this.slice) void oven("expires", { slice: this.slice.id }).catch(() => {});
+		}, ovenHeartbeat.everyMs);
+		this.#beat.unref?.();
 		void this.follow();
 	}
 
@@ -663,7 +670,15 @@ export class MomClient {
 	}
 
 	/** Stop following it. Its slice keeps following the session in oven. */
-	close(): void { this.#closed = true; this.#watch.abort(); this.#resume?.(); }
+	close(): void { this.#closed = true; clearInterval(this.#beat); this.#beat = undefined; this.#watch.abort(); this.#resume?.(); }
+
+	/** This session ended: stop following, then halt and stop its own slice (by id, never by a search) so Oven retires it now, not an hour on. */
+	async end(): Promise<void> {
+		const id = this.slice?.id;
+		this.close();
+		this.slice = undefined;
+		if (id) await this.stopSlice(this.sliceKey(this.trailMode), id).catch(() => {});
+	}
 
 	/** Pausing ends its slice: halt what runs, stop it, and let Oven retire it. Also finds a slice left by an earlier client. */
 	private async release(): Promise<void> {

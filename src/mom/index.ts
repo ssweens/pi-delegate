@@ -145,8 +145,10 @@ export function installMom(pi: ExtensionAPI) {
 	pi.on("session_start", (_event, context) => reset(context));
 	// A new branch: its work on the old one is stopped in oven, and it follows the selected branch.
 	pi.on("session_tree", (_event, context) => { void client?.halt(); reset(context); });
-	pi.on("session_shutdown", () => { rebuilding?.abort.abort(new Error("Path session ended.")); rebuilding = undefined;
-		epoch++; client?.close(); client = undefined; activity.clearMom(); ctx = undefined; });
+	// A reload keeps the session, so its slice stays; any other end retires this session's own Path slice.
+	pi.on("session_shutdown", async (event) => { rebuilding?.abort.abort(new Error("Path session ended.")); rebuilding = undefined;
+		const ended = client; epoch++; client = undefined; activity.clearMom(); ctx = undefined;
+		if (event.reason === "reload") ended?.close(); else await ended?.end(); });
 	// Its hints: the continuity anchor it prepared after a compaction goes into the lead's context once, and in
 	// trail mode its standing (where we are) follows whenever it changed since the last one sent.
 	pi.on("before_agent_start", (started, context) => {

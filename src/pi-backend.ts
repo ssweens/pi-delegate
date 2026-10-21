@@ -17,7 +17,7 @@ import { type AcpRunView, type BackendCapabilities, type CancelRequest, type Clo
 import { RunCompletion } from "./completion.js";
 import { readDelegateSettings } from "./delegate-settings.ts";
 import type { LiveSource } from "./inspector.js";
-import { expiredEvent, OVEN_EXPIRES, ovenCall, requireExpiry, SliceExpired, SliceGone, type Settled, type SliceView } from "./oven.js";
+import { expiredEvent, OVEN_EXPIRES, ovenCall, ovenHeartbeat, requireExpiry, SliceExpired, SliceGone, type Settled, type SliceView } from "./oven.js";
 import type { TrustSource } from "./project-trust.js";
 import type { RunView } from "./render.js";
 import { droppedTools, toolAllowlist } from "./roles.js";
@@ -915,8 +915,7 @@ function tuiSecrets(run: Run): Record<string, string> | undefined {
 /** The watch call each oven run is following, so a cancel ends it. */
 const ovenWatches = new Map<string, AbortController>();
 
-/** How often oven runs renew their slices, well inside OVEN_EXPIRES. A test may shorten it before its first oven run. */
-export const ovenHeartbeat = { everyMs: 10 * 60_000 };
+export { ovenHeartbeat };
 let heartbeat: ReturnType<typeof setInterval> | undefined;
 /** The oven runs this process keeps alive: its own, with a slice, neither cancelled nor expired, running or settled. */
 const kept = (run: Run) => run.runtime === "oven" && !!run.sliceId && !run.foreign && !run.stopped && run.status !== "expired";

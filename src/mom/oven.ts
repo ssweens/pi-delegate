@@ -8,7 +8,7 @@ export class OvenUnreachable extends Error {
 	}
 }
 
-export { OVEN_EXPIRES, ovenUrl, ovenSliceUrl, requireExpiry } from "../oven.js";
+export { OVEN_EXPIRES, ovenHeartbeat, ovenUrl, ovenSliceUrl, requireExpiry } from "../oven.js";
 
 export async function oven<T = any>(tool: string, args: Record<string, unknown>, options: { onEvent?: (event: any) => void; signal?: AbortSignal } = {}): Promise<T> {
 	const url = ovenUrl();

@@ -44,6 +44,9 @@ export class OvenUnreachable extends Error {
  */
 export const OVEN_EXPIRES = { idle: "1h" } as const;
 
+/** How often a parent renews the slices it keeps (delegate runs, Path), well inside OVEN_EXPIRES. A test may shorten it before its first beat. */
+export const ovenHeartbeat = { everyMs: 10 * 60_000 };
+
 /** An oven older than slice expiry answered a create without the `expires` it was sent: its slices would never expire. */
 export class OvenIgnoresExpiry extends Error {
 	constructor(readonly url: string, readonly slice: string, message: string) {
