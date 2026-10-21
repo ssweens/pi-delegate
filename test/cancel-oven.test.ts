@@ -38,14 +38,65 @@ function ovenRun(id: string, extra: Partial<Run> = {}) {
 	return run;
 }
 
-test("cancel of a preparing oven run sends oven_halt with its slice id, and says stopped only on oven's confirmation", async (t) => {
-	const oven = await stubOven((tool) => tool === "halt" ? { id: "s-prep", state: "stopped" } : {});
+const TUI_HALT = { kind: "tui", state: "running", status: { state: "working" }, process: { state: "running", pid: 1 } };
+const TUI_STOP = { kind: "tui", state: "stopped", status: { state: "" }, process: { state: "exited" } };
+
+test("cancel of a durable slice halted to idle sends oven_halt with its slice id and says stopped", async (t) => {
+	const oven = await stubOven((tool) => tool === "halt" ? { id: "s-idle", state: "idle", stage: "idle" } : {});
+	t.after(() => { oven.close(); runs.delete("idle"); });
+	const run = ovenRun("idle", { sliceId: "s-idle" });
+	await cancelRun(run);
+	assert.deepEqual(oven.calls.map((c) => c.tool), ["halt"]);
+	assert.deepEqual(oven.calls[0].args, { slice: "s-idle" });
+	assert.equal(run.status, "cancelled");
+	assert.match(cancelText(run), /idle stopped; automatic revival is disabled/);
+});
+
+test("a tui cancel counts the halt as sent (its answer reads running) and says stopped on oven_stop's answer", async (t) => {
+	const oven = await stubOven((tool) => tool === "halt" ? TUI_HALT : tool === "stop" ? TUI_STOP : {});
+	t.after(() => { oven.close(); runs.delete("tui"); });
+	const run = ovenRun("tui", { sliceId: "s-tui", tui: "claude" } as unknown as Partial<Run>);
+	await cancelRun(run);
+	assert.deepEqual(oven.calls.map((c) => c.tool), ["halt", "stop"]);
+	assert.match(cancelText(run), /tui stopped; automatic revival is disabled/);
+});
+
+test("a tui cancel whose stop leaves the process running is not confirmed", async (t) => {
+	const oven = await stubOven((tool) => tool === "halt" ? TUI_HALT : { ...TUI_STOP, state: "running", process: { state: "running", pid: 1 } });
+	t.after(() => { oven.close(); runs.delete("tuib"); });
+	const run = ovenRun("tuib", { sliceId: "s-tui", tui: "claude" } as unknown as Partial<Run>);
+	await cancelRun(run);
+	assert.match(cancelText(run), /did not confirm the halt: oven answered the stop of slice s-tui with state running, process running/);
+});
+
+test("a preparing durable slice (halt answers running at copying) is followed by oven_stop, and confirmed only by its answer", async (t) => {
+	const oven = await stubOven((tool) => tool === "halt" ? { id: "s-prep", state: "running", stage: "copying" } : tool === "stop" ? { id: "s-prep", state: "stopped", stage: "copying" } : {});
 	t.after(() => { oven.close(); runs.delete("prep"); });
 	const run = ovenRun("prep", { sliceId: "s-prep" });
 	await cancelRun(run);
-	assert.deepEqual(oven.calls.filter((c) => c.tool === "halt"), [{ tool: "halt", args: { slice: "s-prep" } }]);
-	assert.equal(run.status, "cancelled");
-	assert.match(cancelText(run), /prep stopped; automatic revival is disabled/);
+	assert.deepEqual(oven.calls.map((c) => [c.tool, c.args.slice]), [["halt", "s-prep"], ["stop", "s-prep"]]);
+	assert.match(cancelText(run), /prep stopped;/);
+});
+
+test("a preparing slice whose stop fails is reported, not hidden", async (t) => {
+	const oven = await stubOven((tool) => { if (tool === "stop") throw new Error("no such slice"); return { id: "s-prep", state: "running", stage: "starting" }; });
+	t.after(() => { oven.close(); runs.delete("prepf"); });
+	const run = ovenRun("prepf", { sliceId: "s-prep" });
+	await cancelRun(run);
+	assert.match(cancelText(run), /did not confirm the halt: stop failed: oven: no such slice/);
+});
+
+test("a durable halt answered running mid-turn is read again once; still running is unconfirmed, idle is confirmed", async (t) => {
+	let after = "running";
+	const oven = await stubOven((tool) => tool === "halt" ? { id: "s-r", state: "running", stage: "working" } : tool === "status" ? { id: "s-r", state: after, stage: after } : {});
+	t.after(() => { oven.close(); runs.delete("race"); });
+	const run = ovenRun("race", { sliceId: "s-r" });
+	await cancelRun(run);
+	assert.deepEqual(oven.calls.map((c) => c.tool), ["halt", "status"]);
+	assert.match(cancelText(run), /did not confirm the halt: oven answered the halt but still reports slice s-r running/);
+	after = "idle";
+	await cancelRun(run);
+	assert.match(cancelText(run), /race stopped;/);
 });
 
 test("a failing halt is reported by the cancel, not hidden", async (t) => {
@@ -58,20 +109,13 @@ test("a failing halt is reported by the cancel, not hidden", async (t) => {
 	assert.doesNotMatch(cancelText(run), /stopped;/);
 });
 
-test("a halt answered with the slice still running is not confirmed", async (t) => {
-	const oven = await stubOven((tool) => tool === "halt" ? { id: "s-run", state: "running", stage: "copying" } : {});
-	t.after(() => { oven.close(); runs.delete("still"); });
-	const run = ovenRun("still", { sliceId: "s-run" });
-	await cancelRun(run);
-	assert.match(cancelText(run), /did not confirm the halt: .*still reports slice s-run running \(stage copying\)/);
-});
-
 test("a cancel while oven_create has not answered halts the slice the moment its id arrives", async (t) => {
 	let release!: () => void;
 	const held = new Promise<void>((resolve) => { release = resolve; });
 	const oven = await stubOven(async (tool) => {
 		if (tool === "create") { await held; return { id: "s-late", state: "running", stage: "copying", turns: 0 }; }
-		if (tool === "halt") return { id: "s-late", state: "stopped" };
+		if (tool === "halt") return { id: "s-late", state: "running", stage: "copying" };
+		if (tool === "stop") return { id: "s-late", state: "stopped", stage: "copying" };
 		return {};
 	});
 	t.after(() => { oven.close(); runs.delete("late"); });
@@ -83,7 +127,7 @@ test("a cancel while oven_create has not answered halts the slice the moment its
 	assert.equal(oven.calls.some((c) => c.tool === "halt"), false, "no id yet, so no halt could be sent");
 	release();
 	await launched;
-	assert.deepEqual(oven.calls.filter((c) => c.tool === "halt"), [{ tool: "halt", args: { slice: "s-late" } }]);
+	assert.deepEqual(oven.calls.filter((c) => c.tool === "halt" || c.tool === "stop").map((c) => [c.tool, c.args.slice]), [["halt", "s-late"], ["stop", "s-late"]], "halt and stop, each once");
 	assert.equal(run.status, "cancelled");
 	assert.equal(run.haltNote, undefined, "the late halt was confirmed");
 });

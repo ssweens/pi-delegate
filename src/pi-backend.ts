@@ -903,24 +903,43 @@ export const cancelText = (run: Run) => run.haltNote
 	: `${run.id} stopped; automatic revival is disabled.`;
 
 /**
- * End an oven run's slice's work (oven_halt), whatever stage it is in; its conversation and copy stay in oven. A tui slice is
- * also stopped, so no idle TUI is left running; a steer wakes it on the same session. Oven's answer is checked: a failed
- * halt, or a slice still reported running, is kept in run.haltNote for the cancel's reply, never hidden.
+ * End an oven run's slice's work, whatever stage it is in; its conversation and copy stay in oven. Oven's real answers decide
+ * what is reported; a failure to confirm is kept in run.haltNote for the cancel's reply, never hidden.
+ * - tui: oven_halt only types the interrupt key and answers state "running" while the agent's status is still working, so
+ *   a halt without an error counts as sent. oven_stop then kills the agent (a steer wakes it on the same session), and its
+ *   answer is the confirmation: state "stopped" and a process no longer running.
+ * - durable: a halt answered idle or failed is confirmed. "running" at stage copying or starting is a preparing slice, which
+ *   oven's halt does not end; oven_stop marks it stopped (oven reports "stopped" over every other state), so it is followed by
+ *   a stop and confirmed only by that answer. Any other "running" is read again once (oven_status), because an aborted turn
+ *   can read running for an instant; if it still runs, it is unconfirmed.
  */
 async function haltSlice(run: Run) {
 	ovenWatches.get(run.id)?.abort();
 	run.haltNote = undefined;
 	if (run.runtime !== "oven") return;
 	if (!run.sliceId) {
-		// Oven's create has not answered, so the slice id is unknown: launchOven halts the slice the moment it is told.
+		// Oven's create has not answered, so the slice id is unknown: launchOven/launchTui halt the slice the moment it is told.
 		if (run.status === "cancelled") run.haltNote = "oven has not yet returned this run's slice id, so no halt could be sent; it is halted when oven answers";
 		return;
 	}
-	try {
-		const view = await ovenCall<SliceView | undefined>("halt", { slice: run.sliceId });
-		if (view?.state === "running") run.haltNote = `oven answered the halt but still reports slice ${run.sliceId} running${view.stage ? ` (stage ${view.stage})` : ""}`;
-	} catch (error) { run.haltNote = errorMessage(error); }
-	if (run.tui) await ovenCall("stop", { slice: run.sliceId }).catch((error) => { run.haltNote ??= `stop failed: ${errorMessage(error)}`; });
+	const slice = run.sliceId;
+	const stopped = async () => {
+		try {
+			const view = await ovenCall<any>("stop", { slice });
+			if (view?.state !== "stopped" || (view.kind === "tui" && view.process?.state === "running")) run.haltNote = `oven answered the stop of slice ${slice} with state ${view?.state}${view?.process?.state ? `, process ${view.process.state}` : ""}`;
+		} catch (error) { run.haltNote = `stop failed: ${errorMessage(error)}`; }
+	};
+	let view: any;
+	try { view = await ovenCall<any>("halt", { slice }); }
+	catch (error) {
+		run.haltNote = errorMessage(error);
+		if (run.tui) await ovenCall("stop", { slice }).catch(() => {});
+		return;
+	}
+	if (run.tui) { await stopped(); return; }
+	if (view?.state === "running" && (view.stage === "copying" || view.stage === "starting")) { await stopped(); return; }
+	if (view?.state === "running") view = await ovenCall<any>("status", { slice }).catch(() => view);
+	if (view?.state === "running") run.haltNote = `oven answered the halt but still reports slice ${slice} running${view.stage ? ` (stage ${view.stage})` : ""}`;
 }
 
 /** The values of a tui run's declared secrets, from this process's environment; oven keeps them out of argv and records. */
@@ -1102,7 +1121,7 @@ export async function launchOven(run: Run, task: string) {
 			const created = await ovenCall<SliceView>("create", { config, task, cwd: run.cwd, requestId: `pi-delegate:${run.id}`, expires: OVEN_EXPIRES });
 			run.sliceId = created.id;
 			saveRun(run);
-			// Cancelled while oven was still creating (copying): halt the slice now that its id is known.
+			// Cancelled while oven was still creating (copying): halt the slice now that its id is known. This is the only halt for such a run (cancelRun's found no id), and nothing runs between the assignment above and this check.
 			if (run.stopped) { await haltSlice(run); finish(run, run.status); return; }
 			await requireExpiry(created, ovenCall, () => forgetSlice(run));
 			if (created.state === "failed") { finish(run, "error", failure(created)); return; }
