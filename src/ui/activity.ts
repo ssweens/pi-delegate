@@ -1,8 +1,8 @@
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, type Focusable, type TUI, type TuiMouseEvent, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
-import { AgentsPanel, type LiveSource } from "../inspector.js";
-import { frame, withLegend } from "../render.js";
-import { renderTodoSectionLines } from "../todo-render.js";
+import { AgentsPanel, isCurrentAgent, type LiveSource } from "../inspector.js";
+import { frame, runTitle, statusMark, withLegend } from "../render.js";
+import { renderTodoOverviewLines, renderTodoSectionLines } from "../todo-render.js";
 import type { TodoState } from "../todo.js";
 import { COMPACT_KEY, FOCUS_KEY, momSectionLines, type PanelView } from "./panel.ts";
 import { agentListHint, chordLabel, hint, joinHints } from "./hints.ts";
@@ -39,7 +39,7 @@ export function renderActivityLines(sections: readonly (readonly string[])[], th
 	}
 	if (!body.length) return [];
 	const lines = frame("Activity", body, "borderAccent", theme, outer);
-	return withLegend(lines, focused ? agentListHint() : joinHints(hint.left("agents"), `${chordLabel(FOCUS_KEY)} Path`, `${chordLabel(COMPACT_KEY)} compact`), "borderAccent", theme, outer);
+	return withLegend(lines, focused ? agentListHint() : joinHints(hint.left("agents"), `${chordLabel(FOCUS_KEY)} Activity`, `${chordLabel(COMPACT_KEY)} compact`), "borderAccent", theme, outer);
 }
 
 /** The widget is the focus target; AgentsPanel remains the section renderer and input delegate. */
@@ -67,6 +67,7 @@ export class ActivityCoordinator {
 	private openChild?: (id: string) => Promise<void>;
 	private todos?: TodoState;
 	private recap?: string;
+	private overviewRecap?: string;
 	private compact = Reflect.get(globalThis, COMPACT_STATE) === true;
 	private mom?: () => PanelView;
 	private panel?: AgentsPanel;
@@ -110,7 +111,13 @@ export class ActivityCoordinator {
 
 	setRecap(recap: string | undefined): void {
 		this.recap = recap;
+		if (recap !== undefined) this.overviewRecap = recap;
 		this.tui?.requestRender();
+	}
+
+	resetRecap(): void {
+		this.overviewRecap = undefined;
+		this.setRecap(undefined);
 	}
 
 	setCompact(compact: boolean): void {
@@ -139,6 +146,24 @@ export class ActivityCoordinator {
 		if (!on && this.spinner) { clearInterval(this.spinner); this.spinner = undefined; }
 	}
 
+	renderOverview(theme: Theme, width: number): string[] {
+		const inner = Math.max(1, Math.floor(width) - 4);
+		const heading = (text: string) => theme.bold(theme.fg("accent", text));
+		const lines = [heading("Agents")];
+		const runs = this.live?.all().filter(run => isCurrentAgent(run, this.settledBefore)) ?? [];
+		for (const run of runs) {
+			const { color, glyph } = statusMark(run);
+			const indent = "  ".repeat(Math.max(0, (run.depth ?? 1) - 1));
+			lines.push(...wrapTextWithAnsi(`${indent}${theme.fg(color, glyph)} ${runTitle(run)} · ${run.status} · depth ${run.depth ?? 1}`, inner));
+		}
+		if (!runs.length) lines.push(theme.fg("muted", "No current agents."));
+		lines.push("", ...renderTodoOverviewLines(this.todos, theme, width), "");
+		const mom = this.mom?.();
+		lines.push(...(mom ? momSectionLines(mom, theme, width, false) : [heading("Path"), theme.fg("muted", "Path is unavailable.")]));
+		lines.push("", heading("Recap"), ...wrapTextWithAnsi(this.overviewRecap || "No recap yet.", inner));
+		return lines;
+	}
+
 	focusAgents(): void {
 		this.panel?.focus();
 	}
@@ -160,6 +185,7 @@ export class ActivityCoordinator {
 		this.panel = undefined;
 		this.widget = undefined;
 		this.recap = undefined;
+		this.overviewRecap = undefined;
 		this.setCompact(false);
 		if (this.tui && this.clearOnShrink !== undefined) this.tui.setClearOnShrink(this.clearOnShrink);
 		this.clearOnShrink = undefined;

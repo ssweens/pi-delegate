@@ -197,6 +197,7 @@ export function installRecap(pi: ExtensionAPI, activity: ActivityCoordinator, so
 
 	const reset = (ctx: ExtensionContext) => {
 		invalidate();
+		activity.resetRecap();
 		context = ctx;
 		userTurnCount = countUserTurns(ctx);
 		recapCount = restoreRecapCount(ctx);

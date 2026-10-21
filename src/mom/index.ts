@@ -6,7 +6,6 @@ import { MomClient, TRAIL_STANDING, type Command, type SourcePage, type TrailOpt
 import { pathRows } from "./settings.ts";
 import { SettingsPanel } from "../ui/settings-panel.ts";
 import { FULLSCREEN } from "../ui/overlay.ts";
-import { chordLabel } from "../ui/hints.ts";
 import { ANCHOR } from "./anchor.ts";
 import type { FindingRequest } from "./operation.ts";
 import { COMPACT_KEY, FOCUS_KEY, MomView, momToolPreview, type PanelDiagnostics, type PanelView } from "../ui/panel.ts";
@@ -170,7 +169,7 @@ export function installMom(pi: ExtensionAPI) {
 		const saved = client?.snapshot?.diagnostics ?? { sections: [], raw: "{}" }, error = client?.error ?? readError;
 		return error ? { ...saved, sections: [...saved.sections, { title: "Last problem", text: updateErrorSummary(error) }] } : saved;
 	}
-	async function open(context: ExtensionContext) {
+	async function open(context: ExtensionContext, activityTab = false) {
 		if (context.mode !== "tui") {
 			const error = view(true).error;
 			context.ui.notify(`${error ? `What happened: ${error}\n\n` : ""}${cached()}`, "info"); return;
@@ -179,6 +178,7 @@ export function installMom(pi: ExtensionAPI) {
 		viewOpen = true; const held = heldWidget = structuredClone(view(false, false));
 		try {
 			await context.ui.custom<void>((tui, theme, _keys, done) => { closeView = () => done(); return momView = new MomView({
+				activity: activityTab ? width => activity.renderOverview(theme, width) : undefined,
 				view: () => view(true, false), trail: () => client?.trail, findingAction, copy: copyToClipboard, diagnostics,
 				refresh: async () => { const before = client?.snapshot?.passive.trail?.count ?? 0; await request({ kind: "refresh" });
 					const done = outcome(before, refreshed); if (done.error) throw new Error(done.error); return `${done.text[0]!.toUpperCase()}${done.text.slice(1)}`; },
@@ -193,7 +193,7 @@ export function installMom(pi: ExtensionAPI) {
 				draftForLead: text => { const draft = context.ui.getEditorText(); context.ui.setEditorText(`${draft}${draft ? "\n\n" : ""}${text}`); },
 				prepareLeadDraft: async finding => { await findingAction("discuss", finding); const draft = context.ui.getEditorText();
 					context.ui.setEditorText(`${draft}${draft ? "\n\n" : ""}Path suggested: ${finding}\nLet's discuss this before acting.`); },
-			}, theme, tui, () => done()); },
+			}, theme, tui, () => done(), activityTab ? "Activity" : "Overview"); },
 			FULLSCREEN);
 		} catch (error) { context.ui.notify(`Cannot open Path: ${String(error)}`, "error"); }
 		finally { if (heldWidget === held) { momView = undefined; viewOpen = false; closeView = undefined; heldWidget = undefined; sync(); } }
@@ -250,7 +250,7 @@ export function installMom(pi: ExtensionAPI) {
 		if (!client?.snapshot?.controls) throw new Error(readError ?? "Path is not connected.");
 		await context.ui.custom<void>((tui, _theme, _keys, done) => settingsPanel(context, tui, () => done())!);
 	}
-	pi.registerShortcut(FOCUS_KEY, { description: `Open Path's view (Esc or ${chordLabel(FOCUS_KEY)} returns)`, handler: open });
+	pi.registerShortcut(FOCUS_KEY, { description: "Open Activity in the Path tabs", handler: async context => { await open(context, true); } });
 	pi.registerShortcut(COMPACT_KEY, { description: "Toggle the Activity widget between full and compact", handler: async context => { ctx = context; toggleCompact(); } });
 	const TRAIL_DESCRIPTION = "Read Path's trail: where we are and the waypoints into the transcript. query finds where a line landed; before shows what we were doing before the last detour; open lists unfinished steps and questions; evolution shows how the goal changed.";
 	pi.registerTool({ name: "path", label: "Path", description: "Read Path's saved story map, its trail, selected records, or original evidence without a model call. The widget already shows your current place; use this for more detail. Read-only: working agents never maintain Path's notes. Choose at most one of graph, source, trail.",

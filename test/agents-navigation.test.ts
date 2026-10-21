@@ -64,6 +64,26 @@ test("← at the very start of the draft enters the agents list; anywhere else i
 	panel.dispose();
 });
 
+test("Kitty releases do not change Agents focus or selection", async () => {
+	const opened: string[] = [];
+	const { tui, press, focused, editorComponent } = fakeTui({ text: "draft", cursor: { line: 0, col: 0 } });
+	const panel = new AgentsPanel(source([run("a"), run("b"), run("c")]), theme, tui, async id => { opened.push(id); });
+	press("\x1b[1;1:1D");
+	assert.equal(focused(), panel);
+	press("\x1b[1;1:3D");
+	assert.equal(focused(), panel, "Left release keeps focus");
+	press("\x1b[1;1:1B"); press("\x1b[1;1:3B"); press(RIGHT);
+	assert.deepEqual(opened, ["b"], "Down release does not move selection twice");
+	await new Promise(resolve => setImmediate(resolve));
+	press("\x1b[106;5:3u");
+	assert.equal(focused(), panel, "Ctrl+J release does not toggle focus");
+	press(LEFT);
+	assert.equal(focused(), editorComponent, "deliberate Left still returns");
+	press("\x1b[106;5:3u");
+	assert.equal(focused(), editorComponent, "Ctrl+J release stays in the editor");
+	panel.dispose();
+});
+
 test("→ opens the selected child, and the list keeps focus when the child view closes", async () => {
 	const opened: string[] = [];
 	const { tui, press, focused } = fakeTui({ text: "", cursor: { line: 0, col: 0 } });

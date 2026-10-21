@@ -34,6 +34,7 @@ export interface WorkspaceStatus {
 }
 export interface PanelSource {
 	view(): PanelView;
+	activity?(width: number): string[];
 	diagnostics?(): PanelDiagnostics;
 	copy?(text: string): Promise<void>;
 	findingAction?(action: FindingDisposition, finding: string): void | Promise<void>;
@@ -62,8 +63,9 @@ const trailWidgetRows = (view: PanelView, theme: Theme, width: number) => trailR
  * worked in an enhanced-keyboard terminal while F1 and F2 did not.
  */
 const KITTY_FUNCTION_KEYS: Record<string, string> = { f1: "P", f2: "Q", f3: "R", f4: "S" };
-export function functionKey(data: string, key: "f1" | "f2" | "f3" | "f4"): boolean {
+export function functionKey(data: string, key: "f1" | "f2" | "f3" | "f4" | "f5"): boolean {
 	if (matchesKey(data, key)) return true;
+	if (key === "f5") return /^\x1b\[15(?:;\d+(?::[12])?)?~$/.test(data);
 	const final = KITTY_FUNCTION_KEYS[key];
 	return data === `\x1b[${final}` || new RegExp(`^\\x1b\\[1;\\d+(?::\\d+)?${final}$`).test(data);
 }
@@ -275,7 +277,7 @@ export function widgetLines(view: PanelView, theme: Theme, width: number): strin
 	if (view.compact) return section.slice(1);
 	// Like focused Agents, the accent border: borderMuted can disappear on the terminal background.
 	return withLegend(frame(section[0]!, section.slice(1), "borderAccent", theme, w, { truncate: true }),
-		joinHints(`${chordLabel(FOCUS_KEY)} Path`, `${chordLabel(COMPACT_KEY)} compact`, "/path"), "borderAccent", theme, w);
+		joinHints(`${chordLabel(FOCUS_KEY)} Activity`, `${chordLabel(COMPACT_KEY)} compact`, "/path"), "borderAccent", theme, w);
 }
 
 /** One line: freshness, then the current endeavor with its open and waiting counts. */
@@ -314,7 +316,7 @@ export class MomView implements Component {
 	private diagnostics?: PanelDiagnostics;
 	private status?: WorkspaceStatus;
 	private headerSignature = "";
-	private tab: "Overview" | "Map" | "Status" | "Settings" = "Overview";
+	private tab: "Overview" | "Map" | "Status" | "Settings" | "Activity";
 	private settingsPanel?: Component;
 	private browser: GraphBrowser;
 	private trailBrowser: TrailBrowser;
@@ -327,7 +329,8 @@ export class MomView implements Component {
 	private pendingAction = false;
 	private raw = false;
 
-	constructor(private source: PanelSource, private theme: Theme, private tui: TUI, private done: () => void) {
+	constructor(private source: PanelSource, private theme: Theme, private tui: TUI, private done: () => void, initialTab: "Overview" | "Activity" = "Overview") {
+		this.tab = initialTab === "Activity" && source.activity ? "Activity" : "Overview";
 		this.snapshot = structuredClone(source.view());
 		this.diagnostics = structuredClone(source.diagnostics?.());
 		this.status = structuredClone(source.status?.());
@@ -380,8 +383,8 @@ export class MomView implements Component {
 	}
 
 	handleInput(data: string): void {
-		for (const [key, tab] of ([["f1", "Overview"], ["f2", "Map"], ["f3", "Status"], ["f4", "Settings"]] as const)) {
-			if (functionKey(data, key)) { this.switchTab(tab); this.tui.requestRender(); return; }
+		for (const [key, tab] of ([["f1", "Overview"], ["f2", "Map"], ["f3", "Status"], ["f4", "Settings"], ["f5", "Activity"]] as const)) {
+			if ((tab !== "Activity" || this.source.activity) && functionKey(data, key)) { this.switchTab(tab); this.tui.requestRender(); return; }
 		}
 		// Settings has type-to-search: every other key is its own.
 		if (this.tab === "Settings") { this.settingsPanel?.handleInput?.(data); this.tui.requestRender(); return; }
@@ -511,6 +514,7 @@ export class MomView implements Component {
 		const view = this.snapshot;
 		const wrap = (text: string) => wrapTextWithAnsi(text, Math.max(1, width)).map(line => fit(line, width));
 		const lines: string[] = [];
+		if (this.tab === "Activity") return this.source.activity?.(width) ?? [];
 		if (this.tab === "Settings") return (this.settingsPanel?.render(width) ?? wrap("Path is not connected; settings are unavailable."));
 		if (this.tab === "Map") return (this.trailMode && this.mapPane !== "source" ? this.trailBrowser.render(this.theme, width, Number.MAX_SAFE_INTEGER, this.slot()) : this.mapDetails()).flatMap(wrap);
 		if (this.tab === "Status") {
@@ -601,7 +605,7 @@ export class MomView implements Component {
 		const divider = this.theme.fg("dim", " │ ");
 		const status = this.source.status?.();
 		const heading = this.theme.bold(this.theme.fg("accent", "Path")) + this.theme.fg("dim", ` · ${this.tab === "Status" ? "diagnostics" : this.snapshot.status}`);
-		const tabs = (["Overview", "Map", "Status", "Settings"] as const).map((tab, index) => tab === this.tab
+		const tabs = (["Overview", "Map", "Status", "Settings", ...(this.source.activity ? ["Activity" as const] : [])] as const).map((tab, index) => tab === this.tab
 			? this.theme.bg("selectedBg", this.theme.bold(this.theme.fg("accent", ` F${index + 1} ${tab === "Map" ? this.mapLabel : tab} `))) : ` F${index + 1} ${tab === "Map" ? this.mapLabel : tab} `);
 		const header = [fit(heading + (status ? ` · ${status.project.split("/").at(-1)} · ${status.connection}` : ""), w),
 			...(status?.telemetry ? [fit(`${status.telemetry.model} · ${status.telemetry.activity}${status.host ? ` · PID ${status.host.pid}` : ""}`, w)] : []),
@@ -611,7 +615,7 @@ export class MomView implements Component {
 		const navigation = this.tab === "Map" && this.trailMode ? (this.mapPane === "tree" ? joinHints(hint.move("move"), hint.enter("show in transcript")) : joinHints("[ ] source", "N/B page", hint.cancel("trail")))
 			: this.tab === "Map" ? joinHints(this.mapPane === "tree" && hint.move("select"), this.mapPane === "tree" && hint.enter("inspect"), "S source", "D draft")
 			: this.tab === "Status" ? joinHints("V raw", !this.trailMode && this.source.rebuild && "B rebuild map")
-				: this.tab === "Settings" ? "F1–F3 other tabs" : "";
+				: this.tab === "Settings" ? (this.source.activity ? "F1–F3 / F5 other tabs" : "F1–F3 other tabs") : this.tab === "Activity" ? "Home/End" : "";
 		const footer = [
 			...(this.notice ? [fit(this.theme.fg("dim", this.notice), w)] : []),
 			...(this.snapshot.note && (this.source.findingAction || this.source.prepareLeadDraft)

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { mock, test } from "node:test";
 import piRecap from "../src/recap.ts";
+import { ActivityCoordinator } from "../src/ui/activity.ts";
 import { deferred } from "./capture.ts";
 
 const text = (value: string) => [{ type: "text" as const, text: value }];
@@ -33,12 +34,15 @@ function fixture(responseText: string, priorRecapCounts: number[] = [], draft = 
 	const requests: any[] = [];
 	let idle = true, pending = false;
 	let reply = Promise.resolve({ stopReason: "stop", content: text(responseText) });
-	let terminalInput: (() => void) | undefined;
+	let terminalInput: ((data: string) => void) | undefined;
+	const activity = new ActivityCoordinator();
+	const setRecap = activity.setRecap.bind(activity);
+	activity.setRecap = value => { recaps.push(value); setRecap(value); };
 	piRecap({
 		on(name: string, handler: any) { handlers.set(name, handler); },
 		appendEntry() {},
 		registerCommand(name: string, command: any) { commands.set(name, command); },
-	} as any, { setRecap(value: string | undefined) { recaps.push(value); } } as any, sources);
+	} as any, activity, sources);
 	const ctx = {
 		model: { provider: "fixture", id: "fixture" },
 		mode: "tui", hasUI: true,
@@ -53,7 +57,7 @@ function fixture(responseText: string, priorRecapCounts: number[] = [], draft = 
 		},
 		ui: {
 			setWidget() {},
-			onTerminalInput(handler: () => void) { terminalInput = handler; return () => { terminalInput = undefined; }; },
+			onTerminalInput(handler: (data: string) => void) { terminalInput = handler; return () => { terminalInput = undefined; }; },
 			getEditorText: () => draft,
 			notify(message: string, kind: string) { notices.push({ message, kind }); },
 		},
@@ -66,12 +70,12 @@ function fixture(responseText: string, priorRecapCounts: number[] = [], draft = 
 		agentEnd: () => handlers.get("agent_end")?.({}, ctx),
 		settle: () => { idle = false; handlers.get("agent_end")?.({}, ctx); idle = true; return handlers.get("agent_settled")?.({}, ctx); },
 		fire: (name: string, event: unknown = {}) => handlers.get(name)?.(event, ctx),
-		key: () => terminalInput?.(),
+		key: (data = "x") => terminalInput?.(data),
 		setDraft: (value: string) => { draft = value; },
 		setIdle: (value: boolean) => { idle = value; },
 		setPending: (value: boolean) => { pending = value; },
 		hold: () => { const gate = deferred<any>(); reply = gate.promise; return () => gate.resolve({ stopReason: "stop", content: text(responseText) }); },
-		entries, recaps, notices, requests,
+		entries, recaps, notices, requests, activity,
 	};
 }
 
@@ -230,6 +234,25 @@ test("recap clips only an oversized exchange and omits previous recaps", async (
 	assert.match(packet, /NEXT-ACTION/);
 	assert.match(packet, /middle omitted/);
 	assert.doesNotMatch(packet, /OLD-RECAP/);
+});
+
+test("session lifecycle clears retained recap while ordinary terminal keys preserve it", async () => {
+	const theme = { fg: (_c: string, s: string) => s, bold: (s: string) => s } as any;
+	for (const event of ["session_tree", "session_start"]) {
+		const run = fixture("BRANCH-RECAP");
+		run.start();
+		await run.run();
+		for (const key of ["\u001b[A", "\u001b[B", "\u001b[6~", "\u001b[H"]) {
+			run.key(key);
+			assert.match(run.activity.renderOverview(theme, 80).join("\n"), /BRANCH-RECAP/, `${event}: ${JSON.stringify(key)}`);
+		}
+		run.fire(event);
+		const screen = run.activity.renderOverview(theme, 80).join("\n");
+		assert.doesNotMatch(screen, /BRANCH-RECAP/, event);
+		assert.match(screen, /No recap yet\./, event);
+		run.fire("session_shutdown");
+		run.activity.dispose();
+	}
 });
 
 test("input, new work and session changes abort an in-flight recap without publishing it", async () => {

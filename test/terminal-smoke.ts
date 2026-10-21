@@ -110,6 +110,47 @@ try {
 		key("Escape"); await expect(/Path settings/, true);
 		await command("/fixture-spawn Native detail");
 		await expect(/Agents.*1 active/);
+		await command("/fixture-activity");
+		text("\x1b[106;6u");
+		await expect(/F5 Activity/);
+		for (const label of [/F1 Overview/, /F2 Trail/, /F3 Status/, /F4 Settings/, /F5 Activity/]) assert.match(capture(), label);
+		save(`${mode}-activity-tabs`);
+		key("F1"); await expect(/Current work/); assert.match(capture(), /Terminal verification/); save(`${mode}-tab-overview`);
+		key("F2"); await expect(/Trail held steady/); assert.match(capture(), /Verify the original Path tabs/); save(`${mode}-tab-trail`);
+		key("F3"); await expect(/Raw records/); assert.match(capture(), /Ranges awaiting review/); save(`${mode}-tab-status`);
+		key("F4"); await expect(/Background tracking/);
+		key("Enter"); await expect(/Background tracking: off/);
+		key("Enter"); await expect(/Background tracking: on/); save(`${mode}-tab-settings`);
+		key("F5"); await expect(/Home\/End/);
+		key("F1"); await expect(/Current work/);
+		text("\x1b[15;1:1~"); await expect(/Home\/End/); save(`${mode}-tab-kitty-f5`);
+		assert.match(capture(), /Agents/);
+		assert.match(capture(), /Native detail.*running/);
+		for (const status of ["completed", "abandoned", "pending", "in_progress", "blocked"]) assert.match(capture(), new RegExp(`\\[${status}\\]`));
+		assert.match(capture(), /Empty phase/);
+		assert.match(capture(), /No tasks/);
+		assert.match(capture(), /BLOCKER-END/);
+		save(`${mode}-activity-top`);
+		key("NPage"); await sleep(100); save(`${mode}-activity-page`);
+		key("End"); await expect(/RECAP-END/);
+		assert.match(capture(), /Overview task 24/);
+		assert.match(capture(), /Path/);
+		save(`${mode}-activity-end`);
+		tmux("resize-window", "-t", "pi", "-x", "54", "-y", "20");
+		await sleep(150); key("End"); await expect(/RECAP-END/); save(`${mode}-activity-resize`);
+		key("Home"); await expect(/Completed-only task/);
+		key("Escape"); await expect(/OVERVIEW-PARENT-DRAFT/);
+		tmux("resize-window", "-t", "pi", "-x", "110", "-y", "36");
+		key("C-u"); await command("/path"); await expect(/F1.*Overview/);
+		assert.doesNotMatch(capture(), /Completed-only task|Full recap detail/);
+		save(`${mode}-path-only`); key("Escape");
+		text("\x1b[106;6u"); await expect(/Home\/End/);
+		key("End"); text("!"); await expect(/LIVE-RECAP-END/);
+		assert.match(capture(), /\[completed\] LIVE-COMPLETED-TASK/);
+		assert.match(capture(), /Live empty phase/);
+		save(`${mode}-activity-live-completed`);
+		text("\x1b[106;6u"); await expect(/Home\/End/, true);
+		await command("/fixture-activity clear");
 		text("PARENT-DRAFT"); key("C-j"); key("Enter");
 		await expect(/^\s+OUTPUT-30\s*$/m); save(`${mode}-collapsed-live`);
 		assert.doesNotMatch(capture(), /"command":|"path":/);
@@ -125,7 +166,10 @@ try {
 		text("CHILD-DRAFT"); key("Escape"); await expect(/PARENT-DRAFT/); await expect(/→ open · ← editor/);
 		key("Left"); await expect(/← agents · /);
 		// Ctrl+A, not Home: fullscreen mode gives Home to the transcript.
-		key("C-a"); key("Left"); await expect(/→ open · ← editor/);
+		key("C-a"); text("\x1b[1;1:1D"); text("\x1b[1;1:3D");
+		await expect(/→ open · ← editor/); await sleep(800);
+		assert.match(capture(), /→ open · ← editor/, "Kitty Left release must not leave Agents");
+		save(`${mode}-agents-kitty-release`);
 		key("Right"); await expect(/CHILD-DRAFT/); key("C-u");
 		writeFileSync(release, "release");
 		await expect(/Streaming line 35/); save(`${mode}-streaming-latest`);
@@ -216,7 +260,7 @@ try {
 		assert.equal(new Set(outcomes.map((e) => e.details.sessionFile)).size, 1);
 	}
 	assert.deepEqual(api.errors, []);
-	console.log(`PASS real Pi regular/fullscreen: bounded recap input, visible recap, cancellation on return, clean startup, native collapsed/expanded tools, streaming latest, paused scrolling, narrow resize, drafts, same-ID revival, hidden finished frame.\nEvidence: ${box.root}`);
+	console.log(`PASS real Pi regular/fullscreen: all five original/Activity tabs, Settings row saves, standard/Kitty F5, full Activity overview, complete todo states/blockers, scroll/end/resize, live completed-only redraw, preserved draft, Path-only command, Kitty key-release focus, bounded recap input, visible recap, cancellation on return, clean startup, native collapsed/expanded tools, streaming latest, paused scrolling, narrow resize, drafts, same-ID revival, hidden finished frame.\nEvidence: ${box.root}`);
 } catch (error) {
 	try { save("failure"); } catch { /* process may already have exited */ }
 	console.error(`Evidence: ${box.root}`); throw error;

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { installMom } from "../src/mom/index.ts";
-import { FOCUS_KEY, MomView } from "../src/ui/panel.ts";
+import { functionKey, MomView } from "../src/ui/panel.ts";
 
 const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text, bg: (_color: string, text: string) => text, dim: (text: string) => text };
 
@@ -110,6 +110,39 @@ test("Path's view: F4 holds the settings, O turns Path on or off, R runs the ref
 	view.handleInput("b");
 	assert.equal(rebuilds, 1);
 	view.dispose();
+});
+
+test("Activity extends the same tabs, stays live, scrolls, and is optional for Path", () => {
+	let revision = "first", closed = 0;
+	const terminal = { rows: 16, columns: 100 };
+	const source = {
+		view: () => ({ status: "up to date", summary: "ORIGINAL-OVERVIEW" }),
+		activity: () => [revision, ...Array.from({ length: 40 }, (_, i) => `TASK-${i}`), "ACTIVITY-END"],
+	};
+	const tui = { terminal, requestRender() {} } as any;
+	const view = new MomView(source, theme as any, tui, () => { closed++; }, "Activity");
+	for (const label of ["F1 Overview", "F2 Map", "F3 Status", "F4 Settings", "F5 Activity"]) assert.ok(plain(view.render(100)).includes(label));
+	assert.match(plain(view.render(100)), /first/);
+	revision = "live";
+	assert.match(plain(view.render(100)), /live/);
+	view.handleInput("\x1b[F");
+	assert.match(plain(view.render(100)), /ACTIVITY-END/);
+	terminal.rows = 10;
+	assert.equal(view.render(54).length, 10);
+	view.handleInput("\x1b[H");
+	assert.match(plain(view.render(54)), /live/);
+	view.handleInput("\x1bOP"); assert.match(plain(view.render(100)), /ORIGINAL-OVERVIEW/);
+	for (const encoding of ["\x1b[15~", "\x1b[15;1~", "\x1b[15;1:1~"]) {
+		assert.ok(functionKey(encoding, "f5"));
+		view.handleInput(encoding); assert.match(plain(view.render(100)), /live/);
+		view.handleInput("\x1bOP");
+	}
+	assert.equal(functionKey("\x1b[15;1:3~", "f5"), false);
+	view.handleInput("\x1b[106;6u"); assert.equal(closed, 1);
+	const path = new MomView({ view: source.view }, theme as any, tui, () => {});
+	path.handleInput("\x1b[15~");
+	assert.match(plain(path.render(100)), /ORIGINAL-OVERVIEW/);
+	assert.doesNotMatch(plain(path.render(100)), /F5 Activity/);
 });
 
 test("Path's view says settings are unavailable when Path is not connected", () => {

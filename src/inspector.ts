@@ -1,6 +1,6 @@
 /** Live work stays pinned; history is on demand. Both open the same child conversation. */
 import { CustomEditor, getSelectListTheme, keyHint, type KeybindingsManager, type SettingsManager, type Theme, type ThemeColor } from "@earendil-works/pi-coding-agent";
-import { type Component, type Focusable, matchesKey, SelectList, type TUI, type TuiMouseEvent, visibleWidth } from "@earendil-works/pi-tui";
+import { type Component, type Focusable, isKeyRelease, matchesKey, SelectList, type TUI, type TuiMouseEvent, visibleWidth } from "@earendil-works/pi-tui";
 import { ChildTranscript, type ChildActivity } from "./transcript.js";
 import { formatDuration } from "./util/format.ts";
 import { errorMessage } from "./util/text.ts";
@@ -17,6 +17,10 @@ export interface LiveSource {
 	subscribe(listener: () => void): () => void;
 	steer(id: string, message: string): Promise<void>;
 	cancel(id: string): Promise<void>;
+}
+
+export function isCurrentAgent(run: RunView, settledBefore: number): boolean {
+	return !run.settled || (run.endedAt ?? 0) >= settledBefore;
 }
 
 const TICK_MS = 250;
@@ -54,6 +58,7 @@ export class AgentsPanel implements Component, Focusable {
 		// Fullscreen transcript navigation runs before focused-component input. Consume list
 		// navigation here so Home/PageDown cannot move the parent transcript behind the list.
 		this.removeInputListener = tui.addInputListener((data) => {
+			if (isKeyRelease(data)) return { consume: true };
 			if (tui.hasOverlay()) return;
 			if (!this.focused) {
 				if (navKeys(data) !== "left" || this.opening || !this.rows().length) return;
@@ -72,7 +77,7 @@ export class AgentsPanel implements Component, Focusable {
 	}
 
 	private rows(): RunView[] {
-		return this.src.all().filter((r) => !r.settled || (r.endedAt ?? 0) >= this.settledBefore);
+		return this.src.all().filter(run => isCurrentAgent(run, this.settledBefore));
 	}
 
 	/** Settled runs that ended before this time are no longer listed: the person has moved on. */

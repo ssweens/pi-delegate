@@ -21,7 +21,7 @@
  * Pure and theme-agnostic: takes a minimal {@link TodoStyler} so it is unit-
  * testable with a stub; the real pi `Theme` satisfies it structurally.
  */
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { frame } from "./render.js";
 import { GLYPH, TREE } from "./ui/glyphs.ts";
 import { fit } from "./ui/text.ts";
@@ -173,6 +173,26 @@ function renderTodoTaskLine(task: TodoItem, theme: TodoStyler, width: number): s
 			return theme.fg("dim", `${UNCHECKED} ${label}`);
 		}
 	}
+}
+
+export function renderTodoOverviewLines(state: TodoState | undefined, theme: TodoStyler, width: number): string[] {
+	const inner = Math.max(1, Math.floor(width) - 4);
+	const lines = [theme.bold(theme.fg("accent", "Todos"))];
+	if (!state?.phases.length) return [...lines, theme.fg("muted", "No todo phases.")];
+	for (let index = 0; index < state.phases.length; index++) {
+		const phase = state.phases[index]!;
+		const done = phase.tasks.filter(task => task.status === "completed").length;
+		lines.push(...wrapTextWithAnsi(theme.fg("muted", `${phaseDisplayName(phase.name, index + 1)} · ${done}/${phase.tasks.length}`), inner));
+		if (!phase.tasks.length) lines.push(...wrapTextWithAnsi("  No tasks.", inner));
+		for (let t = 0; t < phase.tasks.length; t++) {
+			const task = phase.tasks[t]!;
+			const label = `[${task.status}] ${task.content}${task.blocker ? ` (blocker: ${task.blocker})` : ""}`;
+			const styled = renderTodoTaskLine({ ...task, content: label, blocker: undefined }, theme, visibleWidth(label) + 20);
+			const wrapped = wrapTextWithAnsi(styled, Math.max(1, inner - PREFIX_WIDTH));
+			lines.push(...wrapped.map((line, row) => `${row === 0 ? treeBranchPrefix(t === phase.tasks.length - 1) : treeContinuePrefix(t === phase.tasks.length - 1)}${line}`));
+		}
+	}
+	return lines;
 }
 
 // --- Phase header rendering (nested tree, with progress fraction) ---

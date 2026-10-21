@@ -13,6 +13,49 @@ const sections = [
 	["Path · updating", "  └─ Improve the activity outline"],
 ];
 
+test("overview includes all current agents, complete todos, empty headings, and uncapped recap", () => {
+	const styler = { fg: (_c: string, s: string) => s, bold: (s: string) => s, strikethrough: (s: string) => s } as any;
+	const owner = new ActivityCoordinator();
+	const empty = owner.renderOverview(styler, 50).join("\n");
+	for (const heading of ["Agents", "Todos", "Path", "Recap"]) assert.match(empty, new RegExp(heading));
+	const runs = Array.from({ length: 7 }, (_, i) => ({ id: String(i), task: `Agent ${i}`, status: "complete", settled: true, endedAt: Date.now(), depth: i + 1 }));
+	owner.install({ mode: "print" } as any, { all: () => runs } as any, async () => {});
+	owner.setTodos({ phases: [{ name: "Closed", tasks: [{ content: "DONE-END", status: "completed" }] }, { name: "Empty", tasks: [] },
+		{ name: "Abandoned", tasks: [{ content: "ABANDONED-END", status: "abandoned" }] },
+		{ name: "Blocked", tasks: [{ content: `Full content ${"detail ".repeat(20)}TASK-END`, status: "blocked", blocker: `${"waiting ".repeat(30)}BLOCKER-END` }] }] });
+	owner.setRecap(`${"recap ".repeat(80)}RECAP-END`);
+	owner.setRecap(undefined);
+	const lines = owner.renderOverview(styler, 50), screen = lines.join("\n");
+	for (let i = 0; i < 7; i++) assert.match(screen, new RegExp(`Agent ${i}`));
+	for (const word of ["completed", "abandoned", "blocked", "Empty", "No tasks", "TASK-END", "BLOCKER-END", "RECAP-END"]) assert.match(screen, new RegExp(word));
+	assert.ok(lines.every(line => visibleWidth(line) <= 46));
+	owner.setTodos({ phases: [{ name: "All done", tasks: [{ content: "Still visible", status: "completed" }] }] });
+	assert.match(owner.renderOverview(styler, 50).join("\n"), /Still visible/);
+	owner.dispose();
+});
+
+test("overview uses the widget's prompt cutoff without its four-row cap", (t) => {
+	const now = t.mock.method(Date, "now", () => 100);
+	const owner = new ActivityCoordinator();
+	const styler = { fg: (_c: string, s: string) => s, bold: (s: string) => s } as any;
+	const runs = [
+		{ id: "old", task: "OLD-SETTLED", status: "complete", settled: true, endedAt: 150 },
+		{ id: "boundary", task: "BOUNDARY-SETTLED", status: "complete", settled: true, endedAt: 200 },
+		...Array.from({ length: 7 }, (_, i) => ({ id: String(i), task: `CURRENT-${i}`, status: "running", settled: false })),
+	];
+	owner.install({ mode: "print" } as any, { all: () => runs } as any, async () => {});
+	assert.match(owner.renderOverview(styler, 80).join("\n"), /OLD-SETTLED/);
+	now.mock.mockImplementation(() => 200);
+	owner.markPrompt();
+	const screen = owner.renderOverview(styler, 80).join("\n");
+	assert.doesNotMatch(screen, /OLD-SETTLED/);
+	assert.match(screen, /BOUNDARY-SETTLED/);
+	for (let i = 0; i < 7; i++) assert.match(screen, new RegExp(`CURRENT-${i}`));
+	runs.splice(0, runs.length, { id: "old", task: "OLD-SETTLED", status: "complete", settled: true, endedAt: 150 });
+	assert.match(owner.renderOverview(styler, 80).join("\n"), /No current agents\./);
+	owner.dispose();
+});
+
 test("activity coordinator gives agents, todos, and Path one outline", () => {
 	const lines = renderActivityLines(sections, theme, 72);
 	assert.equal(lines.filter(line => line.includes("╭")).length, 1);
