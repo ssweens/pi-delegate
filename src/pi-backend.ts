@@ -795,7 +795,7 @@ export function summary(run: Run): string {
 	if (run.projectTrustUnknown) s += `\n${TRUST_UNKNOWN}`;
 	if (run.parentRunId) s += `\nstarted by ${run.parentRunId} · depth ${run.depth} of ${maxDepth()}`;
 	if (run.extensionErrors?.length) s += `\nextensions that failed in the child (it ran without them):\n  ${run.extensionErrors.join("\n  ")}`;
-	if (run.droppedTools.length) s += `\ntools the child could not have (a child gets the tools its parent's extensions and MCP tools provide, limited to its role's tools; no delegate or delegate_ctl at the depth limit, ${maxDepth()}; no todo): ${run.droppedTools.join(", ")}`;
+	if (run.droppedTools.length) s += `\ntools the child could not have (a child gets the tools its parent's extensions and MCP tools provide, limited to its role's tools; no delegate or delegate_ctl at the depth limit, ${maxDepth()}): ${run.droppedTools.join(", ")}`;
 	if (run.changedFiles.length) s += `\nchanged: ${run.changedFiles.join(", ")}`;
 	if (run.error) s += `\nerror: ${run.error}`;
 	return s;

@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { deferred, provider, sandbox, harness, type Reply } from "./fixture.ts";
+import { loadState } from "../src/todo-ext.ts";
 
 const MCP_FIXTURE = fileURLToPath(new URL("./mcp-fixture.mjs", import.meta.url));
 const INDEX = fileURLToPath(new URL("../src/index.ts", import.meta.url));
@@ -63,17 +64,19 @@ test("a child loads its parent's extensions; its role's tools line is a plain al
 			const copy = join(box.agentDir, "extensions", "pi-delegate-copy.ts");
 			writeFileSync(copy, `import { writeFileSync } from "node:fs";\nimport delegate from ${JSON.stringify(INDEX)};\nexport default function (pi) { writeFileSync(${JSON.stringify(copyMarker)}, "loaded"); delegate(pi); }\n`);
 			try {
+				writeFileSync(join(box.agentDir, "pi-delegate.json"), JSON.stringify({ todo: { reminders: true } }));
 				const gate = deferred<void>(); gates.push(gate);
-				const arrived = api.script("Everything", { ...call("fixture_tool", { text: "a" }), gate }, call("project_tool", { text: "c" }), { text: "EVERYTHING-DONE" });
+				const arrived = api.script("Everything", call("todo", { op: "add", phase: "Child", content: "Keep this private" }), { ...call("fixture_tool", { text: "a" }), gate }, call("project_tool", { text: "c" }), { text: "EVERYTHING-DONE" });
 				const started = await h.launch("Everything", { role: "everything" });
 				const first = await arrived;
 				const declared = toolNames(first);
-				for (const name of ["read", "bash", "edit", "write", "fixture_tool", "other_tool", "project_tool", "delegate", "delegate_ctl"]) assert(declared.includes(name), `${name} is declared: ${declared}`);
-				assert(!declared.includes("todo"), "the todo tool stays with the root parent");
+				for (const name of ["read", "bash", "edit", "write", "fixture_tool", "other_tool", "project_tool", "delegate", "delegate_ctl", "todo"]) assert(declared.includes(name), `${name} is declared: ${declared}`);
+				await until(() => requestsFor("Everything").length >= 2, "child's next model request");
 				gate.resolve();
 				const result = await h.ctl("wait", started.details.id);
 				assert.equal(result.details.status, "complete", result.content[0].text);
-				const [, afterFixture, afterProject] = requestsFor("Everything");
+				assert.equal(requestsFor("Everything").length, 4, "child todos do not start reminder follow-up turns");
+				const [, , afterFixture, afterProject] = requestsFor("Everything");
 				assert.match(lastTool(afterFixture), /^fixture_tool: a$/);
 				assert.match(lastTool(afterProject), /^project_tool: c$/);
 				assert.deepEqual(result.details.droppedTools, []);
@@ -81,9 +84,11 @@ test("a child loads its parent's extensions; its role's tools line is a plain al
 				const child = run(started.details.id);
 				const tools = child.session.getAllTools();
 				assert.equal(tools.find((tool: any) => tool.name === "delegate").sourceInfo.path, "<inline:pi-delegate>", "delegate is the child's own nested instance's");
-				assert(!tools.some((tool: any) => tool.name === "todo"), "the copy's tools are not in the child");
-				assert.equal(child.offered.has("todo"), false, "the copy was left out before its tools were offered");
-				assert.deepEqual(child.extensionErrors, [], "no conflict is reported: the copy is gone");
+				assert(tools.some((tool: any) => tool.name === "todo"), "the child has its own todo tool");
+				assert.deepEqual(loadState(child.session.sessionManager).phases, [{ name: "Child", tasks: [{ content: "Keep this private", status: "pending" }] }]);
+				assert.deepEqual(loadState(h.runtime.session.sessionManager).phases, [], "the child's todo state is not the parent's");
+				assert.equal(child.offered.has("todo"), true, "the child todo tool is offered");
+				assert.deepEqual(child.extensionErrors, [], "no conflict is reported: the parent copy is gone");
 				assert(!tools.some((tool: any) => tool.name === "path" || tool.name === "mom") && !child.offered.has("path"), "Path stays with the root parent");
 			} finally { rmSync(copy, { force: true }); }
 		});
@@ -122,12 +127,12 @@ test("a child loads its parent's extensions; its role's tools line is a plain al
 			assert.equal(run(result.details.id).writer, false);
 		});
 
-		await t.test("a listed tool no extension provides is reported as dropped; todo is one", async () => {
+		await t.test("todo is available when a role allowlists it", async () => {
 			api.script("Missing", { text: "MISSING-DONE" });
 			const result = await h.waitLaunch("Missing", { role: "missing" });
 			assert.equal(result.details.status, "complete", result.content[0].text);
-			assert.deepEqual(result.details.droppedTools, ["no_such_tool", "todo", "web_*"]);
-			assert.match(result.content[0].text, /tools the child could not have .*: no_such_tool, todo, web_\*/);
+			assert.deepEqual(result.details.droppedTools, ["no_such_tool", "web_*"]);
+			assert(registry(result.details.id).includes("todo"));
 		});
 
 		await t.test("an extension that throws on load does not stop the child and is reported; extensions' session_start never runs in a child", async () => {

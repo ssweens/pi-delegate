@@ -123,10 +123,10 @@ const bringsMom = (extension: LoadExtensionsResult["extensions"][number]) => ["p
 
 /**
  * The extensions a child's session runs. An installed pi-delegate would add the root parent's
- * `delegate`, `delegate_ctl` and `todo`, so it is left out: the child's own nested instance is its only
- * one. Path is the root parent's alone: any extension that brings it (an installed pi-delegate, or
- * pi-tether) is left out too, so a child never follows, maps or advises on its own session. Every
- * other extension keeps only the tools the child may have.
+ * `delegate`, `delegate_ctl` and `todo`, so it is left out. The child gets a separate todo extension
+ * bound to its own session. Path is the root parent's alone: any extension that brings it (an installed
+ * pi-delegate, or pi-tether) is left out too, so a child never follows, maps or advises on its own session.
+ * Every other extension keeps only the tools the child may have.
  */
 function gateExtensions(run: Run, base: LoadExtensionsResult): LoadExtensionsResult {
 	const { allows } = allowlist(run);
@@ -607,6 +607,11 @@ function defaultsReport({ approved, drift }: ModelsDetails["defaults"]): string 
 const delegating = (run: Run) => DELEGATION_TOOLS.some(allowlist(run).allows);
 /** The delegation tools inside a delegating child's own session, as an inline extension of that session. */
 const nestedExtension = (run: Run) => ({ name: "pi-delegate", factory: (pi: ExtensionAPI) => { installDelegate(pi, run); } });
+/** Each SDK child gets its own session-backed todo; automatic reminders remain root-only. */
+const childTodoExtension = (): InlineExtension => ({
+	name: "pi-delegate-todo",
+	factory: (pi: ExtensionAPI) => installTodo(pi, { remindersEnabled: () => false }),
+});
 /**
  * What a child's session takes from the session that started it. Pi caches each extension module's factory
  * for the folder it last loaded extensions for (the root session's), so a child whose loader loads from that
@@ -651,9 +656,9 @@ function mcpProxyExtension(run: Run): InlineExtension {
 	} };
 }
 
-/** The inline extensions of a child's session: its own pi-delegate when it delegates, and its parent's MCP tools. */
+/** A child's private todo, its own pi-delegate when it delegates, and its parent's MCP tools. */
 function childExtensions(run: Run): InlineExtension[] {
-	return [...(delegating(run) ? [nestedExtension(run)] : []), mcpProxyExtension(run)];
+	return [childTodoExtension(), ...(delegating(run) ? [nestedExtension(run)] : []), mcpProxyExtension(run)];
 }
 /**
  * The resource loader of a child's session. It loads from the folder the root session loaded its extensions
@@ -745,13 +750,12 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		resolve: resolvePi,
 		resolveModel,
 	});
-	// Canonical phased todo (transferred from pi-omp; see todo-ext.ts). The reminder reads this
-	// parent's live children: while one is unsettled its completion message re-wakes the loop,
-	// so an incomplete-todo nag at agent_end would be premature.
+	// The root todo reminder waits while this parent has active children because their completion
+	// re-wakes its loop. SDK children install their own todo tool with reminders disabled.
 	/** A wait returns early while a completion notice is on its way into this turn, so the model reads it. */
 	const noticePending = () => Boolean(owner && inFlight(owner).size);
 	const busy = (target: Owner) => ownedRuns(target).some((run) => !run.completion.settled) || acp.owned(target.key).some((run) => run.status === "running");
-	// A delegating child gets the delegation pair only; the todo tool stays the root parent's.
+	// Only the root owns reminder coordination; each SDK child gets its todo via childTodoExtension.
 	if (!nesting) installTodo(pi, {
 		hasActiveJobs: () => Boolean(owner && !owner.closed && busy(owner)),
 		remindersEnabled: () => readTodoSettings(SETTINGS_PATH).reminders,
@@ -1339,8 +1343,8 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 				const roles = sortedRoles(ctx);
 				const approved = loadDefaults().approved;
 				// The tools a child started from here would be offered: this session's, or, in a delegating child,
-				// what its own session was offered. The todo tool stays with the root parent.
-				const offered = (nesting ? [...(nesting.offered ?? [])] : pi.getAllTools().map((tool) => tool.name)).filter((name) => name !== "todo");
+				// what its own session was offered.
+				const offered = nesting ? [...(nesting.offered ?? [])] : pi.getAllTools().map((tool) => tool.name);
 				const withheld = depth + 1 >= maxDepth() ? DELEGATION_TOOLS : [];
 				const rows = roles.map((r) => {
 					const tools = r.tools ?? EVERY_TOOL;

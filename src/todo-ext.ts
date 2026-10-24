@@ -153,8 +153,7 @@ export function syncTodoWidget(ui: Pick<ExtensionCommandContext["ui"], "setWidge
 }
 
 /** Incomplete-work reminder text, or undefined when nothing is open. */
-export function todoReminderText(sessionManager: TodoBranchSource): string | undefined {
-	const state = loadState(sessionManager);
+function reminderText(state: TodoState): string | undefined {
 	const open = countOpen(state);
 	if (open === 0) return undefined;
 	const inProgress = state.phases
@@ -163,6 +162,10 @@ export function todoReminderText(sessionManager: TodoBranchSource): string | und
 		.map((t) => t.content);
 	const heading = inProgress.length > 0 ? `In progress: ${inProgress.join(", ")}. ` : "";
 	return `${heading}You stopped with ${open} open todo item(s). Continue working on them or mark them complete/finished.`;
+}
+
+export function todoReminderText(sessionManager: TodoBranchSource): string | undefined {
+	return reminderText(loadState(sessionManager));
 }
 
 export interface TodoInstallOptions {
@@ -304,23 +307,17 @@ function finalAssistantText(messages: readonly unknown[]): { text: string; stopR
 
 /**
  * Bounded, non-spammy incomplete-todo reminder. Suppressed when:
- * the turn was aborted (Escape), the model is asking the user a question, a
- * reminder is already waiting on the model to act, the cap is spent, or a
- * background delegate child will wake the parent anyway.
+ * the turn was aborted (Escape), the model is asking the user a question, the same todo state
+ * was already reminded, the cap is spent, or a background delegate child will wake the parent anyway.
  */
 function wireTodoReminder(pi: ExtensionAPI, hasActiveJobs: () => boolean, maxReminders: number, remindersEnabled: () => boolean): void {
 	let sent = 0;
-	let awaitingProgress = false;
-
-	// OMP's `onToolResult`: the model acted on the reminder, so it may remind again.
-	pi.on("message_end", (event) => {
-		if (event.message.role === "toolResult") awaitingProgress = false;
-	});
+	let lastReminderState: string | undefined;
 
 	pi.on("agent_end", (event, ctx) => {
 		if (!remindersEnabled()) {
 			sent = 0;
-			awaitingProgress = false;
+			lastReminderState = undefined;
 			return;
 		}
 		const last = finalAssistantText(event.messages);
@@ -331,22 +328,24 @@ function wireTodoReminder(pi: ExtensionAPI, hasActiveJobs: () => boolean, maxRem
 		// reminder. Mirrors omp's agent-session, which returns early on
 		// `stopReason === "aborted"` before its todo checkCompletion ever runs.
 		if (last?.stopReason === "aborted") return;
-		const text = todoReminderText(ctx.sessionManager);
+		const state = loadState(ctx.sessionManager);
+		const text = reminderText(state);
 		if (!text) {
 			// Nothing left to remind about: the next open todo earns a fresh budget.
 			sent = 0;
-			awaitingProgress = false;
+			lastReminderState = undefined;
 			return;
 		}
 		if (sent >= maxReminders) return;
-		// A prior reminder is still waiting for the model to touch its todos.
-		if (awaitingProgress) return;
+		// Unrelated tool results (including scheduled-check work) are not todo progress.
+		const snapshot = JSON.stringify(state);
+		if (snapshot === lastReminderState) return;
 		// The model asked the user something; the ball is in the human's court.
 		if (last?.text.endsWith("?")) return;
 		// A background child's completion message will re-wake the loop on its own.
 		if (hasActiveJobs()) return;
 		sent += 1;
-		awaitingProgress = true;
+		lastReminderState = snapshot;
 		pi.sendUserMessage(text, { deliverAs: "followUp" });
 	});
 }

@@ -206,7 +206,7 @@ try {
 		// One aligned row per role, no wrapped wall of paths.
 		for (const role of ["reviewer", "scout", "worker"]) assert.match(listed, new RegExp(`\\n\\s+${role} +(fresh|fork)`));
 		assert.match(listed, /scout +fresh:low +needs approval +read-only · 5 tools/);
-		assert.match(listed, /worker +fork:medium +needs approval +writes · 7 tools/);
+		assert.match(listed, /worker +fork:medium +needs approval +writes · 8 tools/);
 		// Prose written for the model does not survive a column; no row ends mid-word.
 		assert.doesNotMatch(listed, /Read-only recon of code/);
 		assert.doesNotMatch(listed, /roles\/scout\.md/, "sources belong behind the expand, not in the collapsed row");

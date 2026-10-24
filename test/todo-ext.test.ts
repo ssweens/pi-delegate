@@ -174,8 +174,8 @@ test("/todo command edits state, exports and imports Markdown", async (t) => {
 	assert.equal(h.notices.at(-1)!.level, "warning");
 });
 
-function todoBranch() {
-	return [{ type: "custom", customType: TODO_CUSTOM_TYPE, data: { phases: [{ name: "Work", tasks: [{ content: "Finish the thing", status: "pending" }] }] } }];
+function todoBranch(status = "pending") {
+	return [{ type: "custom", customType: TODO_CUSTOM_TYPE, data: { phases: [{ name: "Work", tasks: [{ content: "Finish the thing", status }] }] } }];
 }
 
 function agentEnd(stopReason: string, text: string) {
@@ -222,25 +222,26 @@ test("reminder is suppressed by abort, an open question, active jobs, and its ca
 	assert.deepEqual(busy.sent, []);
 });
 
-test("reminder waits for model progress and stops at the cap", () => {
+test("unrelated tool results do not re-arm reminders; todo changes do, up to the cap", () => {
 	const h = harness({ maxReminders: 2, remindersEnabled: () => true });
-	const ctx = h.ctx(todoBranch());
+	let ctx = h.ctx(todoBranch());
 	const stop = () => h.fire("agent_end", agentEnd("stop", "stopped with work open"), ctx);
 
 	stop();
 	assert.equal(h.sent.length, 1);
 
-	// Still waiting on the model to act on reminder #1: no second nag.
+	// Unrelated work (including scheduled checks) is not todo progress.
+	h.fire("message_end", { type: "message_end", message: { role: "toolResult" } }, ctx);
 	stop();
 	assert.equal(h.sent.length, 1);
 
-	// Any tool result means the model acted; a later stop may remind again.
-	h.fire("message_end", { type: "message_end", message: { role: "toolResult" } }, ctx);
+	// A changed todo list is evidence of progress and can earn one more reminder.
+	ctx = h.ctx(todoBranch("in_progress"));
 	stop();
 	assert.equal(h.sent.length, 2);
 
-	// Cap spent.
-	h.fire("message_end", { type: "message_end", message: { role: "toolResult" } }, ctx);
+	// The per-session cap still applies after further todo changes.
+	ctx = h.ctx(todoBranch("blocked"));
 	stop();
 	assert.equal(h.sent.length, 2);
 });

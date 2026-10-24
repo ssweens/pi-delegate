@@ -1,7 +1,7 @@
 ---
 name: worker
 description: Implements a bounded, well-specified change within stated ownership. Inherits the parent's context (fork) and model; medium reasoning. Escalate with model=provider/id:high when evidence shows the work is complex.
-tools: read, bash, edit, write, grep, find, ls
+tools: read, bash, edit, write, grep, find, ls, todo
 context: fork
 thinking: medium
 ---

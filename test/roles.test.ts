@@ -24,6 +24,12 @@ test("the delegate reads roles from Pi's agent dir (PI_CODING_AGENT_DIR)", () =>
 	assert(roleDirs("/nowhere", false, AGENT_DIR).includes(join(process.env.PI_CODING_AGENT_DIR!, "agents")));
 });
 
+test("the default worker and reviewer roles can maintain private todos", () => {
+	const roles = loadRoles("/nowhere", false, AGENT_DIR);
+	assert(roles.get("worker")?.tools?.includes("todo"));
+	assert(roles.get("reviewer")?.tools?.includes("todo"));
+});
+
 test("tildify shortens only a leading home directory", () => {
 	const home = process.env.HOME!;
 	assert.equal(tildify(join(home, "x", "y")), "~/x/y");

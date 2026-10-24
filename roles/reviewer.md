@@ -1,7 +1,7 @@
 ---
 name: reviewer
 description: Fresh-context, read-only review of a change set against a stated goal. Trigger on interface, security, concurrency, migration, wide blast radius, or unobserved behavior — not by default.
-tools: read, grep, find, ls, bash
+tools: read, grep, find, ls, bash, todo
 context: fresh
 thinking: high
 ---
