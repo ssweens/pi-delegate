@@ -13,7 +13,7 @@ import { dirname, join } from "node:path";
 import { createAgentSession, type DefaultResourceLoader, type ExtensionAPI, type ExtensionContext, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { AGENT_DIR, SETTINGS_PATH } from "./agent-dir.ts";
 import { type AcpBackend, runningAcpRuns } from "./acp-backend.js";
-import { type AcpRunView, type BackendCapabilities, type CancelRequest, type CloseRequest, DelegateError, type DelegateBackend, PI_CAPABILITIES, type PiRunView, type PiStartInput, requireAction, type SteerRequest, unwrap, type WaitOutcome, type WaitRequest } from "./backend.js";
+import { type AcpRunView, type BackendCapabilities, type CancelRequest, type CloseRequest, DelegateError, type DelegateBackend, OVEN_CAPABILITIES, PI_CAPABILITIES, type PiRunView, type PiStartInput, requireAction, type SteerRequest, unwrap, type WaitOutcome, type WaitRequest } from "./backend.js";
 import { RunCompletion } from "./completion.js";
 import { readDelegateSettings } from "./delegate-settings.ts";
 import type { LiveSource } from "./inspector.js";
@@ -144,6 +144,8 @@ export interface Run {
 	extensions?: string[];
 	/** oven: the slice this run drives; set once oven created it. */
 	sliceId?: string;
+	/** Why the last cancel could not show that oven halted this run's slice; unset when oven confirmed it (or the run has no slice). */
+	haltNote?: string;
 	/** oven: the last heartbeat (oven_expires) that failed, until one succeeds again. */
 	heartbeatError?: string;
 	/** oven tui: the agent whose own TUI oven hosts for this run (a tui slice), and the agent template it was made from. */
@@ -895,12 +897,49 @@ export async function cancelRun(run: Run) {
 	finally { changed(); await Promise.all([stopTree(run), run.session?.abort(), haltSlice(run)]); }
 }
 
-/** End an oven run's slice's work (oven_halt); its conversation and copy stay in oven. A tui slice is also stopped, so no idle TUI is left running; a steer wakes it on the same session. */
+/** What a cancel tells its caller: "stopped" only when oven confirmed the halt (or the run holds no slice). */
+export const cancelText = (run: Run) => run.haltNote
+	? `${run.id} cancel sent; oven did not confirm the halt: ${run.haltNote}. Automatic revival is disabled.`
+	: `${run.id} stopped; automatic revival is disabled.`;
+
+/**
+ * End an oven run's slice's work, whatever stage it is in; its conversation and copy stay in oven. Oven's real answers decide
+ * what is reported; a failure to confirm is kept in run.haltNote for the cancel's reply, never hidden.
+ * - tui: oven_halt only types the interrupt key and answers state "running" while the agent's status is still working, so
+ *   a halt without an error counts as sent. oven_stop then kills the agent (a steer wakes it on the same session), and its
+ *   answer is the confirmation: state "stopped" and a process no longer running.
+ * - durable: a halt answered idle or failed is confirmed. "running" at stage copying or starting is a preparing slice, which
+ *   oven's halt does not end; oven_stop marks it stopped (oven reports "stopped" over every other state), so it is followed by
+ *   a stop and confirmed only by that answer. Any other "running" is read again once (oven_status), because an aborted turn
+ *   can read running for an instant; if it still runs, it is unconfirmed.
+ */
 async function haltSlice(run: Run) {
 	ovenWatches.get(run.id)?.abort();
-	if (run.runtime !== "oven" || !run.sliceId) return;
-	await ovenCall("halt", { slice: run.sliceId }).catch(() => {});
-	if (run.tui) await ovenCall("stop", { slice: run.sliceId }).catch(() => {});
+	run.haltNote = undefined;
+	if (run.runtime !== "oven") return;
+	if (!run.sliceId) {
+		// Oven's create has not answered, so the slice id is unknown: launchOven/launchTui halt the slice the moment it is told.
+		if (run.status === "cancelled") run.haltNote = "oven has not yet returned this run's slice id, so no halt could be sent; it is halted when oven answers";
+		return;
+	}
+	const slice = run.sliceId;
+	const stopped = async () => {
+		try {
+			const view = await ovenCall<any>("stop", { slice });
+			if (view?.state !== "stopped" || (view.kind === "tui" && view.process?.state === "running")) run.haltNote = `oven answered the stop of slice ${slice} with state ${view?.state}${view?.process?.state ? `, process ${view.process.state}` : ""}`;
+		} catch (error) { run.haltNote = `stop failed: ${errorMessage(error)}`; }
+	};
+	let view: any;
+	try { view = await ovenCall<any>("halt", { slice }); }
+	catch (error) {
+		run.haltNote = errorMessage(error);
+		if (run.tui) await ovenCall("stop", { slice }).catch(() => {});
+		return;
+	}
+	if (run.tui) { await stopped(); return; }
+	if (view?.state === "running" && (view.stage === "copying" || view.stage === "starting")) { await stopped(); return; }
+	if (view?.state === "running") view = await ovenCall<any>("status", { slice }).catch(() => view);
+	if (view?.state === "running") run.haltNote = `oven answered the halt but still reports slice ${slice} running${view.stage ? ` (stage ${view.stage})` : ""}`;
 }
 
 /** The values of a tui run's declared secrets, from this process's environment; oven keeps them out of argv and records. */
@@ -1071,7 +1110,7 @@ const failure = (slice: SliceView) => `oven slice ${slice.id} ${slice.state}${sl
  * never starts a second slice or turn. Then it follows the slice until it settles and settles the run like
  * an in-process child's.
  */
-async function launchOven(run: Run, task: string) {
+export async function launchOven(run: Run, task: string) {
 	if (run.tui) return launchTui(run, task);
 	try {
 		milestone(run, { kind: "started", task: task.slice(0, 600) });
@@ -1082,6 +1121,8 @@ async function launchOven(run: Run, task: string) {
 			const created = await ovenCall<SliceView>("create", { config, task, cwd: run.cwd, requestId: `pi-delegate:${run.id}`, expires: OVEN_EXPIRES });
 			run.sliceId = created.id;
 			saveRun(run);
+			// Cancelled while oven was still creating (copying): halt the slice now that its id is known. This is the only halt for such a run (cancelRun's found no id), and nothing runs between the assignment above and this check.
+			if (run.stopped) { await haltSlice(run); finish(run, run.status); return; }
 			await requireExpiry(created, ovenCall, () => forgetSlice(run));
 			if (created.state === "failed") { finish(run, "error", failure(created)); return; }
 		} else await ovenCall("send", { slice: run.sliceId, text: task, requestId: `pi-delegate:${run.id}:${run.segment}` });
@@ -1145,6 +1186,7 @@ async function launchTui(run: Run, task: string) {
 				task: run.taskPrefix ? `${run.taskPrefix}\n\n---\n\n${task}` : task, cwd: run.cwd, copy: "cow", requestId: `pi-delegate:${run.id}`, expires: OVEN_EXPIRES });
 			run.sliceId = created.id;
 			saveRun(run);
+			if (run.stopped) { await haltSlice(run); finish(run, run.status); return; }
 			await requireExpiry(created, ovenCall, () => forgetSlice(run));
 		} else await ovenCall("send", { slice: run.sliceId, text: task, requestId: `pi-delegate:${run.id}:${run.segment}` });
 		beatOven();
@@ -1862,7 +1904,7 @@ export class PiBackend implements DelegateBackend<"pi"> {
 	/** Unsupported: an in-process run holds no external session (PI_CAPABILITIES.close). */
 	async close(runId: string, _input: CloseRequest): Promise<PiRunView> {
 		const run = this.get(runId);
-		unwrap(requireAction(PI_CAPABILITIES, "close"));
+		unwrap(requireAction(run.runtime === "oven" ? OVEN_CAPABILITIES : PI_CAPABILITIES, "close"));
 		return piView(run);
 	}
 }
