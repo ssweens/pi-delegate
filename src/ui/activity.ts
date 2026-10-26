@@ -36,7 +36,7 @@ function formatCountdown(nextAt: number | null | undefined): string {
   return `in ${h}h${mm ? `${mm}m` : ''}`;
 }
 
-function renderSpurSectionLines(jobs: Job[], theme: Theme, width: number, compact = false, selectedId: string | null = null): string[] {
+function renderSpurSectionLines(jobs: Job[], theme: Theme, width: number, compact = false): string[] {
   const heading = theme.bold(theme.fg("accent", "Scheduled"));
   if (!jobs.length) return compact ? [] : [heading, "  No scheduled jobs."];
   const lines: string[] = [];
@@ -44,15 +44,10 @@ function renderSpurSectionLines(jobs: Job[], theme: Theme, width: number, compac
     const sched = scheduleLabel(j);
     const cd = formatCountdown(j.nextAt);
     const phase = j.phase ? j.phase.kind : '';
-    const p = (j.prompt || '').slice(0, 25);
+    const p = (j.prompt || '').slice(0, 30);
     const paused = j.enabled === false ? ' (paused)' : '';
-    lines.push(`  ${j.id}: ${sched} ${cd} [${phase}]${paused} ${p}`);
-    if (selectedId === j.id) {
-      const fullPrompt = (j.prompt || "").slice(0, 60);
-      const last = j.lastRun ? `${new Date(j.lastRun.startedAt).toLocaleTimeString()}${j.lastRun.aborted ? " (aborted)" : ""}` : "none";
-      lines.push(`    prompt: ${fullPrompt} last: ${last}`);
-      lines.push(`    actions: spur pause id=${j.id} | spur run id=${j.id} | spur remove id=${j.id}`);
-    }
+    const line = `  ${j.id}: ${sched} ${cd} [${phase}]${paused} ${p}`;
+    lines.push(truncateToWidth(line, width - 2));
   }
   return [heading, ...lines];
 }
@@ -111,7 +106,6 @@ export class ActivityCoordinator {
 	private installed = false;
 	private settledBefore = Date.now();
 	private spurJobs: Job[] = [];
-	private selectedSpurJob: string | null = null;
 	private momRowsFactory?: MomRowsFactory;
 	private spinner?: ReturnType<typeof setInterval>;
 
@@ -161,10 +155,6 @@ export class ActivityCoordinator {
 		this.tui?.requestRender();
 	}
 
-	selectSpurJob(id: string | null): void {
-		this.selectedSpurJob = id;
-		this.tui?.requestRender();
-	}
 
 	setCompact(compact: boolean): void {
 		this.compact = compact;
@@ -208,8 +198,7 @@ export class ActivityCoordinator {
 		lines.push("", ...renderTodoOverviewLines(this.todos, theme, width), "");
 		const mom = this.mom?.();
 		lines.push(...(mom ? momSectionLines(mom, theme, width, false) : [heading("Path"), theme.fg("muted", "Path is unavailable.")]));
-		const selO = this.selectedSpurJob || (this.spurJobs.length ? this.spurJobs[0].id : null);
-		if (this.spurJobs && this.spurJobs.length) lines.push("", ...renderSpurSectionLines(this.spurJobs, theme, width, false, selO));
+		if (this.spurJobs && this.spurJobs.length) lines.push("", ...renderSpurSectionLines(this.spurJobs, theme, width, false));
 		lines.push("", heading("Recap"), ...wrapTextWithAnsi(this.overviewRecap || "No recap yet.", inner));
 		return lines;
 	}
@@ -258,8 +247,7 @@ export class ActivityCoordinator {
 		this.spin(Boolean(mom?.trail && spinning(mom.status)));
 		if (mom) sections.push(momSectionLines(mom, theme, inner + 4, this.compact));
 		if (this.recap && !this.compact) sections.push(renderRecapSectionLines(this.recap, theme, inner + 4, this.compact));
-		const selW = this.selectedSpurJob || (this.spurJobs.length ? this.spurJobs[0].id : null);
-		if (this.spurJobs && this.spurJobs.length) sections.push(renderSpurSectionLines(this.spurJobs, theme, inner + 4, this.compact, selW));
+		if (this.spurJobs && this.spurJobs.length) sections.push(renderSpurSectionLines(this.spurJobs, theme, inner + 4, this.compact));
 		if (this.compact) {
 			// One line: each section's title and count, side by side.
 			const parts = sections.filter(section => section.length).map(section => section[0]!);
