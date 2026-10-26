@@ -3,7 +3,7 @@ import { Type } from "typebox";
 import { existsSync } from "node:fs";
 import { Scheduler, type Request, scheduleLabel } from "./scheduler.ts";
 import { ConversationStorage } from "./storage.ts";
-import type { ActivityCoordinator } from "../ui/activity.ts"; // for type, will use any if circular
+import type { ActivityCoordinator } from "../ui/activity.ts";
 
 export const SNAPSHOT_TYPE = "pi-spur:snapshot";
 export const PROMPT_TYPE = "pi-spur:prompt";
@@ -35,7 +35,7 @@ export function installSpur(pi: ExtensionAPI, activity: any): void {
       if (job.lastRun) lines.push(`  last run: ${new Date(job.lastRun.startedAt).toISOString()} to ${new Date(job.lastRun.endedAt).toISOString()}${job.lastRun.aborted ? " (aborted)" : ""}`);
       if (job.phase.kind === "uncertain") lines.push(`  ${job.phase.reason}`);
     }
-    if (!scheduler.state.jobs.length) lines.push("No jobs. Open /spur to create one, or use the spur tool.");
+    if (!scheduler.state.jobs.length) lines.push("No jobs. Use the spur tool or check the Activity widget.");
     return lines.join("\n");
   };
   const save = (): void => {
@@ -45,7 +45,7 @@ export function installSpur(pi: ExtensionAPI, activity: any): void {
     if (!native) storage?.save(scheduler.state, false);
     pi.appendEntry(SNAPSHOT_TYPE, structuredClone(scheduler.state));
     if (native) storage?.save(scheduler.state, true);
-    // no manager refresh; activity updated in dispatch/settle
+    // activity updated in dispatch/settle
     updateActivity();
   };
   function updateActivity() {
@@ -71,7 +71,7 @@ export function installSpur(pi: ExtensionAPI, activity: any): void {
       if (reservation?.phase === "admitting" && context.isIdle()) {
         changed = scheduler.orphan() || changed;
         reservation = undefined;
-        notify("Spur admission did not settle. Inspect /spur for uncertain jobs.", "warning");
+        notify("Spur admission did not settle. Inspect Activity widget or use spur tool for uncertain jobs.", "warning");
       }
       if (changed) save();
       if (agentRunning || !context.isIdle() || context.hasPendingMessages() || reservation !== undefined) return;
@@ -88,7 +88,6 @@ export function installSpur(pi: ExtensionAPI, activity: any): void {
     } catch (error) {
       scheduler.state.paused = true;
       notify(`Spur paused: ${String(error)}`, "error");
-      // A failed snapshot must not permit an unrecorded prompt on the next tick.
       if (timer) clearInterval(timer);
       timer = undefined;
     }
@@ -124,7 +123,7 @@ export function installSpur(pi: ExtensionAPI, activity: any): void {
       notify(`Spur cannot restore its newest snapshot: ${String(error)}`, "error");
       return;
     }
-    if (scheduler.state.jobs.some((job) => job.phase.kind === "uncertain")) notify("Spur recovered uncertain work. Open /spur; Run now asks you to acknowledge rerun risk.", "warning");
+    if (scheduler.state.jobs.some((job) => job.phase.kind === "uncertain")) notify("Spur recovered uncertain work. Use spur tool; Run now asks you to acknowledge rerun risk.", "warning");
     const epoch = generation;
     timer = setInterval(() => dispatch(epoch), 250);
     timer.unref();
@@ -166,7 +165,7 @@ export function installSpur(pi: ExtensionAPI, activity: any): void {
         reservation = undefined;
         try { save(); }
         catch (error) { storageError = String(error); scheduler.state.paused = true; notify(storageError, "error"); }
-        if (ev.aborted) notify("Spur admission paused after abort. Open /spur and choose Resume scheduling to continue.", "warning");
+        if (ev.aborted) notify("Spur admission paused after abort. Use spur tool in Activity or check widget to resume.", "warning");
       }
     } finally { agentRunning = false; }
   });
