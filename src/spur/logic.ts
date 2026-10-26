@@ -127,6 +127,7 @@ export function installSpur(pi: ExtensionAPI, activity: any): void {
     const epoch = generation;
     timer = setInterval(() => dispatch(epoch), 250);
     timer.unref();
+    updateActivity();
   };
   const manage = (request: Request): string => {
     if (!context) throw new Error("Spur session is not ready");
