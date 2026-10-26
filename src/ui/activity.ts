@@ -24,6 +24,13 @@ export function renderRecapSectionLines(recap: string, theme: Theme, width: numb
 	return [theme.bold(theme.fg("accent", "Recap")), ...body.map(line => `  ${line}`)];
 }
 
+function renderSpurSectionLines(jobs: any[], theme: any, width: number, compact = false): string[] {
+  const heading = theme.bold ? theme.bold(theme.fg("accent", "Scheduled")) : "Scheduled";
+  if (!jobs || !jobs.length) return compact ? [] : [heading, "  No scheduled jobs."];
+  const lines = jobs.slice(0, compact ? 1 : 5).map((j: any) => `  ${j.id}: ${j.phase ? j.phase.kind : ""} ${ (j.prompt || "").slice(0,30) }`);
+  return [heading, ...lines];
+}
+
 /** Path's settings panel, built for a submenu: `close` returns to the panel that opened it. Undefined until it is connected. */
 /** Path's rows of the settings panel; undefined until Path is connected. */
 export type MomRowsFactory = (context: ExtensionContext, tui: TUI) => SettingsRow[] | undefined;
@@ -77,6 +84,7 @@ export class ActivityCoordinator {
 	private clearOnShrink?: boolean;
 	private installed = false;
 	private settledBefore = Date.now();
+	private spurJobs: any[] = [];
 	private momRowsFactory?: MomRowsFactory;
 	private spinner?: ReturnType<typeof setInterval>;
 
@@ -118,6 +126,12 @@ export class ActivityCoordinator {
 	resetRecap(): void {
 		this.overviewRecap = undefined;
 		this.setRecap(undefined);
+	}
+
+
+	setSpurJobs(jobs: any[]): void {
+		this.spurJobs = jobs || [];
+		this.tui?.requestRender();
 	}
 
 	setCompact(compact: boolean): void {
@@ -162,6 +176,7 @@ export class ActivityCoordinator {
 		lines.push("", ...renderTodoOverviewLines(this.todos, theme, width), "");
 		const mom = this.mom?.();
 		lines.push(...(mom ? momSectionLines(mom, theme, width, false) : [heading("Path"), theme.fg("muted", "Path is unavailable.")]));
+		if (this.spurJobs && this.spurJobs.length) lines.push("", ...renderSpurSectionLines(this.spurJobs, theme, width));
 		lines.push("", heading("Recap"), ...wrapTextWithAnsi(this.overviewRecap || "No recap yet.", inner));
 		return lines;
 	}
@@ -210,6 +225,7 @@ export class ActivityCoordinator {
 		this.spin(Boolean(mom?.trail && spinning(mom.status)));
 		if (mom) sections.push(momSectionLines(mom, theme, inner + 4, this.compact));
 		if (this.recap && !this.compact) sections.push(renderRecapSectionLines(this.recap, theme, inner + 4, this.compact));
+		if (this.spurJobs && this.spurJobs.length) sections.push(renderSpurSectionLines(this.spurJobs, theme, inner + 4, this.compact));
 		if (this.compact) {
 			// One line: each section's title and count, side by side.
 			const parts = sections.filter(section => section.length).map(section => section[0]!);

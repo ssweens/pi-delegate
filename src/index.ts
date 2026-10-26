@@ -40,6 +40,7 @@ import { processOwner } from "./storage.js";
 import { isPiStringsWorkerProcess } from "./util/process.ts";
 import { installMom } from "./mom/index.js";
 import { activityFor } from "./ui/activity.js";
+import { installSpur } from "./spur/logic.js";
 import { installRecap } from "./recap.ts";
 import { DEFAULT_DELEGATE_SETTINGS, pickModel, readDelegateSettings, saveDelegateSettings } from "./delegate-settings.ts";
 import { DEFAULT_TODO_SETTINGS, readTodoSettings, saveTodoSettings } from "./todo-settings.ts";
@@ -684,6 +685,7 @@ function childLoader(run: Run, settingsManager: SettingsManager, reopen: boolean
 export default function (pi: ExtensionAPI) {
 	const work = installDelegate(pi), anchor = installMom(pi);
 	installRecap(pi, activityFor(pi), { work, anchor });
+	installSpur(pi, activityFor(pi));
 }
 
 /**
