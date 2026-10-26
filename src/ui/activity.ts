@@ -9,7 +9,10 @@ import { agentListHint, chordLabel, hint, joinHints } from "./hints.ts";
 import { cut } from "./text.ts";
 import { SPIN_MS, spinning } from "./trail-view.ts";
 import type { SettingsRow } from "./settings-panel.ts";
-import { type Job, scheduleLabel } from "../spur/scheduler.ts";
+import { type Job, type Request, type Snapshot, scheduleLabel } from "../spur/scheduler.ts";
+import { navKeys } from "./keys.ts";
+import { errorMessage } from "../util/text.ts";
+import { formatDuration } from "../util/format.ts";
 
 export const ACTIVITY_WIDGET_KEY = "pi-delegate.activity";
 // Keep the existing cross-extension key so a reload or a separately loaded Path host preserves the mode.
@@ -26,14 +29,40 @@ export function renderRecapSectionLines(recap: string, theme: Theme, width: numb
 }
 
 function formatCountdown(nextAt: number | null | undefined): string {
-  if (!nextAt) return '';
+  if (!nextAt) return 'no next run';
   const d = nextAt - Date.now();
   if (d <= 0) return 'due';
   const m = Math.ceil(d / 60000);
   if (m < 60) return `in ${m}m`;
   const h = Math.floor(m / 60);
+  if (h >= 48) return `in ${Math.floor(h / 24)}d`;
   const mm = m % 60;
   return `in ${h}h${mm ? `${mm}m` : ''}`;
+}
+
+const ACTIVITY_VIEWS = ["All", "Agents", "Processes", "Todos", "Path", "Schedules", "Recap"] as const;
+type ActivityView = typeof ACTIVITY_VIEWS[number];
+
+function jobState(job: Job): string {
+  if (!job.enabled) return "paused";
+  if (job.phase.kind === "pending") return "waiting for idle";
+  if (job.phase.kind === "active") return "running";
+  return job.phase.kind;
+}
+
+function jobDetailLines(job: Job, theme: Theme, width: number): string[] {
+  const field = (label: string, value: string) => wrapTextWithAnsi(`${theme.fg("muted", `${label}:`)} ${value}`, width);
+  const lines = [
+    ...field("Job", job.name && job.name !== job.id ? `${job.name} (${job.id})` : job.id),
+    ...field("Schedule", scheduleLabel(job)),
+    ...field("Next run", job.nextAt ? `${new Date(job.nextAt).toLocaleString()} · ${formatCountdown(job.nextAt)}` : "none"),
+    ...field("State", jobState(job)),
+  ];
+  if (job.phase.kind === "uncertain") lines.push(...field("Why uncertain", job.phase.reason));
+  const last = job.lastRun;
+  lines.push(...field("Last run", last ? `${new Date(last.startedAt).toLocaleString()} · took ${formatDuration(last.endedAt - last.startedAt)}${last.aborted ? " · aborted" : ""}` : "never"));
+  lines.push(theme.fg("muted", "Prompt:"), ...job.prompt.split("\n").flatMap(line => wrapTextWithAnsi(line, Math.max(1, width - 2)).map(part => `  ${part}`)));
+  return lines;
 }
 
 function renderSpurSectionLines(jobs: Job[], theme: Theme, width: number, compact = false): string[] {
@@ -105,7 +134,12 @@ export class ActivityCoordinator {
 	private clearOnShrink?: boolean;
 	private installed = false;
 	private settledBefore = Date.now();
-	private spurJobs: Job[] = [];
+	private spur: Snapshot = { version: 1, paused: false, jobs: [] };
+	private spurControl?: (request: Request) => string;
+	private view: ActivityView = "All";
+	private selectedJob = 0;
+	private confirmRemove?: string;
+	private spurNotice = "";
 	private momRowsFactory?: MomRowsFactory;
 	private spinner?: ReturnType<typeof setInterval>;
 
@@ -150,9 +184,88 @@ export class ActivityCoordinator {
 	}
 
 
-	setSpurJobs(jobs: Job[]): void {
-		this.spurJobs = jobs || [];
+	setSpur(state: Snapshot): void {
+		this.spur = state;
 		this.tui?.requestRender();
+	}
+
+	/** The spur tool's own `manage`, so the Schedules tab changes jobs through the same validation and save. */
+	setSpurControl(control: (request: Request) => string): void { this.spurControl = control; }
+
+	/** Keys for the full-size Activity tab. Returns false for keys the Path view should handle. */
+	activityInput(data: string): boolean {
+		if (this.confirmRemove) {
+			const id = this.confirmRemove;
+			this.confirmRemove = undefined;
+			if (data === "y") this.control({ action: "remove", id }, `Removed ${id}.`);
+			else this.spurNotice = "Remove cancelled.";
+			return true;
+		}
+		const nav = navKeys(data);
+		if (nav === "left" || nav === "right") {
+			const index = ACTIVITY_VIEWS.indexOf(this.view) + (nav === "left" ? -1 : 1);
+			this.showView(ACTIVITY_VIEWS[(index + ACTIVITY_VIEWS.length) % ACTIVITY_VIEWS.length]!);
+			return true;
+		}
+		if (/^[1-7]$/.test(data)) { this.showView(ACTIVITY_VIEWS[Number(data) - 1]!); return true; }
+		if (this.view !== "Schedules") return false;
+		const jobs = this.spur.jobs;
+		if ((nav === "up" || nav === "down") && jobs.length) {
+			this.selectedJob = Math.max(0, Math.min(jobs.length - 1, this.selectedJob + (nav === "up" ? -1 : 1)));
+			this.spurNotice = "";
+			return true;
+		}
+		if (data === "g") {
+			const paused = this.spur.paused;
+			this.control({ action: paused ? "resume" : "pause" }, paused ? "Scheduling resumed." : "Scheduling paused; no job starts until you resume.");
+			return true;
+		}
+		const job = jobs[this.selectedJob];
+		if (!job) return false;
+		if (data === "p") this.control({ action: job.enabled ? "pause" : "resume", id: job.id }, job.enabled ? `Paused ${job.id}.` : `Resumed ${job.id}.`);
+		else if (data === "n") {
+			if (!job.enabled) this.spurNotice = `Resume ${job.id} first; Run now does not override a paused job.`;
+			else this.control({ action: "run", id: job.id }, this.spur.paused ? `Queued ${job.id}; it waits until scheduling resumes (G).` : `Queued ${job.id}; it runs when Pi is idle.`);
+		}
+		else if (data === "d") { this.confirmRemove = job.id; this.spurNotice = `Remove ${job.id}? Y removes it; any other key cancels. Active work is not stopped.`; }
+		else return false;
+		return true;
+	}
+
+	activityHints(): string {
+		const tabs = "←/→ or 1–7 tabs";
+		if (this.view !== "Schedules") return tabs;
+		const any = this.spur.jobs.length > 0;
+		return joinHints(tabs, any && "↑↓ select", any && "P pause/resume", any && "N run now", any && "D remove", this.spur.paused ? "G resume all" : "G pause all");
+	}
+
+	private showView(view: ActivityView): void {
+		this.view = view;
+		this.confirmRemove = undefined;
+		this.spurNotice = "";
+	}
+
+	private control(request: Request, done: string): void {
+		if (!this.spurControl) { this.spurNotice = "Scheduling is not ready in this session."; return; }
+		try { this.spurControl(request); this.spurNotice = done; }
+		catch (error) { this.spurNotice = errorMessage(error); }
+	}
+
+	private scheduleLines(theme: Theme, width: number, detailed: boolean): string[] {
+		const jobs = this.spur.jobs;
+		const lines = wrapTextWithAnsi(theme.bold(theme.fg("accent", "Schedules")) + theme.fg("muted", ` · scheduling ${this.spur.paused ? "paused" : "on"}`), width);
+		if (!jobs.length) return [...lines, ...wrapTextWithAnsi(theme.fg("muted", "No scheduled jobs. Ask the agent to schedule one with the spur tool."), width),
+			...(detailed && this.spurNotice ? ["", ...wrapTextWithAnsi(theme.fg("accent", this.spurNotice), width)] : [])];
+		this.selectedJob = Math.min(this.selectedJob, jobs.length - 1);
+		for (const [index, job] of jobs.entries()) {
+			const selected = detailed && index === this.selectedJob;
+			const row = `${selected ? "›" : " "} ${job.id} · ${scheduleLabel(job)} · ${formatCountdown(job.nextAt)} · ${jobState(job)}`;
+			lines.push(truncateToWidth(selected ? theme.bold(theme.fg("accent", row)) : row, width, "…"));
+		}
+		if (!detailed) return lines;
+		lines.push("", ...jobDetailLines(jobs[this.selectedJob]!, theme, width));
+		if (this.spurNotice) lines.push("", ...wrapTextWithAnsi(theme.fg(this.confirmRemove ? "warning" : "accent", this.spurNotice), width));
+		return lines;
 	}
 
 
@@ -185,22 +298,33 @@ export class ActivityCoordinator {
 	renderOverview(theme: Theme, width: number): string[] {
 		const inner = Math.max(1, Math.floor(width) - 4);
 		const heading = (text: string) => theme.bold(theme.fg("accent", text));
-		const lines = [heading("Agents")];
 		const runs = this.live?.all().filter(run => isCurrentAgent(run, this.settledBefore)) ?? [];
-		for (const run of runs) {
-			const { color, glyph } = statusMark(run);
-			const indent = "  ".repeat(Math.max(0, (run.depth ?? 1) - 1));
-			lines.push(...wrapTextWithAnsi(`${indent}${theme.fg(color, glyph)} ${runTitle(run)} · ${run.status} · depth ${run.depth ?? 1}`, inner));
-		}
-		if (!runs.length) lines.push(theme.fg("muted", "No current agents."));
 		const commands = (this.live?.processes?.() ?? []).filter(v => v.status === "running" || (v.endedAt ?? 0) >= this.settledBefore);
-		if (commands.length) lines.push("", heading("Processes"), ...commands.map(v => processLine(v, theme, inner)));
-		lines.push("", ...renderTodoOverviewLines(this.todos, theme, width), "");
-		const mom = this.mom?.();
-		lines.push(...(mom ? momSectionLines(mom, theme, width, false) : [heading("Path"), theme.fg("muted", "Path is unavailable.")]));
-		if (this.spurJobs && this.spurJobs.length) lines.push("", ...renderSpurSectionLines(this.spurJobs, theme, width, false));
-		lines.push("", heading("Recap"), ...wrapTextWithAnsi(this.overviewRecap || "No recap yet.", inner));
-		return lines;
+		const sections: Record<Exclude<ActivityView, "All">, () => string[]> = {
+			Agents: () => {
+				const lines = [heading("Agents")];
+				for (const run of runs) {
+					const { color, glyph } = statusMark(run);
+					const indent = "  ".repeat(Math.max(0, (run.depth ?? 1) - 1));
+					lines.push(...wrapTextWithAnsi(`${indent}${theme.fg(color, glyph)} ${runTitle(run)} · ${run.status} · depth ${run.depth ?? 1}`, inner));
+				}
+				if (!runs.length) lines.push(theme.fg("muted", "No current agents."));
+				return lines;
+			},
+			Processes: () => [heading("Processes"), ...(commands.length ? commands.map(v => processLine(v, theme, inner)) : [theme.fg("muted", "No current processes.")])],
+			Todos: () => renderTodoOverviewLines(this.todos, theme, width),
+			Path: () => { const mom = this.mom?.(); return mom ? momSectionLines(mom, theme, width, false) : [heading("Path"), theme.fg("muted", "Path is unavailable.")]; },
+			Schedules: () => this.scheduleLines(theme, inner, this.view === "Schedules"),
+			Recap: () => [heading("Recap"), ...wrapTextWithAnsi(this.overviewRecap || "No recap yet.", inner)],
+		};
+		const tabs = ACTIVITY_VIEWS.map((view, index) => view === this.view
+			? theme.bold(theme.fg("accent", `[${index + 1} ${view}]`)) : theme.fg("muted", ` ${index + 1} ${view} `)).join("");
+		const body = this.view === "All"
+			? (["Agents", "Processes", "Todos", "Path", "Schedules", "Recap"] as const)
+				.filter(view => view !== "Processes" || commands.length)
+				.flatMap((view, index) => [...(index ? [""] : []), ...sections[view]()])
+			: sections[this.view]();
+		return [...wrapTextWithAnsi(tabs, inner), "", ...body];
 	}
 
 	focusAgents(): void {
@@ -247,7 +371,7 @@ export class ActivityCoordinator {
 		this.spin(Boolean(mom?.trail && spinning(mom.status)));
 		if (mom) sections.push(momSectionLines(mom, theme, inner + 4, this.compact));
 		if (this.recap && !this.compact) sections.push(renderRecapSectionLines(this.recap, theme, inner + 4, this.compact));
-		if (this.spurJobs && this.spurJobs.length) sections.push(renderSpurSectionLines(this.spurJobs, theme, inner + 4, this.compact));
+		if (this.spur.jobs.length) sections.push(renderSpurSectionLines(this.spur.jobs, theme, inner + 4, this.compact));
 		if (this.compact) {
 			// One line: each section's title and count, side by side.
 			const parts = sections.filter(section => section.length).map(section => section[0]!);

@@ -17,7 +17,7 @@ const Parameters = Type.Object({
   timezone: Type.Optional(Type.String({ description: "IANA timezone, e.g. America/New_York, for cron only; otherwise local time. To change it, also supply the cron schedule. Omit both schedule and timezone to preserve an existing deadline." })),
 });
 
-export function installSpur(pi: ExtensionAPI, activity: any): void {
+export function installSpur(pi: ExtensionAPI, activity: ActivityCoordinator): void {
   let scheduler = new Scheduler();
   let context: ExtensionContext | undefined;
   let timer: ReturnType<typeof setInterval> | undefined;
@@ -45,13 +45,9 @@ export function installSpur(pi: ExtensionAPI, activity: any): void {
     if (!native) storage?.save(scheduler.state, false);
     pi.appendEntry(SNAPSHOT_TYPE, structuredClone(scheduler.state));
     if (native) storage?.save(scheduler.state, true);
-    // activity updated in dispatch/settle
     updateActivity();
   };
-  function updateActivity() {
-    if (!activity) return;
-    activity.setSpurJobs(scheduler.state.jobs);
-  }
+  const updateActivity = (): void => activity.setSpur(structuredClone(scheduler.state));
   const notify = (text: string, type: "info" | "warning" | "error" = "info"): void => context?.ui.notify(text, type);
   const stop = (): void => {
     generation++;
@@ -139,6 +135,7 @@ export function installSpur(pi: ExtensionAPI, activity: any): void {
     return describe();
   };
 
+  activity.setSpurControl(manage);
   pi.on("session_start", (_event, ctx) => restore(ctx));
   pi.on("session_tree", (_event, ctx) => restore(ctx, true));
   pi.on("message_end", () => {

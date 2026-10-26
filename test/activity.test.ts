@@ -146,3 +146,37 @@ test("Path's spinner repaints on its own clock while it works, and the clock sto
 		assert.equal(renders, stopped, "no repaint clock once Path is idle");
 	} finally { coordinator.dispose(); }
 });
+
+test("full-size Activity has a tab per section and Schedules controls jobs through spur", () => {
+	const styler = { fg: (_c: string, s: string) => s, bold: (s: string) => s, bg: (_c: string, s: string) => s, strikethrough: (s: string) => s } as any;
+	const owner = new ActivityCoordinator();
+	const job = { id: "sugg-watch", prompt: "Check the two Harness suggestion runs\nand report changes.", timing: { kind: "interval" as const, milliseconds: 360_000 },
+		nextAt: Date.now() + 300_000, enabled: true, phase: { kind: "idle" as const } };
+	owner.setSpur({ version: 1, paused: false, jobs: [job] });
+	const requests: unknown[] = [];
+	owner.setSpurControl(request => { requests.push(request); return ""; });
+	const all = owner.renderOverview(styler, 80).join("\n");
+	for (const tab of ["1 All", "2 Agents", "3 Processes", "4 Todos", "5 Path", "6 Schedules", "7 Recap"]) assert.match(all, new RegExp(tab));
+	assert.match(all, /sugg-watch · Every 6 minutes · in 5m · idle/);
+	assert.doesNotMatch(all, /Prompt:/);
+	assert.equal(owner.activityInput("6"), true);
+	const schedules = owner.renderOverview(styler, 80).join("\n");
+	assert.match(schedules, /› sugg-watch/);
+	assert.match(schedules, /Schedule: Every 6 minutes/);
+	assert.match(schedules, /Last run: never/);
+	assert.match(schedules, /and report changes\./);
+	assert.doesNotMatch(schedules, /Agents\n/);
+	assert.equal(owner.activityInput("p"), true);
+	assert.equal(owner.activityInput("n"), true);
+	assert.equal(owner.activityInput("d"), true);
+	assert.match(owner.renderOverview(styler, 80).join("\n"), /Remove sugg-watch\?/);
+	assert.equal(owner.activityInput("x"), true);
+	assert.equal(owner.activityInput("d"), true);
+	assert.equal(owner.activityInput("y"), true);
+	assert.equal(owner.activityInput("g"), true);
+	assert.deepEqual(requests, [{ action: "pause", id: "sugg-watch" }, { action: "run", id: "sugg-watch" }, { action: "remove", id: "sugg-watch" }, { action: "pause" }]);
+	assert.equal(owner.activityInput("q"), false);
+	assert.equal(owner.activityInput("1"), true);
+	assert.match(owner.renderOverview(styler, 80).join("\n"), /Agents/);
+	owner.dispose();
+});

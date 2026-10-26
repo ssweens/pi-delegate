@@ -179,6 +179,7 @@ export function installMom(pi: ExtensionAPI) {
 		try {
 			await context.ui.custom<void>((tui, theme, _keys, done) => { closeView = () => done(); return momView = new MomView({
 				activity: activityTab ? width => activity.renderOverview(theme, width) : undefined,
+				activityInput: data => activity.activityInput(data), activityHints: () => activity.activityHints(),
 				view: () => view(true, false), trail: () => client?.trail, findingAction, copy: copyToClipboard, diagnostics,
 				refresh: async () => { const before = client?.snapshot?.passive.trail?.count ?? 0; await request({ kind: "refresh" });
 					const done = outcome(before, refreshed); if (done.error) throw new Error(done.error); return `${done.text[0]!.toUpperCase()}${done.text.slice(1)}`; },

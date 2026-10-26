@@ -35,6 +35,9 @@ export interface WorkspaceStatus {
 export interface PanelSource {
 	view(): PanelView;
 	activity?(width: number): string[];
+	/** Keys the Activity tab handles itself (its sub-tabs and schedule controls); false leaves the key to this view. */
+	activityInput?(data: string): boolean;
+	activityHints?(): string;
 	diagnostics?(): PanelDiagnostics;
 	copy?(text: string): Promise<void>;
 	findingAction?(action: FindingDisposition, finding: string): void | Promise<void>;
@@ -388,6 +391,7 @@ export class MomView implements Component {
 		}
 		// Settings has type-to-search: every other key is its own.
 		if (this.tab === "Settings") { this.settingsPanel?.handleInput?.(data); this.tui.requestRender(); return; }
+		if (this.tab === "Activity" && this.source.activityInput?.(data)) { this.scroller.top = 0; this.tui.requestRender(); return; }
 		const nav = navKeys(data);
 		if (nav === "cancel" && this.tab === "Map" && this.mapPane !== "tree") {
 			this.mapPane = this.mapPane === "source" && !this.trailMode ? "details" : "tree"; this.sourceRequest++; this.scroller.top = 0; this.tui.requestRender(); return;
@@ -615,7 +619,7 @@ export class MomView implements Component {
 		const navigation = this.tab === "Map" && this.trailMode ? (this.mapPane === "tree" ? joinHints(hint.move("move"), hint.enter("show in transcript")) : joinHints("[ ] source", "N/B page", hint.cancel("trail")))
 			: this.tab === "Map" ? joinHints(this.mapPane === "tree" && hint.move("select"), this.mapPane === "tree" && hint.enter("inspect"), "S source", "D draft")
 			: this.tab === "Status" ? joinHints("V raw", !this.trailMode && this.source.rebuild && "B rebuild map")
-				: this.tab === "Settings" ? (this.source.activity ? "F1–F3 / F5 other tabs" : "F1–F3 other tabs") : this.tab === "Activity" ? "Home/End" : "";
+				: this.tab === "Settings" ? (this.source.activity ? "F1–F3 / F5 other tabs" : "F1–F3 other tabs") : this.tab === "Activity" ? (this.source.activityHints?.() ?? "Home/End") : "";
 		const footer = [
 			...(this.notice ? [fit(this.theme.fg("dim", this.notice), w)] : []),
 			...(this.snapshot.note && (this.source.findingAction || this.source.prepareLeadDraft)
