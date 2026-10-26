@@ -2,7 +2,7 @@
 
 Install from a local checkout with `pi install ./pi-delegate`. This private package is not published to npm. During the tether compatibility window, use this package instead of `pi-tether`; do not list both packages in Pi or Oven settings because both declare Path. The delegation tools, phased todo tool, `delegation` skill, and default roles all ship in the package. Nothing is copied to `~/.agents`.
 
-Requires Pi 0.99.1 or newer, below 2.0.0. Minimal delegation for pi: durable child runs, role files, fork context, steer, honest run log, a stock-Pi phased todo list, Path's unified activity view, and an away recap after idle. Path's trail (the append-only index of waypoints into the transcript, mode `trail`) is documented in [`docs/trail.md`](docs/trail.md); the older work-graph modes are in [`docs/map-modes.md`](docs/map-modes.md). Replaces pi-subagents (125 schema params, 14.8k lines, 11 tools in context) and pi-strings.
+Requires Pi 0.99.1 or newer, below 2.0.0. Minimal delegation for pi: durable child runs, role files, fork context, steer, honest run log, a stock-Pi phased todo list, Path's unified activity view (now including Spur scheduled jobs surfaced in the Activity widget), and an away recap after idle. Path's trail (the append-only index of waypoints into the transcript, mode `trail`) is documented in [`docs/trail.md`](docs/trail.md); the older work-graph modes are in [`docs/map-modes.md`](docs/map-modes.md). Replaces pi-subagents (125 schema params, 14.8k lines, 11 tools in context) and pi-strings.
 
 One tool pair, three backends:
 
