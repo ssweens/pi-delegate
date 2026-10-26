@@ -156,6 +156,23 @@ test("acp lifecycle: outcomes, mixed-backend wait, and runs that survive a paren
 			for (const id of [acp, quick]) await h.ctl("close", id);
 		});
 
+		await t.test("process, pi and acp share any/all waits", async () => {
+			api.script("Process mixed pi", { text: "PI-PROCESS-MIXED" });
+			const pi = (await h.waitLaunch("Process mixed pi")).details.id;
+			const acp = (await delegate({ backend: "acp", agent: "fixture", task: "quick" })).details.id;
+			await h.ctl("wait", acp);
+			const processRun = (await delegate({ backend: "process", command: "sleep 0.5; printf 'PROCESS-MIXED\\n'", task: "Mixed process" })).details.id;
+			const ids = [pi, acp, processRun];
+			const any = await h.ctl("wait", undefined, { runIds: ids, mode: "any" });
+			assert.deepEqual(any.details.wait, { reason: "settled", pending: [processRun] });
+			const all = await h.ctl("wait", undefined, { runIds: ids, mode: "all" });
+			assert.deepEqual(all.details.wait, { reason: "settled", pending: [] });
+			assert.equal(all.details.rows.find((v: any) => v.id === processRun).exitCode, 0);
+			assert.match(all.content[0].text, /PROCESS-MIXED/);
+			assert.equal(h.notices.filter((n: any) => n.details?.id === processRun).length, 0);
+			await h.ctl("close", acp);
+		});
+
 		const ids: Record<string, string> = {};
 		await t.test("parent exit parks acp runs: sessions released, records kept", async () => {
 			ids.created = (await delegate({ backend: "acp", agent: "fixture", task: "SET:nonce-7" })).details.id;

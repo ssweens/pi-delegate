@@ -1,11 +1,27 @@
 ---
 name: delegation
-description: "Decision rules for delegating work to child agents with the delegate tool — when to delegate at all, which tier, when a review is a gate versus ceremony, and how to correct a child without a re-review loop. Covers both backends: in-process Pi children and external ACP agents (Codex, Claude, Amp, Pi), including opening an existing Amp thread. Use when considering delegate/delegate_ctl, finding OpenRouter model deals, splitting work across agents, choosing a model tier for a subtask, or running or opening an ACP agent session."
+description: "Decision rules for delegating work to child agents with the delegate tool — when to delegate at all, which tier, when a review is a gate versus ceremony, and how to correct a child without a re-review loop. Covers Pi children, external ACP agents (Codex, Claude, Amp, Pi), existing Amp threads, and ordinary background OS commands through backend process. Use when considering delegate/delegate_ctl, finding OpenRouter model deals, splitting work across agents, choosing a model tier for a subtask, or running or opening an ACP agent session."
 ---
 
 # Delegation
 
 Default: do the work yourself. Delegate only when one of three things is true — **context isolation** (fresh-eyes review), **parallelism** over disjoint ownership, or a **tier switch** (a cheaper or stronger model than you). If the brief would be longer than the expected diff, it is not a delegation.
+
+## Background commands without an agent
+
+For an ordinary command, use `delegate {"backend":"process","command":"npm run build","task":"Build project","cwd":"/absolute/project"}`. This starts no model or agent. Do not research or approve a model for a process.
+
+The call returns immediately with a process-prefixed runId, PID when spawned, and outputFile. `task` is an optional display title. Preserve command bytes. There is no execution timeout by default. An explicit positive integer `timeoutMs` sets the command deadline. Agent fields such as role, model, context, agent, sessionId, runtime, tui, mode, and firstDeliverableMin fail validation.
+
+Use `delegate_ctl status` or `result` for one nonblocking read. Use `wait` for dependent work, including mixed pi, ACP, and process runIds with any/all. Wait timeout and abort only detach. Use `cancel` to stop the owned command tree. Process runs cannot steer, close, or select models, and those controls fail ACTION_UNSUPPORTED. Do not try to revive a one-shot process.
+
+Read the returned status and exit facts before reporting success. Results distinguish done, error, cancelled, timed_out, and interrupted, and include exitCode, signal, bounded output tail, outputFile, and truncation. Full stdout and stderr share the private output file. Completion wakes the parent once unless a joined wait receives it.
+
+Processes survive turns and `/reload`. Quit or session replacement stops owned commands. Reopen reads records without replay or PID adoption; lost-owner running records become interrupted with an unknown outcome. Cancellation verifies descendants before signalling and reports cleanup failures; it does not promise universal daemon cleanup. No environment, PTY, stdin, or arbitrary-PID options exist.
+
+The same Activity box has separate Agents and Processes sections. Process rows have title, state, elapsed time, and exit code, not model, thinking, usage, or health verdicts. Existing list navigation opens command, cwd, PID, outputFile, and output tail; Ctrl+X stops the selected process. Compact mode includes its count.
+
+The agent guidance below applies to pi and ACP, not process commands.
 
 ## Configuration per task class
 

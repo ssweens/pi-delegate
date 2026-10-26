@@ -285,7 +285,7 @@ test("an ACP run view keeps run ID, request IDs, native ID, delivery and outcome
 type Equals<A, B> = (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B ? 1 : 2) ? true : false;
 const pins: [
 	Equals<AcpTurnView["delivery"], "accepted" | "unknown">,
-	Equals<DelegateRunView["backend"], "pi" | "acp">,
+	Equals<DelegateRunView["backend"], "pi" | "acp" | "process">,
 	Equals<AcpStartInput["origin"], "created" | "opened">,
 	Equals<keyof BackendCapabilities, "backend" | (typeof LIFECYCLE_ACTIONS)[number]>,
 	Equals<Parameters<DelegateBackend<"pi">["start"]>[0], PiStartInput>,

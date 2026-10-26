@@ -40,6 +40,16 @@ ACP runs are durable like pi runs. Each run's record (identity, origin, native s
 - `delegate_ctl close` stays final: a closed run is never reopened.
 - A created turn reports delivery `accepted` only when the provider reports completion, the same rule as opened turns.
 
+## Process amendment
+
+The public tool pair also accepts `backend: "process"`. This extends the original pi/ACP decision with a non-agent variant; it does not replace their contracts or authorize a native-host backend.
+
+`ProcessStartInput` carries command, optional title, cwd, and optional execution deadline. Agent fields fail validation. A process returns its runId, PID when available, private merged outputFile, bounded 64 KiB tail, truncation, and distinct exit facts. There is no default execution deadline, model lookup, role approval, token accounting, or agent-health watch.
+
+`ProcessBackend` reuses owner identity, RunStore, completions, and joins. Status, result, wait, and cancel dispatch by run backend. Mixed any/all waits share non-cancelling deadlines and aborts. One completion goes to either the joined wait or the parent notification. Steer, close, opening sessions, and model selection are unsupported, never translated into replay.
+
+The existing Activity box adds a separate Processes section and command detail with a stop action. Agent rows remain unchanged. Reload rebinds live ownership; quit or session replacement stops owned commands. Reopen reads records and marks lost-owner running commands interrupted without replay or PID adoption. Stop acts only on owned handles and verified descendants and reports cleanup failure honestly.
+
 ## Consequences
 
 - Lost: cancelling a turn someone else started in a shared Amp thread. Delegate can't see such turns without observing, so cancel acts only on this run's own turn; with none running it fails `WORKER_NOT_RUNNING`, and a turn started by someone else is never cancelled.

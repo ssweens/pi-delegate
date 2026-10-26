@@ -4,16 +4,18 @@ Install from a local checkout with `pi install ./pi-delegate`. This private pack
 
 Requires Pi 0.99.1 or newer, below 2.0.0. Minimal delegation for pi: durable child runs, role files, fork context, steer, honest run log, a stock-Pi phased todo list, Path's unified activity view, and an away recap after idle. Path's trail (the append-only index of waypoints into the transcript, mode `trail`) is documented in [`docs/trail.md`](docs/trail.md); the older work-graph modes are in [`docs/map-modes.md`](docs/map-modes.md). Replaces pi-subagents (125 schema params, 14.8k lines, 11 tools in context) and pi-strings.
 
-One tool pair, two backends:
+One tool pair, three backends:
 
 - `backend: "pi"` (the default) runs an in-process Pi child.
 - `backend: "acp"` runs an external ACP agent session: Pi, Amp, Codex, Claude or another agent in the ACPX registry. It can create a session or open an existing one by its native ID, such as an Amp `T-…` thread.
 
-[Backends](#backends) has examples for both. [Backend limits](#backend-limits) says what each backend can and cannot do. [Migrating from pi-strings](#migrating-from-pi-strings) maps the old `op_*` tools. The design record is [ADR 0001](docs/adr/0001-delegate-backends.md).
+- `backend: "process"` runs an ordinary OS command without an agent or model.
+
+[Backends](#backends) has agent examples. [Background commands](#background-commands) covers processes. [Backend limits](#backend-limits) says what each backend can and cannot do. [Migrating from pi-strings](#migrating-from-pi-strings) maps the old `op_*` tools. The design record is [ADR 0001](docs/adr/0001-delegate-backends.md).
 
 ## Tools
 
-**`delegate({ backend?, role?, task?, model?, reason?, context?, cwd?, timeoutMs?, agent?, sessionId?, executionEnvironment?, mode? })`**
+**`delegate({ backend?, command?, role?, task?, model?, reason?, context?, cwd?, timeoutMs?, agent?, sessionId?, executionEnvironment?, mode? })`**
 On the pi backend, `role` and `task` are required, and it runs `role` on `task` in its own in-process session (`createAgentSession`). The child re-binds its parent's already-loaded extensions and calls its parent's MCP tools, and gets their tools, limited to its role's [`tools`](#role-tools) line; skills, prompt templates and themes are not loaded. Returns final report, changed files, turns, tokens, cost, run id, and the child's session file path. Refuses a second writing child in a `cwd` that already has one running. `agent`, `sessionId`, `executionEnvironment` and `mode` are ACP-only; see [Backends](#backends).
 
 - `context: "fork"` (default) — child starts with the parent's conversation so far (`buildSessionContext` of the active branch, trailing unresolved tool call trimmed). No re-acquisition. Delegation records are left out of that inheritance — `delegate`/`delegate_ctl` calls, their results, and completion notices — so a child inherits the work rather than a pattern of handing it off; copies of those calls only produced confident re-delegation attempts and false "extension not loaded" diagnoses. The records are left out for children that have the delegation tools too. A forked child is also told, in its own instructions, that the inherited conversation belongs to the agent that delegated to it: stripping the calls stops the mimicry, but the surrounding prose still reads as supervising a worker, and a child that adopts that voice inspects the job instead of doing it. When the parent's recent conversation is mostly orchestration, `fresh` with a complete brief remains the safer choice.
@@ -22,7 +24,7 @@ On the pi backend, `role` and `task` are required, and it runs `role` on `task` 
 - Background handoff — records the run and returns its id before child resource preparation or model work. Do independent work; unjoined completion wakes the parent via `sendMessage(followUp, triggerTurn)`. Use `delegate_ctl wait` only when dependent work needs the result.
 
 **`delegate_ctl({ action: models|deals|rate|approve|roles|status|result|wait|steer|cancel|close, runId?, runIds?, mode?, message?, model?, restart?, timeoutMs?, force?, discardPersistentState?, observe?, ratings? })`**
-`status`, `result`, `wait`, `steer` and `cancel` work on runs of both backends. `close` is ACP-only. `wait` with `runIds` and `mode` joins several runs of either backend. The rest of this section covers `models` and `rate`.
+`status`, `result`, `wait`, and `cancel` work on all three backends. `steer` works on agent runs. `close` is ACP-only. `wait` with `runIds` and `mode` joins any mixture of pi, ACP, and process runs. The rest of this section covers `models` and `rate`.
 
 `models` without a `runId` reports approved defaults per role, DRIFT against the live catalog (default unavailable · price changed · approval >30 days · new offerings · OpenRouter live price or expiration differs), your ratings cache, and the catalog across **all** enabled providers exactly as the registry reports it: one line per offering, `provider/id`, reasoning flag, context window, $/M in/out. Nothing is deduplicated, excluded, scoped, or ranked by price — the same weights on a subscription, a metered API, a local box, and a free tier are different offerings and the agent weighs them in the open.
 
@@ -42,6 +44,22 @@ In the sheet: **1–4** or **Tab/Shift+Tab** changes tabs; **↑↓**, **PgUp/Pg
 Value compares a stated basket of 1M prompt + 250k completion tokens using **listed model prices, not discounted endpoint prices**; frontier means the top 15% of today's AA-Intelligence-scored, tool-capable text models with at least 128k context, and light means the top half below that frontier with at least 32k context. These are relative score bands, not a guarantee of task performance. Free, `:batch`, and per-request-priced models are excluded from the value ranking; promotional offers with missing AA scores remain visible. Non-healthy endpoints are omitted. The scan checks every eligible model's endpoints in batches of eight, caches successful responses for ten minutes unless refreshed, and reports lookup failures rather than claiming a complete promotion scan. Entries absent from Pi's available OpenRouter registry are labeled **not configured**. This action never switches or approves a model.
 
 `rate` stores ratings the agent researched, keyed by exact `provider/id` (`[{model, score, source, note?}]`), in the `ratings` section of `~/.pi/agent/pi-delegate.json`; reported stale after 14 days. Ratings appear on `models` lines.
+
+## Background commands
+
+```json
+{"backend":"process","command":"npm run build","task":"Build project","cwd":"/absolute/project"}
+```
+
+`delegate` returns immediately with a `process-…` runId, PID when spawned, and `outputFile`. `task` is an optional display title. Command bytes are preserved. Processes have no default execution deadline. A positive integer `timeoutMs` sets one, independently of the timeout on `delegate_ctl wait`.
+
+Use `delegate_ctl status` or `result` to read without waiting, `wait` to join, and `cancel` to stop the owned command tree. A wait timeout or abort never stops the command. Unjoined completion wakes the parent once with status, exit code or signal, and output tail. A joined wait receives that completion instead.
+
+Stdout and stderr share a private output file. Results include its path, the last 64 KiB, and a truncation flag. Nonzero exit, launch failure, cancellation, execution timeout, and lost-owner interruption remain distinct. Process calls reject agent fields, including `role`, `model`, `context`, `agent`, `sessionId`, `runtime`, `tui`, `mode`, and `firstDeliverableMin`. `steer`, `close`, and `models` with a process runId fail `ACTION_UNSUPPORTED`. There are no environment, PTY, stdin, or arbitrary-PID adoption options.
+
+The Activity box keeps Agents unchanged and adds Processes with title, state, elapsed time, and exit code when known. Compact mode includes the process count. Use the existing list navigation to select a process. Its detail view shows command, cwd, PID, outputFile, and output tail. Ctrl+X stops it. No model, token, cost, thinking, or agent-health facts appear on process rows.
+
+Commands survive turns and `/reload`. Quitting or replacing the parent session stops its owned commands. Reopening reads records without replay or PID adoption. A command whose owner was lost is `interrupted`, with an unknown outcome. Cleanup signals only owned child handles and verified descendants; cleanup failure is reported, not treated as success. This does not guarantee cleanup of every daemon.
 
 ## Roles
 
@@ -242,7 +260,7 @@ Omit `mode` to return when the first run settles; pass `mode: "all"` when every 
 {"action":"close","runId":"amp-…"}
 ```
 
-`status` with no `runId` lists every run of both backends. Close each ACP run when you are done with it. Close is final.
+`status` with no `runId` lists the parent's agent and process runs. Close each ACP run when you are done with it. Close is final.
 
 ### Observing an opened Amp thread
 
@@ -250,6 +268,7 @@ On an opened Amp run, `delegate_ctl status` or `result` with `observe: true` (an
 
 ## Backend limits
 
+- **Processes.** Commands have no agent, model, session, or writer lock. They run with the parent's OS authority and are not confined to cwd. Coordinate commands that write files with any agents using that directory. See [Background commands](#background-commands) for deadlines, output, stop, and ownership rules.
 - **Authority.** On pi, `role` is a role name, and the role file sets its tools and instructions. On acp, `role` is `read-only` (the default) or `writer`, and ACPX permission policy enforces it. Some agents' own write tools can still reach outside `cwd`: see [ARCHITECTURE.md §4](docs/ARCHITECTURE.md#4-profiles-and-permissions). An opened session rejects `role` and `model` and keeps its native settings.
 - **Identity.** Every run has a delegate run ID. An ACP run also has one provider request ID per turn and the provider's native session ID (`session.nativeSessionId`, such as an Amp `T-…`). The three are never interchangeable. A created session gets a worker contract appended to each prompt. An opened session gets your exact text, undecorated, and a turn sent to it is never retried.
 - **Opening.** pi cannot open an existing session. On acp, opening needs an adapter that verifies native identity and can disconnect. Today the vendored Pi and Amp adapters do. Other agents fail `NATIVE_OPEN_UNSUPPORTED`.
@@ -259,7 +278,7 @@ On an opened Amp run, `delegate_ctl status` or `result` with `observe: true` (an
 - **Steer.** On pi, steer queues into a running child or resumes a finished one. On acp, a running turn must finish or be cancelled first. `model` on steer is rejected on an opened session. `restart` is pi-only.
 - **Close.** `close` is ACP-only; on pi it fails `ACTION_UNSUPPORTED`, so use `cancel`. Close refuses a run with an active turn unless `force: true`, which cancels the turn first. A created session is disposed; `discardPersistentState: true` also stops it from being resumable. An opened session is only disconnected. It is never cancelled, archived or deleted, and `discardPersistentState` fails `OPEN_OVERRIDE_FORBIDDEN`. Disconnecting an opened Pi session ends that local adapter process, so a turn still running there may stop with an unknown outcome.
 - **Parent exit and restart.** pi children recover as [Reload and recovery](#reload-and-recovery) describes. ACP runs are *parked* when the parent exits: each session is released the way close releases it (a created one is closed but kept resumable, an opened one is disconnected), but the run is not closed. A turn still running at exit ends as `PARENT_PROCESS_LOST` with delivery `unknown`. After a restart, `status`, `result` and `wait` read the saved record without starting anything. `steer` revives the run: an opened run reopens the same native ID and checks its identity; a created run resumes only if its adapter supports ACP `session/resume` or `session/load`. Otherwise steer fails `RUN_NOT_RESUMABLE`. The record stays readable, so start a new run. A run that another live Pi process owns is read-only here (`RUN_OWNED_ELSEWHERE`).
-- **Writers.** Each backend allows one writer per `cwd`, but the two backends check separately. Do not run a pi writer and an ACP writer in the same tree.
+- **Writers.** Each agent backend allows one writer per `cwd`, but pi and ACP check separately. Do not run a pi writer and an ACP writer in the same tree.
 
 ## Migrating from pi-strings
 

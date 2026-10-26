@@ -91,7 +91,7 @@ test("compact mode keeps every Activity section represented in one shared box", 
 	const run = { id: "agent-1", segment: 1, stopped: false, settled: false, role: "scout", model: "fixture", cwd: "/tmp", thinking: "", context: "fresh",
 		status: "running", task: "Review the routing", output: "", turns: 0, tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, cost: 0,
 		durationMs: 1000, segmentDurationMs: 1000, changedFiles: [], droppedTools: [], toolCalls: [], revision: 0, depth: 1 };
-	const live = { all: () => [run], activity: () => ({ messages: [], activeTools: new Map() }), subscribe: () => () => {}, steer: async () => {}, cancel: async () => {} } as any;
+	const live = { all: () => [run], processes: () => [{ id: "process-1", backend: "process", command: "sleep 30", task: "Background build", status: "running", startedAt: Date.now() }], activity: () => ({ messages: [], activeTools: new Map() }), subscribe: () => () => {}, steer: async () => {}, cancel: async () => {} } as any;
 	const coordinator = new ActivityCoordinator();
 	coordinator.install(context, live, async () => {});
 	const state = startTask(addTask(addTask(emptyState(), "Tasks", "Keep the current task"), "Tasks", "Hide this detail"), "Keep the current task");
@@ -102,14 +102,18 @@ test("compact mode keeps every Activity section represented in one shared box", 
 	const widget = factory(tui, theme);
 	const lines = widget.render(100);
 	const screen = lines.join("\n");
-	assert.match(screen, /Agents · 1\/1 │ Todos · 0\/2 │ Path · up to date │ ※ recap: Continue the routing review\./);
+	assert.match(screen, /Agents · 1\/1 │ Processes · 1\/1 │ Todos · 0\/2 │ Path · up to date/);
 	assert.doesNotMatch(screen, /Hide this detail/);
 	assert.equal(lines.filter((line: string) => line.startsWith("│")).length, 1, "compact body is one line");
 	assert.equal(screen.split("╭").length - 1, 1, "all compact sections share one outer frame");
 	const click = { type: "click", button: "left", x: 3, y: 1, screenX: 3, screenY: 1, width: 100, height: lines.length, shift: false, alt: false, ctrl: false } as const;
 	assert.deepEqual(widget.handleMouse(click), { handled: true });
 	assert.equal(coordinator.isCompact(), false, "a click expands the box");
-	assert.ok(widget.render(100).length > lines.length);
+	const expanded = widget.render(100);
+	assert.ok(expanded.length > lines.length);
+	assert.match(expanded.join("\n"), /Background build.*running/);
+	const processRow = expanded.find((line: string) => line.includes("Background build"));
+	assert.doesNotMatch(processRow, /Thinking|fixture|scout|tokens|\$/);
 	assert.equal(widget.handleMouse({ ...click, type: "move" }), undefined);
 	widget.handleMouse(click);
 	assert.equal(coordinator.isCompact(), true, "a second click compacts it again");

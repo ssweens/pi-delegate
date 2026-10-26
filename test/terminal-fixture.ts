@@ -68,6 +68,15 @@ export default function (pi: any) {
 			return { consume: true };
 		});
 	} });
+	pi.registerCommand("fixture-process", { handler: async (args: string, ctx: any) => {
+		const result = await tools.get("delegate").execute("fixture", { backend: "process", command: args || "printf 'PROCESS-LIVE\\n'; sleep 60", task: "Process terminal walk", cwd: ctx.cwd }, undefined, undefined, ctx);
+		trace({ event: "process-launch", details: result.details });
+	} });
+	pi.registerCommand("fixture-process-control", { handler: async (args: string, ctx: any) => {
+		const [action, runId] = args.trim().split(/\s+/);
+		const result = await tools.get("delegate_ctl").execute("fixture", { action, runId }, undefined, undefined, ctx);
+		trace({ event: "process-control", action, details: result.details });
+	} });
 	pi.registerCommand("fixture-join", { handler: async (args: string, ctx: any) => {
 		const result = await tools.get("delegate_ctl").execute("fixture", { action: "wait", runId: args.trim() }, undefined, undefined, ctx);
 		trace({ event: "joined", details: result.details });

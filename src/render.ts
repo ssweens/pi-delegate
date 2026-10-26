@@ -9,6 +9,7 @@ import { BOX, GLYPH } from "./ui/glyphs.ts";
 import { cut, fit, fitAlign, fitPad } from "./ui/text.ts";
 import { tildify } from "./util/path.ts";
 import type { AcpRunView } from "./backend.js";
+import type { ProcessRunView } from "./process-backend.js";
 
 export interface RunView {
 	id: string;
@@ -68,6 +69,24 @@ export interface RunView {
 }
 
 /** An ACP run's tokens and cost, summed over its turns. An Amp run's cost is its thread's, as last read (`amp threads usage`). */
+export function processText(v: ProcessRunView, output = true): string {
+	return [
+		`${v.id} ${v.status} · ${v.task ?? v.command} · ${formatDuration((v.endedAt ?? Date.now()) - v.startedAt)}${v.exitCode !== undefined ? ` · exit ${v.exitCode}` : ""}${v.signal ? ` · ${v.signal}` : ""}`,
+		`command: ${v.command}`, `cwd: ${v.cwd}`, `PID: ${v.pid ?? "unknown"}`, `outputFile: ${v.outputFile}`,
+		v.error, output && v.truncated ? "[output tail truncated]" : "", output ? v.output : "",
+	].filter(Boolean).join("\n");
+}
+
+export function processLine(v: ProcessRunView, theme: Theme, width: number): string {
+	const { color, glyph } = statusMark(v);
+	const facts = `${v.status} · ${formatDuration((v.endedAt ?? Date.now()) - v.startedAt)}${v.exitCode !== undefined ? ` · exit ${v.exitCode}` : ""}`;
+	return fit(`${theme.fg(color, glyph)} ${fit((v.task ?? v.command).split("\n")[0]!, Math.max(4, width - facts.length - 5))}  ${theme.fg("muted", facts)}`, width);
+}
+
+export function processLines(v: ProcessRunView, expanded: boolean, theme: Theme, width: number): string[] {
+	return [processLine(v, theme, width), ...(expanded ? wrapTextWithAnsi(processText(v), width) : [])];
+}
+
 export function acpUsage(v: Pick<AcpRunView, "turns" | "usage">): Pick<RunView, "tokens" | "cost"> {
 	const turns = v.turns;
 	const tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
@@ -116,6 +135,7 @@ export function acpRowView(v: AcpRunView): RunView {
 
 /** Recorded details of either backend, as a run view, or undefined when they are not a run. */
 export function asRunView(details: any): RunView | undefined {
+	if (details?.backend === "process") return undefined;
 	if (details?.backend === "acp" && details.session && typeof details.session === "object" && Array.isArray(details.turns) && typeof details.id === "string") return acpRowView(details);
 	return details && typeof details === "object" && typeof details.id === "string" ? details : undefined;
 }
@@ -128,9 +148,9 @@ export function runTitle(v: Pick<RunView, "task" | "role">): string {
 
 /** The durable outcome. No live status, frame, or duplicate dispatch record. */
 /** Status colour and glyph, shared by every surface that shows a child. */
-export function statusMark(v: Pick<RunView, "status">): { color: ThemeColor; glyph: string } {
+export function statusMark(v: { status: RunView["status"] | ProcessRunView["status"] }): { color: ThemeColor; glyph: string } {
 	if (v.status === "running") return { color: "accent", glyph: GLYPH.running };
-	if (v.status === "complete") return { color: "success", glyph: GLYPH.done };
+	if (v.status === "complete" || v.status === "done") return { color: "success", glyph: GLYPH.done };
 	if (v.status === "idle") return { color: "muted", glyph: GLYPH.idle };
 	if (v.status === "error") return { color: "error", glyph: GLYPH.failed };
 	return { color: "warning", glyph: GLYPH.stopped };
@@ -614,6 +634,13 @@ export function resultView(
 	width: number,
 ): string[] {
 	const inner = Math.max(1, width);
+	if (result.details?.backend === "process") {
+		if ((title === "delegate" || action === "wait") && result.details.status === "running") return [];
+		return processLines(result.details, Boolean(opts.expanded), theme, inner);
+	}
+	if (result.details?.kind === "runs" && result.details.rows?.some((v: any) => v.backend === "process")) {
+		return result.details.rows.flatMap((v: any) => v.backend === "process" ? processLines(v, false, theme, inner) : resultLines(asRunView(v)!, false, theme, inner));
+	}
 	const single = asRunView(result.details) ?? asRunView(result.details?.run);
 	if (single) {
 		// Async launch stays invisible in chat; its completion message is the one outcome record.

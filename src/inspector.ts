@@ -9,10 +9,13 @@ import { agentListHint, chordLabel, hint, joinHints, keyLabel } from "./ui/hints
 import { navKeys } from "./ui/keys.ts";
 import { keepInView, moveIndex, stepFor } from "./ui/scroll.ts";
 import { fit, fitPad, indent, padTo } from "./ui/text.ts";
-import { formatToolCall, frame, runTitle, statusMark, withLegend, type RunView } from "./render.js";
+import { formatToolCall, frame, runTitle, statusMark, withLegend, processLine, processText, type RunView } from "./render.js";
+import type { ProcessRunView } from "./process-backend.js";
+import { wrapTextWithAnsi } from "@earendil-works/pi-tui";
 
 export interface LiveSource {
 	all(): RunView[];
+	processes?(): ProcessRunView[];
 	activity(id: string): ChildActivity;
 	subscribe(listener: () => void): () => void;
 	steer(id: string, message: string): Promise<void>;
@@ -76,8 +79,12 @@ export class AgentsPanel implements Component, Focusable {
 		this.update();
 	}
 
-	private rows(): RunView[] {
-		return this.src.all().filter(run => isCurrentAgent(run, this.settledBefore));
+	private rows(): (RunView | ProcessRunView)[] {
+		return [...this.src.all().filter(run => isCurrentAgent(run, this.settledBefore)), ...this.processRows()];
+	}
+
+	private processRows(): ProcessRunView[] {
+		return (this.src.processes?.() ?? []).filter(run => run.status === "running" || (run.endedAt ?? 0) >= this.settledBefore);
 	}
 
 	/** Settled runs that ended before this time are no longer listed: the person has moved on. */
@@ -103,7 +110,7 @@ export class AgentsPanel implements Component, Focusable {
 	}
 
 	private update() {
-		const active = this.src.all().some((v) => !v.settled);
+		const active = this.src.all().some((v) => !v.settled) || this.processRows().some(v => v.status === "running");
 		if (active && !this.timer) this.timer = setInterval(() => this.tui.requestRender(), TICK_MS);
 		if (!active && this.timer) { clearInterval(this.timer); this.timer = undefined; }
 		if (!this.rows().length && this.focused && !this.opening) this.release();
@@ -140,10 +147,10 @@ export class AgentsPanel implements Component, Focusable {
 	}
 
 	private section(width: number, compact = false): { header: string; body: string[]; hint: string } | undefined {
-		const rows = this.rows();
+		const rows = this.src.all().filter(run => isCurrentAgent(run, this.settledBefore));
 		if (!rows.length) return undefined;
 		const index = Math.max(0, rows.findIndex((r) => r.id === this.selectedId));
-		this.selectedId = rows[index].id;
+		this.selectedId ??= rows[index].id;
 		const count = Math.min(LIST_ROWS, Math.max(1, this.tui.terminal.rows - 10), rows.length);
 		this.offset = keepInView(this.offset, index, count, rows.length);
 		const inner = Math.max(1, width - 4);
@@ -189,8 +196,25 @@ export class AgentsPanel implements Component, Focusable {
 	}
 
 	renderSection(width: number, compact = false): string[] {
+		const rows = this.rows();
+		if (!rows.some(v => v.id === this.selectedId)) this.selectedId = rows[0]?.id;
 		const section = this.section(width, compact);
 		return section ? [section.header, ...section.body] : [];
+	}
+
+	renderProcessSection(width: number, compact = false): string[] {
+		const rows = this.processRows();
+		const commands: string[] = [];
+		if (rows.length) {
+			const active = rows.filter(v => v.status === "running").length;
+			commands.push(this.theme.bold(this.theme.fg("accent", "Processes")) + this.theme.fg("muted", ` · ${active}/${rows.length}`));
+			if (!compact) {
+				const index = Math.max(0, rows.findIndex(v => v.id === this.selectedId));
+				const offset = Math.max(0, index - LIST_ROWS + 1);
+				commands.push(...rows.slice(offset, offset + LIST_ROWS).map(v => `${this.focused && v.id === this.selectedId ? this.theme.fg("accent", "›") : " "} ${processLine(v, this.theme, Math.max(1, width - 6))}`));
+			}
+		}
+		return commands;
 	}
 
 	render(width: number): string[] {
@@ -250,6 +274,40 @@ export class AgentHistory implements Component {
 		return withLegend(frame(this.theme.bold("Finished agents"), body, "borderAccent", this.theme, width), joinHints(hint.move("select"), hint.enter("open"), "type to filter", hint.cancel("back")), "borderAccent", this.theme, width);
 	}
 	invalidate() { this.list.invalidate(); }
+}
+
+export class ProcessView implements Component {
+	private offset = 0;
+	private error?: string;
+	private unsubscribe: () => void;
+	private timer: ReturnType<typeof setInterval>;
+	constructor(private id: string, private src: LiveSource, private theme: Theme, private tui: TUI, private done: () => void) {
+		this.unsubscribe = src.subscribe(() => tui.requestRender());
+		this.timer = setInterval(() => tui.requestRender(), TICK_MS);
+	}
+	handleInput(data: string): void {
+		const nav = navKeys(data);
+		if (nav === "cancel" || nav === "left") { setImmediate(this.done); return; }
+		if (matchesKey(data, STOP_KEY)) {
+			void this.src.cancel(this.id).catch(e => { this.error = errorMessage(e); }).finally(() => this.tui.requestRender());
+			return;
+		}
+		const step = stepFor(nav, Math.max(1, this.tui.terminal.rows - 6));
+		if (step !== undefined) this.offset = Math.max(0, this.offset + step);
+		this.tui.requestRender();
+	}
+	render(width: number): string[] {
+		const run = this.src.processes?.().find(v => v.id === this.id);
+		const lines = wrapTextWithAnsi(run ? processText(run) : `${this.id}: unavailable`, Math.max(1, width - 4));
+		if (this.error) lines.push(this.error);
+		const count = Math.max(1, this.tui.terminal.rows - 6);
+		this.offset = Math.min(this.offset, Math.max(0, lines.length - count));
+		const visible = withLegend(frame("Process", lines.slice(this.offset, this.offset + count), "borderAccent", this.theme, width), "↑↓ scroll · ctrl+x stop · Esc back", "borderAccent", this.theme, width);
+		while (visible.length < this.tui.terminal.rows) visible.push("");
+		return visible.map(line => fitPad(line, width));
+	}
+	invalidate(): void {}
+	dispose(): void { clearInterval(this.timer); this.unsubscribe(); }
 }
 
 /** Full-viewport detail. The parent's editor instance, draft, and cursor are never replaced. */

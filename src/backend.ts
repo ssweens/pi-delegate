@@ -5,7 +5,7 @@
  * `delegate`/`delegate_ctl` to a backend, 043 maps the lifecycle controls (acp-backend.ts).
  *
  * Rules this file pins:
- * - `backend` is "pi" (default, today's in-process children) or "acp" (Coordinator workers).
+ * - `backend` is "pi" (default), "acp" (Coordinator workers), or "process" (OS commands).
  *   An unknown backend fails. Nothing ever falls back from acp to pi.
  * - ACP-only fields are rejected on pi, and pi-only fields are rejected on acp, never ignored.
  * - A run keeps its delegate run ID, one provider request ID per turn, the native session ID,
@@ -14,11 +14,12 @@
  */
 import type { AcpModelOption, AcpModelSource, NativeSessionDescription, RequestRecord, RuntimeHandle, SessionOrigin, UsageCost, WorkerRole } from "./acp/domain/types.js";
 import type { RunView } from "./render.js";
+import type { ProcessStartInput, ProcessRunView } from "./process-backend.js";
 
 // ---------------------------------------------------------------------------------------------
 // Backend selection and inputs
 
-export const BACKENDS = ["pi", "acp"] as const;
+export const BACKENDS = ["pi", "acp", "process"] as const;
 export type BackendName = (typeof BACKENDS)[number];
 /** Omitting `backend` means pi, the current behavior. This is a default, not a fallback. */
 export const DEFAULT_BACKEND: BackendName = "pi";
@@ -91,8 +92,8 @@ export interface AcpOpenInput extends CommonStartInput {
 }
 
 export type AcpStartInput = AcpCreateInput | AcpOpenInput;
-export type StartInput = PiStartInput | AcpStartInput;
-export type StartInputFor<B extends BackendName> = B extends "pi" ? PiStartInput : AcpStartInput;
+export type StartInput = PiStartInput | AcpStartInput | ProcessStartInput;
+export type StartInputFor<B extends BackendName> = B extends "pi" ? PiStartInput : B extends "process" ? ProcessStartInput : AcpStartInput;
 
 /** delegate_ctl steer: the next turn on the same run, transcript and run ID. */
 export interface SteerRequest {
@@ -346,8 +347,8 @@ export interface AmpObservation {
 }
 
 export type PiRunView = RunView & { backend: "pi" };
-export type DelegateRunView = PiRunView | AcpRunView;
-export type RunViewFor<B extends BackendName> = B extends "pi" ? PiRunView : AcpRunView;
+export type DelegateRunView = PiRunView | AcpRunView | ProcessRunView;
+export type RunViewFor<B extends BackendName> = B extends "pi" ? PiRunView : B extends "process" ? ProcessRunView : AcpRunView;
 
 export interface WaitOutcome<V> {
 	/** settled: the mode is satisfied. timeout: runs keep going. interrupted: queued parent messages. lost: a run stopped without settling. */
@@ -360,7 +361,7 @@ export interface WaitOutcome<V> {
 // The backend interface
 
 /**
- * Both backends implement this. The tool layer validates input with this module, picks the backend
+ * Agent backends implement this. ProcessBackend exposes supported controls without session methods. The tool layer validates input with this module, picks the backend
  * by `backend` (start) or by the run's recorded backend (every other action), checks capabilities,
  * then calls exactly one method.
  */
@@ -460,10 +461,10 @@ export function firstDeliverableError(minutes: unknown, timeoutMs: number | unde
 	return undefined;
 }
 
-/** Read `backend`. Omitted means pi. Anything that is not exactly "pi" or "acp" is an error. */
+/** Read `backend`. Omitted means pi; unknown names fail without fallback. */
 export function selectBackend(raw: Record<string, unknown>): Validated<BackendName> {
 	if (raw.backend === undefined) return { ok: true, value: DEFAULT_BACKEND };
-	if (!isOneOf(BACKENDS, raw.backend)) return fail("UNKNOWN_BACKEND", `unknown backend ${JSON.stringify(raw.backend)}; use "pi" or "acp"`, "backend");
+	if (!isOneOf(BACKENDS, raw.backend)) return fail("UNKNOWN_BACKEND", `unknown backend ${JSON.stringify(raw.backend)}; use "pi", "acp" or "process"`, "backend");
 	return { ok: true, value: raw.backend };
 }
 
@@ -474,6 +475,16 @@ export function validateStartInput(raw: Record<string, unknown>): Validated<Star
 	const common = commonFields(raw);
 	if (!common.ok) return common;
 
+	if (backend.value === "process") {
+		for (const field of ["role", "model", "context", "agent", "sessionId", "runtime", "tui", "mode", "firstDeliverableMin", "executionEnvironment", "reason"]) {
+			if (raw[field] !== undefined) return fail("INPUT_INVALID", `${field} is not supported on backend process`, field);
+		}
+		if (!isNonEmptyString(raw.command)) return fail("INPUT_INVALID", "command is required with backend process", "command");
+		if (raw.task !== undefined && !isNonEmptyString(raw.task)) return fail("INPUT_INVALID", "task must be a non-empty title", "task");
+		if (common.value.timeoutMs !== undefined && !Number.isSafeInteger(common.value.timeoutMs)) return fail("INPUT_INVALID", "timeoutMs must be a positive safe integer", "timeoutMs");
+		return { ok: true, value: { backend: "process", command: raw.command, ...(raw.task !== undefined ? { task: raw.task as string } : {}), ...common.value } };
+	}
+	if (raw.command !== undefined) return fail("INPUT_INVALID", "command requires backend process", "command");
 	if (backend.value === "pi") {
 		for (const field of ACP_ONLY_FIELDS) {
 			if (raw[field] !== undefined) return fail("FIELD_REQUIRES_ACP", `${field} is ACP-only; pass backend "acp" to use it`, field);

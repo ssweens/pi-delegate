@@ -57,6 +57,22 @@ try {
 		// one evening while this suite kept passing; never again.
 		assert.doesNotMatch(capture(), /\[Extension issues\]/);
 		assert.doesNotMatch(capture(), /shortcut conflict/);
+		await command("/fixture-process");
+		await expect(/Processes.*1\/1/);
+		await expect(/Process terminal walk.*running/);
+		save(`${mode}-process-running`);
+		key("Left"); key("Enter");
+		await expect(/command: printf/); await expect(/PID: \d+/); await expect(/outputFile:/); await expect(/PROCESS-LIVE/);
+		save(`${mode}-process-detail`);
+		key("C-x"); await expect(/cancelled.*exit null.*SIGTERM/);
+		save(`${mode}-process-stopped-detail`);
+		key("Escape"); await expect(/╭─ Process ─/, true);
+		await expect(/Process terminal walk.*cancelled/);
+		key("Escape"); await expect(/← agents/);
+		text("\x1b[107;6u"); await expect(/Processes.*0\/1.*Path/);
+		save(`${mode}-process-compact`);
+		text("\x1b[107;6u");
+		if (process.env.DELEGATE_PROCESS_SMOKE_ONLY === "1") { tmux("kill-session", "-t", "pi"); continue; }
 		const opening = "RECAP-OPEN: build persistent background agent management.";
 		api.script(opening, { text: "RECAP-OPEN-ACK. Preserve native session references." });
 		await command(opening); await expect(/RECAP-OPEN-ACK/);
@@ -260,7 +276,8 @@ try {
 		assert.equal(new Set(outcomes.map((e) => e.details.sessionFile)).size, 1);
 	}
 	assert.deepEqual(api.errors, []);
-	console.log(`PASS real Pi regular/fullscreen: all five original/Activity tabs, Settings row saves, standard/Kitty F5, full Activity overview, complete todo states/blockers, scroll/end/resize, live completed-only redraw, preserved draft, Path-only command, Kitty key-release focus, bounded recap input, visible recap, cancellation on return, clean startup, native collapsed/expanded tools, streaming latest, paused scrolling, narrow resize, drafts, same-ID revival, hidden finished frame.\nEvidence: ${box.root}`);
+	if (process.env.DELEGATE_PROCESS_SMOKE_ONLY === "1") console.log(`PASS real Pi regular/fullscreen: process launch, Activity row, detail command/cwd/PID/outputFile/output, Ctrl+X stop with signal/exit facts, compact process count.\nEvidence: ${box.root}`);
+	else console.log(`PASS real Pi regular/fullscreen: all five original/Activity tabs, Settings row saves, standard/Kitty F5, full Activity overview, complete todo states/blockers, scroll/end/resize, live completed-only redraw, preserved draft, Path-only command, Kitty key-release focus, bounded recap input, visible recap, cancellation on return, clean startup, native collapsed/expanded tools, streaming latest, paused scrolling, narrow resize, drafts, same-ID revival, hidden finished frame.\nEvidence: ${box.root}`);
 } catch (error) {
 	try { save("failure"); } catch { /* process may already have exited */ }
 	console.error(`Evidence: ${box.root}`); throw error;

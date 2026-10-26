@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, type Focusable, type TUI, type TuiMouseEvent, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { AgentsPanel, isCurrentAgent, type LiveSource } from "../inspector.js";
-import { frame, runTitle, statusMark, withLegend } from "../render.js";
+import { frame, runTitle, statusMark, withLegend, processLine } from "../render.js";
 import { renderTodoOverviewLines, renderTodoSectionLines } from "../todo-render.js";
 import type { TodoState } from "../todo.js";
 import { COMPACT_KEY, FOCUS_KEY, momSectionLines, type PanelView } from "./panel.ts";
@@ -157,6 +157,8 @@ export class ActivityCoordinator {
 			lines.push(...wrapTextWithAnsi(`${indent}${theme.fg(color, glyph)} ${runTitle(run)} · ${run.status} · depth ${run.depth ?? 1}`, inner));
 		}
 		if (!runs.length) lines.push(theme.fg("muted", "No current agents."));
+		const commands = (this.live?.processes?.() ?? []).filter(v => v.status === "running" || (v.endedAt ?? 0) >= this.settledBefore);
+		if (commands.length) lines.push("", heading("Processes"), ...commands.map(v => processLine(v, theme, inner)));
 		lines.push("", ...renderTodoOverviewLines(this.todos, theme, width), "");
 		const mom = this.mom?.();
 		lines.push(...(mom ? momSectionLines(mom, theme, width, false) : [heading("Path"), theme.fg("muted", "Path is unavailable.")]));
@@ -203,7 +205,7 @@ export class ActivityCoordinator {
 		const inner = Math.max(1, outer - 4);
 		const sections: string[][] = [];
 		const mom = this.mom?.();
-		if (this.panel) sections.push(this.panel.renderSection(inner + 4, this.compact));
+		if (this.panel) sections.push(this.panel.renderSection(inner + 4, this.compact), this.panel.renderProcessSection(inner + 4, this.compact));
 		if (this.todos) sections.push(renderTodoSectionLines(this.todos, theme, inner + 4, this.compact));
 		this.spin(Boolean(mom?.trail && spinning(mom.status)));
 		if (mom) sections.push(momSectionLines(mom, theme, inner + 4, this.compact));
