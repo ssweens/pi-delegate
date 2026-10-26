@@ -77,7 +77,7 @@ preserves the unattempted suffix and the coverage cursor.
 B on F3 Status in `/path` starts reconstruction in the background and returns to the editor immediately. Path's
 widget shows each pass, the current tool or model activity, streamed character count, elapsed time,
 and the rebuild's Oven slice URL. When complete, it prompts you to press B on F3 Status again to open
-the review modal. The temporary slice retires when reconstruction ends, so its URL appears only
+the review modal. The temporary slice archives execution when reconstruction ends, retaining its saved history, so its URL appears only
 while it is running. Normal Path's slice URL appears separately in the widget and
 the Status tab. Rebuild activity stays live while the map view is held steady. Path copies the selected branch into a private, unfollowed Oven slice and reconstructs
 its map from bounded thread-map chapter digests, including a short, single-window history. Rebuild

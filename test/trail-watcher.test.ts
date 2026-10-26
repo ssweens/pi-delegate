@@ -122,7 +122,7 @@ test("a watcher that failed on one model picks the work up on the next, and a pa
 	writeFileSync(manager.getSessionFile()!, JSON.stringify(manager.getHeader()) + "\n");
 	manager = SessionManager.open(manager.getSessionFile()!);
 	const client = new MomClient({ cwd: box.cwd, sessionManager: manager } as never, { flags: FLAGS, changed() {}, publish() {}, notify() {} });
-	const slice = async () => (await oven<any[]>("list", {})).find(s => s.key === `${client.key}-trail`);
+	const slice = async () => (await oven<any[]>("list", { includeArchived: true })).find(s => s.key === `${client.key}-trail`);
 	const context = () => ({ slice: client.slice && { state: client.slice.state, stage: client.slice.stage, stopped: client.slice.stopped, model: client.slice.model, detail: client.slice.detail }, answered, errors: api.errors });
 	try {
 		await client.connect();
@@ -136,7 +136,7 @@ test("a watcher that failed on one model picks the work up on the next, and a pa
 		await until("the view to move on", async () => client.view(false).status !== "needs you" || undefined, context);
 
 		await client.controls({ enabled: false });
-		await until("the paused watcher", async () => (await slice())?.stopped || undefined, context);
+		await until("the paused watcher", async () => (await slice())?.archived || undefined, context);
 		const before = answered.length;
 		await client.controls({ enabled: true });
 		await until("the resumed watcher", async () => { const s = await slice(); return s && !s.stopped && s.stage === "idle" && answered.length > before ? s : undefined; }, context);

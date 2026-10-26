@@ -53,7 +53,9 @@ test("a child loads its parent's extensions; its role's tools line is a plain al
 	const h = await harness(box, undefined, { extensions: true, tools: ["delegate", "delegate_ctl", "fixture_tool", "other_tool", "project_tool"] });
 	const requestsFor = (task: string) => api.requests.filter((r) => lastUser(r) === task);
 	const run = (id: string) => h.state().runs.get(id);
-	const registry = (id: string) => run(id).session.getAllTools().map((tool: any) => tool.name).sort();
+	// Completed sessions are disposable. Explicitly reopen their saved configuration for registry-only inspection.
+	const reopen = async (id: string) => { const child = run(id); await h.state().owners.get(child.ownerKey).reopen(child); return child; };
+	const registry = async (id: string) => (await reopen(id)).session.getAllTools().map((tool: any) => tool.name).sort();
 	const gates: ReturnType<typeof deferred<void>>[] = [];
 	try {
 		assert(h.runtime.session.getAllTools().some((tool: any) => tool.name === "fixture_tool"), "the parent loaded the fixture extension");
@@ -81,7 +83,7 @@ test("a child loads its parent's extensions; its role's tools line is a plain al
 				assert.match(lastTool(afterProject), /^project_tool: c$/);
 				assert.deepEqual(result.details.droppedTools, []);
 				assert(existsSync(copyMarker), "the installed copy was loaded");
-				const child = run(started.details.id);
+				const child = await reopen(started.details.id);
 				const tools = child.session.getAllTools();
 				assert.equal(tools.find((tool: any) => tool.name === "delegate").sourceInfo.path, "<inline:pi-delegate>", "delegate is the child's own nested instance's");
 				assert(tools.some((tool: any) => tool.name === "todo"), "the child has its own todo tool");
@@ -105,7 +107,7 @@ test("a child loads its parent's extensions; its role's tools line is a plain al
 				api.script("Without Mom", { text: "NO-MOM-DONE" });
 				const result = await h.waitLaunch("Without Mom", { role: "everything" });
 				assert.equal(result.details.status, "complete", result.content[0].text);
-				const child = run(result.details.id);
+				const child = await reopen(result.details.id);
 				const names = child.session.getAllTools().map((tool: any) => tool.name);
 				assert(!names.includes("path") && !names.includes("mom_probe"), `no Path tool in the child: ${names}`);
 				assert(!child.offered.has("mom_probe"), "the whole extension was left out before its tools were offered");
@@ -121,7 +123,7 @@ test("a child loads its parent's extensions; its role's tools line is a plain al
 			const [first, second] = requestsFor("Narrow");
 			assert.deepEqual(toolNames(first), ["fixture_tool", "read"]);
 			assert.match(lastTool(second), /^fixture_tool: n$/);
-			assert.deepEqual(registry(result.details.id), ["fixture_tool", "read"], "write, other_tool, codemode and the rest are not registered at all");
+			assert.deepEqual(await registry(result.details.id), ["fixture_tool", "read"], "write, other_tool, codemode and the rest are not registered at all");
 			assert(run(result.details.id).offered.has("other_tool") && run(result.details.id).offered.has("write"), "they were offered and refused");
 			assert.deepEqual(result.details.droppedTools, []);
 			assert.equal(run(result.details.id).writer, false);
@@ -132,7 +134,7 @@ test("a child loads its parent's extensions; its role's tools line is a plain al
 			const result = await h.waitLaunch("Missing", { role: "missing" });
 			assert.equal(result.details.status, "complete", result.content[0].text);
 			assert.deepEqual(result.details.droppedTools, ["no_such_tool", "web_*"]);
-			assert(registry(result.details.id).includes("todo"));
+			assert((await registry(result.details.id)).includes("todo"));
 		});
 
 		await t.test("an extension that throws on load does not stop the child and is reported; extensions' session_start never runs in a child", async () => {

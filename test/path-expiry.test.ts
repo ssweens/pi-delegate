@@ -12,7 +12,7 @@ import { OvenIgnoresExpiry } from "../src/oven.ts";
 
 /**
  * Path's slices on an oven older than slice expiry: a stub oven (fetch) answers every create without `expires`, as such an
- * oven does. Path stops and retires the slice it just made and fails naming that oven, as delegate runs do.
+ * oven does. Path refuses the provider without deleting the only saved history, as delegate runs do.
  */
 const OLD_OVEN = "http://old-oven.test";
 const realFetch = globalThis.fetch;
@@ -37,7 +37,7 @@ before(async () => {
 });
 after(async () => { globalThis.fetch = realFetch; await rm(dir, { recursive: true, force: true }); });
 
-/** The slice the stub made is stopped and then retired, nothing else is asked of it, and the failure names the oven. */
+/** Refusal names the provider and requests archive, never destructive retirement. */
 async function refused(attempt: Promise<unknown>) {
 	calls = [];
 	const error = await attempt.then(() => assert.fail("Path accepted a slice that never expires"), (e) => e);
@@ -45,12 +45,14 @@ async function refused(attempt: Promise<unknown>) {
 	assert.equal(error.url, OLD_OVEN);
 	const create = calls.findIndex((c) => c.tool === "create");
 	assert.ok(create >= 0 && calls[create]!.args.expires?.idle === "1h", "the create asked for expiry");
+	assert.deepEqual(calls[create]!.args.owner, { client: "pi-delegate", session: "path-expiry" }, "tracking and rebuild attribute the actual parent session");
 	const slice = error.slice;
-	assert.match(error.message, new RegExp(`^oven at ${OLD_OVEN} did not keep expires \\{"idle":"1h"\\} \\(it answered no expires\\): it predates slice expiry and needs updating, or its slices never expire\\. its slice ${slice} was stopped and retired\\.$`));
-	assert.deepEqual(calls.slice(create + 1), [{ tool: "stop", args: { slice } }, { tool: "retire", args: { slices: [slice] } }], "stopped, retired, and nothing more");
+	assert.match(error.message, /did not keep expires .* with expiryAction "archive"/);
+	assert.equal(calls[create]!.args.expiryAction, "archive");
+	assert.deepEqual(calls.slice(create + 1), [{ tool: "archive", args: { slice } }], "no retirement or deletion");
 }
 
-test("Path's tracking slice on an oven that ignores expires is stopped, retired and refused, naming the oven", async () => {
+test("Path's tracking slice refuses an unsafe lease without retiring history", async () => {
 	const client = new MomClient(context, { flags: { "mom-model": "fixture/fixture" }, changed() {}, publish() {}, notify() {} });
 	try {
 		await refused(client.ensure());
@@ -58,6 +60,6 @@ test("Path's tracking slice on an oven that ignores expires is stopped, retired 
 	} finally { client.close(); }
 });
 
-test("Path's rebuild slice on an oven that ignores expires is stopped, retired and refused, naming the oven", async () => {
+test("Path's rebuild refuses an unsafe lease without retiring history", async () => {
 	await refused(rebuildMap(context, identityOf(context.sessionManager, dir), { "mom-model": "fixture/fixture" }, () => {}, new AbortController().signal));
 });

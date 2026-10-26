@@ -8,7 +8,11 @@ const [root, parent, mode, agentDir] = process.argv.slice(2);
 const box = { root, cwd: join(root, "project"), agentDir, env: process.env } as Sandbox;
 const h = await harness(box, parent);
 try {
-	if (mode === "shared") {
+	if (mode === "oven-crash") {
+		const run = await h.launch("Crash lease work", { role: "baker" });
+		console.log(`OVEN_CRASH_RUN ${run.details.id}`);
+		await new Promise(() => {}); // The caller kills this process; no session_shutdown may run.
+	} else if (mode === "shared") {
 		// Same parent session in a second live process: its runs are visible and read-only here,
 		// and this process can still delegate on its own.
 		const theirs = [...h.state().runs.values()] as any[];

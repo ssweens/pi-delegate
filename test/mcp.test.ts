@@ -85,7 +85,9 @@ export default function (pi) {
 			const result = await h.waitLaunch("Narrow", { role: "narrow" });
 			assert.equal(result.details.status, "complete", result.content[0].text);
 			assert.deepEqual(toolNames(requestsFor("Narrow")[0]), ["read"]);
-			const registry = h.state().runs.get(result.details.id).session.getAllTools().map((tool: any) => tool.name).sort();
+			const run = h.state().runs.get(result.details.id);
+			await h.state().owners.get(run.ownerKey).reopen(run); // Explicit read-only inspection of the saved configuration.
+			const registry = run.session.getAllTools().map((tool: any) => tool.name).sort();
 			assert.deepEqual(registry, ["read"], "write, counted_tool and mcp__fake__echo are not registered");
 		});
 

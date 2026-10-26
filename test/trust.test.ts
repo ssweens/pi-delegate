@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { provider, sandbox, harness, type Reply } from "./fixture.ts";
+import { departed } from "../src/pi-backend.ts";
 
 const FIXTURE = fileURLToPath(new URL("./mcp-fixture.mjs", import.meta.url));
 const text = (content: any) => typeof content === "string" ? content : (content ?? []).filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n");
@@ -54,6 +55,7 @@ test("a child of an untrusted project reads nothing from its .pi: no project MCP
 		assert.equal(result.details.status, "complete", result.content[0].text);
 		const run = h.state().runs.get(result.details.id);
 		assert.equal(run.projectTrusted, false, "the run keeps the parent's decision");
+		await h.state().owners.get(run.ownerKey).reopen(run); // Idle execution was disposed; inspection reopens only its saved configuration.
 		assert.equal(run.session.settingsManager.isProjectTrusted(), false, "the child's own session is untrusted");
 		assert.equal(run.offered.has("project_tool"), false, "the child never loaded the project's extension");
 		assert.equal(existsSync(marker("project-ext")), false);
@@ -108,6 +110,7 @@ async function trustBox(options: { projectTrusted: boolean; select?: Select }) {
 		const done = await h.waitLaunch(task, { cwd });
 		assert.equal(done.details.status, "complete", done.content[0].text);
 		const run = h.state().runs.get(done.details.id);
+		await h.state().owners.get(run.ownerKey).reopen(run);
 		return { run, text: done.content[0].text as string, source: run.projectTrustSource as string, trusted: run.projectTrusted as boolean, sessionTrusted: run.session.settingsManager.isProjectTrusted() as boolean };
 	};
 	const close = async () => { api.onUnscripted(); await h.runtime.session.agent.waitForIdle(); await h.runtime.dispose(); await api.close(); rmSync(box.root, { recursive: true, force: true }); };
@@ -289,7 +292,8 @@ test("a nested child never prompts, even under a root with a UI: an unrecorded f
 		t.api.script("Nested coordinator", { tool: { name: "delegate", arguments: { role: "scout", context: "fresh", task: "Nested scout", cwd: folder, model: "fixture/fixture:off" } } });
 		const coordinator = await t.h.waitLaunch("Nested coordinator", { role: "coordinator" });
 		assert.equal(coordinator.details.status, "complete", coordinator.content[0].text);
-		const scout = [...t.h.state().runs.values()].find((run: any) => run.task === "Nested scout");
+		const scout = [...t.h.state().runs.values()].find((run: any) => run.task === "Nested scout")
+			?? departed.get(coordinator.details.id)?.pi.find(run => run.task === "Nested scout");
 		assert(scout, "the coordinator's scout ran");
 		assert.equal(scout.cwd, folder);
 		assert.equal(scout.projectTrusted, true, "the coordinator's own (inherited) decision");
@@ -326,6 +330,7 @@ test("a run record from before trust was recorded stays untrusted and says so", 
 		assert.match(resumed.content[0].text, new RegExp(TRUST_UNKNOWN), "and so does its completion");
 		const run = h.state().runs.get(done.details.id);
 		assert.equal(run.projectTrusted, false, "untrusted, though the parent trusts this folder");
+		await h.state().owners.get(run.ownerKey).reopen(run);
 		assert.equal(run.session.settingsManager.isProjectTrusted(), false);
 		assert.equal(JSON.parse(readFileSync(path, "utf8")).projectTrustUnknown, true, "the record keeps saying so");
 		assert.equal(JSON.parse(readFileSync(path, "utf8")).projectTrustSource, "unknown");

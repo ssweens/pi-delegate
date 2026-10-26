@@ -192,12 +192,17 @@ test("mode is a durable setting: listed, cycled to a declared name, and carried 
 	assert.match(rendered, /work map in the background/, "the selected row's help is under the list");
 	assert.match(rendered, /Type to search/, "Pi's SettingsList, the same panel as /delegate settings");
 	component.handleInput?.("\u001b[B");
+	assert.match(component.render(120).join("\n"), /explicitly keep[\s\S]*Path following/);
+	component.handleInput?.("\r");
+	await new Promise(resolve => setImmediate(resolve));
+	assert.deepEqual(saved, [{ detached: true }], "detached background is an explicit settings choice");
+	component.handleInput?.("\u001b[B");
 	const next = component.render(120).join("\n").replace(/\x1b\[[0-9;]*m/g, "");
 	assert.match(next, /eligible findings from Path's map/);
 	// An on/off row cycles on Enter and saves.
 	component.handleInput?.("\r");
 	await new Promise(resolve => setImmediate(resolve));
-	assert.deepEqual(saved, [{ nudgedClasses: [...PROCESS_RISK_CLASSES] }]);
+	assert.deepEqual(saved, [{ detached: true }, { nudgedClasses: [...PROCESS_RISK_CLASSES] }]);
 	// The mode opens its options, each with its own help.
 	for (let i = 0; i < 3; i++) component.handleInput?.("\u001b[B");
 	component.handleInput?.("\r");
@@ -215,7 +220,7 @@ test("mode is a durable setting: listed, cycled to a declared name, and carried 
 	assert.match(modeled("local-dgx/beverly-4B", "openai-codex/gpt-5.6-sol"), /Model\s+local-dgx\/beverly-4B/, "a saved model is named");
 	assert.match(modeled("", ""), /Model\s+\(not set\)/);
 	// The sidecar accepts mode and decision-model control records alongside the existing ones.
-	assert.deepEqual([...CONTROL_KEYS], ["enabled", "inject", "nudgedClasses", "mode", "model", "decider"]);
+	assert.deepEqual([...CONTROL_KEYS], ["enabled", "inject", "detached", "nudgedClasses", "mode", "model", "decider"]);
 	assert.equal(modeFor("v2").name, "v2");
 });
 
@@ -269,7 +274,7 @@ test("a global setting applies when each session loads it, not only in the trans
 
 test("the model control is durable and scoped to Mom, never to Pi", async () => {
 	const { CONTROL_KEYS } = await import("../src/mom/sidecar.ts");
-	assert.deepEqual([...CONTROL_KEYS], ["enabled", "inject", "nudgedClasses", "mode", "model", "decider"]);
+	assert.deepEqual([...CONTROL_KEYS], ["enabled", "inject", "detached", "nudgedClasses", "mode", "model", "decider"]);
 	// A persisted model overrides the flag when the slice is configured.
 	const withModel = momConfiguration(identity, { ...flags, "mom-model": "fixture/fixture" });
 	assert.match(withModel.instructions, /[\s\S]*/, "instructions still build with a model set");

@@ -62,11 +62,11 @@ export async function rebuildMap(context: ExtensionContext, identity: SessionIde
 		if (signal.aborted) throw signal.reason;
 		const config = momConfiguration({ ...identity, sessionFile: file },
 			{ ...flags, "mom-bootstrap": "1" }, context.modelRegistry);
-		const created = await oven<{ id: string; expires?: unknown; missingTools?: string[] }>("create", {
-			key: `mom-rebuild-${randomUUID()}`, cwd: identity.cwd, copy: "none", expires: OVEN_EXPIRES,
+		const created = await oven<{ id: string; expires?: unknown; expiryAction?: string; missingTools?: string[] }>("create", {
+			owner: { client: "pi-delegate", session: identity.sessionId }, key: `mom-rebuild-${randomUUID()}`, cwd: identity.cwd, copy: "none", expires: OVEN_EXPIRES, expiryAction: "archive",
 			config: { ...config, follow: undefined, retry: [] },
 		});
-		// Checked before it is this rebuild's slice: one an old oven made is stopped and retired here, not stopped again below.
+		// Refuse providers whose lease could destroy the saved history.
 		await requireExpiry(created, oven);
 		slice = created.id;
 		if (created.missingTools?.includes("mom_begin") || created.missingTools?.includes("commit_graph"))
@@ -135,7 +135,10 @@ export async function rebuildMap(context: ExtensionContext, identity: SessionIde
 	} finally {
 		// Stop the private writer before deleting its transcript and sidecar. An interrupted run
 		// cannot write to the original .mom file, even when the modal closes mid-pass.
-		if (slice) await oven("stop", { slice });
+		if (slice) {
+			const released = await oven("archive", { slice });
+			if (!released?.archived || released.state === "running") throw new Error(`Rebuild execution release unconfirmed for ${slice}`);
+		}
 		await rm(folder, { recursive: true, force: true });
 	}
 }

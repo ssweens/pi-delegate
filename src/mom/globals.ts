@@ -25,6 +25,7 @@ export function validGlobals(value: unknown): MomGlobals {
 	if (!isRecord(value)) return {};
 	const source = value, cleaned: MomGlobals = {};
 	if (typeof source.enabled === "boolean") cleaned.enabled = source.enabled;
+	if (typeof source.detached === "boolean") cleaned.detached = source.detached;
 	if (typeof source.inject === "boolean") cleaned.inject = source.inject;
 	if (Array.isArray(source.nudgedClasses) && source.nudgedClasses.every(entry => PROCESS_RISK_CLASSES.includes(entry as never)))
 		cleaned.nudgedClasses = [...new Set(source.nudgedClasses as ProcessRiskClass[])];

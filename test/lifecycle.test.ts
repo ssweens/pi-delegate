@@ -44,7 +44,7 @@ test("real SDK delegation lifecycle (loopback provider, no credentials)", { time
 			// a session already in memory keeps the model it was built with.
 			h.runtime.session.modelRuntime.unregisterProvider("fixture-late");
 			const evicted = state().runs.get(late.details.id);
-			evicted.session.dispose(); evicted.session = undefined; // what retirement and a cold reopen leave behind
+			assert.equal(evicted.session, undefined, "idle child resources are released without evicting its transcript");
 			api.onUnscripted(() => ({ text: "ACK" })); // this revival fails faster than a waiter can attach, so it wakes the parent
 			const gone = await h.ctl("steer", late.details.id, { message: "Should not run" });
 			assert.equal(gone.details.status, "running");
@@ -312,7 +312,7 @@ test("real SDK delegation lifecycle (loopback provider, no credentials)", { time
 		});
 		// Field report: the record moved to the new offering while the retained session kept
 		// calling the old one. Aliases above share a model id, so only the request can tell.
-		await t.test("a replacement offering reaches the retained session, not just the record", async () => {
+		await t.test("a replacement offering reaches the reopened session, not just the record", async () => {
 			h.runtime.session.modelRuntime.registerProvider("fixture-spare", {
 				api: "openai-completions", baseUrl: api.url, apiKey: "loopback-only",
 				models: [{ id: "spare", name: "Distinguishable by request", reasoning: false, input: ["text"], contextWindow: 32768, maxTokens: 4096, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
@@ -322,7 +322,7 @@ test("real SDK delegation lifecycle (loopback provider, no credentials)", { time
 			assert.equal(failed.details.status, "error", failed.content[0].text);
 			assert.equal(failed.details.turns, 0);
 			const id = failed.details.id, file = failed.details.sessionFile;
-			assert.ok(state().runs.get(id).session, "the failed child's session is still in memory");
+			assert.equal(state().runs.get(id).session, undefined, "failed execution is disposed too");
 			const arrived = api.script("Retry elsewhere", { text: "SPARE-OK" });
 			await h.ctl("steer", id, { message: "Retry elsewhere", model: "fixture-spare/spare:off" });
 			const done = await h.ctl("wait", id);
@@ -335,7 +335,9 @@ test("real SDK delegation lifecycle (loopback provider, no credentials)", { time
 		await t.test("cancel during real SDK preflight never dispatches a model request", async () => {
 			api.script("Preflight seed", { text: "SEED" });
 			const { details: { id } } = await h.waitLaunch("Preflight seed");
-			const run = state().runs.get(id), child = run.session;
+			const run = state().runs.get(id);
+			await state().owners.get(run.ownerKey).reopen(run);
+			const child = run.session;
 			const entered = deferred(), release = deferred();
 			const original = child.extensionRunner.emitBeforeAgentStart.bind(child.extensionRunner);
 			child.extensionRunner.emitBeforeAgentStart = async (...args: any[]) => { const result = await original(...args); entered.resolve(); await release.promise; return result; };
@@ -399,7 +401,7 @@ test("real SDK delegation lifecycle (loopback provider, no credentials)", { time
 			api.script("Stalled provider", { error: 503 });
 			const failed = await h.waitLaunch("Stalled provider");
 			const id = failed.details.id;
-			assert.equal(h.state().runs.get(id).session.settingsManager.getRetryEnabled(), false, "the child reads this sandbox's settings: retry off, so one 503 is one attempt");
+			assert.equal(JSON.parse(readFileSync(join(box.agentDir, "settings.json"), "utf8")).retry.enabled, false, "retry off: one 503 is one attempt");
 			assert.equal(failed.details.status, "error");
 			assert.equal(failed.details.failedAttempts, 1);
 			assert.equal(failed.details.turns, 0, "a failed request is not a turn");

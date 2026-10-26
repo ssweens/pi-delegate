@@ -7,6 +7,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { convertToLlm } from "@earendil-works/pi-coding-agent";
 import { CHILD_SETTLED_PROMPT, FORK_BRIDGE, isDelegationCall, stripDelegation } from "../src/index.ts";
 import { deferred, provider, sandbox, harness, type Reply } from "./fixture.ts";
+import { departed } from "../src/pi-backend.ts";
 
 const text = (content: any) => typeof content === "string" ? content : (content ?? []).filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n");
 const lastUser = (request: any) => text(request.messages.findLast((m: any) => m.role === "user")?.content);
@@ -206,13 +207,8 @@ test("a delegating child's subtree ends with it, and a late report is never drop
 			const first = await h.waitLaunch("Retire coordinator", { role: "coordinator" });
 			assert.equal(first.details.status, "complete", first.content[0].text);
 			const run = h.state().runs.get(first.details.id);
-			const scoutId = runFor("Retire scout").id;
-			assert(run.session && hasChildOwner(run));
-			for (let i = 0; run.session && i < 10; i++) {
-				const filler = await h.waitLaunch(`Retire filler ${i}`);
-				assert.equal(filler.details.status, "complete", filler.content[0].text);
-			}
-			await until(() => run.session === undefined, "the coordinator's session to be retired");
+			await until(() => run.session === undefined && !hasChildOwner(run), "idle coordinator resources to be released");
+			const scoutId = departed.get(run.id)!.pi.find(r => r.task === "Retire scout")!.id;
 			assert.equal(hasChildOwner(run), false, "its children's owner closed first");
 			assert.equal(h.state().runs.has(scoutId), false);
 			api.script("Resume after retire", { tool: { name: "delegate_ctl", arguments: { action: "status" } } }, { text: "RESUMED" });
@@ -222,7 +218,8 @@ test("a delegating child's subtree ends with it, and a late report is never drop
 			assert.equal(second.details.segment, 2);
 			assert.equal(second.details.output, "RESUMED");
 			assert.match(lastTool(requestsFor("Resume after retire")[1]), new RegExp(scoutId), "the revived coordinator sees its restored child");
-			assert(hasChildOwner(run), "its children's owner re-attached");
+			await until(() => !run.session && !hasChildOwner(run), "resumed coordinator resources to be released again");
+			assert.ok(departed.get(run.id)?.pi.some(r => r.id === scoutId), "its restored child history remains readable");
 		});
 		await h.runtime.session.agent.waitForIdle();
 	} finally {

@@ -7,7 +7,7 @@ export type SidecarType = "map" | "notice" | "usage" | "injection";
 export type SidecarWriteType = SidecarType;
 /** Every durable delivery setting. A control record names exactly one, so the sidecar can reject a
  * malformed request before it is written and a reader can apply it without guessing. */
-export const CONTROL_KEYS = ["enabled", "inject", "nudgedClasses", "mode", "model", "decider"] as const;
+export const CONTROL_KEYS = ["enabled", "inject", "detached", "nudgedClasses", "mode", "model", "decider"] as const;
 export type ControlKey = typeof CONTROL_KEYS[number];
 export interface SidecarRecord { id: string; sessionId: string; type: SidecarType; at: number; data: Record<string, any> }
 

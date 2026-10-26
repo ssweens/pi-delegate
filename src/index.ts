@@ -1132,7 +1132,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			model: Type.Optional(Type.String({ description: "override. pi: provider/id[:thinking]. acp: the agent's own model ID, created sessions only" })),
 			context: Type.Optional(StringEnum(["fork", "fresh"] as const)),
 			tui: Type.Optional(StringEnum(["pi", "claude", "amp"] as const, { description: 'pi only: run the child as that agent\'s own TUI hosted by oven (a tui slice), in a copy of cwd, on the role as an agent template (its claude:/amp: sections for those agents); model is passed to that agent. Default: the role\'s tui line. Implies runtime "oven"; attach with `oven attach <slice>`' })),
-			runtime: Type.Optional(StringEnum(["in-process", "oven"] as const, { description: 'pi only: where the child runs. Default: the role\'s runtime line, else "in-process". "oven" runs it as an oven slice in a copy of cwd that outlives this session; it never receives your conversation' })),
+			runtime: Type.Optional(StringEnum(["in-process", "oven"] as const, { description: 'pi only: where the child runs. Default: the role\'s runtime line, else "in-process". "oven" runs it as a bounded oven slice in a copy of cwd; completion releases execution and steer resumes saved history. Parent quit releases it; reload only rebinds. It never receives your conversation' })),
 			cwd: Type.Optional(Type.String()),
 			timeoutMs: Type.Optional(Type.Number({ description: `abort the child after this many ms; default ${DEFAULT_TIMEOUT_MS / 60000} min. Size it to the work: a build, suite, or training run that takes hours needs hours here, or it is killed mid-flight` })),
 			firstDeliverableMin: Type.Optional(Type.Number({ description: "pi only: minutes from the start of each segment by which the child should have written its first file; must be under the timeout. Past it with nothing written the run reads no-artifact. Default for a writer: 15 min or 25% of the budget, whichever is sooner; a read-only child has none unless set" })),
@@ -1680,16 +1680,19 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			// A revival of this child waits for this close: reopening mid-close would restore ACP runs that
 			// the close then parks out from under the steer.
 			const closed = (async () => {
-				await closeOwner(previous);
-				const parked = await acp.closeOwner(previous.key);
-				// Parked now: show them as they were left.
-				if (leaving && departed.has(leaving.parentId)) departed.set(leaving.parentId, { pi: departed.get(leaving.parentId)!.pi, acp: parked });
+				try { await closeOwner(previous); }
+				finally {
+					const parked = await acp.closeOwner(previous.key);
+					if (leaving && departed.has(leaving.parentId)) departed.set(leaving.parentId, { pi: departed.get(leaving.parentId)!.pi, acp: parked });
+				}
 			})();
 			if (leaving) closingChildren.set(leaving.parentId, closed);
 			try { await closed; }
-			finally { if (leaving && closingChildren.get(leaving.parentId) === closed) closingChildren.delete(leaving.parentId); }
-			// The Coordinator is process-wide: it stays while another parent in this process may hold runs on it.
-			if (!state.owners.size) await shutdownAcpCoordinator();
+			finally {
+				if (leaving && closingChildren.get(leaving.parentId) === closed) closingChildren.delete(leaving.parentId);
+				// The Coordinator stays while another parent may hold runs, including when Oven release failed.
+				if (!state.owners.size) await shutdownAcpCoordinator();
+			}
 		}
 	}
 	// A nested instance gets this too: closeSession emits it before disposing a child's session.

@@ -100,7 +100,7 @@ export interface WindowOutcome { key: string; compaction: string; at: number; he
 /** Durable delivery controls. `enabled` gates Path entirely; the rest gate one injection surface
  * each, so the user can silence advice without losing its saved map or background maintenance. */
 export interface MomControls { enabled: boolean; inject: boolean; nudgedClasses: ProcessRiskClass[]; mode: string; model: string; decider?: string }
-export interface MomState { observations: Observation[]; checkpoint?: Checkpoint; checkpointId?: string; coverageCut?: Cut; enabled: boolean; inject: boolean; nudgedClasses: ProcessRiskClass[]; mode: string; model: string; decider?: string; unresolvedNotices: string[]; feedback: Record<string, FindingFeedback>; engagement: Engagement; usage?: Usage; error?: string; failure?: CursorFailure; gaps: SkippedGap[]; screen?: AdvisorScreenRecord; cutover?: boolean; /** Records it could not read or apply, and why: skipped, never fatal. */ skipped?: string[]; pendingAnchor?: AnchorState; lastAnchor?: AnchorState; reservedAnchor?: AnchorState & { content: string }; window?: WindowLive; lastWindow?: WindowOutcome; /** Which coverage track this load folded: trail mode keeps its own, apart from the graph modes. */ track?: "graph" | "trail"; /** Trail history still to index. */ backfill?: Backfill }
+export interface MomState { observations: Observation[]; checkpoint?: Checkpoint; checkpointId?: string; coverageCut?: Cut; detached?: boolean; enabled: boolean; inject: boolean; nudgedClasses: ProcessRiskClass[]; mode: string; model: string; decider?: string; unresolvedNotices: string[]; feedback: Record<string, FindingFeedback>; engagement: Engagement; usage?: Usage; error?: string; failure?: CursorFailure; gaps: SkippedGap[]; screen?: AdvisorScreenRecord; cutover?: boolean; /** Records it could not read or apply, and why: skipped, never fatal. */ skipped?: string[]; pendingAnchor?: AnchorState; lastAnchor?: AnchorState; reservedAnchor?: AnchorState & { content: string }; window?: WindowLive; lastWindow?: WindowOutcome; /** Which coverage track this load folded: trail mode keeps its own, apart from the graph modes. */ track?: "graph" | "trail"; /** Trail history still to index. */ backfill?: Backfill }
 
 const failureLike = (x: unknown): x is CursorFailure => isRecord(x) && typeof x.key === "string" && cutLike(x.from) && cutLike(x.through) &&
 	typeof x.firstRef === "string" && typeof x.lastRef === "string" && isNonNegativeInteger(x.count) && x.count > 0 &&
@@ -350,6 +350,7 @@ export async function loadState(store: MomStore, manager: SessionReader, options
 	const saved = mergeGlobals(globals, { enabled: true, inject: true, nudgedClasses: state.nudgedClasses,
 		mode: sessionMode, model: state.model, ...(state.decider === undefined ? {} : { decider: state.decider }) });
 	state.enabled = saved.enabled as boolean;
+	state.detached = globals.detached === true;
 	state.inject = saved.inject as boolean;
 	state.nudgedClasses = saved.nudgedClasses as ProcessRiskClass[];
 	const selectedMode = String(saved.mode ?? "");

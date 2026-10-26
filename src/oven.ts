@@ -7,7 +7,7 @@ import { errorMessage } from "./util/text.ts";
 
 /**
  * A small MCP client for oven, only for `runtime: "oven"` children. pi-delegate does not depend on oven:
- * it calls oven's MCP tools (`oven_create`, `oven_send`, `oven_watch`, `oven_halt`, `oven_expires`) with a JSON-RPC POST
+ * it calls oven's MCP tools (`oven_create`, `oven_send`, `oven_watch`, `oven_archive`, `oven_expires`) with a JSON-RPC POST
  * to OVEN_URL (else oven.json's `port`, else 6836 on 127.0.0.1) at `/mcp`, with the local token oven keeps
  * in its XDG config dir (or OVEN_TOKEN). It never starts oven.
  */
@@ -39,8 +39,8 @@ export class OvenUnreachable extends Error {
 }
 
 /**
- * When every slice pi-delegate makes expires: an hour after the last call on it, so a child never outlives its parent
- * by more than that. While its parent has the run, it renews it (oven_expires, pi-backend's ovenHeartbeat); an open watch holds it too.
+ * Execution lease for non-detached work. Creates pair it with expiryAction: "archive", so a parent crash releases
+ * execution without deleting resumable history. Only active work is renewed; archived history needs no heartbeat.
  */
 export const OVEN_EXPIRES = { idle: "1h" } as const;
 
@@ -55,17 +55,17 @@ export class OvenIgnoresExpiry extends Error {
 	}
 }
 
-/**
- * The slice oven just made must keep OVEN_EXPIRES, for delegate runs and Path alike. When it doesn't, the slice is
- * stopped and retired with `call` (`retired` runs once it is), and this throws OvenIgnoresExpiry naming the oven.
- */
-export async function requireExpiry(slice: { id: string; expires?: unknown }, call: (tool: string, args: Record<string, unknown>) => Promise<unknown>, retired?: () => void): Promise<void> {
-	if (isDeepStrictEqual(slice.expires, OVEN_EXPIRES)) return;
-	const cleanup = await call("stop", { slice: slice.id }).then(() => call("retire", { slices: [slice.id] })).then(
-		() => { retired?.(); return `its slice ${slice.id} was stopped and retired`; },
-		(error) => `stopping and retiring its slice ${slice.id} failed (${errorMessage(error)}); retire it with \`oven retire ${slice.id}\``);
+/** Require a non-destructive execution lease. Refuse old providers without deleting their only saved history. */
+export async function requireExpiry(slice: { id: string; expires?: unknown; expiryAction?: string }, call: (tool: string, args: Record<string, unknown>) => Promise<unknown>, expected: unknown = OVEN_EXPIRES): Promise<void> {
+	if (isDeepStrictEqual(slice.expires, expected) && slice.expiryAction === "archive") return;
+	const cleanup = await call("archive", { slice: slice.id }).then(
+		() => `archive requested for ${slice.id}`,
+		async (error) => {
+			const stopped = await call("stop", { slice: slice.id }).then(() => "stop requested", failure => `stop unconfirmed (${errorMessage(failure)})`);
+			return `archive unconfirmed (${errorMessage(error)}); ${stopped}; history was not retired`;
+		});
 	const url = ovenUrl();
-	throw new OvenIgnoresExpiry(url, slice.id, `oven at ${url} did not keep expires ${JSON.stringify(OVEN_EXPIRES)} (it answered ${slice.expires === undefined ? "no expires" : JSON.stringify(slice.expires)}): it predates slice expiry and needs updating, or its slices never expire. ${cleanup}.`);
+	throw new OvenIgnoresExpiry(url, slice.id, `oven at ${url} did not keep expires ${JSON.stringify(expected)} with expiryAction "archive" (answered ${JSON.stringify({ expires: slice.expires, expiryAction: slice.expiryAction })}); update Oven before resuming. ${cleanup}.`);
 }
 
 /** An oven call answered that its slice expired. The message is oven's own: `No slice <id>: expired (<why>) at <time>`. */
@@ -90,6 +90,8 @@ export const expiredEvent = (slice: string, event: any): SliceExpired | undefine
 export interface SliceView { id: string; state: "running" | "idle" | "failed" | "stopped"; stage?: string; reason?: string; turns: number; detail?: string; output?: string; cwd?: string;
 	/** As oven keeps it; an oven older than slice expiry has none. */
 	expires?: unknown;
+	archived?: boolean;
+	expiryAction?: "archive" | "retire";
 	/** A slice waiting to retry stays running with stage "retrying" (newer oven; absent from older ones). */
 	retry?: { attempt: number; of: number; at: number; error?: string };
 	usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; cost?: number };

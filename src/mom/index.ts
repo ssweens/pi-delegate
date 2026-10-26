@@ -144,7 +144,7 @@ export function installMom(pi: ExtensionAPI) {
 	pi.on("session_start", (_event, context) => reset(context));
 	// A new branch: its work on the old one is stopped in oven, and it follows the selected branch.
 	pi.on("session_tree", (_event, context) => { void client?.halt(); reset(context); });
-	// A reload keeps the session, so its slice stays; any other end retires this session's own Path slice.
+	// Reload only rebinds. Explicit parent end archives owned execution unless detached in /path settings.
 	pi.on("session_shutdown", async (event) => { rebuilding?.abort.abort(new Error("Path session ended.")); rebuilding = undefined;
 		const ended = client; epoch++; client = undefined; activity.clearMom(); ctx = undefined;
 		if (event.reason === "reload") ended?.close(); else await ended?.end(); });

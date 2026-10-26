@@ -5,6 +5,7 @@
  * state, and sends the user's requests. It never writes the `.mom` file.
  */
 import { createHash, randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { branchCheckpoints, emptyUsage, loadState, noticeKey, type MomState, type Usage } from "./checkpoint.ts";
 import { STATUS_DOC, type MomStatus } from "./engine.ts";
@@ -37,7 +38,7 @@ import { errorMessage } from "../util/text.ts";
 export interface SliceHost { pid: number; slice: string; state: string; startedAt: number; sampledAt: number }
 export interface SourcePage { ref: string; text: string; offset: number; totalChars: number; nextOffset: number | null; pairedRef?: string }
 export interface PreparedAnchor { key: string; content: string; at: number }
-export interface Controls { enabled: boolean; inject: boolean; hush: boolean; nudgedClasses: ProcessRiskClass[]; mode: string; model: string; decider?: string }
+export interface Controls { detached?: boolean; enabled: boolean; inject: boolean; hush: boolean; nudgedClasses: ProcessRiskClass[]; mode: string; model: string; decider?: string }
 export interface Telemetry {
 	model: string; activity: string; lastSavedAt?: number; pendingRanges: number; unavailableSources: number;
 	timing?: { startupMs: number; requestMs: number; totalMs: number; oldestEvidenceAgeMs: number };
@@ -46,7 +47,7 @@ export interface Snapshot {
 	passive: PanelView; explicit: PanelView; diagnostics: PanelDiagnostics; usage: Usage; controls: Controls; work?: WorkProjection;
 	startedAt?: number; preparedAnchor?: PreparedAnchor; telemetry: Telemetry; host?: SliceHost;
 }
-export type ControlChange = { enabled: boolean } | { inject: boolean } | { hush: boolean } | { nudgedClasses: ProcessRiskClass[] } | { mode: string } | { model: string } | { decider: string };
+export type ControlChange = { detached: boolean } | { enabled: boolean } | { inject: boolean } | { hush: boolean } | { nudgedClasses: ProcessRiskClass[] } | { mode: string } | { model: string } | { decider: string };
 export type Command =
 	| { kind: "refresh" }
 	| { kind: "graph"; options: { nodes?: string[]; depth?: number; checkpoint?: string } }
@@ -99,6 +100,7 @@ export class MomClient {
 	#records: { type: string; at: number; data: Record<string, any>; id: string }[] = [];
 	#openingError?: string;
 	#closed = false;
+	#ensuring?: Promise<boolean>;
 	#watch = new AbortController();
 	/** Renews its slice while this session lives; cleared at close. */
 	#beat?: ReturnType<typeof setInterval>;
@@ -155,10 +157,12 @@ export class MomClient {
 	/** Ensure its slice (create-or-get by key with its configuration), read its notes, and follow it. */
 	async connect(): Promise<void> {
 		await this.reload();
+		if (this.#closed) return;
 		await this.ensure();
+		if (this.#closed) return;
 		this.#beat ??= setInterval(() => {
-			// A failed beat is nothing to show: the watch and the next beat renew it, and an expired slice is ensure's to remake.
-			if (!this.#closed && this.slice) void oven("expires", { slice: this.slice.id }).catch(() => {});
+			// The watch/reconnect reports transport failures. A failed beat never starts a replacement conversation.
+			if (!this.#closed && !this.state?.detached && !this.paused && this.slice) void oven("expires", { slice: this.slice.id }).catch(() => {});
 		}, ovenHeartbeat.everyMs);
 		this.#beat.unref?.();
 		void this.follow();
@@ -166,8 +170,19 @@ export class MomClient {
 
 	/** Ensure its slice; true when it asked the slice to pick its work up again. */
 	async ensure(reconfigure = false): Promise<boolean> {
-		// A paused Path holds no slice: Oven expires a stopped slice nothing calls, and creating one only to stop it
-		// again would loop (create, stop, expire, "No slice", create…) on every reconnect.
+		if (this.#closed) return false;
+		if (this.#ensuring) {
+			await this.#ensuring;
+			return reconfigure ? this.ensure(true) : false;
+		}
+		const pending = this.ensureSlice(reconfigure);
+		this.#ensuring = pending;
+		try { return await pending; }
+		finally { this.#ensuring = undefined; }
+	}
+
+	private async ensureSlice(reconfigure: boolean): Promise<boolean> {
+		// A paused Path retains history in Oven without an active client watch or lease.
 		if (this.state?.enabled === false) { await this.release(); return false; }
 		// Saved settings override startup flags. Each operation pins its configured mode at begin.
 		// `create` is create-or-get: an idle slice takes this configuration; a running one is returned unchanged.
@@ -187,28 +202,29 @@ export class MomClient {
 		// The watcher is a different slice from a map mode's: its own key, and the other one stops so only one follows.
 		const key = this.sliceKey(trail);
 		await this.stopSlice(this.sliceKey(!trail));
-		const create = { key, cwd: this.identity.cwd, copy: "none", expires: OVEN_EXPIRES,
+		const expires = this.state?.detached ? "never" : OVEN_EXPIRES;
+		const create = { owner: { client: "pi-delegate", session: this.identity.sessionId }, key, cwd: this.identity.cwd, copy: "none", expires, expiryAction: "archive",
 			config: momConfiguration(this.identity, flags, this.context.modelRegistry, trail ? { after: this.coveredThrough() } : {}),
 			...(trail ? { task: `Path trail watcher\n${await trailBriefing(this.identity.sessionFile)}` } : {}) };
-		// An oven older than slice expiry would keep this slice forever: it is stopped and retired, and Path says which oven needs updating.
 		let slice = await oven("create", create);
-		await requireExpiry(slice, oven);
+		// Keyed creates keep their original expiry. Apply only this client's explicit lease setting, without waking it.
+		if (slice.expiryAction === "archive" && !isDeepStrictEqual(slice.expires, expires)) slice = await oven("expires", { slice: slice.id, expires });
+		await requireExpiry(slice, oven, expires);
 		// It is nearly always running, so a changed model or mode would never land: end its current operation,
 		// configure the now idle slice, and have it pick the work up again.
 		const stale = slice.state === "running" && (reconfigure || slice.model !== create.config.model);
 		if (stale) {
 			await oven("halt", { slice: slice.id });
 			slice = await oven("create", create);
-			await requireExpiry(slice, oven);
+			await requireExpiry(slice, oven, expires);
 		}
 		if (slice.state === "failed" && !slice.conversation) throw new Error(`Path's slice in oven failed (${slice.reason}): ${slice.detail}`);
 		assertSliceSupportsMode(String(flags["mom-mode"] ?? ""), slice.missingTools ?? []);
 		this.slice = slice;
 		this.sliceUrl = ovenSliceUrl(slice.id);
-		// Two slices take no work by themselves: one a pause stopped (this client's open watch keeps Oven from retiring
-		// it, so resuming gets it back stopped), and one whose last turn failed under the old configuration (it waits
-		// out its retries, then for the next delivery). Ask either to pick the work up now, as /path refresh does.
-		const asleep = slice.stopped || (reconfigure && ["failed", "retrying"].includes(slice.stage));
+		if (this.#closed) return false; // end() joins this create before releasing; reload only leaves it for rebinding.
+		// Explicit reconnect/resume reacquires the archived mapping, never a replacement conversation.
+		const asleep = slice.archived || slice.stopped || (reconfigure && ["failed", "retrying"].includes(slice.stage));
 		const wake = asleep || (stale && !trail);
 		if (wake) await (trail ? this.refreshTrail() : this.send({ kind: "refresh" }));
 		this.error = undefined;
@@ -225,7 +241,7 @@ export class MomClient {
 				await oven("watch", { slice: this.slice.id, untilSettled: false }, { signal: this.#watch.signal, onEvent: event => this.event(event) });
 			} catch (error) {
 				if (this.#closed) return;
-				// Pausing stops its slice and Oven retires it, which ends this watch: expected, not a fault.
+				// Pausing aborts the watch and archives execution; saved history is not a fault.
 				if (this.state?.enabled === false) { this.slice = undefined; this.error = undefined; this.options.changed(); continue; }
 				this.error = error instanceof OvenUnreachable ? error.message : String(error);
 				this.options.changed();
@@ -525,7 +541,7 @@ export class MomClient {
 	get snapshot(): Snapshot | undefined {
 		const state = this.state;
 		if (!state) return undefined;
-		const controls: Controls = { enabled: !this.paused, inject: state.inject, hush: this.hush, nudgedClasses: [...state.nudgedClasses], mode: state.mode, model: state.model,
+		const controls: Controls = { detached: state.detached === true, enabled: !this.paused, inject: state.inject, hush: this.hush, nudgedClasses: [...state.nudgedClasses], mode: state.mode, model: state.model,
 			// Only what the user saved counts as set: a flag default must never look like a configured model.
 			// Undefined is "nothing saved yet"; empty is "explicitly no decision model".
 			decider: state.decider };
@@ -642,7 +658,15 @@ export class MomClient {
 		const pausing = "enabled" in change && !change.enabled;
 		const resuming = "enabled" in change && change.enabled;
 		const reconfiguring = "mode" in change || "model" in change || "decider" in change;
-		if (pausing) { await this.release(); this.options.changed(); return; }
+		if (pausing) { await this.#ensuring; await this.release(); this.options.changed(); return; }
+		if ("detached" in change) {
+			await this.#ensuring;
+			if (this.slice) {
+				const expires = change.detached ? "never" : OVEN_EXPIRES;
+				await requireExpiry(await oven("expires", { slice: this.slice.id, expires }), oven, expires);
+			}
+			return;
+		}
 		if (resuming) { this.#resume?.(); this.#resume = undefined; }
 		const woke = (reconfiguring || resuming) && await this.ensure(reconfiguring);
 		if (resuming && !woke && !this.trailMode) await this.send({ kind: "refresh" });
@@ -672,29 +696,32 @@ export class MomClient {
 	/** Stop following it. Its slice keeps following the session in oven. */
 	close(): void { this.#closed = true; clearInterval(this.#beat); this.#beat = undefined; this.#watch.abort(); this.#resume?.(); }
 
-	/** This session ended: stop following, then halt and stop its own slice (by id, never by a search) so Oven retires it now, not an hour on. */
+	/** Explicit parent end releases owned execution, unless the user opted into detached background work. */
 	async end(): Promise<void> {
-		const id = this.slice?.id;
 		this.close();
-		this.slice = undefined;
-		if (id) await this.stopSlice(this.sliceKey(this.trailMode), id).catch(() => {});
+		await this.#ensuring;
+		await this.#controlTail;
+		if (!this.slice) return;
+		if (!this.state?.detached || this.paused) await this.release();
+		else await requireExpiry(await oven("expires", { slice: this.slice.id, expires: "never" }), oven, "never");
 	}
 
-	/** Pausing ends its slice: halt what runs, stop it, and let Oven retire it. Also finds a slice left by an earlier client. */
+	/** Pause archives even detached work. Abort the open watch so it cannot keep an execution lease alive. */
 	private async release(): Promise<void> {
-		const id = this.slice?.id;
+		this.#watch.abort();
+		this.#watch = new AbortController();
+		await this.stopSlice(this.sliceKey(this.trailMode), this.slice?.id);
 		this.slice = undefined;
-		await this.stopSlice(this.sliceKey(this.trailMode), id);
 	}
 
 	/** Its slice's key: the trail's watcher and a map mode's operations are different slices of this session. */
 	private sliceKey(trail: boolean): string { return trail ? `${this.key}-trail` : this.key; }
 
-	/** Stop the running slice with this key (or this id), if there is one. */
+	/** Archive only this client's exact slice, or a matching attributed key. Never touch unknown/foreign ownership. */
 	private async stopSlice(key: string, id?: string): Promise<void> {
-		id ??= (await oven<any[]>("list", {}).catch(() => [])).find(slice => slice.key === key && !slice.stopped)?.id;
+		id ??= (await oven<any[]>("list", {})).find(slice => slice.key === key && slice.owner?.client === "pi-delegate" && slice.owner?.session === this.identity.sessionId)?.id;
 		if (!id) return;
-		try { await oven("halt", { slice: id }); await oven("stop", { slice: id }); }
-		catch (error) { if (!/No slice/.test(String(error))) throw error; }
+		const view = await oven("archive", { slice: id });
+		if (view?.archived !== true || view.state === "running") throw new Error(`Path execution release unconfirmed for ${id}`);
 	}
 }

@@ -3,12 +3,13 @@ import { SettingsPanel, type SettingOption, type SettingsRow } from "../ui/setti
 import { PROCESS_RISK_CLASSES, type ProcessRiskClass } from "./process-health.ts";
 import { modeFor, modeNames } from "./modes.ts";
 
-export interface MomSettingsState { enabled: boolean; inject: boolean; hush: boolean; nudgedClasses: ProcessRiskClass[]; mode: string; model: string; decider?: string }
+export interface MomSettingsState { detached?: boolean; enabled: boolean; inject: boolean; hush: boolean; nudgedClasses: ProcessRiskClass[]; mode: string; model: string; decider?: string }
 /** What the Model row shows when Path has no saved model of its own: the flag default it actually runs. */
 export const modelFallback = (fallback: string) => fallback || "(not set)";
-export type MomSettingChange = { enabled: boolean } | { inject: boolean } | { hush: boolean } | { nudgedClasses: ProcessRiskClass[] } | { mode: string } | { model: string } | { decider: string };
+export type MomSettingChange = { detached: boolean } | { enabled: boolean } | { inject: boolean } | { hush: boolean } | { nudgedClasses: ProcessRiskClass[] } | { mode: string } | { model: string } | { decider: string };
 
 const HELP: Record<string, string> = {
+	detached: "Off (default): Path ends with its parent session; a crash releases execution after its lease. On: explicitly keep Path following in Oven after parent quit, without expiry. Pause still releases it. Saving applies to Path globally.",
 	enabled: "On: Path reads new conversation activity and updates its saved work map in the background. Off: pauses those updates. This does not control which suggestions are shown or whether continuity messages are added.",
 	suggestions: "On: show eligible findings from Path's map. Off: hide those findings. Background tracking continues either way.",
 	hush: "On: hide unsolicited suggestions in this Pi session only. Path keeps tracking. This resets when the session reloads.",
@@ -29,14 +30,15 @@ export function pathRows(state: () => MomSettingsState, save: (change: MomSettin
 	/** The flag default Path runs when it has no saved model; shown in place of a bare placeholder. */
 	fallback = ""): SettingsRow[] {
 	const onOff = (on: boolean) => on ? "on" : "off";
-	const toggle = (id: "enabled" | "inject" | "hush", label: string): SettingsRow => ({ id, section: "Path", label, help: HELP[id]!,
-		value: () => onOff(state()[id]), options: () => ON_OFF("", ""), choose: async value => save({ [id]: value === "on" } as MomSettingChange) });
+	const toggle = (id: "enabled" | "inject" | "hush" | "detached", label: string): SettingsRow => ({ id, section: "Path", label, help: HELP[id]!,
+		value: () => onOff(state()[id] === true), options: () => ON_OFF("", ""), choose: async value => save({ [id]: value === "on" } as MomSettingChange) });
 	const picker = (id: "model" | "decider", label: string, value: () => string, pick?: (current: string, done: (selected?: string) => void) => Component): SettingsRow => ({
 		id, section: "Path", label, help: HELP[id]!, value,
 		choose: async selected => save({ [id]: selected.trim() } as MomSettingChange),
 		...(pick ? { submenu: close => pick(id === "model" ? state().model : state().decider ?? "", selected => close(selected)) } : {}) });
 	return [
 		toggle("enabled", "Background tracking"),
+		toggle("detached", "Detached background"),
 		{ id: "suggestions", section: "Path", label: "Suggestions", help: HELP.suggestions!, value: () => onOff(state().nudgedClasses.length > 0),
 			options: () => ON_OFF("", ""), choose: async value => save({ nudgedClasses: value === "on" ? [...PROCESS_RISK_CLASSES] : [] }) },
 		toggle("hush", "Quiet this session"),

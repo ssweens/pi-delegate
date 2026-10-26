@@ -2,7 +2,9 @@ import "./setup.ts"; // First: isolates this file from the real home even when r
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import { once } from "node:events";
+import { ovenToken } from "../src/oven.ts";
 import { createServer } from "node:net";
 import { createServer as createHttpServer, request as httpRequest } from "node:http";
 import { join } from "node:path";
@@ -56,7 +58,7 @@ test("a role becomes the agent's template: Pi gets the top-level fields, Claude 
 	assert.ok(ok.ok && ok.value.backend === "pi" && ok.value.tui === "claude");
 });
 
-test("a tui child runs the agent's own TUI in oven: created from the role in a copy, answered from the agent's record, stopped between segments, woken by steer, halted by cancel", { timeout: 180_000, skip }, async (t) => {
+test("a tui child runs the agent's own TUI in oven: created from the role in a copy, answered from the agent's record, archived between segments, resumed by steer, released by cancel", { timeout: 180_000, skip }, async (t) => {
 	const api = await provider();
 	const box = sandbox(api.url);
 	Object.assign(process.env, { OVEN_URL: `http://127.0.0.1:${await freePort()}`, OVEN_SERVICE: "off", OVEN_TAILSCALE: "off", OVEN_SETUP: "off",
@@ -68,29 +70,39 @@ test("a tui child runs the agent's own TUI in oven: created from the role in a c
 	chmodSync(join(bin, "pi"), 0o755);
 	process.env.PATH = `${bin}:${process.env.PATH}`;
 	const { startDaemon } = await import(DAEMON);
-	const daemon = await startDaemon({ toolHost: { tools: [], dropped: [], errors: [], async promptFor() { return ""; }, close() {} } });
+	const start = () => startDaemon({ toolHost: { tools: [], dropped: [], errors: [], async promptFor() { return ""; }, close() {} } });
+	let daemon = await start();
 	const { ovenCall } = await import("../src/oven.ts");
 	const agents = join(box.cwd, ".pi", "agents");
 	mkdirSync(agents, { recursive: true });
 	writeFileSync(join(agents, "tui-baker.md"), "---\nname: tui-baker\ndescription: Bakes in its own TUI.\ntui: pi\nmodel: fixture/fixture\n---\n\nBake carefully.\n");
 	writeFileSync(join(agents, "tui-keeper.md"), "---\nname: tui-keeper\ndescription: Needs a secret.\ntui: pi\nmodel: fixture/fixture\nsecrets: [FAKE_AGENT_SECRET]\n---\n\nKeep it.\n");
-	const h = await harness(box);
-	const tuiSlices = async () => (await ovenCall<any[]>("list", {})).filter((s) => s.kind === "tui");
+	let h = await harness(box);
+	const tuiSlices = async () => (await ovenCall<any[]>("list", { includeArchived: true })).filter((s) => s.kind === "tui");
 	const sliceOf = async (output: string) => { const id = /oven pi slice (t-[\w-]+)/.exec(output)?.[1]; assert.ok(id, output); return (await tuiSlices()).find((s) => s.id === id)!; };
 	try {
 		let runId = "";
-		await t.test("create from the role, in a copy; the answer is the agent's; the agent stops when the segment settles", async () => {
+		await t.test("create from the role, in a copy; the answer is the agent's; the native process is gone when the segment settles", async () => {
 			const started = await h.launch("Bake one", { role: "tui-baker" });
 			runId = started.details.id;
+			let nativePid = 0;
+			await waitFor(async () => { nativePid = (await tuiSlices()).find(s => s.process?.state === "running")?.process.pid ?? 0; return nativePid > 0; });
 			const result = await h.ctl("wait", runId);
 			assert.equal(result.details.status, "complete", result.content[0].text);
 			const [slice] = await tuiSlices();
 			assert.match(result.details.output, new RegExp(`^answer to: Bake one\\n\\n\\(oven pi slice ${slice.id}; its changes are in its copy, `));
 			assert.notEqual(slice.cwd, realpathSync(box.cwd), "it works in a copy");
+			assert.equal(slice.sender, realpathSync(box.cwd));
+			assert.deepEqual(slice.owner, { client: "pi-delegate", session: h.ctx().sessionManager.getSessionId() });
 			const argv = JSON.parse(readFileSync(join(process.env.HOME!, "fake-agent.argv"), "utf8").trim().split("\n")[0]);
 			assert.equal(argv[argv.indexOf("--model") + 1], "fixture/fixture:off", "the call's model overrides the template's (the harness passes one)");
 			assert.match(argv[argv.indexOf("--append-system-prompt") + 1], /Bake carefully\./, "the role's instructions");
-			await waitFor(async () => (await tuiSlices())[0].state === "stopped");
+			assert.equal(slice.archived, true);
+			assert.notEqual(slice.process.state, "running");
+			assert.throws(() => process.kill(nativePid, 0), { code: "ESRCH" }, "observed native PID no longer exists");
+			assert.ok(slice.attach.socket && slice.attach.session);
+			assert.throws(() => execFileSync("tmux", ["-S", slice.attach.socket, "has-session", "-t", slice.attach.session], { stdio: "ignore" }), "native terminal process is gone");
+			assert.equal((await ovenCall<any[]>("list", {})).some(s => s.id === slice.id), false);
 		});
 
 		await t.test("steer on a settled tui run wakes the same agent session", async () => {
@@ -103,8 +115,8 @@ test("a tui child runs the agent's own TUI in oven: created from the role in a c
 			assert.equal(slices[0].launches, 2, "relaunched on its session");
 		});
 
-		await t.test("cancel halts a running tui child, then stops it", async () => {
-			// pi-delegate's oven calls go through a recording proxy, so the order of halt and stop is visible.
+		await t.test("cancel archives a running tui child and waits for release", async () => {
+			// Record the archive RPC and verify cancel waits for its response.
 			const upstream = new URL(process.env.OVEN_URL!);
 			const calls: { tool: string; slice?: string; sent: number; answered?: number }[] = [];
 			const proxy = createHttpServer((req, res) => {
@@ -135,10 +147,9 @@ test("a tui child runs the agent's own TUI in oven: created from the role in a c
 				await waitFor(async () => (await tuiSlices()).every((s) => s.status?.state !== "working"), 3000);
 				await waitFor(async () => (await tuiSlices()).every((s) => s.state === "stopped"), 3000);
 				const mine = calls.filter((c) => c.slice); // this run's slice is the only one made while the proxy is up
-				const halt = mine.find((c) => c.tool === "oven_halt"), stop = mine.find((c) => c.tool === "oven_stop");
-				assert.ok(halt, `the agent is interrupted: ${JSON.stringify(mine.map((c) => c.tool))}`);
-				assert.ok(stop, "and stopped");
-				assert.ok(halt.answered !== undefined && stop.sent >= halt.answered, "the stop is sent only after the halt is answered, so it can't cut the interrupt short");
+				const archive = mine.find((c) => c.tool === "oven_archive");
+				assert.ok(archive?.answered !== undefined, "cancel awaits archive confirmation");
+				assert.ok((await tuiSlices()).every(s => s.archived && s.process.state !== "running"));
 			} finally {
 				process.env.OVEN_URL = upstream.toString().replace(/\/$/, "");
 				await new Promise((resolve) => proxy.close(resolve));
@@ -182,6 +193,32 @@ test("a tui child runs the agent's own TUI in oven: created from the role in a c
 				assert.match((await h.ctl("wait", run.details.id)).details.output, /^answer to: Keep again/);
 				assert.equal(readFileSync(join(process.env.HOME!, "fake-agent.secret"), "utf8"), value, "a relaunch keeps the value oven was given");
 			} finally { delete process.env.FAKE_AGENT_SECRET; }
+		});
+
+		await t.test("archived native session and copied side effects survive parent and daemon restart", async () => {
+			const result = await h.ctl("wait", runId);
+			const before = await sliceOf(result.details.output);
+			writeFileSync(join(before.cwd, "copy-marker"), "preserved");
+			const argv = readFileSync(join(process.env.HOME!, "fake-agent.argv"), "utf8"), parent = h.parent;
+			await h.runtime.dispose();
+			await daemon.stop();
+			daemon = await start();
+			const cold = spawn(process.execPath, ["--import", "tsx", "test/reopen.ts", box.root, parent, "cold", box.agentDir], { env: { ...box.env, OVEN_URL: process.env.OVEN_URL!, OVEN_TOKEN: ovenToken() }, stdio: ["ignore", "pipe", "pipe"] });
+			let output = ""; cold.stdout.on("data", part => output += part); cold.stderr.on("data", part => output += part);
+			const [code] = await once(cold, "exit"); assert.equal(code, 0, output); assert.match(output, /COLD-READ-ONLY/);
+			h = await harness(box, parent);
+			assert.equal(readFileSync(join(process.env.HOME!, "fake-agent.argv"), "utf8"), argv, "restart does not launch or replay");
+			assert.match((await h.ctl("result", runId)).details.output, /^answer to: Bake again/);
+			assert.match(await ovenCall("result", { slice: before.id }), /^answer to: Bake again/);
+			await h.ctl("steer", runId, { message: "After restart" });
+			const continued = await h.ctl("wait", runId);
+			assert.equal(continued.details.status, "complete", continued.content[0].text);
+			assert.match(continued.details.output, /^answer to: After restart/);
+			const after = await sliceOf(continued.details.output);
+			assert.equal(after.session, before.session);
+			assert.equal(after.cwd, before.cwd);
+			assert.equal(after.archived, true);
+			assert.equal(readFileSync(join(after.cwd, "copy-marker"), "utf8"), "preserved");
 		});
 	} finally {
 		for (const slice of await tuiSlices().catch(() => [])) { await ovenCall("stop", { slice: slice.id }).catch(() => {}); await ovenCall("retire", { slices: [slice.id] }).catch(() => {}); }
