@@ -25,7 +25,7 @@ type Fields = Omit<ProcessRunView, "backend" | "capabilities" | "foreign"> & Par
 interface Run extends Fields {
 	foreign?: boolean; child?: ChildProcess; completion: RunCompletion<ProcessRunView>; waiters: number;
 	hooks: ProcessBackendHooks; store: RunStore<Run, Fields>; delivered?: boolean; fd?: number; poll?: NodeJS.Timeout; deadline?: NodeJS.Timeout;
-	stopping?: Promise<void>; closed?: Promise<true>; stopStatus?: ProcessRunView["status"]; tree: Map<number, string>;
+	stopping?: Promise<boolean>; closed?: Promise<true>; stopStatus?: ProcessRunView["status"]; tree: Map<number, string>;
 }
 const KEY = Symbol.for("@ssweens/pi-delegate/process-runs/1");
 const globals = globalThis as typeof globalThis & { [KEY]?: Map<string, Run> };
@@ -63,7 +63,7 @@ function processes(): ProcessRow[] {
 }
 function track(run: Run, rows: ProcessRow[]): ProcessRow[] {
 	const root = rows.find((p) => p.pid === run.child?.pid);
-	if (root && !run.tree.has(root.pid)) run.tree.set(root.pid, root.identity);
+	if (root && run.child?.exitCode === null && run.child.signalCode === null && !run.tree.has(root.pid)) run.tree.set(root.pid, root.identity);
 	let added: boolean;
 	do {
 		added = false;
@@ -87,14 +87,15 @@ function finish(run: Run): void {
 	try { save(run); } catch (e) { run.status = "error"; run.error = `RUN_NOT_PERSISTED: ${String(e)}`; }
 	run.completion.settle(view(run)); run.hooks.changed(); notify(run);
 }
-async function stop(run: Run, status: ProcessRunView["status"]): Promise<void> {
+async function stop(run: Run, status: ProcessRunView["status"]): Promise<boolean> {
 	if (run.stopping) return run.stopping;
-	if (run.completion.settled) return;
-	run.stopStatus = status;
+	if (!run.child) return true;
+	const completed = run.completion.settled;
+	if (!completed) run.stopStatus = status;
 	clearInterval(run.poll);
-	run.stopping = (async () => {
+	const work = (async () => {
+		let clean = false;
 		try {
-			// Revalidate every PID against its observed birth time before each signal. Never signal a restored PID.
 			for (const signal of ["SIGTERM", "SIGKILL"] as const) {
 				const owned = track(run, processes());
 				for (const p of owned.reverse()) {
@@ -102,15 +103,18 @@ async function stop(run: Run, status: ProcessRunView["status"]): Promise<void> {
 				}
 				const until = Date.now() + 500;
 				while (Date.now() < until && track(run, processes()).length) await new Promise((r) => setTimeout(r, 25));
-				if (!track(run, processes()).length) { run.status = status; return; }
+				if (!track(run, processes()).length) { clean = true; break; }
 			}
-			throw new Error("verified owned processes remain alive");
-		} catch (e) { run.status = "error"; run.error = `PROCESS_CLEANUP_FAILED: ${String(e)}`; }
-	})().finally(async () => {
-		if (run.closed && !await withTimeout(run.closed, 1000)) { run.status = "error"; run.error ??= "PROCESS_CLEANUP_FAILED: child exit was not confirmed"; }
-		finish(run);
-	});
-	return run.stopping;
+			if (!clean) throw new Error("verified owned processes remain alive");
+			if (run.closed && !await withTimeout(run.closed, 1000)) throw new Error("child exit was not confirmed");
+			if (!completed) run.status = status;
+		} catch (e) { clean = false; run.status = "error"; run.error = `PROCESS_CLEANUP_FAILED: ${String(e)}`; }
+		if (completed) { tail(run); save(run); run.hooks.changed(); }
+		else finish(run);
+		return clean;
+	})();
+	run.stopping = work;
+	try { return await work; } finally { if (run.stopping === work) delete run.stopping; }
 }
 export class ProcessBackend {
 	readonly name = "process" as const;
@@ -155,9 +159,9 @@ export class ProcessBackend {
 			run.closed = new Promise((resolve) => child.once("close", () => resolve(true)));
 			child.once("error", (e) => { run.status = "error"; run.error = `PROCESS_LAUNCH_FAILED: ${e.message}`; finish(run); });
 			child.once("close", (code, signal) => {
-				if (run.completion.settled) return;
+				if (child.pid === undefined) return;
 				run.exitCode = code; run.signal = signal;
-				if (run.stopStatus) return;
+				if (run.completion.settled || run.stopStatus) return;
 				run.status = code === 0 ? "done" : "error"; finish(run);
 			});
 			run.poll = setInterval(() => { try { tail(run); track(run, processes()); run.hooks.changed(); } catch (e) { run.error = `PROCESS_OBSERVATION_FAILED: ${String(e)}`; } }, 100);
@@ -202,7 +206,7 @@ export class ProcessBackend {
 	}
 	async closeOwner(ownerKey: string): Promise<ProcessRunView[]> {
 		const owned = [...runs.values()].filter((r) => r.ownerKey === ownerKey && !r.foreign);
-		await Promise.all(owned.map(async (r) => { r.delivered = true; await stop(r, "interrupted"); releaseOwner(r); save(r); }));
+		await Promise.all(owned.map(async (r) => { r.delivered = true; if (await stop(r, "interrupted")) releaseOwner(r); save(r); }));
 		return owned.map(view);
 	}
 }

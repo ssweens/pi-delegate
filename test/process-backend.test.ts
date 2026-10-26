@@ -94,6 +94,71 @@ test("cancellation kills owned parent and separate-group child without touching 
 	assert.equal((await f.backend.cancel(run.id)).status, "cancelled");
 });
 
+for (const action of ["cancel", "closeOwner"] as const) {
+	test(`root exit retains verified workers for ${action} without another completion`, async (t) => {
+		const f = fixture(t);
+		const control = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { stdio: "ignore" });
+		t.after(async () => { control.kill("SIGKILL"); });
+		const run = await f.start("sleep 30 & echo $!; sleep 0.8");
+		await pause(300);
+		const childPid = Number((await f.backend.result(run.id)).output.trim());
+		assert.ok(childPid > 0);
+		t.after(async () => { if (alive(childPid)) process.kill(childPid, "SIGKILL"); });
+		const owned = f.backend.find(run.id, f.dir)!;
+		assert.equal(owned.tree.has(childPid), true);
+		await owned.closed;
+		const before = await f.backend.result(run.id);
+		assert.equal(before.status, "done"); assert.equal(before.exitCode, 0); assert.equal(before.signal, null);
+		assert.equal(alive(childPid), true); assert.equal(f.notices.length, 1);
+		const after = action === "cancel" ? await f.backend.cancel(run.id) : (await f.backend.closeOwner(f.dir)).find(v => v.id === run.id)!;
+		assert.equal(alive(childPid), false); assert.equal(alive(control.pid!), true);
+		assert.equal(after.status, "done"); assert.equal(after.exitCode, 0); assert.equal(after.signal, null);
+		assert.equal(after.endedAt, before.endedAt); assert.equal(f.notices.length, 1);
+		assert.equal((await f.done(run.id)).status, "done");
+		assert.equal(f.notices.length, 1);
+	});
+}
+
+test("failed post-exit cleanup retains ownership until verified workers are stopped", async (t) => {
+	const f = fixture(t), run = await f.start("sleep 30 & echo $!; sleep 0.8");
+	await pause(300);
+	const childPid = Number((await f.backend.result(run.id)).output.trim());
+	assert.ok(childPid > 0);
+	t.after(async () => { if (alive(childPid)) process.kill(childPid, "SIGKILL"); });
+	await f.backend.find(run.id, f.dir)!.closed;
+	assert.equal(alive(childPid), true);
+	const path = process.env.PATH;
+	try {
+		process.env.PATH = f.dir;
+		const end = (await f.backend.closeOwner(f.dir))[0]!;
+		assert.equal(end.status, "error"); assert.match(end.error!, /PROCESS_CLEANUP_FAILED/);
+		assert.equal(end.exitCode, 0); assert.equal(end.signal, null);
+	} finally { process.env.PATH = path; }
+	assert.equal(alive(childPid), true);
+	const record = RunStore.recordPath(f.dir, run.id);
+	assert.equal(JSON.parse(readFileSync(record, "utf8")).ownerToken, processOwner().ownerToken);
+	await f.backend.closeOwner(f.dir);
+	assert.equal(alive(childPid), false);
+	assert.equal(JSON.parse(readFileSync(record, "utf8")).ownerToken, undefined);
+	assert.equal(f.notices.length, 1);
+});
+
+test("cleanup failure retains a live root handle for a later explicit shutdown", async (t) => {
+	const f = fixture(t), run = await f.start(`exec ${node("setInterval(()=>{},1000)")}`);
+	const path = process.env.PATH;
+	try {
+		process.env.PATH = f.dir;
+		assert.equal((await f.backend.closeOwner(f.dir))[0]!.status, "error");
+	} finally { process.env.PATH = path; }
+	assert.equal(alive(run.pid!), true);
+	const record = RunStore.recordPath(f.dir, run.id);
+	assert.equal(JSON.parse(readFileSync(record, "utf8")).ownerToken, processOwner().ownerToken);
+	const end = (await f.backend.closeOwner(f.dir))[0]!;
+	assert.equal(alive(run.pid!), false); assert.equal(end.exitCode, null); assert.equal(end.signal, "SIGTERM");
+	assert.equal(JSON.parse(readFileSync(record, "utf8")).ownerToken, undefined);
+	assert.equal(f.notices.length, 0);
+});
+
 test("unverifiable cleanup reports failure instead of cancelled-and-clean", async (t) => {
 	const f = fixture(t), run = await f.start(`exec ${node("setInterval(()=>{},1000)")}`);
 	const handle = f.backend.find(run.id, f.dir)!.child!;
