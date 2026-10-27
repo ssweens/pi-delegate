@@ -1,11 +1,30 @@
 import "./setup.ts";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import { test } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 import { harness, provider, sandbox } from "./fixture.ts";
 import { validateStartInput } from "../src/backend.ts";
 import { processLine, resultView } from "../src/render.ts";
+
+test("unused registered lifecycle and read-only status leave storage untouched", async (t) => {
+	const box = sandbox("http://127.0.0.1:1/v1");
+	t.after(() => rmSync(box.root, { recursive: true, force: true }));
+	for (const legacy of [false, true]) {
+		const storage = join(box.cwd, ".agents/pi/subsessions");
+		if (legacy) mkdirSync(storage, { recursive: true });
+		const h = await harness(box);
+		try {
+			assert.equal(existsSync(join(box.cwd, ".agents")), legacy);
+			await h.ctl("status");
+			await h.runtime.session.reload();
+			assert.deepEqual(h.errors, []);
+		} finally { await h.runtime.dispose(); }
+		if (legacy) assert.deepEqual(readdirSync(storage), []);
+		else assert.equal(existsSync(join(box.cwd, ".agents")), false);
+	}
+});
 
 test("process input preserves command bytes and rejects agent fields", () => {
 	const command = "  printf 'hello\\n'  ";
@@ -27,6 +46,7 @@ test("process tools: output, waits, notifications, cancel, reload and owner exit
 		await t.test("immediate launch, non-cancelling timed/aborted waits, unsupported controls", async () => {
 			const launch = await start("printf 'LIVE\\n'; sleep 30");
 			const v = launch.details;
+			assert.equal(readFileSync(join(box.cwd, ".agents/pi/subsessions/.gitignore"), "utf8"), "*\n");
 			assert.match(v.id, /^process-/); assert.equal(v.status, "running"); assert.equal(typeof v.pid, "number");
 			assert.match(launch.content[0].text, /PID: .*\noutputFile:/);
 			for (const action of ["steer", "close", "models"]) {

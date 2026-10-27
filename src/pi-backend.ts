@@ -22,7 +22,7 @@ import type { TrustSource } from "./project-trust.js";
 import type { RunView } from "./render.js";
 import { droppedTools, toolAllowlist } from "./roles.js";
 import { modelKey, splitModelRef } from "./model-ref.ts";
-import { ownedElsewhereError, processOwner, readRecord, releaseOwner, RunStore, storageDir, writeRecord } from "./storage.js";
+import { ownedElsewhereError, processOwner, readRecord, releaseOwner, RunStore, storageDir, storagePath, writeRecord } from "./storage.js";
 import type { ActiveTool, ChildActivity } from "./transcript.js";
 import { formatDuration, formatTokens } from "./util/format.ts";
 import { gitSync } from "./util/git.ts";
@@ -254,7 +254,7 @@ function milestone(run: Run, event: Omit<DelegateMilestone, "version" | "runId" 
 }
 function newId(role: string): string { return `${role}-${randomUUID()}`; }
 export function ownerPath(ctx: ExtensionContext): string {
-	return join(storageDir(ctx.sessionManager.getCwd()), "owners", `${ctx.sessionManager.getSessionId()}.json`);
+	return join(storagePath(ctx.sessionManager.getCwd()), "owners", `${ctx.sessionManager.getSessionId()}.json`);
 }
 export function ownedRuns(owner: Owner): Run[] { return [...runs.values()].filter((r) => r.ownerKey === owner.key); }
 export function pointerDir(key: string): string { return key.replace(/\.json$/, ""); }

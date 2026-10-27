@@ -36,7 +36,7 @@ import { tuiTemplate } from "./tui-template.js";
 import { installTodo } from "./todo-ext.js";
 import type { DealsDetails } from "./deals.js";
 import { resolveChildTrust, type ChildTrust } from "./project-trust.js";
-import { processOwner } from "./storage.js";
+import { processOwner, storageDir } from "./storage.js";
 import { isPiStringsWorkerProcess } from "./util/process.ts";
 import { installMom } from "./mom/index.js";
 import { activityFor } from "./ui/activity.js";
@@ -1182,6 +1182,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			if (full) return failed(full);
 			if (start.value.backend === "process") {
 				try {
+					storageDir(ctx.sessionManager.getCwd());
 					const v = await processes.start({ ...start.value, cwd: start.value.cwd ?? ctx.cwd }, signal);
 					return { content: [{ type: "text", text: `${processText(v, false)}\n${START_HINT}` }], details: v };
 				} catch (error) { return failed(error); }
@@ -1192,6 +1193,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 					requireOwner();
 					// A created session works where the parent does unless told otherwise; an opened one keeps its native workspace.
 					const cwd = input.cwd !== undefined ? realpathSync(input.cwd) : input.origin === "created" ? realpathSync(ctx.cwd) : undefined;
+					storageDir(ctx.sessionManager.getCwd());
 					const v = await acp.start({ ...input, ...(cwd !== undefined ? { cwd } : {}) });
 					return { content: [{ type: "text", text: acpStartText(v) }], details: v };
 				} catch (error) {

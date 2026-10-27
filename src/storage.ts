@@ -6,8 +6,12 @@ import { ownerAlive, processIdentity } from "./util/process.ts";
 
 export const SUBSESSION_DIR = join(".agents", "pi", "subsessions");
 
+export function storagePath(cwd: string): string {
+	return join(realpathSync(cwd), SUBSESSION_DIR);
+}
+
 export function storageDir(cwd: string): string {
-	const dir = join(realpathSync(cwd), SUBSESSION_DIR);
+	const dir = storagePath(cwd);
 	mkdirSync(dir, { recursive: true });
 	const ignore = join(dir, ".gitignore");
 	if (!existsSync(ignore)) writeFileSync(ignore, "*\n", { mode: 0o600 });

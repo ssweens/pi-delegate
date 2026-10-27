@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { spawnSync } from "node:child_process";
-import { ownedElsewhere, ownedElsewhereError, processOwner, readRecord, releaseOwner, RunStore, storageDir, writeRecord } from "../src/storage.ts";
+import { ownedElsewhere, ownedElsewhereError, processOwner, readRecord, releaseOwner, RunStore, storageDir, storagePath, writeRecord } from "../src/storage.ts";
 import { ownerAlive, pidAlive, processIdentity } from "../src/util/process.ts";
 import { tempDir } from "./capture.ts";
 
@@ -32,7 +32,10 @@ test("subsession storage is self-ignored and resolves cwd aliases", (t) => {
 	const alias = `${dir}-alias`;
 	symlinkSync(dir, alias);
 	t.after(() => rmSync(alias));
-	const path = storageDir(dir);
+	const path = storagePath(dir);
+	assert.equal(storagePath(alias), path);
+	assert.equal(existsSync(path), false, "resolving storage does not create it");
+	assert.equal(storageDir(dir), path);
 	assert.equal(storageDir(alias), path);
 	assert.equal(readFileSync(join(path, ".gitignore"), "utf8"), "*\n");
 	writeFileSync(join(path, ".gitignore"), "*\n# retained\n");
