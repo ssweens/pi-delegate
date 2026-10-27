@@ -159,6 +159,8 @@ test("full-size Activity has a tab per section and Schedules controls jobs throu
 	for (const tab of ["1 All", "2 Agents", "3 Processes", "4 Todos", "5 Path", "6 Schedules", "7 Recap"]) assert.match(all, new RegExp(tab));
 	assert.match(all, /sugg-watch · Every 6 minutes · in 5m · idle/);
 	assert.doesNotMatch(all, /Prompt:/);
+	assert.match(all, /Press 6 to select a job/);
+	assert.match(owner.activityHints(), /6 job controls/);
 	assert.equal(owner.activityInput("6"), true);
 	const schedules = owner.renderOverview(styler, 80).join("\n");
 	assert.match(schedules, /› sugg-watch/);

@@ -234,8 +234,8 @@ export class ActivityCoordinator {
 
 	activityHints(): string {
 		const tabs = "←/→ or 1–7 tabs";
-		if (this.view !== "Schedules") return tabs;
 		const any = this.spur.jobs.length > 0;
+		if (this.view !== "Schedules") return joinHints(tabs, any && "6 job controls");
 		return joinHints(tabs, any && "↑↓ select", any && "P pause/resume", any && "N run now", any && "D remove", this.spur.paused ? "G resume all" : "G pause all");
 	}
 
@@ -262,7 +262,7 @@ export class ActivityCoordinator {
 			const row = `${selected ? "›" : " "} ${job.id} · ${scheduleLabel(job)} · ${formatCountdown(job.nextAt)} · ${jobState(job)}`;
 			lines.push(truncateToWidth(selected ? theme.bold(theme.fg("accent", row)) : row, width, "…"));
 		}
-		if (!detailed) return lines;
+		if (!detailed) return [...lines, ...wrapTextWithAnsi(theme.fg("muted", "Press 6 to select a job and pause, run or remove it."), width)];
 		lines.push("", ...jobDetailLines(jobs[this.selectedJob]!, theme, width));
 		if (this.spurNotice) lines.push("", ...wrapTextWithAnsi(theme.fg(this.confirmRemove ? "warning" : "accent", this.spurNotice), width));
 		return lines;
