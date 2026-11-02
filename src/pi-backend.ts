@@ -143,7 +143,9 @@ export interface Run {
 	extensions?: string[];
 	/** oven: the slice this run drives; set once oven created it. */
 	sliceId?: string;
-	/** Why execution release is unconfirmed; retained until Oven confirms archive. */
+	/** Durable first stop cause for this segment; late completion cannot replace it. */
+	stopIntent?: { cause: "timeout" | "cancelled"; at: number; segment: number };
+	/** Why execution release is unconfirmed; cleared only on actual release. */
 	haltNote?: string;
 	/** oven: the last heartbeat (oven_expires) that failed, until one succeeds again. */
 	heartbeatError?: string;
@@ -303,12 +305,23 @@ export function childOwner(run: Run): Owner | undefined {
 	for (const owner of state.owners.values()) if (owner.parentRun === run) return owner;
 	return undefined;
 }
+/** Descendant handles remain reachable through retained owners even after their binding detached. */
+function descendants(run: Run): Run[] {
+	const nested = childOwner(run);
+	return nested ? ownedRuns(nested).flatMap(child => [child, ...descendants(child)]) : [];
+}
+function subtreeNote(run: Run): string | undefined {
+	const pending = descendants(run).filter(child => !child.foreign && (!child.completion.settled || child.haltNote));
+	return pending.length ? `execution release unconfirmed in subtree: ${pending.map(child => child.id).join(", ")}. Ownership and writer fences remain held; revival is disabled.` : undefined;
+}
+
 /** A delegating child's own children end with its session, as a root parent's end with its own. */
 async function closeChildOwner(run: Run) {
 	const nested = childOwner(run);
 	if (!nested) return;
 	if (nested.detach) await nested.detach();
-	else await closeOwner(nested);
+	// A prior detach may have consumed its binding while retaining unresolved owned runs.
+	if (state.owners.get(nested.key) === nested) await closeOwner(nested);
 }
 
 /**
@@ -331,9 +344,13 @@ async function stopTree(run: Run) {
 		}
 	};
 	mark(nested);
-	if (run.completion.settled) dropSession(run);
-	else run.closeOnSettle = true;
 	await closeChildOwner(run);
+	if (run.completion.settled) {
+		run.haltNote = subtreeNote(run);
+		saveRun(run);
+		await dropSession(run);
+	}
+	else run.closeOnSettle = true;
 }
 
 /** Disposal is serialized with revival, including asynchronous extension shutdown handlers. */
@@ -382,7 +399,9 @@ function deliver(owner: Owner, message: Notice, retry: () => void) {
 	if ((message.details as any)?.userStarted) { owner.binding.pi.sendMessage(message, { triggerTurn: false }); return; }
 	// A steer reaches the parent at once: an idle one starts a turn, and a busy one reads it at its next
 	// model request, inside the run it is in. A follow-up would wait for that run to end, however long it runs.
-	inFlight(owner).set(noticeKey(message), message);
+	// Health and extension-budget alerts are advisory, not durable reports: replay can make them stale.
+	const kind = (message.details as any)?.kind;
+	if (kind !== "watchdog" && kind !== "extend-request") inFlight(owner).set(noticeKey(message), message);
 	owner.binding.pi.sendMessage(message, { deliverAs: "steer", triggerTurn: true });
 }
 
@@ -597,6 +616,22 @@ const piStore = new RunStore<Run, RunRecord>({
 		return run;
 	},
 	recover: (run, savedAt) => {
+		// RunStore invokes recovery only after adoption, never for a foreign live owner.
+		// A completed coordinator can be stopped solely because its subtree failed to release:
+		// that record has stopped/haltNote but no stopIntent for its already-completed segment.
+		// Oven execution is external to the lost owner and still needs its own release proof.
+		if (run.runtime !== "oven" && (run.stopIntent || (run.stopped && run.haltNote))) {
+			run.status = run.stopIntent?.cause ?? run.status;
+			if (run.haltNote || !run.endedAt) {
+				run.haltNote = undefined;
+				run.endedAt ??= savedAt;
+				const diagnostic = run.stopIntent
+					? "The previous owning process ended before execution settlement was observed. Its in-process execution is gone; the saved stop cause is retained, not proof of a cooperative tool outcome. Inspect the saved work before continuing."
+					: "The previous owning process's in-process subtree is no longer live here. The completed segment and explicit stop are retained; recovery is not proof that every tool stopped cooperatively. Inspect the saved work before an explicit restart.";
+				run.error = [run.error, diagnostic].filter(Boolean).join("\n");
+			}
+			return;
+		}
 		if (run.status !== "running") return;
 		run.status = "interrupted";
 		run.endedAt = savedAt;
@@ -633,7 +668,11 @@ export function restoreRun(path: string, owner: Owner): Run {
 	// A foreign run's live owner is still running or delivering it: show a snapshot, never write or re-deliver it.
 	if (!run.foreign) {
 		try { harvest(run); }
-		catch (error) { run.status = "error"; run.error = errorMessage(error); }
+		catch (error) {
+			run.status = run.stopIntent?.cause ?? "error";
+			const diagnostic = errorMessage(error);
+			if (!run.error?.includes(diagnostic)) run.error = [run.error, diagnostic].filter(Boolean).join("\n");
+		}
 		saveRun(run);
 	}
 	run.completion.settle(finalResult(run));
@@ -760,6 +799,8 @@ export function view(run: Run): RunView {
 		revision: run.revision,
 		lastTool: run.lastTool,
 		error: run.error,
+		...(run.haltNote ? { haltNote: run.haltNote } : {}),
+		...(run.stopIntent ? { stopIntent: run.stopIntent } : {}),
 		sessionFile: run.sessionFile,
 		depth: run.depth,
 		...(run.parentRunId ? { parentRunId: run.parentRunId } : {}),
@@ -802,6 +843,7 @@ export function summary(run: Run): string {
 	if (run.extensionErrors?.length) s += `\nextensions that failed in the child (it ran without them):\n  ${run.extensionErrors.join("\n  ")}`;
 	if (run.droppedTools.length) s += `\ntools the child could not have (a child gets the tools its parent's extensions and MCP tools provide, limited to its role's tools; no delegate or delegate_ctl at the depth limit, ${maxDepth()}): ${run.droppedTools.join(", ")}`;
 	if (run.changedFiles.length) s += `\nchanged: ${run.changedFiles.join(", ")}`;
+	if (run.haltNote) s += `\n${run.haltNote}`;
 	if (run.error) s += `\nerror: ${run.error}`;
 	return s;
 }
@@ -860,10 +902,11 @@ function finish(run: Run, status: Status, error?: string) {
 	}
 	run.turnStartedAt = undefined;
 	run.endedAt = Date.now();
-	run.status = status;
-	if (error) run.error = error;
+	run.status = run.stopIntent?.cause ?? status;
+	if (error && !run.stopIntent) run.error = error;
+	if (run.runtime !== "oven") run.haltNote = run.stopIntent || run.stopped ? subtreeNote(run) : undefined;
 	try { if (run.session) harvest(run); }
-	catch (e) { run.status = "error"; run.error = `Cannot read child transcript: ${errorMessage(e)}`; }
+	catch (e) { if (!run.stopIntent) run.status = "error"; run.error = `Cannot read child transcript: ${errorMessage(e)}`; }
 	if (run.status === "timeout" && !run.error) {
 		run.error = `Stopped after its ${Math.round(run.timeoutMs / 60000)} min budget (timeoutMs, default ${DEFAULT_TIMEOUT_MS / 60000} min). Its work up to that point stands and is not rolled back.`
 			+ (run.segmentFailedAttempts
@@ -877,7 +920,7 @@ function finish(run: Run, status: Status, error?: string) {
 	if (run.offered) run.droppedTools = droppedTools(run.tools, run.offered, run.withheld);
 	run.revision++;
 	try { saveRun(run); }
-	catch (e) { run.status = "error"; run.error = `Could not persist completion: ${errorMessage(e)}`; }
+	catch (e) { if (!run.stopIntent) run.status = "error"; run.error = `Could not persist completion: ${errorMessage(e)}`; }
 	log(run);
 	if (run.closeOnSettle) { run.closeOnSettle = false; dropSession(run); }
 	run.completion.settle(finalResult(run));
@@ -886,19 +929,49 @@ function finish(run: Run, status: Status, error?: string) {
 	changed();
 }
 
+/** Persist intent before signalling abort. Completion remains the execution/capacity fence. */
+function stopIntent(run: Run, cause: "timeout" | "cancelled") {
+	if (!run.stopIntent && !run.completion.settled) run.stopIntent = { cause, at: Date.now(), segment: run.segment };
+	if (run.stopIntent) run.status = run.stopIntent.cause;
+	disarm(run);
+	interrupts.delete(run.id);
+	if (run.runtime !== "oven" && !run.completion.settled)
+		run.haltNote = "execution release unconfirmed; abort requested, waiting for the child to become idle. Capacity and writer ownership remain held; revival is disabled.";
+	saveRun(run);
+	changed();
+}
+
+/** Wait briefly for cooperative cleanup, never confuse the deadline with release. */
+async function stopGrace(run: Run): Promise<void> {
+	// Internal cleanup must not join/claim the parent's completion receipt.
+	const deadline = Date.now() + 1000;
+	while (!run.completion.settled && Date.now() < deadline)
+		await new Promise<void>(resolve => setTimeout(resolve, Math.min(25, deadline - Date.now())));
+}
+
 export async function cancelRun(run: Run) {
 	if (run.foreign) throw ownedElsewhereError(run);
+	const completion = run.completion;
 	run.stopped = true;
-	if (run.status === "running") run.status = "cancelled";
-	stopTimersIfIdle();
-	try { saveRun(run); }
-	// The subtree is marked stopped before the abort can settle this run, so nothing below revives it.
-	finally { changed(); await Promise.all([stopTree(run), run.session?.abort(), haltSlice(run)]); }
+	try { stopIntent(run, "cancelled"); }
+	finally {
+		stopTimersIfIdle();
+		// Mark the subtree synchronously, even when persistence fails; never await SDK idle.
+		const tree = stopTree(run).catch(error => {
+			if (run.completion !== completion) return;
+			run.haltNote = `execution release unconfirmed in subtree: ${errorMessage(error)}`;
+			saveRun(run);
+			changed();
+		});
+		if (run.runtime === "oven") await haltSlice(run);
+		else void Promise.resolve(run.session?.abort()).catch(() => {});
+		await Promise.all([tree, run.runtime !== "oven" && !run.completion.settled ? stopGrace(run) : undefined]);
+	}
 }
 
 /** "Stopped" only after confirmed release, never an uncertain RPC. */
 export const cancelText = (run: Run) => run.haltNote
-	? `${run.id} cancel sent; oven did not confirm release: ${run.haltNote}. Automatic revival is disabled.`
+	? `${run.id} cancel sent; ${run.haltNote}. Automatic revival is disabled.`
 	: `${run.id} stopped; automatic revival is disabled.`;
 
 /** In-flight release, shared by completion/cancel and awaited before any new segment. */
@@ -1287,6 +1360,7 @@ function piJoin(joined: readonly Run[]): Join<WaitRow> {
 	};
 }
 
+const pendingOwnerClose = new WeakSet<Owner>();
 export async function closeOwner(owner: Owner) {
 	owner.binding = undefined;
 	owner.closed = true;
@@ -1299,13 +1373,23 @@ export async function closeOwner(owner: Owner) {
 			// Mark stopped before any await: no descendant completion may revive an ending parent.
 			if (!run.completion.settled) {
 				await cancelRun(run);
-				await run.completion.wait();
+				if (!run.completion.settled) {
+					uncertain.push(`${run.id}: ${run.haltNote}`);
+					return; // Keep the run, session, owner token, and all admission fences.
+				}
 			} else if (run.runtime === "oven" && run.sliceId) await haltSlice(run);
-			await closeChildOwner(run);
+			try { await closeChildOwner(run); }
+			catch (error) {
+				run.haltNote = `execution release unconfirmed in subtree: ${errorMessage(error)}`;
+				saveRun(run);
+				uncertain.push(`${run.id}: ${run.haltNote}`);
+				return; // A settled parent's own prompt does not prove subtree release.
+			}
 			await sessionClosures.get(run.id);
 			await closeSession(run.session);
 			run.session = undefined;
-			if (run.haltNote) uncertain.push(`${run.id}: ${run.haltNote}`);
+			if (run.runtime !== "oven" && run.completion.settled) run.haltNote = subtreeNote(run);
+			if (run.haltNote) { uncertain.push(`${run.id}: ${run.haltNote}`); return; }
 			// Release ownership so the next process to open this parent adopts it.
 			releaseOwner(run);
 			try { saveRun(run); } catch { /* the record stays with its last owner; a dead owner is adopted anyway */ }
@@ -1313,10 +1397,24 @@ export async function closeOwner(owner: Owner) {
 		runs.delete(run.id);
 		stopTimersIfIdle();
 	}));
+	if (uncertain.length) {
+		const pending = closing.flatMap(run => [run, ...descendants(run)]).filter(run => !run.foreign && !run.completion.settled);
+		if (pending.length && !pendingOwnerClose.has(owner)) {
+			pendingOwnerClose.add(owner);
+			void Promise.all(pending.map(run => run.completion.wait())).then(() => closeOwner(owner))
+				.catch(() => {}).finally(() => pendingOwnerClose.delete(owner));
+		}
+		throw new Error(`Parent ended; execution release unconfirmed: ${uncertain.join("; ")}`);
+	}
 	state.owners.delete(owner.key);
+	const parent = owner.parentRun;
+	if (parent && parent.runtime !== "oven" && parent.completion.settled) {
+		parent.haltNote = subtreeNote(parent);
+		try { saveRun(parent); } catch { /* retain the prior durable owner/cause on failure */ }
+		changed();
+	}
 	// After its children's sessions closed (each kept its runs above): a root's tree goes with it.
 	if (!owner.parentRun) for (const run of closing) forgetDeparted(run.id);
-	if (uncertain.length) throw new Error(`Parent ended; execution release unconfirmed: ${uncertain.join("; ")}`);
 }
 
 /**
@@ -1366,12 +1464,19 @@ export function armTimeout(run: Run) {
 	disarm(run);
 	const spent = Date.now() - run.segmentStartedAt;
 	if (spent >= run.timeoutMs) throw new Error(`${run.id} has already run ${Math.round(spent / 60000)} min of this segment; a ${Math.round(run.timeoutMs / 60000)} min budget is already spent. Pass a larger timeoutMs.`);
-	// The explanation is composed in finish(), after harvesting can say where the budget went.
+	const completion = run.completion, segment = run.segment;
 	run.timer = setTimeout(() => {
-		run.status = "timeout";
-		void stopTree(run);
+		if (run.completion !== completion || run.segment !== segment || completion.settled) return;
+		try { stopIntent(run, "timeout"); }
+		catch (error) { run.error = `Could not persist timeout intent: ${errorMessage(error)}`; }
+		void stopTree(run).catch(error => {
+			if (run.completion !== completion || run.segment !== segment) return;
+			run.haltNote = `execution release unconfirmed in subtree: ${errorMessage(error)}`;
+			try { saveRun(run); } catch { /* timeout's persistence diagnostic remains visible */ }
+			changed();
+		});
 		if (run.runtime === "oven") void haltSlice(run);
-		else void run.session?.abort();
+		else void Promise.resolve(run.session?.abort()).catch(() => {});
 	}, run.timeoutMs - spent);
 	const lead = Math.max(WRAP_UP_MIN_MS, run.timeoutMs * 0.15);
 	const wrapIn = run.timeoutMs - spent - lead;
@@ -1387,6 +1492,8 @@ const rebinds = (run: Run, replacement?: Replacement) =>
 	Boolean(replacement) && ((replacement!.model ?? run.model) !== run.model || (replacement!.thinking ?? run.thinking) !== run.thinking);
 
 function beginResume(run: Run, restart: boolean, replacement?: Replacement) {
+	const uncertain = (run.stopped || run.stopIntent ? subtreeNote(run) : undefined) ?? (run.runtime !== "oven" ? run.haltNote : undefined);
+	if (uncertain) throw new Error(`${run.id}: ${uncertain}`);
 	if (!run.completion.settled) throw new Error(`${run.id} is still stopping; wait for completion before resuming.`);
 	if (run.stopped && !restart) throw new Error(`${run.id} was explicitly stopped. Restart only at the user's request (steer with restart: true).`);
 	admit();
@@ -1401,7 +1508,7 @@ function beginResume(run: Run, restart: boolean, replacement?: Replacement) {
 	const next: Run = { ...run, ...replacement, segment: run.segment + 1, stopped: false, acknowledged: false,
 		// A new segment must not publish the prior segment's report while it is still running.
 		output: "",
-		status: "running", endedAt: undefined, error: undefined, revision: run.revision + 1,
+		status: "running", endedAt: undefined, error: undefined, stopIntent: undefined, haltNote: undefined, revision: run.revision + 1,
 		// A resume starts a fresh budget and report scope; persist both with the segment.
 		segmentStartIdx: messagesOf(run).length,
 		segmentFailedAttemptsBase: run.failedAttempts,
@@ -1595,6 +1702,7 @@ export class PiBackend implements DelegateBackend<"pi"> {
 		saveRun(run);
 
 		session.subscribe((ev: any) => {
+			if (run.session !== session || run.completion.settled) return;
 			if (ev.type === "message_start" || ev.type === "message_update") {
 				if (ev.message?.role === "assistant") run.streamingMessage = ev.message;
 			}
@@ -1641,10 +1749,10 @@ export class PiBackend implements DelegateBackend<"pi"> {
 			if (ev.type === "message_end") {
 				if (ev.message?.role === "assistant") {
 					try { harvest(run); }
-					catch (error) { run.status = "error"; run.error = `Cannot read child transcript: ${errorMessage(error)}`; void session.abort(); }
+					catch (error) { if (!run.stopIntent) run.status = "error"; run.error = `Cannot read child transcript: ${errorMessage(error)}`; void session.abort(); }
 				}
 				try { saveRun(run); }
-				catch (error) { run.status = "error"; run.error = `Cannot save child state: ${errorMessage(error)}`; void session.abort(); }
+				catch (error) { if (!run.stopIntent) run.status = "error"; run.error = `Cannot save child state: ${errorMessage(error)}`; void session.abort(); }
 				if (run.status === "running" && ev.message?.role === "assistant") {
 					const text = textOf(ev.message.content, " ").trim();
 					if (text) milestone(run, { kind: "note", text: text.slice(0, 500) });
@@ -1765,9 +1873,9 @@ export class PiBackend implements DelegateBackend<"pi"> {
 					// run never settles in between. A second interrupt before then joins the first.
 					const pending = interrupts.get(run.id);
 					interrupts.set(run.id, pending === undefined ? message : `${pending}\n\n${message}`);
-					// Abort ends the turn's model stream and signals its running tools. Not stopTree: the run goes on,
-					// and its delegated children report into it.
-					await run.session.abort();
+					// abort() signals tools synchronously but waits for idle. Do not block the control call on
+					// uncooperative tools; launch() still waits for prompt() before dispatching the correction.
+					void run.session.abort();
 					return;
 				}
 				await steerLive(run, message); return;

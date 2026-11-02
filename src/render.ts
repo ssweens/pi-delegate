@@ -17,6 +17,8 @@ export interface RunView {
 	completionReceipt?: true;
 	stopped: boolean;
 	settled: boolean;
+	haltNote?: string;
+	stopIntent?: { cause: "timeout" | "cancelled"; at: number; segment: number };
 	role: string;
 	model: string;
 	cwd: string;
@@ -232,6 +234,7 @@ export function resultLines(v: RunView, expanded: boolean, theme: Theme, width: 
 	if (v.providerRetry) lines.push(theme.fg("warning", `provider retrying · retry ${v.providerRetry.attempt}/${v.providerRetry.maxAttempts} · backoff ${v.providerRetry.delayMs}ms · last: ${v.providerRetry.errorMessage}`));
 	if (v.providerRetryMs) lines.push(theme.fg("dim", `provider retry wall ${Math.round(v.providerRetryMs / 1000)}s`));
 	if (v.failedAttempts) lines.push(theme.fg("warning", `${v.failedAttempts} failed provider attempt${v.failedAttempts === 1 ? "" : "s"} before this (last: ${v.lastAttemptError})`));
+	if (v.haltNote) lines.push(...wrapTextWithAnsi(theme.fg("warning", v.haltNote), Math.max(1, width)));
 	if (v.error) lines.push(...wrapTextWithAnsi(theme.fg("error", String(v.error)), Math.max(1, width)));
 	if (v.backend === "acp") {
 		lines.push(theme.fg("dim", "id ") + theme.fg("muted", v.id) + theme.fg("dim", "  backend ") + theme.fg("muted", "acp") + theme.fg("dim", "  agent ") + theme.fg("muted", v.agent ?? "")

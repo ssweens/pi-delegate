@@ -3,14 +3,14 @@ import assert from "node:assert/strict";
 import { mock, test } from "node:test";
 import { RunCompletion } from "../src/completion.ts";
 import { SILENT_MS, SLOW_TURN_MS, WRAP_UP_MIN_MS } from "../src/health.ts";
-import { armTimeout, healthAlert, type Run, runs, salvage, state, trackProgress, wrapUpMessage } from "../src/pi-backend.ts";
+import { armTimeout, healthAlert, inFlight, notify, redeliver, type Run, runs, salvage, state, trackProgress, wrapUpMessage } from "../src/pi-backend.ts";
 
 /** A bound owner whose notices land in `sent`, and a running run it owns with a session that records steers. */
 function fixture(id: string) {
 	const sent: any[] = [], steers: string[] = [];
 	const key = `owner-${id}`;
 	state.owners.set(key, { key, dir: "", queued: new Set(), closed: false,
-		binding: { pi: { sendMessage: (message: any) => sent.push(message), events: { emit() {} } }, ctx: {} } as any });
+		binding: { pi: { sendMessage: (message: any) => sent.push(message), events: { emit() {} } }, ctx: { sessionManager: { getEntries: () => [] } } } as any });
 	const run = {
 		id, ownerKey: key, status: "running", completion: new RunCompletion(), segment: 1, segmentStartedAt: Date.now(), timeoutMs: 20 * 60_000,
 		output: "", changedFiles: [], toolCalls: [], activeTools: new Map(),
@@ -111,6 +111,26 @@ test("the watchdog alerts once per transition out of moving, never for moving", 
 	run.providerRetry = { attempt: 2, maxAttempts: 3, delayMs: 1000, errorMessage: "overloaded", startedAt: 0 };
 	healthAlert(run, run.lastProgressAt + 1);
 	assert.match(sent[2].content, /watch-a retrying: .*provider retry 2\/3 \(overloaded\)/);
+});
+
+test("advisory alerts are not replayed when the parent settles; completion reports still are", (t) => {
+	const { run, sent, done } = fixture("advisory-replay");
+	t.after(done);
+	const owner = state.owners.get(run.ownerKey)!;
+	const report = { customType: "delegate" as const, content: "delegate finished", display: true,
+		details: { id: "finished-run", segment: 1, completionReceipt: true } };
+	notify(owner, report);
+	healthAlert(run, run.segmentStartedAt + SILENT_MS + 1);
+	trackProgress(run, { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "EXTEND: 5 - finish the work" }] } });
+	assert.equal(sent.length, 3);
+	assert.equal(inFlight(owner).size, 1, "only the completion report needs guaranteed redelivery");
+	run.status = "timeout";
+	redeliver(owner, false);
+	redeliver(owner, true);
+	assert.equal(sent.filter(message => message.details.kind === "watchdog").length, 1);
+	assert.equal(sent.filter(message => message.details.kind === "extend-request").length, 1);
+	assert.equal(sent.filter(message => message.details.completionReceipt).length, 3);
+	assert.equal(inFlight(owner).size, 0);
 });
 
 test("the watchdog interval finds running runs and stops when none is left", (t) => {

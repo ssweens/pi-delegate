@@ -180,7 +180,7 @@ export class AgentsPanel implements Component, Focusable {
 				: v.status === "running"
 				? v.activeTool ? formatToolCall(v.activeTool.name, v.activeTool.args, this.theme) : this.theme.fg("dim", "Thinking…")
 				: v.settled ? this.theme.fg(v.status === "complete" ? "dim" : "warning", v.status)
-				: this.theme.fg("warning", "Stopping…");
+				: this.theme.fg("warning", v.haltNote ? `${v.status} · release unconfirmed` : "Stopping…");
 			return prefix + fitPad(title, titleWidth) + " " + fitPad(this.theme.fg("muted", v.role), roleWidth) + " " + model + fitPad(activity, activityWidth) + " " + this.theme.fg("dim", time);
 		});
 		const range = rows.length > count ? ` · ${this.offset + 1}–${this.offset + count}/${rows.length}` : "";
