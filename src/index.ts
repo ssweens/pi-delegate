@@ -1261,7 +1261,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 					}
 					if (p.action !== "wait") {
 						const v = p.action === "cancel" ? await processes.cancel(p.runId) : await processes.result(p.runId);
-						return { content: [{ type: "text", text: processText(v) }], details: v, isError: v.status !== "running" && v.status !== "done" };
+						return { content: [{ type: "text", text: processText(v) }], details: v, isError: v.status !== "running" && v.status !== "done" && !(p.action === "cancel" && v.status === "cancelled") };
 					}
 				} catch (error) { return failed(error); }
 			}

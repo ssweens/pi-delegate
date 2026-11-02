@@ -1,4 +1,4 @@
-import { spawn, execFileSync, type ChildProcess } from "node:child_process";
+import { spawn, execFile, execFileSync, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { closeSync, existsSync, fstatSync, openSync, readSync } from "node:fs";
 import { basename, join } from "node:path";
@@ -14,7 +14,7 @@ export interface ProcessRunView {
 	backend: "process"; id: string; command: string; task?: string; cwd: string;
 	status: "running" | "done" | "error" | "cancelled" | "timed_out" | "interrupted";
 	pid?: number; startedAt: number; endedAt?: number; exitCode?: number | null; signal?: NodeJS.Signals | null;
-	output: string; outputFile: string; truncated: boolean; error?: string;
+	output: string; outputFile: string; truncated: boolean; error?: string; observationError?: string;
 	capabilities: ProcessCapabilities; foreign?: { ownerPid: number; ownerHost: string };
 }
 export interface ProcessBackendHooks {
@@ -37,8 +37,8 @@ const capabilities: ProcessCapabilities = {
 	wait: { supported: true }, result: { supported: true }, status: { supported: true }, cancel: { supported: true, scope: "run" },
 };
 function view(run: Run): ProcessRunView {
-	const { id, command, task, cwd, status, pid, startedAt, endedAt, exitCode, signal, output, outputFile, truncated, error } = run;
-	return { backend: "process", id, command, task, cwd, status, pid, startedAt, endedAt, exitCode, signal, output, outputFile, truncated, error, capabilities,
+	const { id, command, task, cwd, status, pid, startedAt, endedAt, exitCode, signal, output, outputFile, truncated, error, observationError } = run;
+	return { backend: "process", id, command, task, cwd, status, pid, startedAt, endedAt, exitCode, signal, output, outputFile, truncated, error, observationError, capabilities,
 		...(run.foreign ? { foreign: { ownerPid: run.ownerPid ?? 0, ownerHost: run.ownerHost ?? "" } } : {}) };
 }
 function save(run: Run): void { run.store.save(run, RunStore.recordPath(run.hooks.runDir(run.ownerKey), run.id)); }
@@ -54,12 +54,30 @@ function tail(run: Run): void {
 	} finally { if (run.fd === undefined) closeSync(fd); }
 }
 interface ProcessRow { pid: number; ppid: number; identity: string; zombie: boolean }
-function processes(): ProcessRow[] {
-	return execFileSync("ps", ["-axo", "pid=,ppid=,stat=,lstart="], { encoding: "utf8", timeout: 2000 }).trim().split("\n").map((line) => {
+async function processes(): Promise<ProcessRow[]> {
+	const output = await new Promise<string>((resolve, reject) => {
+		execFile("ps", ["-axo", "pid=,ppid=,stat=,lstart="], { encoding: "utf8", timeout: 2000 }, (error, stdout) => error ? reject(error) : resolve(stdout));
+	});
+	return output.trim().split("\n").map((line) => {
 		const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/.exec(line);
 		if (!match) throw new Error("Cannot parse process ownership snapshot");
-		return { pid: Number(match[1]), ppid: Number(match[2]), zombie: match[3]!.startsWith("Z"), identity: match[4]! };
+		return { pid: Number(match[1]), ppid: Number(match[2]), zombie: match[3]!.startsWith("Z"), identity: match[4]!.trim() };
 	});
+}
+// Coalesce running commands onto one bounded, nonblocking ownership snapshot.
+// Cancellation takes fresh snapshots, never a cached list of PIDs to signal.
+let observing: Promise<void> | undefined;
+let observeAfter = 0;
+function observe(): void {
+	if (observing || Date.now() < observeAfter) return;
+	const active = [...runs.values()].filter((r) => r.child && !r.foreign && !r.completion.settled && !r.stopStatus);
+	if (!active.length) return;
+	observeAfter = Date.now() + 250;
+	observing = processes().then((rows) => {
+		for (const run of active) { track(run, rows); delete run.observationError; }
+	}, (e) => {
+		for (const run of active) run.observationError = `PROCESS_OBSERVATION_FAILED: ${String(e)}`;
+	}).finally(() => { observing = undefined; });
 }
 function track(run: Run, rows: ProcessRow[]): ProcessRow[] {
 	const root = rows.find((p) => p.pid === run.child?.pid);
@@ -69,10 +87,10 @@ function track(run: Run, rows: ProcessRow[]): ProcessRow[] {
 		added = false;
 		for (const p of rows) {
 			const parent = rows.find((row) => row.pid === p.ppid);
-			if (!run.tree.has(p.pid) && parent && run.tree.get(parent.pid) === parent.identity) { run.tree.set(p.pid, p.identity); added = true; }
+			if (!run.tree.has(p.pid) && parent && run.tree.get(parent.pid)?.trim() === parent.identity) { run.tree.set(p.pid, p.identity); added = true; }
 		}
 	} while (added);
-	return rows.filter((p) => !p.zombie && run.tree.get(p.pid) === p.identity);
+	return rows.filter((p) => !p.zombie && run.tree.get(p.pid)?.trim() === p.identity);
 }
 function notify(run: Run): void {
 	if (run.waiters || run.delivered || !run.completion.settled) return;
@@ -96,18 +114,21 @@ async function stop(run: Run, status: ProcessRunView["status"]): Promise<boolean
 	const work = (async () => {
 		let clean = false;
 		try {
+			// Preserve descendants discovered by an in-flight background snapshot.
+			await observing;
 			for (const signal of ["SIGTERM", "SIGKILL"] as const) {
-				const owned = track(run, processes());
+				const owned = track(run, await processes());
+				if (run.child?.pid !== undefined && !run.tree.has(run.child.pid)) throw new Error("root identity was never verified; descendant cleanup cannot be confirmed");
 				for (const p of owned.reverse()) {
 					try { process.kill(p.pid, signal); } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ESRCH") throw e; }
 				}
 				const until = Date.now() + 500;
-				while (Date.now() < until && track(run, processes()).length) await new Promise((r) => setTimeout(r, 25));
-				if (!track(run, processes()).length) { clean = true; break; }
+				while (Date.now() < until && track(run, await processes()).length) await new Promise((r) => setTimeout(r, 25));
+				if (!track(run, await processes()).length) { clean = true; break; }
 			}
 			if (!clean) throw new Error("verified owned processes remain alive");
 			if (run.closed && !await withTimeout(run.closed, 1000)) throw new Error("child exit was not confirmed");
-			if (!completed) run.status = status;
+			if (!completed) run.status = run.error ? "error" : status;
 		} catch (e) { clean = false; run.status = "error"; run.error = `PROCESS_CLEANUP_FAILED: ${String(e)}`; }
 		if (completed) { tail(run); save(run); run.hooks.changed(); }
 		else finish(run);
@@ -156,15 +177,29 @@ export class ProcessBackend {
 			run.fd = openSync(run.outputFile, "wx+", 0o600);
 			const child = run.child = spawn(input.command, { shell: true, cwd: run.cwd, detached: true, stdio: ["ignore", run.fd, run.fd] });
 			run.pid = child.pid;
+			// Pin identity before yielding: an exited child cannot be reaped/reused by
+			// this event loop yet. Delayed global snapshots can then extend its tree
+			// after exit, but can never rebind this PID to another start identity.
+			if (child.pid !== undefined) {
+				try {
+					const identity = execFileSync("ps", ["-p", String(child.pid), "-o", "lstart="], { encoding: "utf8", timeout: 2000 }).trim();
+					if (!identity) throw new Error("root identity is unavailable");
+					run.tree.set(child.pid, identity);
+				} catch (e) { run.observationError = `PROCESS_OBSERVATION_FAILED: ${String(e)}`; }
+			}
 			run.closed = new Promise((resolve) => child.once("close", () => resolve(true)));
 			child.once("error", (e) => { run.status = "error"; run.error = `PROCESS_LAUNCH_FAILED: ${e.message}`; finish(run); });
 			child.once("close", (code, signal) => {
 				if (child.pid === undefined) return;
 				run.exitCode = code; run.signal = signal;
 				if (run.completion.settled || run.stopStatus) return;
-				run.status = code === 0 ? "done" : "error"; finish(run);
+				run.status = code === 0 && !run.error ? "done" : "error"; finish(run);
 			});
-			run.poll = setInterval(() => { try { tail(run); track(run, processes()); run.hooks.changed(); } catch (e) { run.error = `PROCESS_OBSERVATION_FAILED: ${String(e)}`; } }, 100);
+			run.poll = setInterval(() => {
+				try { tail(run); } catch (e) { run.error = `OUTPUT_READ_FAILED: ${String(e)}`; }
+				observe(); run.hooks.changed();
+			}, 100);
+			observe();
 			if (input.timeoutMs !== undefined) {
 				const end = run.startedAt + input.timeoutMs;
 				const deadline = () => { const left = end - Date.now(); if (left <= 0) void stop(run, "timed_out"); else run.deadline = setTimeout(deadline, Math.min(left, 2 ** 31 - 1)); };
