@@ -67,6 +67,8 @@ test("a delegating child's runs stay in the root's tree after its session closes
 	for (const v of after.slice(1)) { assert.equal(v.depth, 2); assert.equal(v.parentRunId ?? coordinatorId, coordinatorId); assert.equal(v.settled, true); }
 	assert.match(JSON.stringify(root.live.activity(scoutId).messages), /SCOUT-FIRST-REPORT/, "its transcript is still readable");
 	assert.match(JSON.stringify(root.live.activity(workerId).messages), /READY/);
+	assert.equal((await h.ctl("status", workerId)).details.error.code, "RUN_NOT_FOUND", "new ancestor controls do not add an ACP reopen path");
+	assert(!childOwnerOf(coordinatorId), "reading an unsupported ACP descendant did not reopen its lead");
 
 	// Steering it from the root reopens the coordinator's session first, then steers it, as a root child's revival does.
 	api.script("Steered after its parent closed", { text: "SCOUT-SECOND-REPORT" });

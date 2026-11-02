@@ -1295,8 +1295,10 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			remember(ctx);
 			// Idle lead sessions may have retired with readable descendants. Reattach their saved
 			// owner chain (without a model turn), as the Agents frame does before steering one.
-			for (const id of p.runId ? [p.runId] : p.action === "wait" ? p.runIds ?? [] : [])
-				if (findDeparted(id)) await revive(id);
+			for (const id of p.runId ? [p.runId] : p.action === "wait" ? p.runIds ?? [] : []) {
+				const gone = findDeparted(id);
+				if (gone?.run || gone?.process) await revive(id);
+			}
 			if (p.runId) {
 				const nestedRun = runs.get(p.runId);
 				const target = inTree(nestedRun) ? state.owners.get(nestedRun.ownerKey) : processOwnerInTree(p.runId);
