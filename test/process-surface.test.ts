@@ -7,6 +7,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { harness, provider, sandbox } from "./fixture.ts";
 import { validateStartInput } from "../src/backend.ts";
 import { processLine, resultView } from "../src/render.ts";
+import { createCodemodeExtension } from "@earendil-works/pi-coding-agent";
 
 test("unused registered lifecycle and read-only status leave storage untouched", async (t) => {
 	const box = sandbox("http://127.0.0.1:1/v1");
@@ -24,6 +25,20 @@ test("unused registered lifecycle and read-only status leave storage untouched",
 		if (legacy) assert.deepEqual(readdirSync(storage), []);
 		else assert.equal(existsSync(join(box.cwd, ".agents")), false);
 	}
+});
+
+test("codemode continues after successful process cancellation", async () => {
+	const api = await provider(), box = sandbox(api.url);
+	const h = await harness(box, undefined, { tools: ["delegate", "delegate_ctl", "codemode"], register: createCodemodeExtension({ models: false }) });
+	try {
+		const run = (await h.launch("Cancel from script", { backend: "process", command: "/bin/sleep 30", role: undefined, model: undefined, context: undefined })).details;
+		api.script("Cancel and continue", { tool: { name: "codemode", arguments: { code: `const result = await tools.delegate_ctl({action:"cancel",runId:${JSON.stringify(run.id)}}); text(result); await tools.delegate_ctl({action:"status"}); text("AFTER_CANCEL");` } } }, { text: "DONE" });
+		await h.runtime.session.prompt("Cancel and continue");
+		const result = h.runtime.session.agent.state.messages.find((m: any) => m.role === "toolResult" && m.toolName === "codemode") as any;
+		assert.ok(result); assert.equal(result.isError, false);
+		assert.match(result.content.map((b: any) => b.text ?? "").join("\n"), /AFTER_CANCEL/);
+		assert.equal((await h.ctl("result", run.id)).details.status, "cancelled");
+	} finally { await h.runtime.dispose(); await api.close(); rmSync(box.root, { recursive: true, force: true }); }
 });
 
 test("process input preserves command bytes and rejects agent fields", () => {
@@ -67,6 +82,23 @@ test("process tools: output, waits, notifications, cancel, reload and owner exit
 			assert.equal((await h.ctl("status", v.id)).details.pid, v.pid);
 			const cancelled = await h.ctl("cancel", v.id);
 			assert.equal(cancelled.details.status, "cancelled"); assert.equal(cancelled.details.signal, "SIGTERM");
+			assert.equal(cancelled.isError, false);
+			assert.equal((await h.ctl("result", v.id)).isError, true);
+		});
+		await t.test("cancel succeeds with exit zero; failed cleanup remains a tool error", async () => {
+			const v = (await start("trap 'exit 0' TERM; printf READY; while :; do /bin/sleep 0.1; done")).details;
+			for (const until = Date.now() + 3000; !(await h.ctl("result", v.id)).details.output.includes("READY") && Date.now() < until;) await sleep(20);
+			const cancelled = await h.ctl("cancel", v.id);
+			assert.equal(cancelled.isError, false); assert.equal(cancelled.details.status, "cancelled");
+			assert.equal(cancelled.details.exitCode, 0); assert.equal(cancelled.details.signal, null);
+			const next = (await start("/bin/sleep 30")).details;
+			const path = process.env.PATH;
+			try {
+				process.env.PATH = box.cwd;
+				const failed = await h.ctl("cancel", next.id);
+				assert.equal(failed.isError, true); assert.equal(failed.details.status, "error");
+				assert.match(failed.details.error, /PROCESS_CLEANUP_FAILED/);
+			} finally { process.env.PATH = path; await h.ctl("cancel", next.id); }
 		});
 		await t.test("joined completion returns exit facts with no duplicate notice", async () => {
 			const v = (await start("sleep 0.2; printf 'EXIT-SEVEN\\n'; exit 7")).details;

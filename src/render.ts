@@ -75,7 +75,7 @@ export function processText(v: ProcessRunView, output = true): string {
 	return [
 		`${v.id} ${v.status} · ${v.task ?? v.command} · ${formatDuration((v.endedAt ?? Date.now()) - v.startedAt)}${v.exitCode !== undefined ? ` · exit ${v.exitCode}` : ""}${v.signal ? ` · ${v.signal}` : ""}`,
 		`command: ${v.command}`, `cwd: ${v.cwd}`, `PID: ${v.pid ?? "unknown"}`, `outputFile: ${v.outputFile}`,
-		v.error, output && v.truncated ? "[output tail truncated]" : "", output ? v.output : "",
+		v.error, v.observationError, output && v.truncated ? "[output tail truncated]" : "", output ? v.output : "",
 	].filter(Boolean).join("\n");
 }
 
