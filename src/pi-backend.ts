@@ -17,6 +17,7 @@ import { type AcpRunView, type BackendCapabilities, type CancelRequest, type Clo
 import { RunCompletion } from "./completion.js";
 import { readDelegateSettings } from "./delegate-settings.ts";
 import type { LiveSource } from "./inspector.js";
+import type { ProcessBackend, ProcessRunView } from "./process-backend.js";
 import { expiredEvent, OVEN_EXPIRES, ovenCall, ovenHeartbeat, requireExpiry, SliceExpired, SliceGone, type Settled, type SliceView } from "./oven.js";
 import type { TrustSource } from "./project-trust.js";
 import type { RunView } from "./render.js";
@@ -221,6 +222,11 @@ export interface Owner {
 	steerFromUser?: (run: Run, message: string) => Promise<void>;
 	/** The attached binding's ACP backend: the one that reads, steers and cancels this owner's ACP runs. */
 	acp?: AcpBackend;
+	/** Live, binding-local APIs for user-started branches and ancestor controls. */
+	startBranch?: (input: Record<string, unknown>) => Promise<any>;
+	control?: (params: any, signal?: AbortSignal) => Promise<any>;
+	piBackend?: PiBackend;
+	processes?: ProcessBackend;
 	/** A root parent's view of its whole tree, as the Agents frame reads and acts on it. */
 	live?: LiveSource;
 	/** Open one of this owner's settled runs' sessions without starting a turn: a delegating run's own children reattach with it. */
@@ -279,17 +285,19 @@ export function runRecordPaths(owner: Owner): string[] {
  * new model): the root lists, reads and revives them as it does its own settled children, until the next
  * prompt hides them. Keyed by the delegating run's id; its revival restores them live and drops the entry.
  */
-export interface Departed { pi: Run[]; acp: { view: AcpRunView; activity: ChildActivity }[] }
+export interface Departed { pi: Run[]; acp: { view: AcpRunView; activity: ChildActivity }[]; process?: ProcessRunView[] }
 export const departed = new Map<string, Departed>();
 /** A delegating child's close still in progress (parking its ACP runs), by its run id. A revival waits for it. */
 export const closingChildren = new Map<string, Promise<void>>();
 /** A departed run, and the delegating run whose session held it. */
-export function findDeparted(id: string): { parentId: string; run?: Run; acp?: Departed["acp"][number] } | undefined {
+export function findDeparted(id: string): { parentId: string; run?: Run; acp?: Departed["acp"][number]; process?: ProcessRunView } | undefined {
 	for (const [parentId, gone] of departed) {
 		const run = gone.pi.find((r) => r.id === id);
 		if (run) return { parentId, run };
 		const acpRun = gone.acp.find((a) => a.view.id === id);
 		if (acpRun) return { parentId, acp: acpRun };
+		const process = gone.process?.find((r) => r.id === id);
+		if (process) return { parentId, process };
 	}
 	return undefined;
 }
@@ -1367,7 +1375,7 @@ export async function closeOwner(owner: Owner) {
 	// A delegating child's runs outlive its session in the root's view; a root's take its whole tree along.
 	const closing = ownedRuns(owner);
 	const uncertain: string[] = [];
-	if (owner.parentRun) departed.set(owner.parentRun.id, { pi: closing.filter((run) => !run.foreign), acp: departed.get(owner.parentRun.id)?.acp ?? [] });
+	if (owner.parentRun) departed.set(owner.parentRun.id, { ...departed.get(owner.parentRun.id), pi: closing.filter((run) => !run.foreign), acp: departed.get(owner.parentRun.id)?.acp ?? [] });
 	await Promise.all(ownedRuns(owner).map(async (run) => {
 		if (!run.foreign) {
 			// Mark stopped before any await: no descendant completion may revive an ending parent.
@@ -1553,7 +1561,7 @@ function extensionError(run: Run, message: string) {
 // --- The backend ------------------------------------------------------------------------------
 
 /** The parent call a pi start or steer runs in: its context (session, model registry, UI) and its progress callback. */
-export interface PiCall { ctx: ExtensionContext; onUpdate?: (update: any) => void }
+export interface PiCall { ctx: ExtensionContext; onUpdate?: (update: any) => void; beforeStart?: () => void }
 
 /** The parent binding's part of the pi backend: what needs its extension API, model runtime or tool context. */
 export interface PiBackendHooks {
@@ -1916,7 +1924,9 @@ export class PiBackend implements DelegateBackend<"pi"> {
 
 	async start(input: PiStartInput, signal?: AbortSignal, call?: PiCall): Promise<PiRunView> {
 		if (!call) throw new DelegateError("INPUT_INVALID", "a pi run starts from its parent's delegate call");
-		return piView(this.create(await this.hooks.resolve(input, call, signal), call));
+		const spec = await this.hooks.resolve(input, call, signal);
+		call.beforeStart?.(); // A direct branch's lead may have ended during trust/model resolution.
+		return piView(this.create(spec, call));
 	}
 
 	/**

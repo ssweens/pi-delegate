@@ -74,6 +74,7 @@ export interface RunView {
 export function processText(v: ProcessRunView, output = true): string {
 	return [
 		`${v.id} ${v.status} · ${v.task ?? v.command} · ${formatDuration((v.endedAt ?? Date.now()) - v.startedAt)}${v.exitCode !== undefined ? ` · exit ${v.exitCode}` : ""}${v.signal ? ` · ${v.signal}` : ""}`,
+		...(v.parentRunId ? [`under: ${v.parentRunId} (depth ${v.depth})`] : []),
 		`command: ${v.command}`, `cwd: ${v.cwd}`, `PID: ${v.pid ?? "unknown"}`, `outputFile: ${v.outputFile}`,
 		v.error, v.observationError, output && v.truncated ? "[output tail truncated]" : "", output ? v.output : "",
 	].filter(Boolean).join("\n");
@@ -81,7 +82,7 @@ export function processText(v: ProcessRunView, output = true): string {
 
 export function processLine(v: ProcessRunView, theme: Theme, width: number): string {
 	const { color, glyph } = statusMark(v);
-	const facts = `${v.status} · ${formatDuration((v.endedAt ?? Date.now()) - v.startedAt)}${v.exitCode !== undefined ? ` · exit ${v.exitCode}` : ""}`;
+	const facts = `${v.status} · ${formatDuration((v.endedAt ?? Date.now()) - v.startedAt)}${v.exitCode !== undefined ? ` · exit ${v.exitCode}` : ""}${v.parentRunId ? ` · under ${v.parentRunId}` : ""}`;
 	return fit(`${theme.fg(color, glyph)} ${fit((v.task ?? v.command).split("\n")[0]!, Math.max(4, width - facts.length - 5))}  ${theme.fg("muted", facts)}`, width);
 }
 

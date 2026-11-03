@@ -27,7 +27,8 @@
     "test": "npm run build && tsx --import ./test/setup.ts --test test/*.test.ts test/acp/*.test.ts test/acp/integration/*.test.ts",
     "test:acp:e2e": "PI_STRINGS_E2E=1 tsx --test test/acp/integration/*.test.ts",
     "check:install": "tsx --import ./test/setup.ts test/install-smoke.ts",
-    "smoke:tui": "tsx --import ./test/setup.ts test/terminal-smoke.ts"
+    "smoke:tui": "tsx --import ./test/setup.ts test/terminal-smoke.ts",
+    "smoke:branch": "tsx --import ./test/setup.ts test/branch-terminal-smoke.ts"
   },
   "pi": {
     "extensions": [
