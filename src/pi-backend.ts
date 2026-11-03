@@ -164,7 +164,7 @@ export interface Run {
 	parentRunId?: string;
 	/** Which entry of the role's model list the run got, and why earlier entries were skipped. */
 	modelPick?: string;
-	/** Started by the person with /delegate: its completion is shown without starting a model turn. */
+	/** Started by /delegate: its owner manages it through safe follow-up notices. */
 	userStarted?: true;
 	/** Every tool name the child's current session was offered, allowed or not; droppedTools is read from it. */
 	offered?: Set<string>;
@@ -405,19 +405,16 @@ export const CHILD_SETTLED_PROMPT = "A child you delegated has settled; its repo
 function deliver(owner: Owner, message: Notice, retry: () => void) {
 	if (!owner.binding || owner.closed) return;
 	if (owner.parentRun) { wakeChild(owner.parentRun, message, retry); return; }
-	// A run the person started with /delegate reports to them: shown, and in context for the next turn,
-	// without spending a model turn on it.
-	if ((message.details as any)?.userStarted) { owner.binding.pi.sendMessage(message, { triggerTurn: false }); return; }
-	// A steer reaches the parent at once: an idle one starts a turn, and a busy one reads it at its next
-	// model request, inside the run it is in. A follow-up would wait for that run to end, however long it runs.
+	// User-command work belongs to the main agent, but must wait for its current work to settle.
+	// Ordinary model-created children retain their existing next-request steer delivery.
 	// Health and extension-budget alerts are advisory, not durable reports: replay can make them stale.
 	const kind = (message.details as any)?.kind;
 	if (kind !== "watchdog" && kind !== "extend-request") inFlight(owner).set(noticeKey(message), message);
-	owner.binding.pi.sendMessage(message, { deliverAs: "steer", triggerTurn: true });
+	owner.binding.pi.sendMessage(message, { deliverAs: (message.details as any)?.userStarted ? "followUp" : "steer", triggerTurn: true });
 }
 
-/** A notice's identity: its run and segment (an ACP run's turn count stands in for a segment). */
-export const noticeKey = (message: Notice) => { const d = message.details as any; return `${d?.id}:${d?.segment ?? d?.turns?.length ?? ""}`; };
+/** Start handoff and completion have distinct receipts, even in the same execution segment. */
+export const noticeKey = (message: Notice) => { const d = message.details as any; return `${d?.id}:${d?.segment ?? d?.turns?.length ?? ""}${d?.kind === "user-start" ? ":start" : ""}`; };
 /**
  * Completion notices sent to the root parent and not yet in its conversation. Pi drops queued extension
  * messages when the person aborts the run (it clears its queues), so whatever is still here when the
@@ -431,8 +428,8 @@ export function inFlight(owner: Owner): Map<string, Notice> {
 }
 /**
  * The parent's run settled with notices that never reached its conversation. After an abort they are
- * appended without a turn, shown and in context for the next prompt, as the person stopped the run;
- * otherwise they start the turn they were sent to start.
+ * ordinary reports are appended without a turn, respecting the person's stop. User-command ownership
+ * still needs automatic management: those notices activate a safe follow-up after the abort settles.
  */
 export function redeliver(owner: Owner, aborted: boolean) {
 	if (!inFlight(owner).size) return;
@@ -446,8 +443,9 @@ export function redeliver(owner: Owner, aborted: boolean) {
 	if (!lost.length || !owner.binding || owner.closed) return;
 	const { pi } = owner.binding;
 	for (const message of lost) {
-		if (!aborted) inFlight(owner).set(noticeKey(message), message);
-		pi.sendMessage(message, aborted ? { triggerTurn: false } : { deliverAs: "steer", triggerTurn: true });
+		const managed = (message.details as any)?.userStarted;
+		if (!aborted || managed) inFlight(owner).set(noticeKey(message), message);
+		pi.sendMessage(message, aborted && !managed ? { triggerTurn: false } : { deliverAs: managed ? "followUp" : "steer", triggerTurn: true });
 	}
 }
 
@@ -509,7 +507,7 @@ export function notify(owner: Owner, notice: Notice): void {
 }
 
 /** A run's completion notice, either backend's: its report, and its details for the renderer and the receipt. */
-export const finishedNotice = (report: string, details: unknown): Notice => ({ customType: "delegate", content: `delegate finished\n${report}`, display: true, details });
+export const finishedNotice = (report: string, details: unknown): Notice => ({ customType: "delegate", content: `${(details as any)?.userStarted ? "The user-started work you own has finished. Verify the result, handle any failure or blocker, and integrate it into your work now; do not wait for another user prompt.\n" : ""}delegate finished\n${report}`, display: true, details });
 
 /**
  * An exception about a running run, told to its owner as one short notice by the completion path (notify). Advisory:
@@ -2026,8 +2024,6 @@ export class PiBackend implements DelegateBackend<"pi"> {
 			replacement = { model: modelKey(model), thinking: thinking ?? run.thinking, contextWindow: model.contextWindow };
 		}
 		if (input.timeoutMs !== undefined) replacement = { ...replacement, timeoutMs: input.timeoutMs };
-		// The model steered it: its completion wakes the model, whoever started it.
-		if (run.userStarted) { run.userStarted = undefined; saveRun(run); }
 		// Its receipt exists before the message can reach the session; an oven slice reports no message events.
 		const receipt = run.runtime === "oven" ? undefined : noteSteer(run, input.message, input.interrupt);
 		try { await this.steerRun(run, input.message, input.restart, replacement, input.interrupt); }

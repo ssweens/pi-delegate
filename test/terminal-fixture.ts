@@ -14,10 +14,10 @@ export default function (pi: any) {
 	const trace = (event: any) => appendFileSync(join(root, "trace.jsonl"), JSON.stringify(event) + "\n");
 	const { pi: captured, tools } = capturePi(pi, (target) => ({
 		sendMessage: (message: any, options: any) => {
-			trace({ event: "complete", details: message.details });
+			trace({ event: "complete", details: message.details, content: message.content, options });
 			// This UI-only probe renders/persists real results without an unrelated parent reply.
-			// Automatic wake-up is checked separately in lifecycle.test.ts.
-			return target.sendMessage(message, { ...options, triggerTurn: false });
+			// The command-management smoke opts into real start/completion wake-ups.
+			return target.sendMessage(message, process.env.DELEGATE_SMOKE_MANAGEMENT === "1" && message.details?.userStarted ? options : { ...options, triggerTurn: false });
 		},
 	}));
 	const trail = { waypoints: [{ id: "fixture:w1", sessionId: "fixture", at: Date.now(), kind: "set_out" as const,

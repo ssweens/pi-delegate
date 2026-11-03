@@ -16,7 +16,7 @@ export interface ProcessRunView {
 	pid?: number; startedAt: number; endedAt?: number; exitCode?: number | null; signal?: NodeJS.Signals | null;
 	output: string; outputFile: string; truncated: boolean; error?: string; observationError?: string;
 	capabilities: ProcessCapabilities; foreign?: { ownerPid: number; ownerHost: string };
-	depth?: number; parentRunId?: string;
+	depth?: number; parentRunId?: string; userStarted?: true;
 }
 export interface ProcessBackendHooks {
 	ownerKey(): string; runDir(ownerKey: string): string; changed(): void;
@@ -41,7 +41,7 @@ const capabilities: ProcessCapabilities = {
 function view(run: Run): ProcessRunView {
 	const { id, command, task, cwd, status, pid, startedAt, endedAt, exitCode, signal, output, outputFile, truncated, error, observationError } = run;
 	return { backend: "process", id, command, task, cwd, status, pid, startedAt, endedAt, exitCode, signal, output, outputFile, truncated, error, observationError, capabilities,
-		...(run.depth !== undefined ? { depth: run.depth } : {}), ...(run.parentRunId ? { parentRunId: run.parentRunId } : {}),
+		...(run.userStarted ? { userStarted: true as const } : {}), ...(run.depth !== undefined ? { depth: run.depth } : {}), ...(run.parentRunId ? { parentRunId: run.parentRunId } : {}),
 		...(run.foreign ? { foreign: { ownerPid: run.ownerPid ?? 0, ownerHost: run.ownerHost ?? "" } } : {}) };
 }
 function save(run: Run): void { run.store.save(run, RunStore.recordPath(run.hooks.runDir(run.ownerKey), run.id)); }
@@ -169,11 +169,11 @@ export class ProcessBackend {
 			save(run);
 		}
 	}
-	async start(input: ProcessStartInput, _signal?: AbortSignal): Promise<ProcessRunView> {
+	async start(input: ProcessStartInput, _signal?: AbortSignal, origin: { userStarted?: true } = {}): Promise<ProcessRunView> {
 		if (!input.command.trim() || (input.timeoutMs !== undefined && (!Number.isSafeInteger(input.timeoutMs) || input.timeoutMs <= 0))) throw new DelegateError("INPUT_INVALID", "command must be nonempty and timeoutMs a positive safe integer");
 		this.hooks.admit?.();
 		const ownerKey = this.hooks.ownerKey(), id = `process-${randomUUID()}`;
-		const run: Run = { ...processOwner(), ...this.hooks.lineage?.(), id, ownerKey, command: input.command, task: input.task, cwd: input.cwd ?? process.cwd(), status: "running", startedAt: Date.now(), output: "", outputFile: join(this.hooks.runDir(ownerKey), `${id}.output`), truncated: false, completion: new RunCompletion(), waiters: 0, tree: new Map(), hooks: this.hooks, store: this.store };
+		const run: Run = { ...processOwner(), ...this.hooks.lineage?.(), ...origin, id, ownerKey, command: input.command, task: input.task, cwd: input.cwd ?? process.cwd(), status: "running", startedAt: Date.now(), output: "", outputFile: join(this.hooks.runDir(ownerKey), `${id}.output`), truncated: false, completion: new RunCompletion(), waiters: 0, tree: new Map(), hooks: this.hooks, store: this.store };
 		try { save(run); } catch (e) { throw new DelegateError("RUN_NOT_PERSISTED", `command was not started: ${String(e)}`); }
 		runs.set(id, run);
 		try {

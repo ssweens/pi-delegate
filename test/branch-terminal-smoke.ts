@@ -28,59 +28,56 @@ const until = async (check: () => boolean) => {
 };
 const records = () => {
 	const dir = join(box.cwd, ".agents/pi/subsessions");
-	try { return readdirSync(dir).filter(f => /^(coordinator|scout)-.*\.json$/.test(f)).map(f => JSON.parse(readFileSync(join(dir, f), "utf8"))); }
+	try { return readdirSync(dir).filter(f => /^(worker|scout)-.*\.json$/.test(f)).map(f => JSON.parse(readFileSync(join(dir, f), "utf8"))); }
 	catch { return []; }
 };
 const gate = deferred(), childGate = deferred();
+let child: any, managed = false;
 try {
-	mkdirSync(join(box.agentDir, "agents"), { recursive: true });
-	writeFileSync(join(box.agentDir, "agents/coordinator.md"), "---\nname: coordinator\ndescription: TUI branch lead\ntools: read, delegate, delegate_ctl\nmodel: fixture/fixture:off\n---\nCoordinate.\n");
 	writeFileSync(join(box.agentDir, "keybindings.json"), JSON.stringify({ "tui.input.newLine": ["shift+enter"] }));
-	const leadRequest = api.script("TUI lead", { text: "TUI-LEAD-ACTIVE", gate });
-	const childRequest = api.script("TUI branch", { text: "TUI-BRANCH-RESULT", gate: childGate });
-	api.onUnscripted(() => ({ text: "TUI-LEAD-SAW-BRANCH" }));
+	const parentRequest = api.script("TUI current conversation", { text: "TUI-MAIN-ACTIVE", gate });
+	const childRequest = api.script("TUI bare task", { text: "TUI-TASK-RESULT", gate: childGate });
+	api.onUnscripted(() => {
+		if (!managed) { managed = true; return { tool: { name: "delegate_ctl", arguments: { action: "status", runId: child.id } } }; }
+		return { text: "TUI-MAIN-VERIFIED-AND-INTEGRATED" };
+	});
 	const args = [process.execPath, cli, "--offline", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--extension", resolve(import.meta.dirname, "terminal-fixture.ts"), "--model", "fixture/fixture", "--thinking", "off", "--tui-mode", "regular", "--session-dir", join(box.root, "parents")];
 	const launcher = join(box.root, "launch.sh");
-	writeFileSync(launcher, `#!/bin/sh\ncd ${quote(box.cwd)}\nexec env HOME=${quote(box.root)} PI_CODING_AGENT_DIR=${quote(box.agentDir)} PI_OFFLINE=1 PI_TELEMETRY=0 DELEGATE_SMOKE_ROOT=${quote(box.root)} ${args.map(quote).join(" ")}\n`, { mode: 0o700 });
+	writeFileSync(launcher, `#!/bin/sh\ncd ${quote(box.cwd)}\nexec env HOME=${quote(box.root)} PI_CODING_AGENT_DIR=${quote(box.agentDir)} PI_OFFLINE=1 PI_TELEMETRY=0 DELEGATE_SMOKE_ROOT=${quote(box.root)} DELEGATE_SMOKE_MANAGEMENT=1 ${args.map(quote).join(" ")}\n`, { mode: 0o700 });
 	tmux("new-session", "-d", "-s", "pi", "-x", "140", "-y", "40", `sh ${quote(launcher)}`);
 	await until(() => /FIXTURE-READY/.test(capture()));
 	assert.doesNotMatch(capture(), /\[Extension issues\]|shortcut conflict/);
-	command("/delegate fresh:coordinator TUI lead"); await leadRequest;
-	await until(() => records().some(r => r.task === "TUI lead"));
-	const lead = records().find(r => r.task === "TUI lead");
-	save("before-branch");
-	command("/delegate fresh:scout TUI branch"); await childRequest;
-	await until(() => /started under/.test(capture()));
-	const child = records().find(r => r.task === "TUI branch");
-	assert.equal(child.parentRunId, lead.id); assert.equal(child.depth, 2); assert.notEqual(child.ownerKey, lead.ownerKey);
-	save("branch-started");
-	command("/delegate process printf 'TUI-PROCESS-RESULT'; sleep 30");
-	await until(() => /Processes.*1\/1/.test(capture()));
-	const processFile = readdirSync(join(box.cwd, ".agents/pi/subsessions"), { recursive: true })
-		.map(String).find(f => /\/process\/process-.*\.json$/.test(f));
-	assert(processFile);
-	const processRun = JSON.parse(readFileSync(join(box.cwd, ".agents/pi/subsessions", processFile), "utf8"));
-	assert.equal(processRun.parentRunId, lead.id); assert.equal(processRun.depth, 2);
-	save("process-branch-started");
-	// Open the new branch process row through the real Agents panel, not a fixture control.
-	tmux("send-keys", "-t", "pi", "Left", "Down", "Down", "Enter");
-	await until(() => /╭─ Process ─/.test(capture()) && /outputFile:/.test(capture()));
-	assert.match(capture(), /under: coordinator-/);
-	save("process-branch-detail");
-	tmux("send-keys", "-t", "pi", "C-x");
-	await until(() => JSON.parse(readFileSync(join(box.cwd, ".agents/pi/subsessions", processFile), "utf8")).status === "cancelled");
-	save("process-branch-cancelled");
-	tmux("send-keys", "-t", "pi", "Escape");
-	await until(() => !/╭─ Process ─/.test(capture()));
-	tmux("send-keys", "-t", "pi", "Escape");
+	command("TUI current conversation"); await parentRequest;
+	save("main-active-before-delegate");
+	command("/delegate TUI bare task"); const request = await childRequest;
+	await until(() => records().some(r => r.task === "TUI bare task"));
+	child = records().find(r => r.task === "TUI bare task");
+	assert.equal(child.role, "worker"); assert.equal(child.context, "fork");
+	assert.equal(child.parentRunId, undefined); assert.equal(child.depth, 1); assert.equal(child.userStarted, true);
+	assert.match(JSON.stringify(request.messages), /TUI current conversation/);
+	const trace = () => readFileSync(join(box.root, "trace.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+	await until(() => trace().some(e => e.details?.kind === "user-start"));
+	const start = trace().find(e => e.details?.kind === "user-start");
+	assert.equal(start.details.id, child.id); assert.equal(start.options.deliverAs, "followUp"); assert.equal(start.options.triggerTurn, true);
+	assert.match(start.content, /own and must manage/);
+	assert.equal(api.requests.length, 2, "ownership queued; main response is not interrupted");
+	save("bare-task-started-ownership-queued");
 	childGate.resolve();
 	await until(() => records().some(r => r.id === child.id && r.status === "complete"));
-	assert.equal(api.requests.length, 2, "child completion waits while lead response is active");
+	await until(() => trace().some(e => e.details?.id === child.id && e.details?.kind !== "user-start"));
+	assert.equal(api.requests.length, 2, "completion also waits for busy main to settle");
+	save("task-complete-main-still-active");
 	gate.resolve();
-	await until(() => records().some(r => r.id === lead.id && r.output.includes("TUI-LEAD-SAW-BRANCH")));
-	save("lead-received-branch");
-	assert(api.requests.some(r => JSON.stringify(r.messages).includes("TUI-BRANCH-RESULT")));
-	console.log(`PASS inferred-lead Pi/process branch commands (no run IDs) in real Pi TUI, root process cancel, owner lineage, and deferred lead completion. Evidence: ${box.root}`);
+	await until(() => api.requests.some(r => /TUI-TASK-RESULT/.test(JSON.stringify(r.messages)) && /Verify the result/.test(JSON.stringify(r.messages))));
+	await until(() => /TUI-MAIN-VERIFIED-AND-INTEGRATED/.test(capture()));
+	assert(managed, "main automatically supervised the run with delegate_ctl");
+	assert(api.requests.some(r => r.messages.some((m: any) => m.tool_calls?.some((call: any) => call.function.name === "delegate_ctl" && JSON.parse(call.function.arguments).runId === child.id))));
+	const parentFile = JSON.parse(readFileSync(join(box.root, "parent.json"), "utf8")).file;
+	await until(() => /own and must manage/.test(readFileSync(parentFile, "utf8")) && /TUI-TASK-RESULT/.test(readFileSync(parentFile, "utf8")));
+	save("main-owned-managed-and-handled-completion");
+	writeFileSync(join(box.root, "requests.json"), JSON.stringify(api.requests, null, 2));
+	assert.deepEqual(api.errors, []);
+	console.log(`PASS bare /delegate task: worker/fork root ownership, immediate start, busy-main non-interruption, mandatory ownership follow-up and automatic completion management in real Pi TUI. Evidence: ${box.root}`);
 } finally {
 	gate.resolve(); childGate.resolve();
 	try { tmux("kill-server"); } catch { /* startup may have failed */ }

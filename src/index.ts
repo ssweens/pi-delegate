@@ -936,19 +936,6 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		}
 		return false;
 	};
-	const runningLead = (run: Run | undefined): run is Run => inTree(run) && !run.foreign && !run.runtime
-		&& !run.stopped && run.status === "running" && !run.completion.settled;
-	const branchLead = () => {
-		const recentFirst = (a: Run, b: Run) => (b.lastProgressAt ?? b.segmentStartedAt) - (a.lastProgressAt ?? a.segmentStartedAt)
-			|| b.segmentStartedAt - a.segmentStartedAt || b.startedAt - a.startedAt;
-		const leads = [...runs.values()].filter((run) => {
-			const target = childOwner(run);
-			return runningLead(run) && run.depth < maxDepth() && target?.binding && !target.closed && target.startBranch;
-		}).sort(recentFirst);
-		if (leads[1] && recentFirst(leads[0], leads[1]) === 0)
-			throw new Error("Cannot infer the current running lead: runtime activity is tied; nothing was started. Try again after lead activity.");
-		return leads[0];
-	};
 	/** Attached owners reachable from this session only; never use a process-global ID as authority. */
 	const treeOwners = (): Owner[] => {
 		if (!owner) return [];
@@ -1251,7 +1238,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			if (start.value.backend === "process") {
 				try {
 					storageDir(ctx.sessionManager.getCwd());
-					const v = await processes.start({ ...start.value, cwd: start.value.cwd ?? ctx.cwd }, signal);
+					const v = await processes.start({ ...start.value, cwd: start.value.cwd ?? ctx.cwd }, signal, _id === "user-command" ? { userStarted: true } : {});
 					return { content: [{ type: "text", text: `${processText(v, false)}\n${START_HINT}` }], details: v };
 				} catch (error) { return failed(error); }
 			}
@@ -1762,53 +1749,49 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			handler: async (_args, ctx) => { await openHistory(ctx); },
 		});
 		pi.registerCommand("delegate", {
-			description: "fork:<role>|fresh:<role> <task> · process <command> (current running lead) · root fresh:<role>|fork:<role> <task> · settings",
+			description: "<task> (worker, current conversation) · optional fresh|fork, role:<role>, fresh:<role>|fork:<role> · process <command> · settings",
 			getArgumentCompletions: (prefix) => {
 				const ctx = owner?.binding?.ctx;
 				const roles = ctx ? sortedRoles(ctx) : [];
 				const items = [{ value: "settings", label: "settings", description: "Every pi-delegate setting, below the prompt" },
-					{ value: "root ", label: "root", description: "Start a root-owned child, not a branch of a running lead" },
-					{ value: "process ", label: "process", description: "Run a command under the most recently active eligible running lead" },
-					...roles.flatMap((r) => (["fork", "fresh"] as const).map((kind) => ({ value: `${kind}:${r.name} `, label: `${kind}:${r.name}`,
-						description: `${kind === "fork" ? "with parent conversation" : "no conversation"} · current lead, otherwise root · ${r.description}` })))];
-				const rootRoles = items.filter((item) => /^(fork|fresh):/.test(item.value))
-					.map((item) => ({ ...item, value: `root ${item.value}`, label: `root ${item.label}`, description: "Root-owned child, regardless of running leads" }));
-				const matching = [...items, ...rootRoles].filter((item) => item.value.startsWith(prefix.trim()));
+					{ value: "fresh ", label: "fresh", description: "Optional: start without the main conversation" },
+					{ value: "fork ", label: "fork", description: "Optional: inherit the main conversation (default)" },
+					{ value: "process ", label: "process", description: "Run a shell command owned by the main agent" },
+					...roles.flatMap((r) => ["role", "fork", "fresh"].map((kind) => ({ value: `${kind}:${r.name} `, label: `${kind}:${r.name}`, description: r.description })))];
+				const matching = items.filter((item) => item.value.startsWith(prefix.trim()));
 				return matching.length ? matching : null;
 			},
 			handler: async (args, ctx) => {
 				const text = args.trim();
 				try {
 					if (!text || text === "settings") { await openSettings(ctx); return; }
-					const root = text.startsWith("root ");
-					const body = root ? text.slice(5).trim() : text;
-					const launch = /^(fork|fresh):(\S+)\s+([\s\S]+)$/.exec(body);
-					const command = /^process\s+([\s\S]+)$/.exec(body);
-					if ((!launch && !command) || (root && !launch))
-						throw new Error("Use /delegate fresh:<role>|fork:<role> <task>, process <command>, root fresh:<role>|fork:<role> <task>.");
-					const lead = root ? undefined : branchLead();
-					if (lead) {
-						requireOwner();
-						if (mode() === "off") throw new Error("Delegation is turned off in /delegate settings; nothing was started.");
-						await lead.ready;
-						if (branchLead() !== lead)
-							throw new Error("The running lead changed while preparing the branch; nothing was started. Try again.");
-						const target = childOwner(lead);
-						if (!runningLead(lead) || lead.depth >= maxDepth() || !target?.binding || target.closed || !target.startBranch)
-							throw new Error("Branch target needs a live delegation runtime (role tools must allow delegate or delegate_ctl, below the depth cap); nothing was started.");
-						const input = command ? { backend: "process", command: command[1] }
-							: { backend: "pi", context: launch![1], role: launch![2], task: launch![3] };
-						const started = await target.startBranch(input);
-						ctx.ui.notify(`${started.id} started under ${lead.id}. Completion goes to that lead as a follow-up, not a root interruption.`, "info");
-						return;
+					// `root` remains a compatibility alias; every command launch belongs to this main session.
+					let task = text.startsWith("root ") ? text.slice(5).trim() : text;
+					let role = "worker", context = "fork";
+					const command = /^process\s+([\s\S]+)$/.exec(task);
+					if (!command) {
+						for (;;) {
+							const option = /^(?:(fresh|fork)(?::(\S+))?|role:(\S+))\s+([\s\S]+)$/.exec(task);
+							if (!option) break;
+							if (option[1]) context = option[1];
+							role = option[2] ?? option[3] ?? role;
+							task = option[4].trim();
+						}
+						if (!task || /^(?:under:|(?:fresh|fork)(?::\S+)?$|role:\S*$|process$)/.test(task))
+							throw new Error("Use /delegate <task>. Optional overrides: fresh, fork, role:<role>, fresh:<role>, fork:<role>.");
+						if (!toolContext) ctx.ui.notify("This child has no MCP tools: they reach a child through this session's tools, which pi-delegate sees once the model has called delegate or delegate_ctl here.", "warning");
 					}
-					if (!launch) throw new Error("No eligible running lead for this process branch; nothing was started. Start a lead whose role allows delegate or delegate_ctl below the depth cap.");
-					const [, context, role, task] = launch;
-					// A child calls MCP tools through this session's last tool context; a command has none of its own.
-					if (!toolContext) ctx.ui.notify("This child has no MCP tools: they reach a child through this session's tools, which pi-delegate sees once the model has called delegate or delegate_ctl here.", "warning");
-					const result = await delegateTool.execute("user-command", { role, task, context }, undefined, undefined, ctx);
-					const run = result.details?.id ? runs.get(result.details.id) : undefined;
-					if (run && !result.isError) { run.userStarted = true; saveRun(run); changed(); }
+					const input = command ? { backend: "process", command: command[1] } : { role, context, task, runtime: "in-process" };
+					const result = await delegateTool.execute("user-command", input, undefined, undefined, ctx);
+					if (result.details?.id && !result.isError) {
+						const run = runs.get(result.details.id);
+						if (run) { run.userStarted = true; saveRun(run); changed(); }
+						notify(requireOwner(), {
+							customType: "delegate", display: true,
+							content: `The user started delegate ${result.details.id} directly. You, the main conversation agent, own and must manage this work.\nTask: ${command ? command[1] : task}\nIncorporate it into your work now. Supervise with delegate_ctl status/steer/cancel as needed, handle blockers, and verify and integrate its result when it completes. Do not wait for another user prompt. It is already running: continue other work unless you need its result; do not launch a duplicate.`,
+							details: { ...result.details, kind: "user-start", userStarted: true },
+						});
+					}
 					ctx.ui.notify(result.content?.[0]?.text ?? "delegate returned nothing", result.isError ? "error" : "info");
 				} catch (error) { ctx.ui.notify(errorMessage(error), "error"); }
 			},
