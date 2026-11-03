@@ -3,6 +3,7 @@ name: scout
 description: Read-only recon of code the parent has not seen; returns compressed, pointer-rich context. Use when acquiring context would cost the parent more than a handoff.
 tools: read, grep, find, ls, bash
 context: fresh
+omitAgentsMd: true
 thinking: low
 ---
 

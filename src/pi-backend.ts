@@ -66,6 +66,9 @@ export interface Run {
 	acknowledged: boolean;
 	systemPrompt: string;
 	contextFiles: { path: string; content: string }[];
+	omitAgentsMd?: boolean;
+	inheritedContextFiles?: { path: string; content: string }[];
+	discoveredContextFiles?: { path: string; content: string }[];
 	appendSystemPrompt: string[];
 	/** The role's `tools` line, names and `*` patterns; EVERY_TOOL when it has none. */
 	tools: string[];
@@ -857,7 +860,7 @@ export function resultText(run: Run): string {
 function log(run: Run) {
 	try {
 		mkdirSync(dirname(LOG_FILE), { recursive: true });
-		const { session: _s, timer: _t, wrapTimer: _w, activityCache: _a, streamingMessage: _m, activeTools: _tools, completion: _completion, ready: _ready, systemPrompt: _prompt, contextFiles: _context, appendSystemPrompt: _append, offered: _offered, closeOnSettle: _close, ...rest } = run;
+		const { session: _s, timer: _t, wrapTimer: _w, activityCache: _a, streamingMessage: _m, activeTools: _tools, completion: _completion, ready: _ready, systemPrompt: _prompt, contextFiles: _context, inheritedContextFiles: _inheritedContext, discoveredContextFiles: _discoveredContext, appendSystemPrompt: _append, offered: _offered, closeOnSettle: _close, ...rest } = run;
 		appendFileSync(LOG_FILE, `${JSON.stringify({ ...rest, output: run.output.slice(0, 2000), ts: Date.now() })}\n`);
 	} catch {
 		/* logging must never fail the run */
@@ -1582,6 +1585,9 @@ export interface PiRunSpec {
 	thinking: string;
 	contextWindow?: number;
 	modelPick?: string;
+	omitAgentsMd?: boolean;
+	inheritedContextFiles?: { path: string; content: string }[];
+	appendSystemPrompt?: string[];
 	systemPrompt: string;
 	context: "fork" | "fresh";
 	tools: string[];
@@ -1942,7 +1948,7 @@ export class PiBackend implements DelegateBackend<"pi"> {
 			...fields,
 			id, ownerKey: owner.key, recordPath: RunStore.recordPath(dir, id),
 			segment: 1, stopped: false, acknowledged: false,
-			contextFiles: [], appendSystemPrompt: [],
+			contextFiles: [], appendSystemPrompt: spec.appendSystemPrompt ?? [],
 			sessionFile, sessionId: manager.getSessionId(),
 			completion: new RunCompletion<RunResult>(),
 			status: "running",
@@ -1991,8 +1997,6 @@ export class PiBackend implements DelegateBackend<"pi"> {
 			run.forkedMessages = spec.context === "fork" ? messages.length : undefined;
 			await loader.reload();
 			this.hooks.owner();
-			run.contextFiles = loader.getAgentsFiles().agentsFiles;
-			run.appendSystemPrompt = loader.getAppendSystemPrompt();
 			saveRun(run);
 			changed();
 		})();

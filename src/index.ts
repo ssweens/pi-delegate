@@ -4,19 +4,21 @@ import { fileURLToPath } from "node:url";
 import {
 	type ExtensionAPI,
 	type ExtensionContext,
+	type ExtensionCommandContext,
+	type BuildSystemPromptOptions,
 	type InlineExtension,
 	type LoadExtensionsResult,
 	type RegisteredTool,
 	buildSessionContext,
 	convertToLlm,
 	DefaultResourceLoader,
-	loadProjectContextFiles,
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { modelKey, parseModelSpec, matchesSpec } from "./model-ref.ts";
+import { childInstructionExtension, instructionFiles, startupInstructions } from "./instructions.ts";
 import { allModels, availableModels, findModel, scopedModels } from "./registry.ts";
 import { clipText, errorMessage, textOf } from "./util/text.ts";
 import { ageDays, formatDuration } from "./util/format.ts";
@@ -661,14 +663,14 @@ function mcpProxyExtension(run: Run): InlineExtension {
 
 /** A child's private todo, its own pi-delegate when it delegates, and its parent's MCP tools. */
 function childExtensions(run: Run): InlineExtension[] {
-	return [childTodoExtension(), ...(delegating(run) ? [nestedExtension(run)] : []), mcpProxyExtension(run)];
+	return [childTodoExtension(), ...(delegating(run) ? [nestedExtension(run)] : []), mcpProxyExtension(run), childInstructionExtension(run, AGENT_DIR, () => saveRun(run))];
 }
 /**
  * The resource loader of a child's session. It loads from the folder the root session loaded its extensions
  * for, so Pi's factory cache hands it the factories the root already imported, each bound to the child's own
  * extension API; the child's trust in `settingsManager` still decides the project's part. Context files are
  * the child's folder's. Skills, prompt templates and themes stay out. A reopened session gets the context
- * files saved on the run.
+ * files saved on the run, delivered by its instruction-context hook rather than the system prompt.
  */
 function childLoader(run: Run, settingsManager: SettingsManager, reopen: boolean): DefaultResourceLoader {
 	const cwd = parentLinks.get(run)?.extensionCwd ?? run.cwd;
@@ -677,9 +679,12 @@ function childLoader(run: Run, settingsManager: SettingsManager, reopen: boolean
 		noSkills: true, noPromptTemplates: true, noThemes: true,
 		extensionFactories: childExtensions(run),
 		extensionsOverride: (base) => gateExtensions(run, base),
-		...(reopen
-			? { noContextFiles: true, agentsFilesOverride: () => ({ agentsFiles: run.contextFiles }), appendSystemPromptOverride: () => run.appendSystemPrompt }
-			: { agentsFilesOverride: () => ({ agentsFiles: loadProjectContextFiles({ cwd: run.cwd, agentDir: AGENT_DIR }) }) }),
+		noContextFiles: true,
+		agentsFilesOverride: () => {
+			if (!reopen) run.contextFiles = run.omitAgentsMd ? [] : startupInstructions(run.cwd, AGENT_DIR);
+			return { agentsFiles: [] };
+		},
+		appendSystemPromptOverride: () => run.appendSystemPrompt,
 	});
 }
 export default function (pi: ExtensionAPI) {
@@ -694,6 +699,8 @@ export default function (pi: ExtensionAPI) {
  * level down, with its children's completions delivered to that child.
  */
 function installDelegate(pi: ExtensionAPI, nesting?: Run) {
+	let promptContext: BuildSystemPromptOptions | undefined;
+	pi.on("before_agent_start", (event) => { promptContext = event.systemPromptOptions; });
 	const activity = nesting ? undefined : activityFor(pi);
 	// The session this instance serves runs at this depth; the children it starts run one deeper.
 	const depth = nesting?.depth ?? 0;
@@ -1115,7 +1122,11 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		// Like the model: the role's line is a default the call can override.
 		const runtime = tui ? "oven" : p.runtime ?? role.runtime ?? "in-process";
 		// An oven slice runs outside this process and never receives the conversation, as an ACP child.
-		const context = runtime === "oven" ? "fresh" : p.context ?? role.context ?? "fork";
+		const context = runtime === "oven" ? "fresh" : p.context ?? role.context ?? "fresh";
+		const omitAgentsMd = p.omitAgentsMd ?? role.omitAgentsMd ?? false;
+		if (runtime === "oven" && (p.omitAgentsMd !== undefined || omitAgentsMd)) throw new DelegateError("INPUT_INVALID", "omitAgentsMd is supported only by in-process Pi children; Oven and hosted TUIs own their instruction loading", "omitAgentsMd");
+		const parentPrompt = context === "fork" ? ("getSystemPromptOptions" in ctx ? (ctx as ExtensionCommandContext).getSystemPromptOptions() : promptContext) : undefined;
+		const inheritedContextFiles = context === "fork" ? (nesting ? instructionFiles(nesting) : parentPrompt?.contextFiles ?? []) : [];
 		const systemPrompt = PLAN_CONFLICT_RULE + role.systemPrompt + (role.systemPrompt.includes("STATUS:") ? "" : contractFooter(delegates, atDepthCap && toolAllowlist(tools).allows("delegate"), cap))
 			+ (delegates ? childrenFooter(depth + 1, cap) : "") + (context === "fork" ? FORK_FOOTER : "");
 		// An oven slice writes in its own copy, never in this tree.
@@ -1126,13 +1137,15 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		const hosted = tui ? tuiTemplate(role, tui, systemPrompt) : undefined;
 		return {
 			role: role.name, task: p.task, cwd, model: tui ? `${tui}:${p.model ?? "template"}` : modelKey(model), thinking, contextWindow: model?.contextWindow, ...(modelPick ? { modelPick } : {}),
-			systemPrompt, context, tools, ...(withheld ? { withheld } : {}), writer: isWriter && runtime !== "oven", timeoutMs,
+			systemPrompt, context, tools, omitAgentsMd, inheritedContextFiles,
+			appendSystemPrompt: parentPrompt?.appendSystemPrompt ? [parentPrompt.appendSystemPrompt] : [],
+			...(withheld ? { withheld } : {}), writer: isWriter && runtime !== "oven", timeoutMs,
 			...(p.firstDeliverableMin !== undefined ? { firstDeliverableMin: p.firstDeliverableMin } : {}),
 			depth: depth + 1, ...(nesting ? { parentRunId: nesting.id } : {}),
 			...(runtime === "oven" ? { runtime: "oven" as const, extensions: role.extensions ?? [] } : {}),
 			...(tui && hosted ? { tui, template: hosted.template, ...(hosted.taskPrefix ? { taskPrefix: hosted.taskPrefix } : {}), ...(p.model ? { modelOverride: p.model } : {}) } : {}),
 			projectTrusted, projectTrustSource,
-			inherited: () => context === "fork" ? convertToLlm(trimDangling(stripDelegation(buildSessionContext(ctx.sessionManager.buildContextEntries()).messages))) : [],
+			inherited: () => context === "fork" ? convertToLlm(trimDangling(stripDelegation(buildSessionContext(ctx.sessionManager.buildContextEntries()).messages))).filter((message) => message.role !== "system") : [],
 		};
 	}
 	// Held by name so /delegate fork:|fresh: starts a run through the very same path as the tool.
@@ -1146,7 +1159,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			"Run a role on a task in its own session; returns its final report, changed files, tokens, cost, and a runId. The delegation skill covers when to delegate, review triggers, and the model-proposal procedure. " +
 			"Delegate only for context isolation, parallelism, or a model-tier switch — if the brief would be longer than the expected diff, do the work yourself. " +
 			"Start the brief with a short task title on its own line, then objective, ownership, interfaces/constraints, verification, return shape. " +
-			'context "fork" (default) hands the child your conversation so far; "fresh" is for adversarial review. ' +
+			'Fresh children (default unless the role selects fork) get their own system prompt, applicable instruction files and the brief, not your conversation or appended prompt. Explicit context "fork" inherits your conversation, appended prompt and loaded instructions. omitAgentsMd skips startup instruction files only; launch values override role defaults (scout omits), and later reads still discover nested instructions. This option is in-process Pi only; unsupported runtimes reject it. ' +
 			"Runs in the background by default \u2014 the call returns a run id at once and you are woken once, when the child finishes. There are no progress pings by design; waiting is not your work. Do other work, or use delegate_ctl wait with that runId to block without polling when nothing else can proceed, or delegate_ctl status for a single progress read when someone asks. A launch never joins the child; use delegate_ctl wait only when dependent work needs its result. A child re-binds the extensions your session loaded and calls your session's MCP tools, and gets their tools (built-ins, extension tools, mcp__<server>__<tool>, delegate and delegate_ctl), limited to its role's tools list; at the depth limit (" + MAX_DELEGATION_DEPTH + " unless the user changed it) it gets no delegate or delegate_ctl. Model: run delegate_ctl models first; when model: is omitted a role's approved default is used, else the first usable entry of the role's model list. Starts beyond the user's limit on running children fail with CONCURRENCY_LIMIT: wait for one to finish. Proposing a model that is not the approved default is a conversation with the user, not a tool step: state the offering, price, rating and tradeoff, get their answer, then call delegate; if they want it kept, delegate_ctl action=approve. Use delegate_ctl to list roles, wait, check status, steer, or cancel. " +
 			'backend "acp" runs an external ACP agent session instead (agent required, e.g. "pi", "amp", "codex", "claude"): it creates a session and sends task as its first turn, or with sessionId opens that exact native session (an Amp T-ID, say) without owning it and sends task only when given. ' +
 			"An ACP child never receives your conversation (no context), and an opened session keeps its native role and model. Its report carries the agent's native session ID and each turn's request ID and delivery. Close an ACP run with delegate_ctl close when done. " +
@@ -1158,6 +1171,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			task: Type.Optional(Type.String({ description: "agent brief; required except acp with sessionId. process: optional human title" })),
 			model: Type.Optional(Type.String({ description: "override. pi: provider/id[:thinking]. acp: the agent's own model ID, created sessions only" })),
 			context: Type.Optional(StringEnum(["fork", "fresh"] as const)),
+			omitAgentsMd: Type.Optional(Type.Boolean({ description: "Skip startup instruction files only. Overrides the role's default, including false. Does not scrub forked history or disable nested discovery. In-process Pi only." })),
 			tui: Type.Optional(StringEnum(["pi", "claude", "amp"] as const, { description: 'pi only: run the child as that agent\'s own TUI hosted by oven (a tui slice), in a copy of cwd, on the role as an agent template (its claude:/amp: sections for those agents); model is passed to that agent. Default: the role\'s tui line. Implies runtime "oven"; attach with `oven attach <slice>`' })),
 			runtime: Type.Optional(StringEnum(["in-process", "oven"] as const, { description: 'pi only: where the child runs. Default: the role\'s runtime line, else "in-process". "oven" runs it as a bounded oven slice in a copy of cwd; completion releases execution and steer resumes saved history. Parent quit releases it; reload only rebinds. It never receives your conversation' })),
 			cwd: Type.Optional(Type.String()),
@@ -1399,7 +1413,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 					const { allows } = toolAllowlist(tools, withheld);
 					return {
 						name: r.name,
-						mode: `${r.context ?? "fork"}${r.thinking ? `:${r.thinking}` : ""}`,
+						mode: `${r.context ?? "fresh"}${r.thinking ? `:${r.thinking}` : ""}`,
 						model: approved[r.name]?.spec ?? r.model ?? "needs approval",
 						approved: Boolean(approved[r.name]),
 						writes: WRITE_TOOLS.some(allows),
@@ -1553,7 +1567,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			return [`${r.name} — ${r.description}`,
 				`  models: ${r.models?.join(", ") ?? "inherits this session's model"}`,
 				`  runs on now: ${now}`,
-				`  ${r.context ?? "fork"} context${r.thinking ? ` · thinking ${r.thinking}` : ""} · tools: ${r.tools?.join(", ") ?? "every tool"}`,
+				`  ${r.context ?? "fresh"} context${r.omitAgentsMd ? " · startup instructions omitted" : ""}${r.thinking ? ` · thinking ${r.thinking}` : ""} · tools: ${r.tools?.join(", ") ?? "every tool"}`,
 				`  ${r.source}`, ""];
 		});
 		return [...lines, `Edit a role's model: line to list models, most preferred first. Roles are read from ${roleSourcesText(AGENT_DIR)}.`];

@@ -23,6 +23,10 @@ The same Activity box has separate Agents and Processes sections. Process rows h
 
 The agent guidance below applies to pi and ACP, not process commands.
 
+## Child instruction context
+
+Ordinary in-process children start fresh with their own role prompt, applicable instruction files and the task. `omitAgentsMd: true` skips the startup instruction bundle only; scout opts out by default. An explicit launch `false` overrides the role. Successful reads still discover nested/path-scoped instructions. Explicit forks inherit conversation, appended prompt and loaded instructions; omission does not scrub that history. Reopen keeps the saved setting and file snapshots. ACP/process reject the option; Oven and hosted TUIs reject explicit values and omitting roles because their instruction loaders are separate.
+
 ## Configuration per task class
 
 | task class | executor | context | review |

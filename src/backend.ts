@@ -32,7 +32,7 @@ export const ACP_ONLY_FIELDS = ["agent", "sessionId", "executionEnvironment", "m
 /** Accepted only with backend "acp" and agent "amp". On any other agent each one is an error. */
 export const AMP_ONLY_FIELDS = ["mode"] as const;
 /** Accepted only with backend "pi". An ACP child cannot receive the parent conversation. */
-export const PI_ONLY_FIELDS = ["context", "runtime", "tui"] as const;
+export const PI_ONLY_FIELDS = ["context", "runtime", "tui", "omitAgentsMd"] as const;
 /** Opening an existing native session keeps its settings: these are creation-only (Coordinator rule). */
 export const OPEN_FORBIDDEN_FIELDS = ["role", "model", "mode"] as const;
 
@@ -52,6 +52,7 @@ export interface PiStartInput extends CommonStartInput {
 	/** provider/id[:thinking] */
 	model?: string;
 	context?: "fork" | "fresh";
+	omitAgentsMd?: boolean;
 	/** Overrides the role's runtime: an in-process Pi child, or an oven slice. */
 	runtime?: "in-process" | "oven";
 	/** Run the child as this agent's own TUI hosted by oven (a tui slice); implies runtime "oven". Overrides the role's `tui` line. */
@@ -476,7 +477,7 @@ export function validateStartInput(raw: Record<string, unknown>): Validated<Star
 	if (!common.ok) return common;
 
 	if (backend.value === "process") {
-		for (const field of ["role", "model", "context", "agent", "sessionId", "runtime", "tui", "mode", "firstDeliverableMin", "executionEnvironment", "reason"]) {
+		for (const field of ["role", "model", "context", "omitAgentsMd", "agent", "sessionId", "runtime", "tui", "mode", "firstDeliverableMin", "executionEnvironment", "reason"]) {
 			if (raw[field] !== undefined) return fail("INPUT_INVALID", `${field} is not supported on backend process`, field);
 		}
 		if (!isNonEmptyString(raw.command)) return fail("INPUT_INVALID", "command is required with backend process", "command");
@@ -508,6 +509,10 @@ export function validateStartInput(raw: Record<string, unknown>): Validated<Star
 		if (raw.context !== undefined) {
 			if (raw.context !== "fork" && raw.context !== "fresh") return fail("INPUT_INVALID", 'context must be "fork" or "fresh"', "context");
 			value.context = raw.context;
+		}
+		if (raw.omitAgentsMd !== undefined) {
+			if (typeof raw.omitAgentsMd !== "boolean") return fail("INPUT_INVALID", "omitAgentsMd must be a boolean", "omitAgentsMd");
+			value.omitAgentsMd = raw.omitAgentsMd;
 		}
 		if (raw.firstDeliverableMin !== undefined) {
 			const due = firstDeliverableError(raw.firstDeliverableMin, value.timeoutMs);

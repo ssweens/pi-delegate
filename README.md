@@ -15,11 +15,11 @@ One tool pair, three backends:
 
 ## Tools
 
-**`delegate({ backend?, command?, role?, task?, model?, reason?, context?, cwd?, timeoutMs?, agent?, sessionId?, executionEnvironment?, mode? })`**
+**`delegate({ backend?, command?, role?, task?, model?, reason?, context?, omitAgentsMd?, cwd?, timeoutMs?, agent?, sessionId?, executionEnvironment?, mode? })`**
 On the pi backend, `role` and `task` are required, and it runs `role` on `task` in its own in-process session (`createAgentSession`). The child re-binds its parent's already-loaded extensions and calls its parent's MCP tools, and gets their tools, limited to its role's [`tools`](#role-tools) line; skills, prompt templates and themes are not loaded. Returns final report, changed files, turns, tokens, cost, run id, and the child's session file path. Refuses a second writing child in a `cwd` that already has one running. `agent`, `sessionId`, `executionEnvironment` and `mode` are ACP-only; see [Backends](#backends).
 
-- `context: "fork"` (default) — child starts with the parent's conversation so far (`buildSessionContext` of the active branch, trailing unresolved tool call trimmed). No re-acquisition. Delegation records are left out of that inheritance — `delegate`/`delegate_ctl` calls, their results, and completion notices — so a child inherits the work rather than a pattern of handing it off; copies of those calls only produced confident re-delegation attempts and false "extension not loaded" diagnoses. The records are left out for children that have the delegation tools too. A forked child is also told, in its own instructions, that the inherited conversation belongs to the agent that delegated to it: stripping the calls stops the mimicry, but the surrounding prose still reads as supervising a worker, and a child that adopts that voice inspects the job instead of doing it. When the parent's recent conversation is mostly orchestration, `fresh` with a complete brief remains the safer choice.
-- `context: "fresh"` — adversarial/independent review.
+- `context: "fork"` (explicitly requested by the launch or role) — child starts with the parent's conversation so far (`buildSessionContext` of the active branch, trailing unresolved tool call trimmed). No re-acquisition. Delegation records are left out of that inheritance — `delegate`/`delegate_ctl` calls, their results, and completion notices — so a child inherits the work rather than a pattern of handing it off; copies of those calls only produced confident re-delegation attempts and false "extension not loaded" diagnoses. The records are left out for children that have the delegation tools too. A forked child is also told, in its own instructions, that the inherited conversation belongs to the agent that delegated to it: stripping the calls stops the mimicry, but the surrounding prose still reads as supervising a worker, and a child that adopts that voice inspects the job instead of doing it. When the parent's recent conversation is mostly orchestration, `fresh` with a complete brief remains the safer choice.
+- `context: "fresh"` (default) — the child gets its own role prompt, applicable instruction files and the brief, without the parent conversation, appended prompt or previously discovered instructions.
 - `model: "provider/id[:thinking]"` — tier switch at call time; no new role needed.
 - Background handoff — records the run and returns its id before child resource preparation or model work. Do independent work; unjoined completion wakes the parent via `sendMessage(followUp, triggerTurn)`. Use `delegate_ctl wait` only when dependent work needs the result.
 
@@ -71,15 +71,24 @@ name: scout
 description: Read-only recon of code the parent has not seen.
 tools: read, grep, find, ls, bash
 context: fresh
+omitAgentsMd: true
 thinking: low
 ---
 
 Instructions for the child.
 ```
 
-`context` is `fork` (the default) or `fresh`. `model`, `thinking` and `timeoutMs` set the role's defaults. `tools` is described next.
+`context` is `fresh` (the default) or `fork`. `model`, `thinking` and `timeoutMs` set the role's defaults. `tools` is described next.
 
 `model` can list several models, most preferred first: `model: openrouter/big:high, local/small` or a YAML list. A `delegate` call that names no model, for a role with no approved default, runs on the first entry this session can use: it needs credentials, and with **Model picking** set to *First scoped* (the default) it must also be in Pi's scoped models (`--models`, or `enabledModels`) when a scope is set. The run's `status` and `result` say which entry it got and why each earlier one was skipped (`model picked: …`). When none is usable the call fails with `MODEL_UNAVAILABLE`, naming each reason; a role that lists models never quietly runs on your model instead. A single `model` entry is a pin, as before: it ignores the scope. `/delegate settings` → **Roles** shows what each role would run on right now.
+
+### Instruction files
+
+Ordinary in-process Pi children receive applicable instruction files by default. `omitAgentsMd: true` in a role skips the startup bundle; the bundled scout opts out and worker includes it. A launch value overrides the role, so `omitAgentsMd: false` explicitly includes instructions for scout. The bundle includes Pi’s context-file hierarchy and fallbacks, and unconditional `.agents/rules/*.md`; `~/.agents/AGENTS.md` takes precedence when included. Instruction content is sent as separate user-message context wrapped in `<system-reminder>`, never added to the child’s role system prompt. Skills and tool permissions are unchanged.
+
+Omission is startup-only. Successful `read` calls still attach nested AGENTS.md and rule files whose `paths` globs match (for example `paths: ["src/**/*.ts"]`). Failed reads add nothing; reading a global skill does not restore omitted global instructions. Snapshots and omission survive reopen, and repeated reads do not duplicate instruction context. Forks retain the parent’s loaded context and appended prompt; omission does not scrub inherited history. An explicit false on a fork can load instructions omitted by its parent.
+
+This option applies to in-process Pi children. ACP and process calls reject it. Oven and hosted TUIs use their own instruction loaders: an explicit launch value, or a role that omits instructions, is rejected there before launch. Their existing default loading is unchanged.
 
 ### Role tools
 

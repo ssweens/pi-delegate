@@ -19,6 +19,7 @@ export interface Role {
 	thinking?: string;
 	tools?: string[];
 	context?: "fork" | "fresh";
+	omitAgentsMd?: boolean;
 	timeoutMs?: number;
 	/** Where its children run by default: in this Pi process, or as an oven slice. A delegate call can override it. */
 	runtime?: "in-process" | "oven";
@@ -146,6 +147,7 @@ export function loadRoles(cwd: string, projectTrusted: boolean, agentDir: string
 			}
 			const { fm, body } = parseFrontmatter(text);
 			if (!fm.name) continue;
+			if (fm.omitAgentsMd !== undefined && fm.omitAgentsMd !== "true" && fm.omitAgentsMd !== "false") throw new Error(`${file}: omitAgentsMd must be true or false`);
 			const ctx = (fm.context ?? fm.defaultContext) as string | undefined;
 			const models = modelList(fm.model ?? fm.models);
 			roles.set(fm.name, {
@@ -157,6 +159,7 @@ export function loadRoles(cwd: string, projectTrusted: boolean, agentDir: string
 				thinking: fm.thinking && fm.thinking !== "default" ? fm.thinking : undefined,
 				tools: toolList(fm.tools),
 				context: ctx === "fresh" || ctx === "fork" ? ctx : undefined,
+				...(fm.omitAgentsMd !== undefined ? { omitAgentsMd: fm.omitAgentsMd === "true" } : {}),
 				timeoutMs: fm.timeoutMs ? Number(fm.timeoutMs) || undefined : undefined,
 				runtime: fm.runtime === "oven" || fm.runtime === "in-process" ? fm.runtime : undefined,
 				extensions: toolList(fm.extensions),

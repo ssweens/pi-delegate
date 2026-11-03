@@ -9,7 +9,7 @@ pi-delegate runs in-process Pi children through `delegate`/`delegate_ctl`. pi-st
 ## Decision
 
 - One package and one Coordinator. `delegate` takes `backend: "pi" | "acp"`. Omitted means `pi`, today's behavior. An unknown backend fails. Nothing falls back from acp to pi.
-- ACP-only fields (`agent`, `sessionId`, `executionEnvironment: local|orb`) fail on pi. `context` fails on acp. An opened session rejects `role` and `model`.
+- ACP-only fields (`agent`, `sessionId`, `executionEnvironment: local|orb`) fail on pi. `context` and `omitAgentsMd` fail on acp. `omitAgentsMd` is a launch/role setting for in-process Pi children only: it skips startup instruction-file context, not nested discovery. Unsupported Oven/TUI launches reject explicit values and omitting roles. See [Child instruction context](../instruction-context-plan.md). An opened session rejects `role` and `model`.
 - A run keeps these apart: delegate run ID, one provider request ID per turn, native session ID (Amp `T-…`), delivery (`accepted|unknown`) and provider outcome. Accepted is not finished.
 - Each run reports its capabilities. An unsupported action fails with `ACTION_UNSUPPORTED` and never becomes a different action.
 - No Amp plugin bridge. Amp controls use native paths: steer is a native send, and cancel is ACP session cancel. 042 deleted the bridge module, its vendored Amp plugin, the `PI_STRINGS_AMP_BRIDGE_*` settings and the bridge tests.
