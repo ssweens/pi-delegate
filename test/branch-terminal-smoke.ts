@@ -62,9 +62,17 @@ try {
 	const processRun = JSON.parse(readFileSync(join(box.cwd, ".agents/pi/subsessions", processFile), "utf8"));
 	assert.equal(processRun.parentRunId, lead.id); assert.equal(processRun.depth, 2);
 	save("process-branch-started");
-	command(`/fixture-process-control cancel ${processRun.id}`);
+	// Open the new branch process row through the real Agents panel, not a fixture control.
+	tmux("send-keys", "-t", "pi", "Left", "Down", "Down", "Enter");
+	await until(() => /╭─ Process ─/.test(capture()) && /outputFile:/.test(capture()));
+	assert.match(capture(), /under: coordinator-/);
+	save("process-branch-detail");
+	tmux("send-keys", "-t", "pi", "C-x");
 	await until(() => JSON.parse(readFileSync(join(box.cwd, ".agents/pi/subsessions", processFile), "utf8")).status === "cancelled");
 	save("process-branch-cancelled");
+	tmux("send-keys", "-t", "pi", "Escape");
+	await until(() => !/╭─ Process ─/.test(capture()));
+	tmux("send-keys", "-t", "pi", "Escape");
 	childGate.resolve();
 	await until(() => records().some(r => r.id === child.id && r.status === "complete"));
 	assert.equal(api.requests.length, 2, "child completion waits while lead response is active");

@@ -51,6 +51,7 @@ test("user starts Pi and process branches through the running lead's binding", {
 		assert.match(notices.at(-1)!, /started under/);
 		assert.equal((await h.ctl("status", child.id)).details.id, child.id, "root reads branch");
 		assert.equal((await leadOwner.control({ action: "status", runId: child.id })).details.id, child.id, "lead reads branch");
+		assert.match((await h.ctl("approve", child.id)).content[0].text, /approve requires role and model/, "incidental runId does not forward a root-only action");
 		childGate.resolve();
 		await until(() => child.completion.settled);
 		await sleep(80);
@@ -122,6 +123,7 @@ test("user starts Pi and process branches through the running lead's binding", {
 		const stoppedRecord = JSON.parse(readFileSync(join(leadOwner.dir, "process", `${stoppedProcess.id}.json`), "utf8"));
 		assert.equal(stoppedRecord.status, "interrupted", "stopping lead releases its process branch");
 		assert(h.state().owners.get(lead.ownerKey).live.processes().some((v: any) => v.id === stoppedProcess.id), "departed process remains root-visible");
+		assert.equal((await h.ctl("wait", "ignored-runId", { runIds: [stoppedProcess.id] })).details.status, "interrupted", "runIds takes precedence and restores departed process ownership without replay");
 		assert.equal((await h.ctl("result", stoppedProcess.id)).details.status, "interrupted", "root reads process after its lead session closes, without replay");
 		assert.equal(lead.status, "cancelled", "reading a departed process does not restart its stopped lead");
 		assert.deepEqual(h.errors, []);

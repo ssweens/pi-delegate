@@ -939,8 +939,9 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		all: () => owner ? treeViews(owner) : [],
 		processes: () => {
 			const ids = new Set(owner ? treeViews(owner).map((v) => v.id) : []);
-			return [...treeOwners().flatMap((target) => target.processes?.owned(target.key) ?? []),
+			const rows = [...treeOwners().flatMap((target) => target.processes?.owned(target.key) ?? []),
 				...[...departed].flatMap(([id, gone]) => ids.has(id) ? gone.process ?? [] : [])];
+			return [...new Map(rows.map((v) => [v.id, v])).values()];
 		},
 		activity: (id) => {
 			const r = runs.get(id);
@@ -1295,11 +1296,15 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			remember(ctx);
 			// Idle lead sessions may have retired with readable descendants. Reattach their saved
 			// owner chain (without a model turn), as the Agents frame does before steering one.
-			for (const id of p.runId ? [p.runId] : p.action === "wait" ? p.runIds ?? [] : []) {
-				const gone = findDeparted(id);
-				if (gone?.run || gone?.process) await revive(id);
-			}
-			if (p.runId) {
+			const runAction = ["status", "result", "wait", "steer", "cancel", "close", "models"].includes(p.action);
+			const requestedIds = p.action === "wait" ? p.runIds ?? (p.runId ? [p.runId] : []) : runAction && p.runId ? [p.runId] : [];
+			try {
+				for (const id of requestedIds) {
+					const gone = findDeparted(id);
+					if (gone?.run || gone?.process) await revive(id);
+				}
+			} catch (error) { return failed(error instanceof DelegateError ? error : new DelegateError("RUN_UNAVAILABLE", errorMessage(error))); }
+			if (runAction && p.runId) {
 				const nestedRun = runs.get(p.runId);
 				const target = inTree(nestedRun) ? state.owners.get(nestedRun.ownerKey) : processOwnerInTree(p.runId);
 				if (p.action !== "wait" && target && target !== requireOwner() && target.binding && !target.closed && target.control)
@@ -1649,7 +1654,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		navigationOpen = true;
 		try {
 			const { ChildView, ProcessView } = await import("./inspector.js");
-			if (processes.find(id, requireOwner().key)) {
+			if (liveSource.processes?.().some((v) => v.id === id)) {
 				await ctx.ui.custom<undefined>((tui, theme, _kb, done) => new ProcessView(id, liveSource, theme, tui, () => done(undefined)), FULLSCREEN);
 				return;
 			}
@@ -1737,7 +1742,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 				const items = [{ value: "settings", label: "settings", description: "Every pi-delegate setting, below the prompt" },
 					...roles.flatMap((r) => (["fork", "fresh"] as const).map((kind) => ({ value: `${kind}:${r.name} `, label: `${kind}:${r.name}`,
 						description: `${kind === "fork" ? "with this conversation" : "no conversation"} · ${r.description}` }))),
-					...[...runs.values()].filter((run) => inTree(run) && !run.foreign && !run.stopped && run.status === "running" && !run.runtime && childOwner(run)?.binding)
+					...[...runs.values()].filter((run) => inTree(run) && !run.foreign && !run.stopped && run.status === "running" && !run.runtime && run.depth < maxDepth() && childOwner(run)?.binding)
 						.map((run) => ({ value: `under:${run.id} `, label: `under:${run.id}`, description: run.task }))];
 				const matching = items.filter((item) => item.value.startsWith(prefix.trim()));
 				return matching.length ? matching : null;
