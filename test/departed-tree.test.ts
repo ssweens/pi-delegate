@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
-import { harness, provider, sandbox } from "./fixture.ts";
+import { deferred, harness, provider, sandbox } from "./fixture.ts";
 import { configureAcpCoordinator, shutdownAcpCoordinator } from "../src/acp/instance.ts";
 
 const fakeAcpAgent = new URL("./acp/fixtures/fake-acp-agent.ts", import.meta.url).pathname;
@@ -25,6 +25,8 @@ test("a delegating child's runs stay in the root's tree after its session closes
 	mkdirSync(join(box.cwd, ".pi", "agents"), { recursive: true });
 	writeFileSync(join(box.cwd, ".pi", "agents", "coordinator.md"), "---\nname: coordinator\ndescription: Starts a pi scout and an ACP worker, and joins both.\ntools: read, delegate, delegate_ctl\ncontext: fresh\n---\n\nYou coordinate.\n");
 	const h = await harness(box);
+	// Observe the live owner before releasing the report: an idle session may retire immediately.
+	const reportStarted = deferred(), reportGate = deferred();
 	// The coordinator starts a scout, then an ACP worker, joins both, and reports.
 	api.onUnscripted((request) => {
 		if (firstUser(request) !== "Coordinate a departure") return { text: "ACK" };
@@ -34,14 +36,19 @@ test("a delegating child's runs stay in the root's tree after its session closes
 		if (!scout) return { tool: { name: "delegate", arguments: { role: "scout", context: "fresh", task: "Departing scout", model: "fixture/fixture:off" } } };
 		if (!worker) return { tool: { name: "delegate", arguments: { backend: "acp", agent: "fixture", task: "Departing ACP worker" } } };
 		if (tools.length === 2) return { tool: { name: "delegate_ctl", arguments: { action: "wait", runIds: [scout, worker], mode: "all" } } };
-		return { text: "COORDINATOR-DONE" };
+		reportStarted.resolve();
+		return { text: "COORDINATOR-DONE", gate: reportGate };
 	});
 	api.script("Departing scout", { text: "SCOUT-FIRST-REPORT" });
 	t.after(async () => { await h.runtime.dispose(); await shutdownAcpCoordinator(); configureAcpCoordinator({}); await api.close(); });
 
 	const started = await h.launch("Coordinate a departure", { role: "coordinator" });
 	const coordinatorId = started.details.id;
-	assert.equal((await h.ctl("wait", coordinatorId)).details.status, "complete");
+	const completed = h.ctl("wait", coordinatorId);
+	await reportStarted.promise;
+	assert([...h.state().owners.values()].some((o: any) => o.parentRun?.id === coordinatorId), "while its session is active, the coordinator's runs are live");
+	reportGate.resolve();
+	assert.equal((await completed).details.status, "complete");
 	const root = [...h.state().owners.values()].find((o: any) => !o.parentRun && o.live);
 	const rows = () => root.live.all();
 	const ids = rows().map((v: any) => v.id);
@@ -51,7 +58,6 @@ test("a delegating child's runs stay in the root's tree after its session closes
 	assert(scoutId && workerId, `both of the coordinator's runs are listed: ${ids.join(", ")}`);
 	const state = h.state();
 	const childOwnerOf = (runId: string) => [...state.owners.values()].find((o: any) => o.parentRun?.id === runId);
-	assert(childOwnerOf(coordinatorId), "while its session is open, the coordinator's runs are live");
 
 	// Cancelling the settled coordinator closes its session and its children's owner, as a retirement does.
 	await h.ctl("cancel", coordinatorId);
@@ -61,6 +67,8 @@ test("a delegating child's runs stay in the root's tree after its session closes
 	for (const v of after.slice(1)) { assert.equal(v.depth, 2); assert.equal(v.parentRunId ?? coordinatorId, coordinatorId); assert.equal(v.settled, true); }
 	assert.match(JSON.stringify(root.live.activity(scoutId).messages), /SCOUT-FIRST-REPORT/, "its transcript is still readable");
 	assert.match(JSON.stringify(root.live.activity(workerId).messages), /READY/);
+	assert.equal((await h.ctl("status", workerId)).details.error.code, "RUN_NOT_FOUND", "new ancestor controls do not add an ACP reopen path");
+	assert(!childOwnerOf(coordinatorId), "reading an unsupported ACP descendant did not reopen its lead");
 
 	// Steering it from the root reopens the coordinator's session first, then steers it, as a root child's revival does.
 	api.script("Steered after its parent closed", { text: "SCOUT-SECOND-REPORT" });

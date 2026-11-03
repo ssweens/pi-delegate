@@ -753,6 +753,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 	});
 	const processes = new ProcessBackend({
 		ownerKey: () => requireOwner().key,
+		lineage: () => ({ depth: depth + 1, ...(nesting ? { parentRunId: nesting.id } : {}) }),
 		changed,
 		settled: (v, ownerKey) => {
 			const target = state.owners.get(ownerKey);
@@ -832,6 +833,26 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		bound.resume = (run, message) => piBackend.steerRun(run, message);
 		bound.steerFromUser = (run, message) => piBackend.steerRun(run, message, true);
 		bound.acp = acp;
+		bound.piBackend = piBackend;
+		bound.processes = processes;
+		bound.control = (params, signal) => controlTool.execute("ancestor-control", params, signal, undefined, bound.binding!.ctx);
+		bound.startBranch = async (input) => {
+			const beforeStart = () => {
+				requireOwner();
+				if (!nesting || nesting.foreign || nesting.stopped || nesting.status !== "running" || nesting.completion.settled)
+					throw new DelegateError("LEAD_NOT_RUNNING", "The branch lead is no longer running; nothing was started.");
+			};
+			beforeStart();
+			const start = unwrap(validateStartInput(input));
+			if (start.backend === "acp" || (start.backend === "pi" && (start.tui !== undefined || start.runtime === "oven")))
+				throw new DelegateError("INPUT_INVALID", "Direct branches support in-process Pi and process only; no native session opening.");
+			if (depth + 1 > maxDepth()) throw new DelegateError("DEPTH_EXCEEDED", `delegation depth cap is ${maxDepth()}`);
+			admit();
+			const ctx = bound.binding!.ctx;
+			if (start.backend === "process") return processes.start({ ...start, cwd: start.cwd ?? ctx.cwd });
+			// Direct Pi branches stay in-process; never open an ACP or hosted native session.
+			return piBackend.start({ ...start, runtime: "in-process" }, undefined, { ctx, beforeStart });
+		};
 		bound.reopen = (run) => piBackend.openSession(run);
 		if (!nesting) bound.live = liveSource;
 		// This delegating child's runs are live again, restored from their records.
@@ -915,9 +936,20 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		}
 		return false;
 	};
+	/** Attached owners reachable from this session only; never use a process-global ID as authority. */
+	const treeOwners = (): Owner[] => {
+		if (!owner) return [];
+		return [...state.owners.values()].filter((target) => target === owner || inTree(target.parentRun));
+	};
+	const processOwnerInTree = (id: string) => treeOwners().find((target) => target.processes?.find(id, target.key));
 	const liveSource: LiveSource = {
 		all: () => owner ? treeViews(owner) : [],
-		processes: () => owner ? processes.owned(owner.key) : [],
+		processes: () => {
+			const ids = new Set(owner ? treeViews(owner).map((v) => v.id) : []);
+			const rows = [...treeOwners().flatMap((target) => target.processes?.owned(target.key) ?? []),
+				...[...departed].flatMap(([id, gone]) => ids.has(id) ? gone.process ?? [] : [])];
+			return [...new Map(rows.map((v) => [v.id, v])).values()];
+		},
 		activity: (id) => {
 			const r = runs.get(id);
 			if (inTree(r)) return activityOf(r);
@@ -945,8 +977,9 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			await steerer(r, message);
 		},
 		cancel: async (id) => {
-			const target = requireOwner();
-			if (processes.find(id, target.key)) { await processes.cancel(id); return; }
+			requireOwner();
+			const commandOwner = processOwnerInTree(id);
+			if (commandOwner) { await commandOwner.processes!.cancel(id); return; }
 			const backend = acpOwner(id);
 			if (backend) { await backend.cancel(id, {}); return; }
 			const r = runs.get(id); if (inTree(r)) await cancelRun(r);
@@ -1052,19 +1085,25 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 	 * A run this wait reports is delivered by it; any other run keeps its own wake-up.
 	 */
 	async function waitRuns(owner: Owner, ids: readonly string[], mode: "any" | "all", ctx: ExtensionContext, signal?: AbortSignal, timeoutMs?: number) {
-		const piIds: string[] = [], acpIds: string[] = [], processIds: string[] = [];
+		const acpIds: string[] = [];
+		const groups = new Map<Owner, { pi: string[]; process: string[] }>();
 		for (const id of ids) {
-			if (processes.find(id, owner.key)) processIds.push(id);
-			else if (acp.find(id, owner.key)) acpIds.push(id);
-			else if (piBackend.find(id, owner.key)) piIds.push(id);
-			else throw new DelegateError("RUN_NOT_FOUND", `unknown runId ${id}; known: ${knownRuns(owner)}`, "runIds");
+			if (acp.find(id, owner.key)) { acpIds.push(id); continue; }
+			const run = runs.get(id);
+			const target = inTree(run) ? state.owners.get(run.ownerKey) : processOwnerInTree(id);
+			if (!target?.binding || target.closed) throw new DelegateError("RUN_NOT_FOUND", `unknown runId ${id}; known: ${knownRuns(owner)}`, "runIds");
+			const group = groups.get(target) ?? { pi: [], process: [] };
+			group[inTree(run) ? "pi" : "process"].push(id);
+			groups.set(target, group);
 		}
 		if (signal?.aborted) throw waitCancelled(ids.length === 1 ? "child" : "runs");
 		const joins: Join<WaitRow | AcpRunView | ProcessRunView>[] = [];
 		// Each join can refuse a run (a capability); take the ACP one before the pi runs are subscribed.
 		if (acpIds.length) joins.push(acp.join(acpIds));
-		if (piIds.length) joins.push(piBackend.join(piIds));
-		if (processIds.length) joins.push(processes.join(processIds));
+		for (const [target, group] of groups) {
+			if (group.pi.length) joins.push(target.piBackend!.join(group.pi));
+			if (group.process.length) joins.push(target.processes!.join(group.process));
+		}
 		const outcome = await joinRuns(joins, ids, mode, {
 			...(signal ? { signal } : {}), ...(timeoutMs !== undefined ? { timeoutMs } : {}),
 			interrupted: () => ctx.hasPendingMessages() || noticePending(), lost: ACP_JOIN_LOST,
@@ -1227,7 +1266,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 	};
 	pi.registerTool(delegateTool);
 
-	pi.registerTool({
+	const controlTool = {
 		name: "delegate_ctl",
 		renderCall: blockingCall((args) => args?.action === "wait" ? `Waiting for ${args.runId ?? (Array.isArray(args.runIds) && args.runIds.length ? args.runIds.join(", ") : "a child")}` : undefined),
 		renderResult: resultRenderer("delegate_ctl"),
@@ -1267,8 +1306,24 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 				),
 			),
 		}),
-		async execute(_id, p, signal, onUpdate, ctx) {
+		async execute(_id: string, p: any, signal: AbortSignal | undefined, onUpdate: any, ctx: ExtensionContext): Promise<any> {
 			remember(ctx);
+			// Idle lead sessions may have retired with readable descendants. Reattach their saved
+			// owner chain (without a model turn), as the Agents frame does before steering one.
+			const runAction = ["status", "result", "wait", "steer", "cancel", "close", "models"].includes(p.action);
+			const requestedIds = p.action === "wait" ? p.runIds ?? (p.runId ? [p.runId] : []) : runAction && p.runId ? [p.runId] : [];
+			try {
+				for (const id of requestedIds) {
+					const gone = findDeparted(id);
+					if (gone?.run || gone?.process) await revive(id);
+				}
+			} catch (error) { return failed(error instanceof DelegateError ? error : new DelegateError("RUN_UNAVAILABLE", errorMessage(error))); }
+			if (runAction && p.runId) {
+				const nestedRun = runs.get(p.runId);
+				const target = inTree(nestedRun) ? state.owners.get(nestedRun.ownerKey) : processOwnerInTree(p.runId);
+				if (p.action !== "wait" && target && target !== requireOwner() && target.binding && !target.closed && target.control)
+					return target.control(p, signal);
+			}
 			if (p.runId && processes.find(p.runId, requireOwner().key)) {
 				try {
 					if (p.action !== "status" && p.action !== "result" && p.action !== "cancel" && p.action !== "wait") {
@@ -1439,7 +1494,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			}
 			// One wait for one run or several, of either backend (waitRuns).
 			if (p.action === "wait") {
-				const ids = [...new Set(p.runIds ?? (p.runId ? [p.runId] : []))];
+				const ids = [...new Set<string>(p.runIds ?? (p.runId ? [p.runId] : []))];
 				try {
 					if (!ids.length) throw new DelegateError("INPUT_INVALID", "wait needs runId or runIds", "runIds");
 					return await waitRuns(owner, ids, p.mode ?? "any", ctx, signal, p.timeoutMs);
@@ -1511,7 +1566,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			}
 			return { content: [{ type: "text", text: "unreachable" }], isError: true, details: undefined };
 		},
-	});
+	};
 
 	pi.registerMessageRenderer("delegate", (message: any, { expanded }: any, theme: any) => {
 		const v = message.details as RunView | undefined;
@@ -1613,7 +1668,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		navigationOpen = true;
 		try {
 			const { ChildView, ProcessView } = await import("./inspector.js");
-			if (processes.find(id, requireOwner().key)) {
+			if (liveSource.processes?.().some((v) => v.id === id)) {
 				await ctx.ui.custom<undefined>((tui, theme, _kb, done) => new ProcessView(id, liveSource, theme, tui, () => done(undefined)), FULLSCREEN);
 				return;
 			}
@@ -1647,6 +1702,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		if (ctx.mode !== "tui") return;
 		activity?.install(ctx, liveSource, (id) => openChild(ctx, id));
 	});
+	pi.registerTool(controlTool);
 	// A delegating child has no UI: its commands and shortcut stay the root parent's.
 	if (!nesting) {
 		// The mode applies from the next turn the person starts, and at session start: no reload.
@@ -1693,22 +1749,44 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			handler: async (_args, ctx) => { await openHistory(ctx); },
 		});
 		pi.registerCommand("delegate", {
-			description: "Delegate settings (mode, limits, model picking, roles, Path) · fork:<role> <task> · fresh:<role> <task>",
+			description: "Delegate settings · fork:<role>|fresh:<role> <task> · under:<runId> fresh:<role>|fork:<role> <task> · under:<runId> process <command>",
 			getArgumentCompletions: (prefix) => {
 				const ctx = owner?.binding?.ctx;
 				const roles = ctx ? sortedRoles(ctx) : [];
 				const items = [{ value: "settings", label: "settings", description: "Every pi-delegate setting, below the prompt" },
 					...roles.flatMap((r) => (["fork", "fresh"] as const).map((kind) => ({ value: `${kind}:${r.name} `, label: `${kind}:${r.name}`,
-						description: `${kind === "fork" ? "with this conversation" : "no conversation"} · ${r.description}` })))];
+						description: `${kind === "fork" ? "with this conversation" : "no conversation"} · ${r.description}` }))),
+					...[...runs.values()].filter((run) => inTree(run) && !run.foreign && !run.stopped && run.status === "running" && !run.runtime && run.depth < maxDepth() && childOwner(run)?.binding)
+						.map((run) => ({ value: `under:${run.id} `, label: `under:${run.id}`, description: run.task }))];
 				const matching = items.filter((item) => item.value.startsWith(prefix.trim()));
 				return matching.length ? matching : null;
 			},
 			handler: async (args, ctx) => {
 				const text = args.trim();
-				const launch = /^(fork|fresh):(\S+)\s+([\s\S]+)$/.exec(text);
 				try {
 					if (!text || text === "settings") { await openSettings(ctx); return; }
-					if (!launch) throw new Error("Use /delegate settings, /delegate fork:<role> <task>, or /delegate fresh:<role> <task>.");
+					const under = /^under:(\S+)\s+([\s\S]+)$/.exec(text);
+					const body = under ? under[2] : text;
+					const launch = /^(fork|fresh):(\S+)\s+([\s\S]+)$/.exec(body);
+					if (under) {
+						requireOwner();
+						if (mode() === "off") throw new Error("Delegation is turned off in /delegate settings; nothing was started.");
+						const lead = runs.get(under[1]);
+						const runningLead = () => inTree(lead) && !lead.foreign && !lead.runtime && !lead.stopped && lead.status === "running" && !lead.completion.settled;
+						if (!runningLead()) throw new Error("Branch target must be a running in-process Pi lead in this session's tree; nothing was started.");
+						await lead!.ready;
+						const target = childOwner(lead!);
+						if (!runningLead() || !target?.binding || target.closed || !target.startBranch)
+							throw new Error("Branch target needs a live delegation runtime (role tools must allow delegate or delegate_ctl, below the depth cap); nothing was started.");
+						const command = /^process\s+([\s\S]+)$/.exec(body);
+						if (!launch && !command) throw new Error("Use /delegate under:<runId> fresh:<role>|fork:<role> <task>, or under:<runId> process <command>.");
+						const input = command ? { backend: "process", command: command[1] }
+							: { backend: "pi", context: launch![1], role: launch![2], task: launch![3] };
+						const started = await target.startBranch(input);
+						ctx.ui.notify(`${started.id} started under ${lead!.id}. Completion goes to that lead as a follow-up, not a root interruption.`, "info");
+						return;
+					}
+					if (!launch) throw new Error("Use /delegate settings, /delegate fork:<role> <task>, /delegate fresh:<role> <task>, or /delegate under:<runId> fresh:<role>|fork:<role>|process <task or command>.");
 					const [, context, role, task] = launch;
 					// A child calls MCP tools through this session's last tool context; a command has none of its own.
 					if (!toolContext) ctx.ui.notify("This child has no MCP tools: they reach a child through this session's tools, which pi-delegate sees once the model has called delegate or delegate_ctl here.", "warning");
@@ -1736,8 +1814,8 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		// A delegating child's ACP runs, as they stand, while its binding can still read them: parking them
 		// waits on the Coordinator, and the root's tree keeps showing them meanwhile.
 		const leaving = reason !== "reload" && owner?.parentRun && owner.binding?.pi === pi
-			? { parentId: owner.parentRun.id, acp: acp.owned(owner.key).map((view) => ({ view, activity: acp.activity(view.id) })) } : undefined;
-		if (leaving) departed.set(leaving.parentId, { pi: departed.get(leaving.parentId)?.pi ?? [], acp: leaving.acp });
+			? { parentId: owner.parentRun.id, acp: acp.owned(owner.key).map((view) => ({ view, activity: acp.activity(view.id) })), process: processes.owned(owner.key) } : undefined;
+		if (leaving) departed.set(leaving.parentId, { pi: departed.get(leaving.parentId)?.pi ?? [], acp: leaving.acp, process: leaving.process });
 		const previous = owner;
 		owner = undefined;
 		if (!previous || previous.binding?.pi !== pi) return;
@@ -1752,7 +1830,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 				finally {
 					await processes.closeOwner(previous.key);
 					const parked = await acp.closeOwner(previous.key);
-					if (leaving && departed.has(leaving.parentId)) departed.set(leaving.parentId, { pi: departed.get(leaving.parentId)!.pi, acp: parked });
+					if (leaving && departed.has(leaving.parentId)) departed.set(leaving.parentId, { pi: departed.get(leaving.parentId)!.pi, acp: parked, process: processes.owned(previous.key) });
 				}
 			})();
 			if (leaving) closingChildren.set(leaving.parentId, closed);

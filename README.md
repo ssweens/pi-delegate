@@ -436,7 +436,25 @@ The mode applies from the main session's next turn, the limits and model picking
 
 **`/delegate fork:<role> <task>`** and **`/delegate fresh:<role> <task>`** start a child yourself, with or without this conversation; the command completes role names. It runs through the same path as the `delegate` tool. Its report is shown in the transcript and is in context for the next turn, but it does not start a model turn, unless the model has since steered that child. A child reaches MCP tools through this session's tool context, which pi-delegate only has once the model has called `delegate` or `delegate_ctl` in this session; until then the command warns that the child has no MCP tools.
 
-Completions reach the parent at once. An idle parent is woken; a busy one, however long its run, reads the report at its next model request inside that run, as a steer, instead of only after the run ends. A `delegate_ctl wait` returns early while a report is on its way in. If you stop the run (Esc), Pi clears its queued messages; a report that had not reached the conversation yet is recorded then, shown and in context for your next prompt, without starting a turn.
+### Start a branch under a running lead
+
+Start a new child directly, without asking the lead model to delegate:
+
+```text
+/delegate under:<lead-runId> fresh:scout Review the parser and report edge cases
+/delegate under:<lead-runId> fork:reviewer Check the lead's current approach
+/delegate under:<lead-runId> process npm run lint
+```
+
+Use the exact delegate run ID from the Agents frame or `delegate_ctl status`; command completion lists eligible running leads. The lead must be a running, locally owned, in-process Pi child in this session's tree. Its role must allow `delegate` or `delegate_ctl`, and it must be below the depth cap. Other targets fail without starting anything under the root. Finished leads are not restarted by this command. Delegation-off, depth, concurrency, role, trust, and writer-directory limits still apply.
+
+The lead's own live binding creates and owns the branch. Pi branches appear under that lead in the Agents tree; process branches appear in Processes with an `under` run ID. Both keep `parentRunId` and depth in their records. The lead and root can use `delegate_ctl status/result/wait/cancel` with the branch ID; Pi branches also support steer. Root multi-run waits can include Pi and process descendants. Plain root `status` still lists only direct children. Stopping the lead or ending the root session stops its branch subtree; reload only rebinds it.
+
+`fresh` sends only the new brief. `fork` copies the **lead's** current conversation, not the root's. The child uses its role's approved model/default and the lead's working directory. Pi branches stay in-process. Their completion, or a process exit report, goes to the lead as a follow-up: it does not abort active work or steer into the current response. If the lead reports first, normal nested completion resumes it; an explicitly stopped or timed-out lead is not revived. Joining the branch claims its completion instead of sending a duplicate follow-up.
+
+This first slice has no prior-session picker or session-reference expansion and does not require pi-atta. Text such as `@session:<path>` in a brief is only literal context for the child to inspect with its allowed tools; it never opens, resumes, adopts, or reparents that session. The command neither starts ACP children nor opens ACP/native sessions.
+
+Completions for ordinary root-owned tool launches reach the parent at once. An idle parent is woken; a busy one, however long its run, reads the report at its next model request inside that run, as a steer, instead of only after the run ends. A `delegate_ctl wait` returns early while a report is on its way in. If you stop the run (Esc), Pi clears its queued messages; a report that had not reached the conversation yet is recorded then, shown and in context for your next prompt, without starting a turn.
 
 ## Control-tool output
 
