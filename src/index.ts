@@ -936,6 +936,19 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		}
 		return false;
 	};
+	const runningLead = (run: Run | undefined): run is Run => inTree(run) && !run.foreign && !run.runtime
+		&& !run.stopped && run.status === "running" && !run.completion.settled;
+	const branchLead = () => {
+		const recentFirst = (a: Run, b: Run) => (b.lastProgressAt ?? b.segmentStartedAt) - (a.lastProgressAt ?? a.segmentStartedAt)
+			|| b.segmentStartedAt - a.segmentStartedAt || b.startedAt - a.startedAt;
+		const leads = [...runs.values()].filter((run) => {
+			const target = childOwner(run);
+			return runningLead(run) && run.depth < maxDepth() && target?.binding && !target.closed && target.startBranch;
+		}).sort(recentFirst);
+		if (leads[1] && recentFirst(leads[0], leads[1]) === 0)
+			throw new Error("Cannot infer the current running lead: runtime activity is tied; nothing was started. Try again after lead activity.");
+		return leads[0];
+	};
 	/** Attached owners reachable from this session only; never use a process-global ID as authority. */
 	const treeOwners = (): Owner[] => {
 		if (!owner) return [];
@@ -1749,44 +1762,47 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			handler: async (_args, ctx) => { await openHistory(ctx); },
 		});
 		pi.registerCommand("delegate", {
-			description: "Delegate settings · fork:<role>|fresh:<role> <task> · under:<runId> fresh:<role>|fork:<role> <task> · under:<runId> process <command>",
+			description: "fork:<role>|fresh:<role> <task> · process <command> (current running lead) · root fresh:<role>|fork:<role> <task> · settings",
 			getArgumentCompletions: (prefix) => {
 				const ctx = owner?.binding?.ctx;
 				const roles = ctx ? sortedRoles(ctx) : [];
 				const items = [{ value: "settings", label: "settings", description: "Every pi-delegate setting, below the prompt" },
+					{ value: "root ", label: "root", description: "Start a root-owned child, not a branch of a running lead" },
+					{ value: "process ", label: "process", description: "Run a command under the most recently active eligible running lead" },
 					...roles.flatMap((r) => (["fork", "fresh"] as const).map((kind) => ({ value: `${kind}:${r.name} `, label: `${kind}:${r.name}`,
-						description: `${kind === "fork" ? "with this conversation" : "no conversation"} · ${r.description}` }))),
-					...[...runs.values()].filter((run) => inTree(run) && !run.foreign && !run.stopped && run.status === "running" && !run.runtime && run.depth < maxDepth() && childOwner(run)?.binding)
-						.map((run) => ({ value: `under:${run.id} `, label: `under:${run.id}`, description: run.task }))];
-				const matching = items.filter((item) => item.value.startsWith(prefix.trim()));
+						description: `${kind === "fork" ? "with parent conversation" : "no conversation"} · current lead, otherwise root · ${r.description}` })))];
+				const rootRoles = items.filter((item) => /^(fork|fresh):/.test(item.value))
+					.map((item) => ({ ...item, value: `root ${item.value}`, label: `root ${item.label}`, description: "Root-owned child, regardless of running leads" }));
+				const matching = [...items, ...rootRoles].filter((item) => item.value.startsWith(prefix.trim()));
 				return matching.length ? matching : null;
 			},
 			handler: async (args, ctx) => {
 				const text = args.trim();
 				try {
 					if (!text || text === "settings") { await openSettings(ctx); return; }
-					const under = /^under:(\S+)\s+([\s\S]+)$/.exec(text);
-					const body = under ? under[2] : text;
+					const root = text.startsWith("root ");
+					const body = root ? text.slice(5).trim() : text;
 					const launch = /^(fork|fresh):(\S+)\s+([\s\S]+)$/.exec(body);
-					if (under) {
+					const command = /^process\s+([\s\S]+)$/.exec(body);
+					if ((!launch && !command) || (root && !launch))
+						throw new Error("Use /delegate fresh:<role>|fork:<role> <task>, process <command>, root fresh:<role>|fork:<role> <task>.");
+					const lead = root ? undefined : branchLead();
+					if (lead) {
 						requireOwner();
 						if (mode() === "off") throw new Error("Delegation is turned off in /delegate settings; nothing was started.");
-						const lead = runs.get(under[1]);
-						const runningLead = () => inTree(lead) && !lead.foreign && !lead.runtime && !lead.stopped && lead.status === "running" && !lead.completion.settled;
-						if (!runningLead()) throw new Error("Branch target must be a running in-process Pi lead in this session's tree; nothing was started.");
-						await lead!.ready;
-						const target = childOwner(lead!);
-						if (!runningLead() || !target?.binding || target.closed || !target.startBranch)
+						await lead.ready;
+						if (branchLead() !== lead)
+							throw new Error("The running lead changed while preparing the branch; nothing was started. Try again.");
+						const target = childOwner(lead);
+						if (!runningLead(lead) || lead.depth >= maxDepth() || !target?.binding || target.closed || !target.startBranch)
 							throw new Error("Branch target needs a live delegation runtime (role tools must allow delegate or delegate_ctl, below the depth cap); nothing was started.");
-						const command = /^process\s+([\s\S]+)$/.exec(body);
-						if (!launch && !command) throw new Error("Use /delegate under:<runId> fresh:<role>|fork:<role> <task>, or under:<runId> process <command>.");
 						const input = command ? { backend: "process", command: command[1] }
 							: { backend: "pi", context: launch![1], role: launch![2], task: launch![3] };
 						const started = await target.startBranch(input);
-						ctx.ui.notify(`${started.id} started under ${lead!.id}. Completion goes to that lead as a follow-up, not a root interruption.`, "info");
+						ctx.ui.notify(`${started.id} started under ${lead.id}. Completion goes to that lead as a follow-up, not a root interruption.`, "info");
 						return;
 					}
-					if (!launch) throw new Error("Use /delegate settings, /delegate fork:<role> <task>, /delegate fresh:<role> <task>, or /delegate under:<runId> fresh:<role>|fork:<role>|process <task or command>.");
+					if (!launch) throw new Error("No eligible running lead for this process branch; nothing was started. Start a lead whose role allows delegate or delegate_ctl below the depth cap.");
 					const [, context, role, task] = launch;
 					// A child calls MCP tools through this session's last tool context; a command has none of its own.
 					if (!toolContext) ctx.ui.notify("This child has no MCP tools: they reach a child through this session's tools, which pi-delegate sees once the model has called delegate or delegate_ctl here.", "warning");
