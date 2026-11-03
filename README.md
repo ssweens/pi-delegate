@@ -434,19 +434,23 @@ The child transcript uses Pi's own assistant/user message, built-in tool, and ed
 
 The mode applies from the main session's next turn, the limits and model picking from the next `delegate` call. No reload is needed.
 
-**`/delegate fork:<role> <task>`** and **`/delegate fresh:<role> <task>`** start a child yourself, with or without this conversation; the command completes role names. It runs through the same path as the `delegate` tool. Its report is shown in the transcript and is in context for the next turn, but it does not start a model turn, unless the model has since steered that child. A child reaches MCP tools through this session's tool context, which pi-delegate only has once the model has called `delegate` or `delegate_ctl` in this session; until then the command warns that the child has no MCP tools.
+**`/delegate fork:<role> <task>`** and **`/delegate fresh:<role> <task>`** start a child yourself; the command completes role names. With an eligible running lead, they start a branch owned by the most recently active lead (see below). With no eligible lead, they use the ordinary root-owned `delegate` tool path. Use **`/delegate root fork:<role> <task>`** or **`/delegate root fresh:<role> <task>`** to start a root-owned child even while a lead is running. For root-owned command launches, `fork` copies the root conversation and `fresh` starts without it. Its report is shown in the transcript and is in context for the next turn, but it does not start a model turn, unless the model has since steered that child. A child reaches MCP tools through this session's tool context, which pi-delegate only has once the model has called `delegate` or `delegate_ctl` in this session; until then the command warns that the child has no MCP tools.
 
 ### Start a branch under a running lead
 
 Start a new child directly, without asking the lead model to delegate:
 
 ```text
-/delegate under:<lead-runId> fresh:scout Review the parser and report edge cases
-/delegate under:<lead-runId> fork:reviewer Check the lead's current approach
-/delegate under:<lead-runId> process npm run lint
+/delegate fresh:scout Review the parser and report edge cases
+/delegate fork:reviewer Check the lead's current approach
+/delegate process npm run lint
 ```
 
-Use the exact delegate run ID from the Agents frame or `delegate_ctl status`; command completion lists eligible running leads. The lead must be a running, locally owned, in-process Pi child in this session's tree. Its role must allow `delegate` or `delegate_ctl`, and it must be below the depth cap. Other targets fail without starting anything under the root. Finished leads are not restarted by this command. Delegation-off, depth, concurrency, role, trust, and writer-directory limits still apply.
+The command infers the current lead from live runtime state. An eligible lead is a running, locally owned, in-process Pi child in this session's tree, with an open, attached delegation runtime. Its role must allow `delegate` or `delegate_ctl`, and it must be below the depth cap.
+
+With several eligible leads, the most recent `lastProgressAt` (message completion or tool activity) wins, falling back to the segment start. A later segment start, then original start, breaks activity ties. If all those clocks tie, the command fails clearly without starting anything; retry after lead activity. There is no arbitrary map-order fallback, `under:` parameter, run-ID entry, or chooser. The Agents panel's remembered selection does not designate a current lead.
+
+With no eligible lead, `process` fails clearly; ordinary `fresh`/`fork` launches remain root-owned. Finished leads are not restarted by inference. Delegation-off, depth, concurrency, role, trust, and writer-directory limits still apply.
 
 The lead's own live binding creates and owns the branch. Pi branches appear under that lead in the Agents tree; process branches appear in Processes with an `under` run ID. Both keep `parentRunId` and depth in their records. The lead and root can use `delegate_ctl status/result/wait/cancel` with the branch ID; Pi branches also support steer. Root multi-run waits can include Pi and process descendants. Plain root `status` still lists only direct children. Stopping the lead or ending the root session stops its branch subtree; reload only rebinds it.
 

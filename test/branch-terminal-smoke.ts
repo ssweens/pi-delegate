@@ -49,12 +49,12 @@ try {
 	await until(() => records().some(r => r.task === "TUI lead"));
 	const lead = records().find(r => r.task === "TUI lead");
 	save("before-branch");
-	command(`/delegate under:${lead.id} fresh:scout TUI branch`); await childRequest;
+	command("/delegate fresh:scout TUI branch"); await childRequest;
 	await until(() => /started under/.test(capture()));
 	const child = records().find(r => r.task === "TUI branch");
 	assert.equal(child.parentRunId, lead.id); assert.equal(child.depth, 2); assert.notEqual(child.ownerKey, lead.ownerKey);
 	save("branch-started");
-	command(`/delegate under:${lead.id} process printf 'TUI-PROCESS-RESULT'; sleep 30`);
+	command("/delegate process printf 'TUI-PROCESS-RESULT'; sleep 30");
 	await until(() => /Processes.*1\/1/.test(capture()));
 	const processFile = readdirSync(join(box.cwd, ".agents/pi/subsessions"), { recursive: true })
 		.map(String).find(f => /\/process\/process-.*\.json$/.test(f));
@@ -80,7 +80,7 @@ try {
 	await until(() => records().some(r => r.id === lead.id && r.output.includes("TUI-LEAD-SAW-BRANCH")));
 	save("lead-received-branch");
 	assert(api.requests.some(r => JSON.stringify(r.messages).includes("TUI-BRANCH-RESULT")));
-	console.log(`PASS direct Pi/process branch commands in real Pi TUI, root process cancel, owner lineage, and deferred lead completion. Evidence: ${box.root}`);
+	console.log(`PASS inferred-lead Pi/process branch commands (no run IDs) in real Pi TUI, root process cancel, owner lineage, and deferred lead completion. Evidence: ${box.root}`);
 } finally {
 	gate.resolve(); childGate.resolve();
 	try { tmux("kill-server"); } catch { /* startup may have failed */ }
