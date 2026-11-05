@@ -24,6 +24,7 @@ export function installSpur(pi: ExtensionAPI, activity: ActivityCoordinator): vo
   let generation = 0;
   let storage: ConversationStorage | undefined;
   let storageError: string | undefined;
+  let savedState = "";
   let agentRunning = false;
   let reservation: { generation: number; phase: "admitting" | "started" } | undefined;
 
@@ -44,6 +45,7 @@ export function installSpur(pi: ExtensionAPI, activity: ActivityCoordinator): vo
     const native = !!nativeFile && existsSync(nativeFile);
     if (!native) storage?.save(scheduler.state, false);
     pi.appendEntry(SNAPSHOT_TYPE, structuredClone(scheduler.state));
+    savedState = JSON.stringify(scheduler.state);
     if (native) storage?.save(scheduler.state, true);
     updateActivity();
   };
@@ -111,6 +113,7 @@ export function installSpur(pi: ExtensionAPI, activity: ActivityCoordinator): vo
           pi.appendEntry(SNAPSHOT_TYPE, structuredClone(scheduler.state));
         }
       }
+      savedState = JSON.stringify(scheduler.state);
       const nativeFile = ctx.sessionManager.getSessionFile();
       if (nativeFile && existsSync(nativeFile)) storage.markNative();
     } catch (error) {
@@ -145,7 +148,7 @@ export function installSpur(pi: ExtensionAPI, activity: ActivityCoordinator): vo
     }
   });
   pi.on("session_shutdown", () => {
-    try { if (context && !storageError) save(); }
+    try { if (context && !storageError && JSON.stringify(scheduler.state) !== savedState) save(); }
     finally { stop(); }
   });
   pi.on("agent_start", () => {
