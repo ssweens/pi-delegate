@@ -21,6 +21,8 @@ import type { ProcessBackend, ProcessRunView } from "./process-backend.js";
 import { expiredEvent, OVEN_EXPIRES, ovenCall, ovenHeartbeat, requireExpiry, SliceExpired, SliceGone, type Settled, type SliceView } from "./oven.js";
 import type { TrustSource } from "./project-trust.js";
 import type { RunView } from "./render.js";
+import { loadState as loadTodos } from "./todo-ext.ts";
+import type { TodoState, WorkContext } from "./todo.ts";
 import { droppedTools, toolAllowlist } from "./roles.js";
 import { modelKey, splitModelRef } from "./model-ref.ts";
 import { ownedElsewhereError, processOwner, readRecord, releaseOwner, RunStore, storageDir, storagePath, writeRecord } from "./storage.js";
@@ -93,6 +95,11 @@ export interface Run {
 	changedFiles: string[];
 	droppedTools: string[];
 	output: string;
+	/** Timestamp of the text, independent of tool/liveness updates. */
+	outputAt?: number;
+	/** Session-backed checklist projection, refreshed on todo changes and transcript harvest. */
+	todos?: TodoState;
+	work?: WorkContext;
 	failedAttempts: number;
 	/** Failed attempts in the current segment, for causal timeout reporting. */
 	segmentFailedAttempts: number;
@@ -655,9 +662,9 @@ const piStore = new RunStore<Run, RunRecord>({
 	foreignSave: "throw",
 });
 export function saveRun(run: Run): void { piStore.save(run, run.recordPath); }
-function messagesOf(run: Run): any[] {
+function messagesOf(run: Run, source?: SessionManager): any[] {
 	if (!run.sessionFile) return [];
-	const manager = run.session?.sessionManager ?? openTranscript(run);
+	const manager = source ?? run.session?.sessionManager ?? openTranscript(run);
 	return manager.getEntries().filter((e: any) => e.type === "message").map((e: any) => e.message);
 }
 function openTranscript(run: Run): SessionManager {
@@ -724,13 +731,16 @@ function dirtyDelta(before: Map<string, number> | undefined, cwd: string): strin
 export function harvest(run: Run) {
 	// An oven run has no transcript here: its output and turns come from oven (launchOven).
 	if (run.runtime === "oven") return;
-	const msgs = messagesOf(run);
+	const manager = run.session?.sessionManager ?? openTranscript(run);
+	const msgs = messagesOf(run, manager);
+	run.todos = loadTodos(manager);
 	let turns = 0;
 	const tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 	let cost = 0;
 	const changed = new Set<string>(dirtyDelta(run.dirtyBefore, run.cwd) ?? []);
 	const gitBacked = run.dirtyBefore !== undefined;
 	let output = "";
+	let outputAt: number | undefined;
 	let failedAttempts = 0;
 	let lastAttemptError: string | undefined;
 	for (let i = run.startIdx; i < msgs.length; i++) {
@@ -758,7 +768,10 @@ export function harvest(run: Run) {
 		}
 		// A resumed segment may fail before producing text. Do not re-report the last
 		// completed segment as if it were the current attempt's report.
-		if (i >= run.segmentStartIdx && text.trim()) output = text;
+		if (i >= run.segmentStartIdx && text.trim()) {
+			output = text;
+			outputAt = typeof m.timestamp === "number" && Number.isFinite(m.timestamp) ? m.timestamp : undefined;
+		}
 	}
 	run.turns = turns;
 	run.failedAttempts = failedAttempts;
@@ -767,6 +780,7 @@ export function harvest(run: Run) {
 	run.tokens = tokens;
 	run.cost = cost;
 	run.changedFiles = [...changed].sort();
+	run.outputAt = outputAt;
 	run.output = output.length > OUTPUT_CAP ? `${output.slice(0, OUTPUT_CAP)}\n…[truncated ${output.length - OUTPUT_CAP} chars]` : output;
 }
 
@@ -789,6 +803,9 @@ export function view(run: Run): RunView {
 		status: run.status,
 		task: run.task,
 		output: run.output,
+		...(run.outputAt !== undefined ? { outputAt: run.outputAt } : {}),
+		...(run.todos ? { todos: run.todos } : {}),
+		...((run.todos?.work ?? run.work) ? { work: run.todos?.work ?? run.work } : {}),
 		turns: run.turns,
 		tokens: run.tokens,
 		cost: run.cost,
@@ -804,6 +821,7 @@ export function view(run: Run): RunView {
 		...(run.providerRetry ? { providerRetry: run.providerRetry } : {}),
 		toolCalls: run.toolCalls,
 		activeTool: run.activeTools.values().next().value,
+		activeToolCount: run.activeTools.size,
 		joinedWaiters: run.completion.waiting,
 		revision: run.revision,
 		lastTool: run.lastTool,
@@ -1516,7 +1534,7 @@ function beginResume(run: Run, restart: boolean, replacement?: Replacement) {
 	const rebind = rebinds(run, replacement);
 	const next: Run = { ...run, ...replacement, segment: run.segment + 1, stopped: false, acknowledged: false,
 		// A new segment must not publish the prior segment's report while it is still running.
-		output: "",
+		output: "", outputAt: undefined,
 		status: "running", endedAt: undefined, error: undefined, stopIntent: undefined, haltNote: undefined, revision: run.revision + 1,
 		// A resume starts a fresh budget and report scope; persist both with the segment.
 		segmentStartIdx: messagesOf(run).length,
@@ -1585,6 +1603,7 @@ export interface PiBackendHooks {
 /** A new run as its parent's call resolved it (PiBackendHooks.resolve), before anything is recorded. */
 export interface PiRunSpec {
 	role: string;
+	work?: WorkContext;
 	task: string;
 	cwd: string;
 	model: string;
@@ -1755,13 +1774,23 @@ export class PiBackend implements DelegateBackend<"pi"> {
 				const active = run.activeTools.get(ev.toolCallId);
 				if (active) active.result = { ...ev.partialResult, isError: false };
 			}
-			if (ev.type === "tool_execution_end") run.activeTools.delete(ev.toolCallId);
+			if (ev.type === "tool_execution_end") {
+				run.activeTools.delete(ev.toolCallId);
+				if (ev.toolName === "todo") run.todos = loadTodos(session.sessionManager);
+			}
 			trackProgress(run, ev);
 			run.revision++;
 			if (ev.type === "message_end") {
 				if (ev.message?.role === "assistant") {
-					try { harvest(run); }
-					catch (error) { if (!run.stopIntent) run.status = "error"; run.error = `Cannot read child transcript: ${errorMessage(error)}`; void session.abort(); }
+					try {
+						harvest(run);
+						// Pi emits message_end before appending that message to its session tree.
+						const text = textOf(ev.message.content).trim();
+						if (text) {
+							run.output = text.length > OUTPUT_CAP ? `${text.slice(0, OUTPUT_CAP)}\n…[truncated ${text.length - OUTPUT_CAP} chars]` : text;
+							run.outputAt = typeof ev.message.timestamp === "number" ? ev.message.timestamp : undefined;
+						}
+					} catch (error) { if (!run.stopIntent) run.status = "error"; run.error = `Cannot read child transcript: ${errorMessage(error)}`; void session.abort(); }
 				}
 				try { saveRun(run); }
 				catch (error) { if (!run.stopIntent) run.status = "error"; run.error = `Cannot save child state: ${errorMessage(error)}`; void session.abort(); }

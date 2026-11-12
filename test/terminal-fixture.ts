@@ -82,7 +82,8 @@ export default function (pi: any) {
 		trace({ event: "joined", details: result.details });
 	} });
 	pi.registerCommand("fixture-spawn", { handler: async (args: string, ctx: any) => {
-		const result = await tools.get("delegate").execute("fixture", { role: "scout", model: "fixture/fixture:off", context: "fresh", cwd: ctx.cwd, task: args || "Native detail" }, undefined, undefined, ctx);
+		const input = args.trim().startsWith("{") ? JSON.parse(args) : { task: args || "Native detail" };
+		const result = await tools.get("delegate").execute("fixture", { role: "scout", model: "fixture/fixture:off", context: "fresh", cwd: ctx.cwd, ...input }, undefined, undefined, ctx);
 		trace({ event: "launch", details: result.details });
 	} });
 }

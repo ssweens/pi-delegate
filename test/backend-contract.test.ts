@@ -71,6 +71,16 @@ test("pi keeps today's fields and requires a role name and a task", () => {
 	assert.equal(errorOf(validateStartInput({ role: "scout", task: "t", timeoutMs: -1 })).field, "timeoutMs");
 });
 
+test("work labels are explicit, bounded and Pi-only", () => {
+	assert.deepEqual(validateStartInput({ role: "worker", task: "t", work: { mode: "Werkit", role: "Op" } }),
+		{ ok: true, value: { backend: "pi", role: "worker", task: "t", work: { mode: "Werkit", role: "Op" } } });
+	for (const work of [null, "Op", { role: " " }, { role: "x".repeat(81) }, { role: "\u001b[31mOp" }, { phase: "Verify" }]) {
+		assert.equal(errorOf(validateStartInput({ role: "worker", task: "t", work })).field, "work");
+	}
+	assert.equal(errorOf(validateStartInput({ backend: "acp", agent: "claude", task: "t", work: { role: "Op" } })).field, "work");
+	assert.equal(errorOf(validateStartInput({ backend: "process", command: "true", work: { role: "Op" } })).field, "work");
+});
+
 test("firstDeliverableMin: positive minutes, at most the cap, before the timeout; pi only", () => {
 	assert.deepEqual(validateStartInput({ role: "worker", task: "t", timeoutMs: 60 * 60_000, firstDeliverableMin: 10 }),
 		{ ok: true, value: { backend: "pi", role: "worker", task: "t", timeoutMs: 60 * 60_000, firstDeliverableMin: 10 } });

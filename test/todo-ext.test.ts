@@ -117,6 +117,23 @@ test("tool drives the widget, restores it on session navigation, and clears when
 	assert.ok(completion.includes("☑ Keep the current task visible"));
 });
 
+test("work labels persist independently of checklist operations and branch restore", async () => {
+	const h = harness();
+	const tool = h.tools.get("todo");
+	const call = (params: unknown) => tool.execute("work", params, undefined, undefined, h.ctx());
+	await call({ op: "view", work: { mode: "Werkit", role: "Op" } });
+	const labels = h.entries.slice();
+	await call({ op: "add", phase: "Verify", content: "Room smoke" });
+	await call({ op: "start", content: "Room smoke" });
+	assert.deepEqual(loadState(h.ctx().sessionManager).work, { mode: "Werkit", role: "Op" });
+	await call({ op: "init" });
+	assert.deepEqual(loadState(h.ctx().sessionManager), { phases: [], work: { mode: "Werkit", role: "Op" } });
+	await call({ op: "view", work: {} });
+	assert.deepEqual(loadState(h.ctx().sessionManager).work, {});
+	assert.deepEqual(loadState(h.ctx(labels).sessionManager).work, { mode: "Werkit", role: "Op" });
+	await assert.rejects(call({ op: "view", work: { role: " " } }), /work must contain/);
+});
+
 test("loadState prefers delegate entries, falls back to legacy pi-omp, skips malformed input", () => {
 	const legacy = { type: "custom", customType: LEGACY_TODO_CUSTOM_TYPE, data: { phases: [{ name: "Old", tasks: [{ content: "from omp", status: "pending" }] }] } };
 	const own = { type: "custom", customType: TODO_CUSTOM_TYPE, data: { phases: [{ name: "New", tasks: [{ content: "from delegate", status: "pending" }] }] } };

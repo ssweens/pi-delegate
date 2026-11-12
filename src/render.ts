@@ -1,3 +1,5 @@
+import { stripVTControlCharacters } from "node:util";
+import { todoProgress, type TodoState, type WorkContext } from "./todo.ts";
 import type { Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme, keyHint } from "@earendil-works/pi-coding-agent";
 import { formatPercent, type DealsDetails, type DealRow } from "./deals.js";
@@ -30,6 +32,9 @@ export interface RunView {
 	status: "running" | "complete" | "error" | "cancelled" | "timeout" | "interrupted" | "idle" | "expired";
 	task: string;
 	output: string;
+	outputAt?: number;
+	todos?: TodoState;
+	work?: WorkContext;
 	turns: number;
 	tokens: { input: number; output: number; cacheRead: number; cacheWrite: number };
 	cost: number;
@@ -45,6 +50,7 @@ export interface RunView {
 	providerRetry?: { attempt: number; maxAttempts: number; delayMs: number; errorMessage: string; startedAt: number };
 	toolCalls: { name: string; args: Record<string, unknown>; at?: number }[];
 	activeTool?: { name: string; args: Record<string, unknown> };
+	activeToolCount?: number;
 	joinedWaiters?: number;
 	revision: number;
 	lastTool?: string;
@@ -182,6 +188,40 @@ export function runLine(v: RunView, theme: Theme, width: number, now = Date.now(
 	const title = fit(runTitle(v), Math.max(4, width - 2 - visibleWidth(suffix)));
 	void now;
 	return fit(`${theme.fg(color, glyph)} ${theme.bold(title)}${suffix}`, width);
+}
+
+/** A bounded, plain-text excerpt of model commentary, never a claim of verification. */
+export function progressText(text: string): string {
+	const line = stripVTControlCharacters(text).split(/\r?\n/, 8).find((line) => line.trim() && !/^\s*```/.test(line)) ?? "";
+	return line.replace(/[\x00-\x1f\x7f-\x9f]/g, "").replace(/^\s{0,3}(?:#{1,6}\s+|>\s*)/, "").replace(/\[([^\]]+)\]\([^)]*\)/g, "$1").replace(/\*\*|`/g, "").trim();
+}
+
+/** Semantic progress wins over execution detail; warnings are never hidden by an old note. */
+export function agentProgress(v: RunView, theme: FrameTheme, width: number, now = Date.now()): string {
+	if (v.haltNote) return fit(theme.fg("warning", `${v.status} · release unconfirmed`), width);
+	if (!v.settled && v.status !== "running") return theme.fg("warning", "Stopping…");
+	if (v.status !== "running") return theme.fg(v.status === "complete" ? "dim" : "warning", v.status);
+	if (v.providerRetry) return theme.fg("warning", `retry ${v.providerRetry.attempt}/${v.providerRetry.maxAttempts}`);
+	if (v.backend === "acp") return fit(theme.fg("dim", `session ${v.nativeSessionId ?? "pending"}`), width);
+	const todo = todoProgress(v.todos);
+	if (todo?.blocker) return fit(theme.fg("warning", `blocked: ${progressText(todo.blocker)}`), width);
+	const phase = todo?.phase ? fit(progressText(todo.phase), width >= 44 ? Math.min(20, Math.floor(width / 3)) : 10) : "";
+	const count = todo ? `${phase ? `${phase} ` : ""}${todo.done}/${todo.total}${width >= 44 ? " tasks" : ""}` : "";
+	const note = progressText(v.output);
+	const activity = note || (todo?.now ? progressText(todo.now) : v.activeTool ? formatToolCall(v.activeTool.name, v.activeTool.args, theme as Theme) : "Thinking…");
+	const age = note && v.outputAt !== undefined ? ` · ${formatDuration(Math.max(0, now - v.outputAt))} ago` : "";
+	const prefix = count ? `${count} · ` : "";
+	return fit(theme.fg("muted", prefix) + fit(note ? theme.fg("dim", activity) : activity, Math.max(1, width - visibleWidth(prefix) - visibleWidth(age))) + theme.fg("dim", age), width);
+}
+
+/** One extra row only while selected; the full checklist remains in the child inspector. */
+export function agentDetail(v: RunView, theme: FrameTheme, width: number, now = Date.now()): string {
+	const todo = todoProgress(v.todos);
+	const work = v.work?.mode ? [progressText(v.work.mode)] : [];
+	const tool = v.activeTool ? formatToolCall(v.activeTool.name, v.activeTool.args, theme as Theme) + ((v.activeToolCount ?? 0) > 1 ? ` +${v.activeToolCount! - 1}` : "") : "";
+	const details = [...work, todo?.blocker ? `blocked: ${progressText(todo.blocker)}` : todo?.now ? `now: ${progressText(todo.now)}` : "", tool].filter(Boolean);
+	if (!details.length) details.push(agentProgress(v, theme, width, now));
+	return fit(theme.fg("dim", `↳ ${details.join(" · ")}`), width);
 }
 
 /** What a board line reads off a Pi run; Run satisfies it, and the optional ones are the live-progress facts. */

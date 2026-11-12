@@ -1175,7 +1175,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		}
 		const hosted = tui ? tuiTemplate(role, tui, systemPrompt) : undefined;
 		return {
-			role: role.name, task: p.task, cwd, model: tui ? `${tui}:${p.model ?? "template"}` : modelKey(model), thinking, contextWindow: model?.contextWindow, ...(modelPick ? { modelPick } : {}),
+			role: role.name, ...(p.work ? { work: p.work } : {}), task: p.task, cwd, model: tui ? `${tui}:${p.model ?? "template"}` : modelKey(model), thinking, contextWindow: model?.contextWindow, ...(modelPick ? { modelPick } : {}),
 			systemPrompt, context, tools, omitAgentsMd, inheritedContextFiles,
 			appendSystemPrompt: parentPrompt?.appendSystemPrompt ? [parentPrompt.appendSystemPrompt] : [],
 			...(withheld ? { withheld } : {}), writer: isWriter && runtime !== "oven", timeoutMs,
@@ -1210,6 +1210,10 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			task: Type.Optional(Type.String({ description: "agent brief; required except acp with sessionId. process: optional human title" })),
 			model: Type.Optional(Type.String({ description: "override. pi: provider/id[:thinking]. acp: the agent's own model ID, created sessions only" })),
 			context: Type.Optional(StringEnum(["fork", "fresh"] as const)),
+			work: Type.Optional(Type.Object({
+				mode: Type.Optional(Type.String({ minLength: 1, maxLength: 80 })),
+				role: Type.Optional(Type.String({ minLength: 1, maxLength: 80 })),
+			}, { additionalProperties: false, description: "Pi only: explicit workflow/work-role labels for Activity, independent of tool permissions. The child may update them with todo work." })),
 			omitAgentsMd: Type.Optional(Type.Boolean({ description: "Skip startup instruction files only. Overrides the role's default, including false. Does not scrub forked history or disable nested discovery. In-process Pi only." })),
 			tui: Type.Optional(StringEnum(["pi", "claude", "amp"] as const, { description: 'pi only: run the child as that agent\'s own TUI hosted by oven (a tui slice), in a copy of cwd, on the role as an agent template (its claude:/amp: sections for those agents); model is passed to that agent. Default: the role\'s tui line. Implies runtime "oven"; attach with `oven attach <slice>`' })),
 			runtime: Type.Optional(StringEnum(["in-process", "oven"] as const, { description: 'pi only: where the child runs. Default: the role\'s runtime line, else "in-process". "oven" runs it as a bounded oven slice in a copy of cwd; completion releases execution and steer resumes saved history. Parent quit releases it; reload only rebinds. It never receives your conversation' })),

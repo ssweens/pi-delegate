@@ -24,6 +24,7 @@ import {
 	emptyState,
 	markdownToPhases,
 	parseTodoState,
+	parseWorkContext,
 	phasesToMarkdown,
 	removeTask,
 	startTask,
@@ -80,6 +81,10 @@ const PARAMS = Type.Object({
 	phase: Type.Optional(Type.String()),
 	content: Type.Optional(Type.String()),
 	blocker: Type.Optional(Type.String()),
+	work: Type.Optional(Type.Object({
+		mode: Type.Optional(Type.String({ minLength: 1, maxLength: 80 })),
+		role: Type.Optional(Type.String({ minLength: 1, maxLength: 80 })),
+	}, { additionalProperties: false, description: "Declare this session’s workflow/work-role labels; absent leaves them unchanged, {} clears them. No task or phase is inferred." })),
 });
 type TodoParams = Static<typeof PARAMS>;
 
@@ -113,7 +118,7 @@ export function loadState(sessionManager: TodoBranchSource): TodoState {
 function applyOp(state: TodoState, p: TodoParams): TodoState {
 	switch (p.op) {
 		case "init":
-			return emptyState();
+			return { ...state, phases: [] };
 		case "add":
 			return addTask(state, p.phase ?? TODO_DEFAULT_PHASE, p.content ?? "");
 		case "start":
@@ -192,7 +197,7 @@ export function installTodo(pi: ExtensionAPI, options: TodoInstallOptions = {}):
 		name: "todo",
 		label: "Todos",
 		description:
-			"Manage a phased todo list. Ops: init, add (content, phase), start (content), done (content), drop/rm (content), block/unblock (content, blocker), view. Tasks are addressed by their content string; one task is in_progress; completing auto-promotes the next open task.",
+			"Manage a phased todo list. Ops: init, add (content, phase), start (content), done (content), drop/rm (content), block/unblock (content, blocker), view. Optional work {mode, role} declares display labels for this session, including with view; {} clears labels. Tasks are addressed by their content string; one task is in_progress; completing auto-promotes the next open task.",
 		promptSnippet: "todo(op, content?, phase?, blocker?) — manage phased todos",
 		parameters: PARAMS,
 		// The todo panel renders its own framed block (the Agents frame
@@ -201,7 +206,10 @@ export function installTodo(pi: ExtensionAPI, options: TodoInstallOptions = {}):
 		renderShell: "self",
 		executionMode: "sequential",
 		execute: async (_toolCallId, params: TodoParams, _signal, _onUpdate, ctx) => {
-			const state = applyOp(loadState(ctx.sessionManager), params);
+			const work = params.work === undefined ? undefined : parseWorkContext(params.work);
+			if (params.work !== undefined && !work) throw new Error("work must contain only mode/role labels of 1–80 plain-text characters");
+			const next = applyOp(loadState(ctx.sessionManager), params);
+			const state = work ? { ...next, work } : next;
 			pi.appendEntry(TODO_CUSTOM_TYPE, state);
 			syncTodoWidget(ctx.ui, state, options.activity);
 			const text = params.op === "init" ? "Todos cleared." : viewTasks(state);
@@ -254,7 +262,7 @@ export function installTodo(pi: ExtensionAPI, options: TodoInstallOptions = {}):
 				case "import": {
 					const source = rest[0] ?? join(ctx.cwd, TODO_FILE);
 					const md = await fs.readFile(source, "utf8");
-					const imported = persist(markdownToPhases(md));
+					const imported = persist({ ...state, ...markdownToPhases(md) });
 					ctx.ui.notify(`Imported ${countOpen(imported)} open tasks from ${source}`, "info");
 					return;
 				}

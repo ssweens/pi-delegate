@@ -24,6 +24,9 @@ test("worker milestones reach only the parent event bus while the worker continu
 		firstGate.resolve();
 		for (let i = 0; i < 100 && (api.requests.length < 2 || !seen.some((e) => e.kind === "note")); i++) await new Promise((resolve) => setTimeout(resolve, 20));
 		assert.equal(launch.details.status, "running");
+		const current = await h.ctl("status", id);
+		assert.equal(current.details.output, "I found a narrow path; reading seed.txt next.", "message_end text is visible before the next message settles");
+		assert.equal(typeof current.details.outputAt, "number", "report age uses the source message timestamp");
 		assert.deepEqual(seen.slice(0, 2).map((e) => e.kind), ["started", "note"]);
 		assert.equal(seen[0].runId, id);
 		assert.equal(seen[0].task, "Investigate boundary");
