@@ -13,8 +13,21 @@ import {
 	removeTask,
 	startTask,
 	unblockTask,
+	todoProgress,
 	viewTasks,
 } from "../src/todo.ts";
+
+test("progress counts the child checklist, excludes abandoned work and uses only an active phase", () => {
+	assert.equal(todoProgress(emptyState()), undefined);
+	let state = addTask(emptyState(), "Build", "Service");
+	state = addTask(state, "Verify", "Room smoke");
+	state = addTask(state, "Verify", "Dropped alternative");
+	state = completeTask(state, "Service");
+	state = dropTask(state, "Dropped alternative");
+	assert.deepEqual(todoProgress(state), { done: 1, total: 2, phase: "Verify", now: "Room smoke" });
+	state = blockTask(state, "Room smoke", "Environment unavailable");
+	assert.deepEqual(todoProgress(state), { done: 1, total: 2, blocker: "Environment unavailable" });
+});
 
 test("addTask creates a phase and pending task", () => {
 	const s = addTask(emptyState(), "Tasks", "scaffold crate");

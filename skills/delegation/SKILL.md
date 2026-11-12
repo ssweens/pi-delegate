@@ -149,7 +149,7 @@ If the child is `interrupted`, inspect its saved work before continuing; tool si
 When the saved offering is gone, rate-limited, or wrong for the remaining work, pass `model:` to that same `steer`. The child continues under its own ID, transcript, tools, and instructions on the offering you name, and later segments keep it; earlier segments keep what they ran on. Choose it like any other model decision — read `models`, propose the offering with its price and serving tradeoff, act on the user's answer. Never relaunch a fresh child to escape an exhausted subscription, and never pick the replacement yourself. A running child refuses the switch: wait for its turn or `cancel` it first.
 
 ## The brief
-Start with a short task title on its own line. It labels the child in the Agents frame; the UI does not guess a summary.
+Start with a short task title on its own line. It labels the child in the Agents frame; the UI does not guess a summary. When the workflow or work role is known, pass `work: {mode, role}` on a Pi launch; these are explicit display labels, separate from the permission role. A child may update its labels with `todo`'s optional `work`, including `op: "view"`. For multi-phase work, keep a short child-owned phased checklist and update it at actual milestones; do not copy skill instructions into task text. Tiny one-step tasks need no checklist. The Activity row shows the child's checklist and latest commentary, not the parent's checklist or a tool-derived guess.
 
 ```
 <short task title>

@@ -9,9 +9,10 @@ import { agentListHint, chordLabel, hint, joinHints, keyLabel } from "./ui/hints
 import { navKeys } from "./ui/keys.ts";
 import { keepInView, moveIndex, stepFor } from "./ui/scroll.ts";
 import { fit, fitPad, indent, padTo } from "./ui/text.ts";
-import { formatToolCall, frame, runTitle, statusMark, withLegend, processLine, processText, type RunView } from "./render.js";
+import { agentDetail, agentProgress, progressText, frame, runTitle, statusMark, withLegend, processLine, processText, type RunView } from "./render.js";
 import type { ProcessRunView } from "./process-backend.js";
 import { wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { renderTodoOverviewLines } from "./todo-render.ts";
 
 export interface LiveSource {
 	all(): RunView[];
@@ -151,37 +152,30 @@ export class AgentsPanel implements Component, Focusable {
 		if (!rows.length) return undefined;
 		const index = Math.max(0, rows.findIndex((r) => r.id === this.selectedId));
 		this.selectedId ??= rows[index].id;
-		const count = Math.min(LIST_ROWS, Math.max(1, this.tui.terminal.rows - 10), rows.length);
+		const count = Math.min(LIST_ROWS, Math.max(1, this.tui.terminal.rows - 10 - (this.focused ? 1 : 0)), rows.length);
 		this.offset = keepInView(this.offset, index, count, rows.length);
 		const inner = Math.max(1, width - 4);
-		// One width for every row, so the column lines up. It only appears where the activity
-		// column keeps at least 16 columns after it; narrower terminals drop it entirely.
-		const roleWidth = 12;
-		const titleWidth = Math.min(36, Math.floor(inner * 0.38));
-		const modelSpare = inner - 4 - titleWidth - roleWidth - 7 - 4 - 16;
+		const roleWidth = 8;
+		const titleWidth = Math.min(30, Math.max(16, Math.floor(inner * 0.28)));
 		const shown = rows.slice(this.offset, this.offset + count);
-		const modelWidth = inner >= 65 && modelSpare >= 16 && shown.some((v) => v.model) ? Math.min(28, modelSpare) : 0;
-		const body = shown.map((v) => {
+		// Launch-time model identity yields to progress at ordinary terminal widths.
+		const modelWidth = width >= 160 && shown.some((v) => v.model) ? 24 : 0;
+		const now = Date.now();
+		const body = shown.flatMap((v) => {
 			const selected = this.focused && v.id === this.selectedId;
 			// A run started by a delegating child sits under it: one step in per level below the root's children.
 			const level = Math.max(0, Math.min(4, (v.depth ?? 1) - 1));
 			const branch = level ? this.theme.fg("dim", `${indent(level - 1)}└ `) : "";
 			const prefix = `${selected ? this.theme.fg("accent", "›") : " "} ${branch}${icon(v, this.theme)} `;
 			const time = formatDuration(v.durationMs);
-			const title = this.theme.fg(selected ? "accent" : v.settled ? "muted" : "text", runTitle(v));
-			if (inner < 65) return fitPad(`${prefix}${title}`, Math.max(1, inner - time.length - 1)) + ` ${time}`;
-			// Reserve the column on every row once it is shown, so a session with no model
-			// stays blank instead of pulling the activity column left.
+			const title = this.theme.fg(selected ? "accent" : v.settled ? "muted" : "text", progressText(runTitle(v)));
+			const detail = selected ? ["    " + (inner < 65 ? agentProgress(v, this.theme, Math.max(1, inner - 4), now) : agentDetail(v, this.theme, Math.max(1, inner - 4), now))] : [];
+			if (inner < 65) return [fitPad(`${prefix}${title}`, Math.max(1, inner - time.length - 1)) + ` ${time}`, ...detail];
 			const model = modelWidth ? fitPad(this.theme.fg("muted", v.model), modelWidth) + " " : "";
-			const activityWidth = Math.max(1, inner - 4 - titleWidth - roleWidth - visibleWidth(model) - time.length - 3);
-			// An ACP agent streams no tool calls here: its session is the fact worth the column.
-			const activity = v.backend === "acp"
-				? this.theme.fg("dim", v.status === "running" ? `session ${v.nativeSessionId ?? "pending"}` : v.status)
-				: v.status === "running"
-				? v.activeTool ? formatToolCall(v.activeTool.name, v.activeTool.args, this.theme) : this.theme.fg("dim", "Thinking…")
-				: v.settled ? this.theme.fg(v.status === "complete" ? "dim" : "warning", v.status)
-				: this.theme.fg("warning", v.haltNote ? `${v.status} · release unconfirmed` : "Stopping…");
-			return prefix + fitPad(title, titleWidth) + " " + fitPad(this.theme.fg("muted", v.role), roleWidth) + " " + model + fitPad(activity, activityWidth) + " " + this.theme.fg("dim", time);
+			const activityWidth = Math.max(1, inner - visibleWidth(prefix) - titleWidth - roleWidth - visibleWidth(model) - time.length - 3);
+			const activity = agentProgress(v, this.theme, activityWidth, now);
+			const role = progressText(v.work?.role ?? v.role);
+			return [prefix + fitPad(title, titleWidth) + " " + fitPad(this.theme.fg("muted", role), roleWidth) + " " + model + fitPad(activity, activityWidth) + " " + this.theme.fg("dim", time), ...detail];
 		});
 		const range = rows.length > count ? ` · ${this.offset + 1}–${this.offset + count}/${rows.length}` : "";
 		// A queued prompt in the parent editor is otherwise unexplained: say when its turn is blocked here.
@@ -410,7 +404,8 @@ export class ChildView implements Component, Focusable {
 			this.transcript.update(this.src.activity(this.id));
 			this.revision = v.revision ?? 0;
 		}
-		const lines = this.transcript.render(width);
+		const checklist = v.todos ? renderTodoOverviewLines(v.todos, this.theme, width) : ["Checklist unavailable for this run"];
+		const lines = [...this.transcript.render(width), "", ...checklist];
 		this.cache = { revision: v.revision ?? 0, width, lines };
 		return lines;
 	}
@@ -420,10 +415,11 @@ export class ChildView implements Component, Focusable {
 		const v = this.current();
 		if (!v) return [fitPad(`Child unavailable · ${keyLabel("app.interrupt")} parent`, width), ...Array(Math.max(0, height - 1)).fill(padTo("", width))];
 		const inner = Math.max(1, width - 4);
-		const header = `${icon(v, this.theme)} ${this.theme.bold(runTitle(v))}${this.theme.fg("muted", ` · ${v.role}`)}`;
+		const work = [v.work?.mode, v.work?.role ?? v.role].filter(Boolean).map((label) => progressText(label!)).join(" · ");
+		const header = `${icon(v, this.theme)} ${this.theme.bold(progressText(runTitle(v)))}${this.theme.fg("muted", ` · ${work}`)}`;
 		const meta = v.backend === "acp"
 			? [v.status, formatDuration(v.durationMs), `acp ${v.agent ?? ""}`, `${v.origin === "opened" ? "opened session" : "session"} ${v.nativeSessionId ?? "pending"}${v.executionEnvironment ? ` (${v.executionEnvironment})` : ""}`, v.model].filter(Boolean).join(" · ")
-			: `${v.status} · ${formatDuration(v.durationMs)} · ${v.model}${v.thinking ? `:${v.thinking}` : ""}`;
+			: `${v.status} · ${formatDuration(v.durationMs)} · ${v.model}${v.thinking ? `:${v.thinking}` : ""}${v.work?.role && v.work.role !== v.role ? ` · permission role: ${progressText(v.role)}` : ""}`;
 		const head = frame(header, [fit(meta, inner)], "borderMuted", this.theme, width);
 		const editor = this.editor.render(width);
 		const footer = [

@@ -22,8 +22,42 @@ export interface TodoPhase {
 	tasks: TodoItem[];
 }
 
+export interface WorkContext {
+	mode?: string;
+	role?: string;
+}
+
+/** Explicit display labels, never workflow policy or tool permissions. */
+export function parseWorkContext(value: unknown): WorkContext | undefined {
+	if (!isRecord(value) || Object.keys(value).some((key) => key !== "mode" && key !== "role")) return undefined;
+	const work: WorkContext = {};
+	for (const key of ["mode", "role"] as const) {
+		const label = value[key];
+		if (label === undefined) continue;
+		if (typeof label !== "string" || !label.trim() || label.length > 80 || /[\x00-\x1f\x7f-\x9f]/.test(label)) return undefined;
+		work[key] = label.trim();
+	}
+	return work;
+}
+
 export interface TodoState {
 	phases: TodoPhase[];
+	work?: WorkContext;
+}
+
+/** Counts belong to this child’s whole checklist; abandoned work is not completion. */
+export function todoProgress(state: TodoState | undefined): { done: number; total: number; phase?: string; now?: string; blocker?: string } | undefined {
+	if (!state) return undefined;
+	let done = 0, total = 0;
+	let phase: string | undefined, now: string | undefined, blocker: string | undefined;
+	for (const group of state.phases) for (const task of group.tasks) {
+		if (task.status === "abandoned") continue;
+		total++;
+		if (task.status === "completed") done++;
+		if (!now && task.status === "in_progress") { phase = group.name; now = task.content; }
+		if (!blocker && task.status === "blocked") blocker = task.blocker || task.content;
+	}
+	return total ? { done, total, ...(phase ? { phase } : {}), ...(now ? { now } : {}), ...(blocker ? { blocker } : {}) } : undefined;
 }
 
 const STATUSES: readonly TodoStatus[] = ["pending", "in_progress", "completed", "abandoned", "blocked"];
@@ -75,7 +109,9 @@ export function parseTodoState(value: unknown): TodoState | undefined {
 		}
 		out.push({ name, tasks: parsedTasks });
 	}
-	return { phases: out };
+	const work = value.work === undefined ? undefined : parseWorkContext(value.work);
+	if (value.work !== undefined && !work) return undefined;
+	return { phases: out, ...(work ? { work } : {}) };
 }
 
 export function countOpen(state: TodoState): number;
@@ -96,7 +132,7 @@ export function findTask(state: TodoState, content: string): { phase: TodoPhase;
 }
 
 function mapState(state: TodoState, fn: (phase: TodoPhase) => TodoPhase): TodoState {
-	return { phases: state.phases.map(fn) };
+	return { ...state, phases: state.phases.map(fn) };
 }
 
 function mapTasks(state: TodoState, fn: (task: TodoItem) => TodoItem): TodoState {
@@ -120,13 +156,14 @@ export function addTask(state: TodoState, phaseName: string, content: string): T
 	const phaseIdx = state.phases.findIndex((p) => p.name === phaseName);
 	if (phaseIdx === -1) {
 		return {
+			...state,
 			phases: [...state.phases, { name: phaseName, tasks: [{ content, status: "pending" }] }],
 		};
 	}
 	const phases = state.phases.map((phase, i) =>
 		i === phaseIdx ? { ...phase, tasks: [...phase.tasks, { content, status: "pending" as const }] } : phase,
 	);
-	return { phases };
+	return { ...state, phases };
 }
 
 /**
@@ -188,6 +225,7 @@ export function dropTask(state: TodoState, content: string): TodoState {
 /** Remove a task entirely. */
 export function removeTask(state: TodoState, content: string): TodoState {
 	return {
+		...state,
 		phases: state.phases
 			.map((phase) => ({ name: phase.name, tasks: phase.tasks.filter((t) => t.content !== content) }))
 			.filter((phase) => phase.tasks.length > 0),
@@ -198,7 +236,8 @@ export function removeTask(state: TodoState, content: string): TodoState {
 export function viewTasks(state: TodoState): string {
 	const open = countOpen(state);
 	const total = state.phases.reduce((n, p) => n + p.tasks.length, 0);
-	const lines: string[] = [`Todos: ${open}/${total} open`];
+	const labels = [state.work?.mode, state.work?.role].filter(Boolean).join(" · ");
+	const lines: string[] = [...(labels ? [`Work: ${labels}`] : []), `Todos: ${open}/${total} open`];
 	for (const phase of state.phases) {
 		lines.push(`\n[${phase.name}]`);
 		for (const t of phase.tasks) {

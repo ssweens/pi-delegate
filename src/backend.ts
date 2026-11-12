@@ -14,6 +14,7 @@
  */
 import type { AcpModelOption, AcpModelSource, NativeSessionDescription, RequestRecord, RuntimeHandle, SessionOrigin, UsageCost, WorkerRole } from "./acp/domain/types.js";
 import type { RunView } from "./render.js";
+import { parseWorkContext, type WorkContext } from "./todo.ts";
 import type { ProcessStartInput, ProcessRunView } from "./process-backend.js";
 
 // ---------------------------------------------------------------------------------------------
@@ -32,7 +33,7 @@ export const ACP_ONLY_FIELDS = ["agent", "sessionId", "executionEnvironment", "m
 /** Accepted only with backend "acp" and agent "amp". On any other agent each one is an error. */
 export const AMP_ONLY_FIELDS = ["mode"] as const;
 /** Accepted only with backend "pi". An ACP child cannot receive the parent conversation. */
-export const PI_ONLY_FIELDS = ["context", "runtime", "tui", "omitAgentsMd"] as const;
+export const PI_ONLY_FIELDS = ["context", "runtime", "tui", "omitAgentsMd", "work"] as const;
 /** Opening an existing native session keeps its settings: these are creation-only (Coordinator rule). */
 export const OPEN_FORBIDDEN_FIELDS = ["role", "model", "mode"] as const;
 
@@ -52,6 +53,8 @@ export interface PiStartInput extends CommonStartInput {
 	/** provider/id[:thinking] */
 	model?: string;
 	context?: "fork" | "fresh";
+	/** Explicit workflow and work-role labels, separate from the tool-permission role. */
+	work?: WorkContext;
 	omitAgentsMd?: boolean;
 	/** Overrides the role's runtime: an in-process Pi child, or an oven slice. */
 	runtime?: "in-process" | "oven";
@@ -477,7 +480,7 @@ export function validateStartInput(raw: Record<string, unknown>): Validated<Star
 	if (!common.ok) return common;
 
 	if (backend.value === "process") {
-		for (const field of ["role", "model", "context", "omitAgentsMd", "agent", "sessionId", "runtime", "tui", "mode", "firstDeliverableMin", "executionEnvironment", "reason"]) {
+		for (const field of ["role", "model", "context", "omitAgentsMd", "agent", "sessionId", "runtime", "tui", "mode", "firstDeliverableMin", "executionEnvironment", "reason", "work"]) {
 			if (raw[field] !== undefined) return fail("INPUT_INVALID", `${field} is not supported on backend process`, field);
 		}
 		if (!isNonEmptyString(raw.command)) return fail("INPUT_INVALID", "command is required with backend process", "command");
@@ -493,6 +496,11 @@ export function validateStartInput(raw: Record<string, unknown>): Validated<Star
 		if (!isNonEmptyString(raw.role)) return fail("INPUT_INVALID", "role is required: a pi-delegate role name", "role");
 		if (!isNonEmptyString(raw.task)) return fail("INPUT_INVALID", "task is required", "task");
 		const value: PiStartInput = { backend: "pi", role: raw.role, task: raw.task, ...common.value };
+		if (raw.work !== undefined) {
+			const work = parseWorkContext(raw.work);
+			if (!work) return fail("INPUT_INVALID", "work must contain only mode/role labels of 1–80 plain-text characters", "work");
+			value.work = work;
+		}
 		if (raw.runtime !== undefined) {
 			if (raw.runtime !== "in-process" && raw.runtime !== "oven") return fail("INPUT_INVALID", 'runtime is "in-process" or "oven"', "runtime");
 			value.runtime = raw.runtime;
