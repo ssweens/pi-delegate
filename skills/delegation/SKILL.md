@@ -9,7 +9,7 @@ Default: do the work yourself. Delegate only when one of three things is true â€
 
 ## Background commands without an agent
 
-For an ordinary command, use `delegate {"backend":"process","command":"npm run build","task":"Build project","cwd":"/absolute/project"}`. This starts no model or agent. Do not research or approve a model for a process.
+For an ordinary command, use `delegate {"backend":"process","command":"npm run build","task":"Build project","cwd":"/absolute/project"}`. This starts no model or agent. Do not research or approve a model for a process. **Never use `nohup`, `&`, `disown`, or detached background shells outside Pi** â€” every background command must go through `delegate(backend="process")` so it stays tied to Pi's Activity panel, status, and cancel/cleanup lifecycle.
 
 The call returns immediately with a process-prefixed runId, PID when spawned, and outputFile. `task` is an optional display title. Preserve command bytes. There is no execution timeout by default. An explicit positive integer `timeoutMs` sets the command deadline. Agent fields such as role, model, context, agent, sessionId, runtime, tui, mode, and firstDeliverableMin fail validation.
 
