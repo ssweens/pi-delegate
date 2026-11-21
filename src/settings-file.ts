@@ -6,7 +6,7 @@
  *   recap     — away recap controls: enabled and idle threshold (recap-settings.ts)
  *   path      — Path's controls: mode, model, decision model, tracking, continuity, suggestion classes
  *   mom       — Path's former section name: still read (and merged under `path`), never written
- *   defaults  — the approved default model per role, with the catalog it was approved against
+ *   defaults  — each role's approved model, rates, and reviewed catalog
  *   ratings   — researched quality ratings, per exact `provider/id`
  *
  * One file for the package's settings, so there is one place to look and one place to edit. The
@@ -27,7 +27,14 @@ import { isRecord } from "./util/text.ts";
 import writeFileAtomic from "write-file-atomic";
 
 /** One approved role default, as `delegate_ctl approve` records it: `spec` is `provider/id[:thinking]`. */
-export interface ApprovedDefault { spec: string; reason?: string; approvedAt: number; cost?: { input: number; output: number } }
+export interface ApprovedDefault {
+	spec: string;
+	reason?: string;
+	approvedAt: number;
+	cost?: { input: number; output: number };
+	costSource?: "registry" | "openrouter";
+	catalogAtApproval?: string[];
+}
 export interface RatingEntry { score: number; source: string; note?: string }
 export interface SettingsFile {
 	/** Delegation's controls, validated by delegate-settings.ts. */
@@ -84,9 +91,14 @@ export function mergeSettings(current: SettingsFile, patch: SettingsFile): Setti
 	if (patch.path) next.path = { ...current.path, ...patch.path };
 	if (patch.todo) next.todo = { ...current.todo, ...patch.todo };
 	if (patch.recap) next.recap = { ...current.recap, ...patch.recap };
-	if (patch.defaults) next.defaults = { ...current.defaults, ...patch.defaults,
-		approved: { ...current.defaults?.approved, ...patch.defaults.approved },
-		...(patch.defaults.catalogAtApproval ? { catalogAtApproval: patch.defaults.catalogAtApproval } : {}) };
+	if (patch.defaults) {
+		const approved = { ...current.defaults?.approved, ...patch.defaults.approved };
+		const legacyCatalog = current.defaults?.catalogAtApproval;
+		if (legacyCatalog?.length) for (const [role, entry] of Object.entries(approved)) {
+			if (!entry.catalogAtApproval) approved[role] = { ...entry, catalogAtApproval: legacyCatalog };
+		}
+		next.defaults = { approved };
+	}
 	if (patch.ratings) next.ratings = { ...current.ratings, ...patch.ratings,
 		entries: { ...current.ratings?.entries, ...patch.ratings.entries } };
 	return next;

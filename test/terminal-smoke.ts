@@ -1,7 +1,7 @@
 import "./setup.ts"; // First: isolates this file from the real home even when run on its own.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -34,10 +34,74 @@ const key = (...keys: string[]) => tmux("send-keys", "-t", "pi", ...keys);
 const text = (value: string) => tmux("send-keys", "-t", "pi", "-l", value);
 const mouse = (button: number, row: number) => text(`\x1b[<${button};3;${row}M${button === 0 ? `\x1b[<0;3;${row}m` : ""}`);
 async function command(value: string) { text(value); key("Enter"); }
+async function checkModelReview(mode: string) {
+	const settingsPath = join(box.agentDir, "pi-delegate.json");
+	const previous = existsSync(settingsPath) ? readFileSync(settingsPath, "utf8") : undefined;
+	writeFileSync(settingsPath, JSON.stringify({ ...JSON.parse(previous ?? "{}"), defaults: { approved: {
+		reviewer: { spec: "fixture/retired", approvedAt: Date.now() },
+		scout: { spec: "fixture/agent-1.2-mini", approvedAt: Date.now(), cost: { input: 0, output: 0 } },
+	} } }));
+	try {
+		api.script("Review delegate defaults", { tool: { name: "delegate_ctl", arguments: { action: "models" } } }, { text: "MODEL-REVIEW-SEEN" });
+		key("C-u"); await command("Review delegate defaults");
+		await expect(/MODEL-REVIEW-SEEN/);
+		assert.match(capture(), /1 blocking issue · 1 upgrade option · 1 notice/);
+		save(`${mode}-model-review`);
+		key("C-o"); await expect(/newer same-family\/tier candidate/);
+		assert.match(capture(), /blocked\s+scout: new upgrade candidate: fixture\/agent-1.3-mini/);
+		assert.match(capture(), /upgrades\s+scout: fixture\/agent-1.3-mini/);
+		assert.match(capture(), /notices\s+reviewer: fixture\/retired unavailable/);
+		save(`${mode}-model-review-expanded`); key("C-o");
+	} finally {
+		if (previous === undefined) rmSync(settingsPath);
+		else writeFileSync(settingsPath, previous);
+	}
+}
+
+const focusedSmoke = process.env.DELEGATE_FOCUSED_SMOKE;
+async function checkActiveFirst(mode: string) {
+	for (let i = 1; i <= 5; i++) {
+		const task = `Finished scout ${i}`;
+		api.script(task, { text: "FINISHED-OK" });
+		await command(`/fixture-spawn ${task}`);
+		await expect(new RegExp(`Agents.*${i} done`));
+		await command("/fixture-process printf 'FINISHED-PROCESS\\n'");
+		await expect(new RegExp(`Processes.*0/${i}`));
+	}
+	const gate = deferred();
+	const task = "Still running scout";
+	const release = join(box.root, `${mode}-activity.release`);
+	api.script(task, { text: "ACTIVE-OK", gate });
+	try {
+		await command(`/fixture-spawn ${task}`);
+		await expect(/Agents.*1 active.*5 done/);
+		await command(`/fixture-process while [ ! -f ${quote(release)} ]; do sleep 0.05; done`);
+		const active = await expect(/Process terminal walk.*running/);
+		assert.match(active, /Still running scout[\s\S]*Process terminal walk[^\n]*running[\s\S]*Finished scout 1/);
+		save(`${mode}-activity-active-first`);
+		key("Left"); await expect(/›.*Still running scout/);
+		for (let i = 0; i < 11; i++) key("Down");
+		await expect(/›.*Process terminal walk.*done/);
+		key("Escape");
+		const back = await expect(/Still running scout[\s\S]*Process terminal walk[^\n]*running[\s\S]*Finished scout 1/);
+		assert.doesNotMatch(back, /›.*Process terminal walk/);
+		save(`${mode}-activity-active-after-focus`);
+	} finally {
+		gate.resolve();
+		writeFileSync(release, "");
+	}
+	await expect(/Processes.*0\/6/);
+	await expect(/Agents.*6 done/);
+}
 try {
 	writeFileSync(join(box.cwd, "sample.ts"), Array.from({ length: 36 }, (_, i) => `export const line${i + 1} = ${i + 1};`).join("\n"));
 	// The setup the README documents: Ctrl+J belongs to the Agents frame, the newline keeps Shift+Enter.
 	writeFileSync(join(box.agentDir, "keybindings.json"), JSON.stringify({ "tui.input.newLine": ["shift+enter"] }));
+	const modelPath = join(box.agentDir, "models.json");
+	const modelConfig = JSON.parse(readFileSync(modelPath, "utf8"));
+	const fixtureModels = modelConfig.providers.fixture.models;
+	fixtureModels.push(...["agent-1.2-mini", "agent-1.3-mini"].map(id => ({ ...fixtureModels[0], id, name: id })));
+	writeFileSync(modelPath, JSON.stringify(modelConfig));
 	for (const mode of ["regular", "fullscreen"]) {
 		const release = join(box.root, `${mode}.release`);
 		const finalGate = deferred();
@@ -57,6 +121,12 @@ try {
 		// one evening while this suite kept passing; never again.
 		assert.doesNotMatch(capture(), /\[Extension issues\]/);
 		assert.doesNotMatch(capture(), /shortcut conflict/);
+		if (focusedSmoke) {
+			if (focusedSmoke === "model-review") await checkModelReview(mode);
+			else if (focusedSmoke === "active-first") await checkActiveFirst(mode);
+			else throw new Error(`Unknown focused smoke: ${focusedSmoke}`);
+			tmux("kill-session", "-t", "pi"); continue;
+		}
 		await command("/fixture-process");
 		await expect(/Processes.*1\/1/);
 		await expect(/Process terminal walk.*running/);
@@ -231,6 +301,7 @@ try {
 		await expect(/roles\/scout\.md/);
 		assert.match(capture(), /Read-only recon of code the parent has not seen/, "the full purpose is what the expand is for");
 		save(`${mode}-control-expanded`); key("C-o");
+		await checkModelReview(mode);
 		// A long text report previews its head — what it leads with — not its tail.
 		api.script("Show all runs", { tool: { name: "delegate_ctl", arguments: { action: "status" } } }, { text: "STATUS-SEEN" });
 		key("C-u"); await command("Show all runs");
@@ -268,7 +339,7 @@ try {
 		key("C-c"); await expect(/MULTI-B/, true);
 		tmux("kill-session", "-t", "pi");
 	}
-	const events = readFileSync(join(box.root, "trace.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+	const events = focusedSmoke ? [] : readFileSync(join(box.root, "trace.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
 	for (const launch of events.filter((e) => e.event === "launch")) {
 		const outcomes = events.filter((e) => e.event === "complete" && e.details.id === launch.details.id);
 		assert.deepEqual(outcomes.map((e) => e.details.segment), [1, 2, 3, 4]);
@@ -276,7 +347,8 @@ try {
 		assert.equal(new Set(outcomes.map((e) => e.details.sessionFile)).size, 1);
 	}
 	assert.deepEqual(api.errors, []);
-	if (process.env.DELEGATE_PROCESS_SMOKE_ONLY === "1") console.log(`PASS real Pi regular/fullscreen: process launch, Activity row, detail command/cwd/PID/outputFile/output, Ctrl+X stop with signal/exit facts, compact process count.\nEvidence: ${box.root}`);
+	if (focusedSmoke) console.log(`PASS real Pi regular/fullscreen: ${focusedSmoke}.\nEvidence: ${box.root}`);
+	else if (process.env.DELEGATE_PROCESS_SMOKE_ONLY === "1") console.log(`PASS real Pi regular/fullscreen: process launch, Activity row, detail command/cwd/PID/outputFile/output, Ctrl+X stop with signal/exit facts, compact process count.\nEvidence: ${box.root}`);
 	else console.log(`PASS real Pi regular/fullscreen: all five original/Activity tabs, Settings row saves, standard/Kitty F5, full Activity overview, complete todo states/blockers, scroll/end/resize, live completed-only redraw, preserved draft, Path-only command, Kitty key-release focus, bounded recap input, visible recap, cancellation on return, clean startup, native collapsed/expanded tools, streaming latest, paused scrolling, narrow resize, drafts, same-ID revival, hidden finished frame.\nEvidence: ${box.root}`);
 } catch (error) {
 	try { save("failure"); } catch { /* process may already have exited */ }

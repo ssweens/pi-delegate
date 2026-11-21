@@ -56,7 +56,7 @@ test("Mom's controls are global: they live in one file in the agent dir, not in 
 
 		// One file, three sections, and no write drops another section's data.
 		await rm(file, { force: true });
-		await writeSettings({ defaults: { approved: { scout: { spec: "openai-codex/gpt-5.6-luna", approvedAt: 1 } }, catalogAtApproval: ["openai-codex/gpt-5.6-luna"] } }, file);
+		await writeSettings({ defaults: { approved: { scout: { spec: "openai-codex/gpt-5.6-luna", approvedAt: 1 } } } }, file);
 		await writeSettings({ ratings: { updatedAt: 2, entries: { "x/y": { score: 50, source: "test" } } } }, file);
 		await writeSettings({ mom: { mode: "v2" } }, file);
 		const all = JSON.parse(await readFile(file, "utf8"));

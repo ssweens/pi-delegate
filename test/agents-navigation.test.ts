@@ -104,12 +104,12 @@ test("runs a child started are indented under it, and settled runs stay until th
 		run("done", { task: "Finished scout", settled: true, status: "complete", endedAt: now })];
 	const { tui } = fakeTui({ text: "", cursor: { line: 0, col: 0 } });
 	const panel = new AgentsPanel(source(rows), theme, tui, async () => {});
-	const lines = panel.renderSection(100);
+	const lines = panel.renderSections(100).flat();
 	assert.match(lines[0]!, /Agents · 2 active · 1 done/);
 	assert.match(lines.find((l) => l.includes("Nested scout"))!, /└ /, "a grandchild is drawn under its parent");
 	assert.match(lines.find((l) => l.includes("Finished scout"))!, /complete/);
 	panel.hideSettledBefore(now + 1);
-	const after = panel.renderSection(100);
+	const after = panel.renderSections(100).flat();
 	assert.match(after[0]!, /Agents · 2 active$/);
 	assert(!after.some((l) => l.includes("Finished scout")), "the person moved on: the settled run leaves the list");
 	panel.dispose();

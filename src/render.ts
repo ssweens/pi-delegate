@@ -414,7 +414,13 @@ export interface ModelsDetails {
 	unratedHidden: number;
 	endpointCap?: number;
 	rows: ModelRow[];
-	defaults: { approved: { role: string; spec: string; ageDays: number; reason?: string }[]; drift: string[] };
+	defaults: {
+		approved: { role: string; spec: string; ageDays: number; reason?: string }[];
+		drift: string[];
+		upgrades?: string[];
+		notices?: string[];
+		newModelIds?: Record<string, string[]>;
+	};
 	ratings: string;
 	openrouter: { summary: string; error: boolean };
 	liveOnly: { count: number; rows: { id: string; price: string; aa?: AAIndices }[] };
@@ -435,6 +441,8 @@ const isModelsDetails = (d: any): d is ModelsDetails => d?.kind === "models"
 	&& typeof d.filter === "string" && typeof d.total === "number" && typeof d.matched === "number" && typeof d.unratedHidden === "number"
 	&& Array.isArray(d.providers) && d.providers.every((p: any) => Array.isArray(p) && typeof p[0] === "string" && typeof p[1] === "number")
 	&& Array.isArray(d.defaults?.approved) && isStrings(d.defaults.drift)
+	&& (d.defaults.upgrades === undefined || isStrings(d.defaults.upgrades))
+	&& (d.defaults.notices === undefined || isStrings(d.defaults.notices))
 	&& d.defaults.approved.every((a: any) => typeof a?.role === "string" && typeof a?.spec === "string" && typeof a?.ageDays === "number")
 	&& typeof d.ratings === "string" && typeof d.openrouter?.summary === "string"
 	&& typeof d.liveOnly?.count === "number" && Array.isArray(d.liveOnly.rows)
@@ -526,19 +534,25 @@ function modelTable(rows: ModelRow[], expanded: boolean, theme: Theme, width: nu
 function modelsView(title: string, subject: string, d: ModelsDetails, expanded: boolean, theme: Theme, width: number): string[] {
 	const dim = (s: string) => theme.fg("dim", s);
 	const sep = dim(" \u00b7 ");
-	const { approved, drift } = d.defaults;
+	const { approved, drift, upgrades, notices } = d.defaults;
 	const shown = expanded ? d.rows : d.rows.slice(0, MODEL_PREVIEW_ROWS);
 	const out = [fit(theme.fg("toolTitle", theme.bold(title)) + ` ${theme.fg("accent", "models")}` + (subject ? theme.fg("muted", ` ${subject}`) : "")
 		+ theme.fg("muted", `  ${d.matched}${d.filter ? "" : " rated"} of ${d.total} offerings`), width)];
-	// Collapsed, one line says what the defaults are and whether anything needs attention; the
-	// expand spells each of those out below the table instead.
-	if (!expanded) out.push(fit("  " + dim("defaults ")
-		+ (approved.length ? approved.map((a) => theme.fg("text", a.role) + dim(" \u2192 ") + theme.fg("muted", a.spec)).join(sep) : dim("none approved"))
-		+ (drift.length ? sep + theme.fg("warning", `${drift.length} change${drift.length === 1 ? "" : "s"} since approval`) : "")
-		+ (d.openrouter.error ? sep + theme.fg("warning", `OpenRouter ${d.openrouter.summary}`) : ""), width));
-	if (shown.length) out.push(...modelTable(shown, expanded, theme, width));
-	else out.push("  " + theme.fg("muted", d.filter ? `no registry offering matches "${d.filter}"` : "no rated offerings yet"));
+	const findings = [
+		drift.length ? theme.fg("warning", notices ? `${drift.length} blocking issue${drift.length === 1 ? "" : "s"}` : `${drift.length} change${drift.length === 1 ? "" : "s"} since approval`) : "",
+		upgrades?.length ? theme.fg("accent", `${upgrades.length} upgrade option${upgrades.length === 1 ? "" : "s"}`) : "",
+		notices?.length ? dim(`${notices.length} notice${notices.length === 1 ? "" : "s"}`) : "",
+		d.openrouter.error ? theme.fg("warning", `OpenRouter ${d.openrouter.summary}`) : "",
+	].filter(Boolean);
+	const showTable = () => {
+		if (shown.length) out.push(...modelTable(shown, expanded, theme, width));
+		else out.push("  " + theme.fg("muted", d.filter ? `no registry offering matches "${d.filter}"` : "no rated offerings yet"));
+	};
 	if (!expanded) {
+		if (findings.length) out.push(fit(`  ${findings.join(sep)}`, width));
+		out.push(fit("  " + dim("defaults ")
+			+ (approved.length ? approved.map((a) => theme.fg("text", a.role) + dim(" → ") + theme.fg("muted", a.spec)).join(sep) : dim("none approved")), width));
+		showTable();
 		const hidden = d.matched - shown.length;
 		const withheld = [
 			hidden > 0 ? `\u2026 ${hidden} more` : "",
@@ -552,14 +566,17 @@ function modelsView(title: string, subject: string, d: ModelsDetails, expanded: 
 		const lines = typeof value === "string" ? wrapTextWithAnsi(value, valueWidth) : value;
 		lines.forEach((l, i) => out.push((i ? " ".repeat(FIELD_LABEL + 2) : `  ${dim(label.padEnd(FIELD_LABEL))}`) + l));
 	};
-	if (d.matched > d.rows.length) out.push("  " + dim(`\u2026 ${d.matched - d.rows.length} more beyond the first ${d.rows.length}; a filter narrows them`));
-	out.push("");
 	if (!approved.length) field("defaults", dim("none approved"));
 	for (const a of approved) {
 		field(a === approved[0] ? "defaults" : "", theme.fg("text", a.role) + dim(" \u2192 ") + theme.fg("muted", a.spec) + dim(` \u00b7 approved ${a.ageDays}d ago`));
 		if (a.reason) field("", dim(a.reason));
 	}
-	drift.forEach((x, i) => field(i ? "" : "drift", theme.fg("warning", x)));
+	drift.forEach((x, i) => field(i ? "" : notices ? "blocked" : "drift", theme.fg("warning", x)));
+	upgrades?.forEach((x, i) => field(i ? "" : "upgrades", theme.fg("accent", x)));
+	notices?.forEach((x, i) => field(i ? "" : "notices", dim(x)));
+	out.push("");
+	showTable();
+	if (d.matched > d.rows.length) out.push("  " + dim(`… ${d.matched - d.rows.length} more beyond the first ${d.rows.length}; a filter narrows them`));
 	field("OpenRouter", theme.fg(d.openrouter.error ? "warning" : "muted", d.openrouter.summary)
 		+ (d.endpointCap ? dim(` \u00b7 endpoints for the first ${d.endpointCap} matches only`) : ""));
 	field("ratings", theme.fg("muted", d.ratings));

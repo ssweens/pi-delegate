@@ -42,7 +42,8 @@ test("time formats: one duration form and one age form everywhere", () => {
 
 test("model refs: one parser, one formatter", () => {
 	assert.deepEqual(parseModelSpec("openai/gpt-5:high"), { provider: "openai", id: "gpt-5", thinking: "high" });
-	assert.deepEqual(parseModelSpec("openrouter/qwen/qwen3:free"), { provider: "openrouter", id: "qwen/qwen3", thinking: "free" });
+	assert.deepEqual(parseModelSpec("openrouter/qwen/qwen3:free"), { provider: "openrouter", id: "qwen/qwen3:free" });
+	assert.deepEqual(parseModelSpec("openrouter/qwen/qwen3:free:low"), { provider: "openrouter", id: "qwen/qwen3:free", thinking: "low" });
 	assert.deepEqual(parseModelSpec("ollama/llama3:8b/x"), { provider: "ollama", id: "llama3:8b/x" }, "a colon followed by / is part of the id");
 	assert.deepEqual(parseModelSpec("gpt-5"), { id: "gpt-5" });
 	assert.deepEqual(parseModelSpec("gpt-5:low"), { id: "gpt-5", thinking: "low" });

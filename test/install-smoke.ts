@@ -22,7 +22,7 @@ const required = [
 	"src/mom/index.ts", "src/mom/mom-tools.ts", "src/trail/watcher.ts", "src/trail/record.ts", "src/mom/modes.ts", "src/mom/v2.ts", "src/mom/classify.ts", "src/mom/model-picker.ts", "src/ui/activity.ts", "src/ui/panel.ts", "src/work/projection.ts",
 	"src/acp-backend.ts", "src/acp/runtime/acpx-runtime.ts", "src/acp/domain/types.ts",
 	...runtimeBinaries, runtimeModule,
-	"skills/delegation/SKILL.md", "roles/scout.md", "roles/worker.md", "roles/reviewer.md", "docs/ARCHITECTURE.md",
+	"skills/delegation/SKILL.md", "skills/delegate-model-setup/SKILL.md", "roles/scout.md", "roles/worker.md", "roles/reviewer.md", "docs/ARCHITECTURE.md",
 ];
 const walk = (dir: string): string[] => readdirSync(join(repo, dir), { withFileTypes: true }).flatMap((entry) => entry.isDirectory() ? walk(`${dir}/${entry.name}`) : [`${dir}/${entry.name}`]);
 const inside = (child: string, parent: string) => child === parent || child.startsWith(parent + sep);
@@ -66,7 +66,9 @@ try {
 	assert.equal(tools.filter((name) => name === "todo").length, 1);
 	assert.equal(tools.filter((name) => name === "path").length, 1);
 	const skill = loader.getSkills().skills.find((skill) => skill.name === "delegation"); assert(skill);
-	assert.match(readFileSync(skill.filePath, "utf8"), /Model per role/);
+	assert.match(readFileSync(skill.filePath, "utf8"), /delegate-model-setup/);
+	const modelSkill = loader.getSkills().skills.find((skill) => skill.name === "delegate-model-setup"); assert(modelSkill);
+	assert.match(readFileSync(modelSkill.filePath, "utf8"), /MODEL_REVIEW_REQUIRED/);
 	const definition = result.extensions.flatMap((extension) => [...extension.tools.values()]).find((tool) => tool.definition.name === "delegate");
 	assert(definition); assert.match(definition.definition.description, /delegation skill/);
 	const installed = result.extensions.find((extension) => extension.tools.has("delegate")); assert(installed);

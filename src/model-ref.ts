@@ -20,12 +20,14 @@ export function splitModelRef(ref: string): { provider: string; id: string } | u
 
 /**
  * A model spec as a role or a request writes it: `provider/id`, a bare `id` (any provider's offering), either with
- * a `:thinking` suffix. A trailing `:x` is a thinking level only when no `/` follows it (ids may contain `:`).
+ * a `:thinking` suffix. OpenRouter's `:free` and `:batch` route suffixes are part of its IDs.
  */
 export function parseModelSpec(spec: string): { provider?: string; id: string; thinking?: string } {
 	let rest = spec, thinking: string | undefined;
 	const colon = rest.lastIndexOf(":");
-	if (colon > 0 && !rest.slice(colon + 1).includes("/")) { thinking = rest.slice(colon + 1); rest = rest.slice(0, colon); }
+	const suffix = rest.slice(colon + 1);
+	const routeSuffix = spec.startsWith("openrouter/") && (suffix === "free" || suffix === "batch");
+	if (colon > 0 && !suffix.includes("/") && !routeSuffix) { thinking = suffix; rest = rest.slice(0, colon); }
 	const split = splitModelRef(rest);
 	return { ...(split ?? { id: rest }), ...(thinking !== undefined ? { thinking } : {}) };
 }

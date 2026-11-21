@@ -124,7 +124,8 @@ test("a models report previews offerings as an aligned table, not the model's te
 	const lines = modelLines(models(rows));
 	const flat = lines.join("\n");
 	assert.match(lines[0], /delegate_ctl models "step"\s+8 of 998 offerings/);
-	assert.match(flat, /defaults scout → vendor\/luna · 1 change since approval/);
+	assert.match(flat, /1 change since approval/);
+	assert.match(flat, /defaults scout → vendor\/luna/);
 	assert.doesNotMatch(flat, /DEFAULTS|OPENROUTER|CATALOG/, "the model's text is not the human's view");
 	assert.match(flat, /local-llm\/stepfun-ai\/Step-3\.7-Flash-IQ3_XS\s+262k\s+\$0\/0\s+no reasoning/);
 	assert.match(flat, /openrouter\/stepfun\/step-3\.7-flash\s+262k\s+\$0\.1\/0\.3\s+39\.6\s+current · live \$0\.16\/0\.92\/M/, "exceptions are named on the row");

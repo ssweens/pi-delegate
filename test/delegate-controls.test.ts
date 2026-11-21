@@ -67,6 +67,25 @@ test("delegate settings: limits, mode, model lists and completion delivery (real
 			assert.match(none.content[0].text, /MODEL_UNAVAILABLE: none of the role's models can be used: absent\/one: .*; absent\/two: /);
 		});
 
+		await t.test("an unavailable approved default returns an availability error, not drift", async () => {
+			const path = join(box.agentDir, "pi-delegate.json");
+			writeFileSync(path, JSON.stringify({ defaults: { approved: {
+				scout: { spec: "fixture/missing:off", approvedAt: Date.now() },
+			} } }));
+			const refused = await h.launch("Missing approved offering", { model: undefined });
+			assert.equal(refused.isError, true);
+			assert.match(refused.content[0].text, /MODEL_UNAVAILABLE: .*fixture\/missing.*unavailable/);
+			assert.equal([...h.state().runs.values()].some((r: any) => r.task === "Missing approved offering"), false);
+
+			const approved = await h.ctl("approve", undefined, { role: "scout", model: "fixture/fixture:off", message: "Verified fixture" });
+			assert.match(approved.content[0].text, /saved as default/);
+			api.script("Approved offering works", { text: "APPROVED" });
+			const launched = await h.waitLaunch("Approved offering works", { model: undefined });
+			assert.equal(launched.details.status, "complete", launched.content[0].text);
+			assert.equal(launched.details.model, "fixture/fixture");
+			settings({});
+		});
+
 		await t.test("mode off parks the delegation tools; orchestrator describes itself and refuses the parent's own writes", async () => {
 			settings({ mode: "off" });
 			const off = await h.launch("Refused while off");

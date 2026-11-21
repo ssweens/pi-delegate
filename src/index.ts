@@ -18,12 +18,13 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { modelKey, parseModelSpec, matchesSpec } from "./model-ref.ts";
+import { modelTerms, perM, ratesText, reviewCatalog, reviewDefault } from "./model-review.ts";
 import { childInstructionExtension, instructionFiles, startupInstructions } from "./instructions.ts";
 import { allModels, availableModels, findModel, scopedModels } from "./registry.ts";
 import { clipText, errorMessage, textOf } from "./util/text.ts";
 import { ageDays, formatDuration } from "./util/format.ts";
 import { tildify } from "./util/path.ts";
-import { readLegacySection, readSettings, writeSettings } from "./settings-file.ts";
+import { type ApprovedDefault, readLegacySection, readSettings, writeSettings } from "./settings-file.ts";
 import type { LiveSource } from "./inspector.js";
 import { budgetText, clock, firstDeliverableAt, runHealth } from "./health.js";
 import { type AAIndices, acpRowView, asRunView, boardLine, empty, framed, type LiveFacts, type ModelRow, type ModelsDetails, onBoard, resultLines, resultView, type RunView } from "./render.js";
@@ -56,7 +57,6 @@ import {
 
 export { AGENT_DIR };
 export { CHILD_SETTLED_PROMPT, DELEGATE_MILESTONE_EVENT, type DelegateMilestone, FORK_BRIDGE, TRUST_UNKNOWN } from "./pi-backend.ts";
-const STALE_DAYS = 30;
 const RATINGS_STALE_DAYS = 14;
 const OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models";
 const OPENROUTER_TTL_MS = 10 * 60 * 1000;
@@ -275,26 +275,12 @@ function trimDangling(messages: any[]): any[] {
 	return out;
 }
 
-interface ApprovedModel {
-	spec: string; // provider/id:thinking
-	reason?: string;
-	approvedAt: number;
-	cost?: { input: number; output: number };
-}
-interface Defaults {
-	approved: Record<string, ApprovedModel>;
-	catalogAtApproval: string[];
-}
-
-function loadDefaults(): Defaults {
-	// The `defaults` section of the settings file, or the file this used to live in.
-	const d = readSettings(SETTINGS_PATH).defaults ?? readLegacySection("defaults", AGENT_DIR);
-	return { approved: d?.approved ?? {}, catalogAtApproval: d?.catalogAtApproval ?? [] };
-}
-
-/** Written by delegate_ctl approve after the user agreed in conversation, or by the user's editor. Snapshot is the full catalog. */
-async function saveDefault(role: string, entry: ApprovedModel, available: any[]) {
-	await writeSettings({ defaults: { approved: { [role]: entry }, catalogAtApproval: available.map(modelKey).sort() } }, SETTINGS_PATH);
+function loadDefaults(): Record<string, ApprovedDefault> {
+	const defaults = readSettings(SETTINGS_PATH).defaults ?? readLegacySection("defaults", AGENT_DIR);
+	const approved = defaults?.approved ?? {};
+	const legacy = defaults?.catalogAtApproval;
+	if (!legacy?.length) return approved;
+	return Object.fromEntries(Object.entries(approved).map(([role, entry]) => [role, entry.catalogAtApproval ? entry : { ...entry, catalogAtApproval: legacy }]));
 }
 
 interface Rating {
@@ -325,6 +311,7 @@ interface LiveOR {
 	error?: string;
 }
 let liveOR: LiveOR | undefined;
+let pendingOR: Promise<LiveOR> | undefined;
 
 /**
  * One OpenRouter read. The request itself is aborted at the timeout (a race that only stops waiting, as withTimeout
@@ -337,21 +324,25 @@ async function openRouterJson(url: string): Promise<any> {
 }
 
 async function fetchOpenRouter(force = false): Promise<LiveOR> {
-	if (!force && liveOR && !liveOR.error && Date.now() - liveOR.at < OPENROUTER_TTL_MS) return liveOR;
-	try {
-		const data = (await openRouterJson(OPENROUTER_MODELS_URL))?.data;
-		if (!Array.isArray(data)) throw new Error("unexpected payload");
-		liveOR = { at: Date.now(), byId: new Map(data.map((m: any) => [m.id, m])) };
-	} catch (e: any) {
-		liveOR = { at: Date.now(), byId: liveOR?.byId ?? new Map(), error: errorMessage(e) };
-	}
-	return liveOR;
+	if (pendingOR) return pendingOR;
+	if (!force && liveOR && Date.now() - liveOR.at < (liveOR.error ? 60_000 : OPENROUTER_TTL_MS)) return liveOR;
+	pendingOR = (async () => {
+		try {
+			const data = (await openRouterJson(OPENROUTER_MODELS_URL))?.data;
+			if (!Array.isArray(data)) throw new Error("unexpected payload");
+			liveOR = { at: Date.now(), byId: new Map(data.map((m: any) => [m.id, m])) };
+		} catch (e: any) {
+			liveOR = { at: Date.now(), byId: liveOR?.byId ?? new Map(), error: errorMessage(e) };
+		}
+		return liveOR;
+	})().finally(() => { pendingOR = undefined; });
+	return pendingOR;
 }
 
-function perM(v: unknown): number | undefined {
-	if (v === undefined || v === null || v === "") return undefined;
-	const n = Number(v);
-	return Number.isFinite(n) ? Math.round(n * 1e6 * 1e4) / 1e4 : undefined;
+/** An implicit launch or approval does not start a network lookup in offline Pi. */
+function liveDefaultTerms(): LiveOR | Promise<LiveOR> | undefined {
+	if (process.env.PI_OFFLINE !== "1") return fetchOpenRouter();
+	return liveOR && Date.now() - liveOR.at < OPENROUTER_TTL_MS ? liveOR : undefined;
 }
 
 function livePriceStr(l: any): string {
@@ -564,47 +555,33 @@ function costStr(m: any): string {
 	return m?.cost ? `$${m.cost.input ?? 0}/${m.cost.output ?? 0}/M` : "$?";
 }
 
-/** Approved defaults + drift against the live catalog. */
-function defaultsFacts(ctx: ExtensionContext): ModelsDetails["defaults"] {
-	const d = loadDefaults();
-	const avail = availableModels(ctx);
-	const byKey = new Map(avail.map((m) => [modelKey(m), m]));
+function defaultsFacts(available: ReturnType<typeof availableModels>, live: LiveOR, ratings: Ratings): ModelsDetails["defaults"] {
+	const now = Date.now();
 	const approved: ModelsDetails["defaults"]["approved"] = [];
-	const drift: string[] = [];
-	for (const [role, a] of Object.entries(d.approved)) {
-		const { provider, id } = parseModelSpec(a.spec);
-		const base = provider ? modelKey({ provider, id }) : id;
-		const m = byKey.get(base);
-		approved.push({ role, spec: a.spec, ageDays: ageDays(a.approvedAt), reason: a.reason });
-		if (!m) drift.push(`${role}: ${base} is no longer available`);
-		else if (a.cost && m.cost && (a.cost.input !== m.cost.input || a.cost.output !== m.cost.output))
-			drift.push(`${role}: price changed $${a.cost.input}/${a.cost.output} \u2192 $${m.cost.input}/${m.cost.output}/M`);
-		if (m && m.provider === "openrouter" && liveOR && !liveOR.error) {
-			const l = liveOR.byId.get(m.id);
-			if (!l) drift.push(`${role}: ${base} not listed on OpenRouter right now`);
-			else {
-				const lp = perM(l.pricing?.prompt);
-				const lc = perM(l.pricing?.completion);
-				if (lp !== undefined && lc !== undefined && a.cost && (lp !== a.cost.input || lc !== a.cost.output))
-					drift.push(`${role}: OpenRouter live price $${lp}/${lc}/M vs approved $${a.cost.input}/${a.cost.output}/M`);
-				if (l.expiration_date) drift.push(`${role}: OpenRouter lists expiration ${l.expiration_date}`);
-			}
-		}
-		if (ageDays(a.approvedAt) > STALE_DAYS) drift.push(`${role}: approval is ${ageDays(a.approvedAt)}d old \u2014 re-verify`);
+	const drift: string[] = [], upgrades: string[] = [], notices: string[] = [];
+	const newModelIds = Object.create(null) as Record<string, string[]>;
+	for (const [role, entry] of Object.entries(loadDefaults()).sort(([a], [b]) => a.localeCompare(b))) {
+		const { spec, ageDays, reason, available: currentAvailable, cost, blockers, notices: notes, upgrade, added } = reviewDefault(entry, available, live, now);
+		if (added.length) newModelIds[role] = added;
+		approved.push({ role, spec, ageDays, reason });
+		for (const issue of blockers) drift.push(`${role}: ${issue}`);
+		for (const note of notes) notices.push(`${role}: ${note}`);
+		if (!upgrade) continue;
+		const key = modelKey(upgrade.offering);
+		const rated = ratingStr(ratings, key).trim();
+		const aa = upgrade.offering.provider === "openrouter" ? aaStr(aaOf(live.byId.get(upgrade.offering.id))).trim() : "";
+		const options = currentAvailable ? "keep current, try once, or make default" : "try once or make default";
+		upgrades.push(`${role}: ${key} — newer same-family/tier candidate; current ${ratesText(cost)} → candidate ${ratesText(upgrade.cost)}; ${rated || aa || "quality unverified"}. Options: ${options}.`);
 	}
-	if (d.catalogAtApproval.length) {
-		const snap = new Set(d.catalogAtApproval);
-		const added = avail.map(modelKey).filter((k) => !snap.has(k));
-		if (added.length) drift.push(`${added.length} new since approval${added.length <= 8 ? `: ${added.join(", ")}` : " (message=<substring> to list)"}`);
-	}
-	// Without an approval there is nothing to drift from; the report has always said just "none".
-	return { approved, drift: approved.length ? drift : [] };
+	return { approved, drift, upgrades, notices, newModelIds };
 }
 
-function defaultsReport({ approved, drift }: ModelsDetails["defaults"]): string {
+function defaultsReport({ approved, drift, upgrades, notices }: ModelsDetails["defaults"]): string {
 	if (!approved.length) return "DEFAULTS: none";
-	let out = `DEFAULTS (approved by user)\n${approved.map((a) => `  ${a.role}: ${a.spec}  approved ${a.ageDays}d ago${a.reason ? ` \u2014 ${a.reason}` : ""}`).join("\n")}`;
-	if (drift.length) out += `\nDRIFT:\n  ${drift.join("\n  ")}`;
+	let out = `DEFAULTS (approved by user)\n${approved.map((a) => `  ${a.role}: ${a.spec}  approved ${a.ageDays}d ago${a.reason ? ` — ${a.reason}` : ""}`).join("\n")}`;
+	if (drift.length) out += `\nDRIFT (automatic launch blocked):\n  ${drift.join("\n  ")}`;
+	if (upgrades?.length) out += `\nUPGRADES (never automatic):\n  ${upgrades.join("\n  ")}`;
+	if (notices?.length) out += `\nNOTICES (non-blocking):\n  ${notices.join("\n  ")}`;
 	return out;
 }
 
@@ -1137,15 +1114,33 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		// model, passed to oven as an override), never from this session's Pi models.
 		const tui = p.tui ?? role.tui;
 		if (tui && p.runtime === "in-process") throw new DelegateError("INPUT_INVALID", `role "${role.name}" runs as a ${tui} tui child in oven; runtime "in-process" does not apply`, "runtime");
-		const approved = tui ? undefined : loadDefaults().approved[role.name];
+		let approved = !tui && !p.model ? loadDefaults()[role.name] : undefined;
+		let live: LiveOR | undefined;
+		if (approved && parseModelSpec(approved.spec).provider === "openrouter") {
+			const lookup = liveDefaultTerms();
+			if (lookup instanceof Promise) {
+				live = await lookup;
+				if (signal?.aborted) throw new DelegateError("ABORTED", "the delegate call was aborted before the child started; nothing was started");
+				admit();
+				// An approval may have changed while the catalog was loading.
+				approved = loadDefaults()[role.name];
+			} else live = lookup;
+		}
+		if (approved) {
+			const { blockers, available } = reviewDefault(approved, availableModels(ctx), live, Date.now());
+			if (blockers.length) throw new DelegateError("MODEL_REVIEW_REQUIRED",
+				`${role.name}: ${blockers.join("; ")}. Nothing started. Run delegate_ctl models and review the choice with the user. Do not retry with an override without their approval.`, "model");
+			if (!available) throw new DelegateError("MODEL_UNAVAILABLE", `${role.name}: ${approved.spec} unavailable (not in the catalog or no credentials)`, "model");
+		}
 		let resolved: { model: any; thinking?: string; pick?: string } = { model: undefined };
 		if (!tui) {
-			try { resolved = p.model ?? approved?.spec ? resolveModel(p.model ?? approved!.spec, ctx) : resolveRoleModels(role.models, ctx); }
+			const spec = p.model ?? approved?.spec;
+			try { resolved = spec ? resolveModel(spec, ctx) : resolveRoleModels(role.models, ctx); }
 			catch (error) { throw new DelegateError("MODEL_UNAVAILABLE", errorMessage(error), "model"); }
 			if (!resolved.model) throw new DelegateError("MODEL_UNAVAILABLE", "no model available for child", "model");
 		}
 		const { model, thinking: specThinking, pick: modelPick } = resolved;
-		const thinking = String(specThinking ?? (p.model ? undefined : approved && parseModelSpec(approved.spec).thinking) ?? role.thinking ?? (tui ? "default" : "medium"));
+		const thinking = String(specThinking ?? role.thinking ?? (tui ? "default" : "medium"));
 		const timeoutMs = p.timeoutMs ?? role.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 		// Validated against the call's own timeoutMs already; the role's or the default budget is known only here.
 		const late = p.firstDeliverableMin !== undefined ? firstDeliverableError(p.firstDeliverableMin, timeoutMs) : undefined;
@@ -1199,7 +1194,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			"Delegate only for context isolation, parallelism, or a model-tier switch — if the brief would be longer than the expected diff, do the work yourself. " +
 			"Start the brief with a short task title on its own line, then objective, ownership, interfaces/constraints, verification, return shape. " +
 			'Fresh children (default unless the role selects fork) get their own system prompt, applicable instruction files and the brief, not your conversation or appended prompt. Explicit context "fork" inherits your conversation, appended prompt and loaded instructions. omitAgentsMd skips startup instruction files only; launch values override role defaults (scout omits), and later reads still discover nested instructions. This option is in-process Pi only; unsupported runtimes reject it. ' +
-			"Runs in the background by default \u2014 the call returns a run id at once and you are woken once, when the child finishes. There are no progress pings by design; waiting is not your work. Do other work, or use delegate_ctl wait with that runId to block without polling when nothing else can proceed, or delegate_ctl status for a single progress read when someone asks. A launch never joins the child; use delegate_ctl wait only when dependent work needs its result. A child re-binds the extensions your session loaded and calls your session's MCP tools, and gets their tools (built-ins, extension tools, mcp__<server>__<tool>, delegate and delegate_ctl), limited to its role's tools list; at the depth limit (" + MAX_DELEGATION_DEPTH + " unless the user changed it) it gets no delegate or delegate_ctl. Model: run delegate_ctl models first; when model: is omitted a role's approved default is used, else the first usable entry of the role's model list. Starts beyond the user's limit on running children fail with CONCURRENCY_LIMIT: wait for one to finish. Proposing a model that is not the approved default is a conversation with the user, not a tool step: state the offering, price, rating and tradeoff, get their answer, then call delegate; if they want it kept, delegate_ctl action=approve. Use delegate_ctl to list roles, wait, check status, steer, or cancel. " +
+			"Runs in the background by default \u2014 the call returns a run id at once and you are woken once, when the child finishes. There are no progress pings by design; waiting is not your work. Do other work, or use delegate_ctl wait with that runId to block without polling when nothing else can proceed, or delegate_ctl status for a single progress read when someone asks. A launch never joins the child; use delegate_ctl wait only when dependent work needs its result. A child re-binds the extensions your session loaded and calls your session's MCP tools, and gets their tools (built-ins, extension tools, mcp__<server>__<tool>, delegate and delegate_ctl), limited to its role's tools list; at the depth limit (" + MAX_DELEGATION_DEPTH + " unless the user changed it) it gets no delegate or delegate_ctl. Model: automatic use of a role's approved default is checked at launch; MODEL_REVIEW_REQUIRED means inspect delegate_ctl models and ask the user before changing or overriding it. If no default is approved, the role's model list or the parent model applies. Starts beyond the user's limit on running children fail with CONCURRENCY_LIMIT: wait for one to finish. Proposing a model that is not the approved default is a conversation with the user, not a tool step: state the offering, price, rating and tradeoff, get their answer, then call delegate; if they want it kept, delegate_ctl action=approve. Use delegate_ctl to list roles, wait, check status, steer, or cancel. " +
 			'backend "acp" runs an external ACP agent session instead (agent required, e.g. "pi", "amp", "codex", "claude"): it creates a session and sends task as its first turn, or with sessionId opens that exact native session (an Amp T-ID, say) without owning it and sends task only when given. ' +
 			"An ACP child never receives your conversation (no context), and an opened session keeps its native role and model. Its report carries the agent's native session ID and each turn's request ID and delivery. Close an ACP run with delegate_ctl close when done. " +
 			'backend "process" runs a shell command without an agent or model: command is required; task is an optional title. Returns immediately with runId, PID when spawned, outputFile. Agent-only fields fail validation. No execution deadline unless timeoutMs is supplied. Status/result read output and exit facts; wait joins without cancelling on timeout/abort; cancel stops the owned tree. Processes survive turns and reload; quit/session replacement stops them. Reopen reads records without replay or PID adoption.',
@@ -1276,7 +1271,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		renderResult: resultRenderer("delegate_ctl"),
 		label: "Delegate control",
 		description:
-			"Before using this tool, read skills/delegation/SKILL.md if you have not read it in this session. models without runId: every offering across all enabled providers, verbatim from the registry (provider/id, reasoning, context, $/M), plus live OpenRouter pricing, tiered rates, expirations and Artificial Analysis indices, your cached ratings, approved defaults and drift \u2014 call before the first delegate of a session. models with an ACP runId list that agent's current model and selectable native/fallback IDs with labels and descriptions. One-run status/result show the same catalog compactly. deals: read-only OpenRouter promotion and price/quality shortlist for frontier and light work; does not choose or approve a model. " +
+			"Before using this tool, read skills/delegation/SKILL.md if you have not read it in this session. models without runId: every offering across all enabled providers, verbatim from the registry (provider/id, reasoning, context, $/M), plus live OpenRouter pricing, tiered rates, expirations and Artificial Analysis indices, your cached ratings, per-role defaults, blocking drift, and optional upgrades. Use for setup or MODEL_REVIEW_REQUIRED; see skills/delegate-model-setup/SKILL.md. models with an ACP runId list that agent's current model and selectable native/fallback IDs with labels and descriptions. One-run status/result show the same catalog compactly. deals: read-only OpenRouter promotion and price/quality shortlist for frontier and light work; does not choose or approve a model. " +
 			"rate: store quality ratings you researched, per exact offering (provider/id), so choices are grounded; stale after 14 days. approve: record a role's default model after the user agreed in conversation. " +
 			"roles: list roles. status: one run or all \u2014 a nonblocking progress read: status, current tool, tool calls so far, elapsed, remaining time budget. result: current report without waiting. wait: join an existing runId; returns its final report, immediately if finished. If queued messages arrive while waiting it returns early with the child still running — answer them, then wait again to rejoin. If the child stops without reporting completion it returns an error report instead of blocking until the run budget. Cancelling wait only detaches; the child keeps running. An attached waiter receives completion instead of a separate wake-up. steer: queue a correction or resume a finished child in the background, keeping its context; returns immediately. A running child reads a plain steer only at its next turn boundary (status shows `steer pending` until it does); with interrupt: true abort is requested immediately and the message becomes its next prompt after the current turn settles, same run and budget — use that when a child is silent, looping or in a long think. Use wait to join the resumed work. Saved children are restored on parent reopen without running; steer revives them with their original configuration unless you pass model:, which moves that child to another offering from the next segment on \u2014 propose it in conversation first, including when the saved offering is exhausted or gone. Explicitly stopped children require restart:true and the user's request. cancel: stop the child and prevent automatic revival. " +
 			"Process runIds support status/result/wait/cancel, with outputFile, bounded output tail, status, exit code and signal. steer/close/models on a process fail ACTION_UNSUPPORTED. No model lookup is needed for commands. " +
@@ -1347,7 +1342,13 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 				const { model, thinking } = resolveModel(p.model, ctx);
 				if (!model) return { content: [{ type: "text", text: `model not found: ${p.model}` }], isError: true, details: undefined };
 				const spec = `${modelKey(model)}${thinking ? `:${thinking}` : ""}`;
-				await saveDefault(p.role, { spec, reason: p.message, approvedAt: Date.now(), cost: model.cost ? { input: model.cost.input, output: model.cost.output } : undefined }, availableModels(ctx));
+				const live = model.provider === "openrouter" ? await liveDefaultTerms() : undefined;
+				if (signal?.aborted) return failed(new DelegateError("ABORTED", "model approval was aborted; nothing was saved"));
+				const available = availableModels(ctx);
+				if (!available.some(m => m.id === model.id && m.provider === model.provider))
+					return failed(new DelegateError("MODEL_UNAVAILABLE", `${spec} unavailable (not in the catalog or no credentials)`, "model"));
+				const entry = { spec, reason: p.message, approvedAt: Date.now(), ...modelTerms(model, live), catalogAtApproval: reviewCatalog(available) };
+				await writeSettings({ defaults: { approved: { [p.role]: entry } } }, SETTINGS_PATH);
 				return { content: [{ type: "text", text: `${p.role} \u2192 ${spec} saved as default (${tildify(SETTINGS_PATH)}). Only call this after the user has agreed in conversation.` }], details: undefined };
 			}
 			if (p.action === "rate") {
@@ -1450,7 +1451,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 					: f
 						? `\n\nno registry offering matches "${p.message}"`
 						: "\n\nno rated offerings; message=<substring> to search, action=rate to add";
-				const defaults = defaultsFacts(ctx);
+				const defaults = defaultsFacts(all, live, ratings);
 				const details: ModelsDetails = {
 					kind: "models", filter: p.message ?? "", total: all.length, providers,
 					matched: offers.length, unratedHidden: f ? 0 : all.length - offers.length, endpointCap, rows,
@@ -1462,7 +1463,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			}
 			if (p.action === "roles") {
 				const roles = sortedRoles(ctx);
-				const approved = loadDefaults().approved;
+				const approved = loadDefaults();
 				// The tools a child started from here would be offered: this session's, or, in a delegating child,
 				// what its own session was offered.
 				const offered = nesting ? [...(nesting.offered ?? [])] : pi.getAllTools().map((tool) => tool.name);
@@ -1616,7 +1617,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 	/** The roles page: what a delegate call without model: would run on now, and where each role comes from. */
 	function roleLines(ctx: ExtensionContext): string[] {
 		const roles = sortedRoles(ctx);
-		const approved = loadDefaults().approved;
+		const approved = loadDefaults();
 		const lines = roles.flatMap((r) => {
 			let now: string;
 			try {

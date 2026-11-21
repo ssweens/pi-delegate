@@ -23,8 +23,19 @@ export interface LiveSource {
 	cancel(id: string): Promise<void>;
 }
 
-export function isCurrentAgent(run: RunView, settledBefore: number): boolean {
-	return !run.settled || (run.endedAt ?? 0) >= settledBefore;
+/** Preserve source order within each group, without moving an active child behind a finished parent. */
+export function currentExecutions(src: LiveSource | undefined, settledBefore: number) {
+	const agents: RunView[] = [], finishedAgents: RunView[] = [];
+	const processes: ProcessRunView[] = [], finishedProcesses: ProcessRunView[] = [];
+	for (const run of src?.all() ?? []) {
+		if (!run.settled) agents.push(run);
+		else if ((run.endedAt ?? 0) >= settledBefore) finishedAgents.push(run);
+	}
+	for (const run of src?.processes?.() ?? []) {
+		if (run.status === "running") processes.push(run);
+		else if ((run.endedAt ?? 0) >= settledBefore) finishedProcesses.push(run);
+	}
+	return { agents, finishedAgents, processes, finishedProcesses };
 }
 
 const TICK_MS = 250;
@@ -81,11 +92,8 @@ export class AgentsPanel implements Component, Focusable {
 	}
 
 	private rows(): (RunView | ProcessRunView)[] {
-		return [...this.src.all().filter(run => isCurrentAgent(run, this.settledBefore)), ...this.processRows()];
-	}
-
-	private processRows(): ProcessRunView[] {
-		return (this.src.processes?.() ?? []).filter(run => run.status === "running" || (run.endedAt ?? 0) >= this.settledBefore);
+		const { agents, finishedAgents, processes, finishedProcesses } = currentExecutions(this.src, this.settledBefore);
+		return [...agents, ...processes, ...finishedAgents, ...finishedProcesses];
 	}
 
 	/** Settled runs that ended before this time are no longer listed: the person has moved on. */
@@ -97,7 +105,9 @@ export class AgentsPanel implements Component, Focusable {
 	focus() {
 		if (this.opening || this.tui.hasOverlay()) return;
 		if (this.focused) { this.release(); return; }
-		if (!this.rows().length) return;
+		const rows = this.rows();
+		if (!rows.length) return;
+		if (!rows.some(r => r.id === this.selectedId)) this.selectedId = rows[0].id;
 		// Both Pi renderers expose this public TuiBase method; the TUI interface omits it.
 		this.previousFocus = (this.tui as TUI & { getFocusedComponent(): Component | null }).getFocusedComponent();
 		this.tui.setFocus(this.focusTarget ?? this);
@@ -111,10 +121,11 @@ export class AgentsPanel implements Component, Focusable {
 	}
 
 	private update() {
-		const active = this.src.all().some((v) => !v.settled) || this.processRows().some(v => v.status === "running");
+		const rows = this.rows();
+		const active = rows.some(v => v.backend === "process" ? v.status === "running" : !v.settled);
 		if (active && !this.timer) this.timer = setInterval(() => this.tui.requestRender(), TICK_MS);
 		if (!active && this.timer) { clearInterval(this.timer); this.timer = undefined; }
-		if (!this.rows().length && this.focused && !this.opening) this.release();
+		if (!rows.length && this.focused && !this.opening) this.release();
 		this.tui.requestRender();
 	}
 
@@ -147,13 +158,11 @@ export class AgentsPanel implements Component, Focusable {
 		this.tui.requestRender();
 	}
 
-	private section(width: number, compact = false): { header: string; body: string[]; hint: string } | undefined {
-		const rows = this.src.all().filter(run => isCurrentAgent(run, this.settledBefore));
+	private section(rows: readonly RunView[], width: number, compact = false) {
 		if (!rows.length) return undefined;
-		const index = Math.max(0, rows.findIndex((r) => r.id === this.selectedId));
-		this.selectedId ??= rows[index].id;
-		const count = Math.min(LIST_ROWS, Math.max(1, this.tui.terminal.rows - 10 - (this.focused ? 1 : 0)), rows.length);
-		this.offset = keepInView(this.offset, index, count, rows.length);
+		const index = this.focused ? rows.findIndex(r => r.id === this.selectedId) : -1;
+		const count = Math.min(LIST_ROWS, Math.max(1, this.tui.terminal.rows - 10 - (index >= 0 ? 1 : 0)), rows.length);
+		this.offset = index < 0 ? 0 : keepInView(this.offset, index, count, rows.length);
 		const inner = Math.max(1, width - 4);
 		const roleWidth = 8;
 		const titleWidth = Math.min(30, Math.max(16, Math.floor(inner * 0.28)));
@@ -161,9 +170,10 @@ export class AgentsPanel implements Component, Focusable {
 		// Launch-time model identity yields to progress at ordinary terminal widths.
 		const modelWidth = width >= 160 && shown.some((v) => v.model) ? 24 : 0;
 		const now = Date.now();
-		const body = shown.flatMap((v) => {
+		const activeBody: string[] = [], finishedBody: string[] = [];
+		const renderRow = (v: RunView) => {
 			const selected = this.focused && v.id === this.selectedId;
-			// A run started by a delegating child sits under it: one step in per level below the root's children.
+			// Indent by depth even when the parent has already moved to the finished group.
 			const level = Math.max(0, Math.min(4, (v.depth ?? 1) - 1));
 			const branch = level ? this.theme.fg("dim", `${indent(level - 1)}└ `) : "";
 			const prefix = `${selected ? this.theme.fg("accent", "›") : " "} ${branch}${icon(v, this.theme)} `;
@@ -176,7 +186,8 @@ export class AgentsPanel implements Component, Focusable {
 			const activity = agentProgress(v, this.theme, activityWidth, now);
 			const role = progressText(v.work?.role ?? v.role);
 			return [prefix + fitPad(title, titleWidth) + " " + fitPad(this.theme.fg("muted", role), roleWidth) + " " + model + fitPad(activity, activityWidth) + " " + this.theme.fg("dim", time), ...detail];
-		});
+		};
+		for (const run of shown) (run.settled ? finishedBody : activeBody).push(...renderRow(run).map(line => fit(line, inner)));
 		const range = rows.length > count ? ` · ${this.offset + 1}–${this.offset + count}/${rows.length}` : "";
 		// A queued prompt in the parent editor is otherwise unexplained: say when its turn is blocked here.
 		const joined = rows.some((v) => v.joinedWaiters);
@@ -184,40 +195,46 @@ export class AgentsPanel implements Component, Focusable {
 		const counts = [active ? `${active} active` : "", done ? `${done} done` : ""].filter(Boolean).join(" · ");
 		const header = this.theme.bold(this.theme.fg("accent", "Agents")) + this.theme.fg("muted", ` · ${counts}${range}`)
 			+ (joined ? this.theme.fg("warning", " · parent blocked in wait") : "");
-		// Compact is one line shared with the other sections: just the title and active/total.
-		if (compact) return { header: this.theme.bold(this.theme.fg("accent", "Agents")) + this.theme.fg("muted", ` · ${active}/${rows.length}`), body: [], hint: this.focused ? agentListHint() : joinHints(hint.left("agents"), "/agents history") };
-		return { header, body: body.map((l) => fit(l, inner)), hint: this.focused ? agentListHint() : joinHints(hint.left("agents"), "/agents history") };
+		const compactHeader = this.theme.bold(this.theme.fg("accent", "Agents")) + this.theme.fg("muted", ` · ${active}/${rows.length}`);
+		return { header: compact ? compactHeader : header, activeBody, finishedBody, active };
 	}
 
-	renderSection(width: number, compact = false): string[] {
-		const rows = this.rows();
-		if (!rows.some(v => v.id === this.selectedId)) this.selectedId = rows[0]?.id;
-		const section = this.section(width, compact);
-		return section ? [section.header, ...section.body] : [];
-	}
-
-	renderProcessSection(width: number, compact = false): string[] {
-		const rows = this.processRows();
-		const commands: string[] = [];
-		if (rows.length) {
-			const active = rows.filter(v => v.status === "running").length;
-			commands.push(this.theme.bold(this.theme.fg("accent", "Processes")) + this.theme.fg("muted", ` · ${active}/${rows.length}`));
-			if (!compact) {
-				const index = Math.max(0, rows.findIndex(v => v.id === this.selectedId));
-				const offset = Math.max(0, index - LIST_ROWS + 1);
-				commands.push(...rows.slice(offset, offset + LIST_ROWS).map(v => `${this.focused && v.id === this.selectedId ? this.theme.fg("accent", "›") : " "} ${processLine(v, this.theme, Math.max(1, width - 6))}`));
-			}
+	private processSection(rows: readonly ProcessRunView[], width: number, compact: boolean) {
+		if (!rows.length) return undefined;
+		const active = rows.filter(v => v.status === "running").length;
+		const header = this.theme.bold(this.theme.fg("accent", "Processes")) + this.theme.fg("muted", ` · ${active}/${rows.length}`);
+		const index = this.focused ? rows.findIndex(v => v.id === this.selectedId) : -1;
+		const offset = Math.max(0, index - LIST_ROWS + 1);
+		const activeBody: string[] = [], finishedBody: string[] = [];
+		if (!compact) for (const v of rows.slice(offset, offset + LIST_ROWS)) {
+			(v.status === "running" ? activeBody : finishedBody).push(`${this.focused && v.id === this.selectedId ? this.theme.fg("accent", "›") : " "} ${processLine(v, this.theme, Math.max(1, width - 6))}`);
 		}
-		return commands;
+		return { header, active, activeBody, finishedBody };
+	}
+
+	renderSections(width: number, compact = false): string[][] {
+		const { agents, finishedAgents, processes, finishedProcesses } = currentExecutions(this.src, this.settledBefore);
+		const running: string[][] = [], done: string[][] = [];
+		const include = (section: ReturnType<AgentsPanel["section"]>, finishedLabel: string) => {
+			if (!section) return;
+			const { header, active, activeBody, finishedBody } = section;
+			if (compact) { (active ? running : done).push([header]); return; }
+			if (activeBody.length) running.push([header, ...activeBody]);
+			if (finishedBody.length) done.push([activeBody.length ? this.theme.fg("muted", finishedLabel) : header, ...finishedBody]);
+		};
+		include(this.section([...agents, ...finishedAgents], width, compact), "Finished agents");
+		include(this.processSection([...processes, ...finishedProcesses], width, compact), "Finished processes");
+		return [...running, ...done];
 	}
 
 	render(width: number): string[] {
-		const section = this.section(width);
+		const { agents, finishedAgents } = currentExecutions(this.src, this.settledBefore);
+		const section = this.section([...agents, ...finishedAgents], width);
 		if (!section) return [];
 		const border = this.focused ? "borderAccent" : "borderMuted";
-		return withLegend(frame(section.header, section.body, border, this.theme, width), section.hint, border, this.theme, width);
+		const help = this.focused ? agentListHint() : joinHints(hint.left("agents"), "/agents history");
+		return withLegend(frame(section.header, [...section.activeBody, ...section.finishedBody], border, this.theme, width), help, border, this.theme, width);
 	}
-
 	invalidate() {}
 	dispose() {
 		if (this.focused) this.release();

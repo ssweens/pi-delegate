@@ -41,7 +41,7 @@ test("overview uses the widget's prompt cutoff without its four-row cap", (t) =>
 	const runs = [
 		{ id: "old", task: "OLD-SETTLED", status: "complete", settled: true, endedAt: 150 },
 		{ id: "boundary", task: "BOUNDARY-SETTLED", status: "complete", settled: true, endedAt: 200 },
-		...Array.from({ length: 7 }, (_, i) => ({ id: String(i), task: `CURRENT-${i}`, status: "running", settled: false })),
+		...Array.from({ length: 7 }, (_, i) => ({ id: String(i), task: `CURRENT-${i}`, status: "running", settled: false, output: "" })),
 	];
 	owner.install({ mode: "print" } as any, { all: () => runs } as any, async () => {});
 	assert.match(owner.renderOverview(styler, 80).join("\n"), /OLD-SETTLED/);

@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, type Focusable, type TUI, type TuiMouseEvent, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
-import { AgentsPanel, isCurrentAgent, type LiveSource } from "../inspector.js";
+import { AgentsPanel, currentExecutions, type LiveSource } from "../inspector.js";
 import { agentProgress, frame, runTitle, statusMark, withLegend, processLine } from "../render.js";
 import { renderTodoOverviewLines, renderTodoSectionLines } from "../todo-render.js";
 import type { TodoState } from "../todo.js";
@@ -298,21 +298,23 @@ export class ActivityCoordinator {
 	renderOverview(theme: Theme, width: number): string[] {
 		const inner = Math.max(1, Math.floor(width) - 4);
 		const heading = (text: string) => theme.bold(theme.fg("accent", text));
-		const runs = this.live?.all().filter(run => isCurrentAgent(run, this.settledBefore)) ?? [];
-		const commands = (this.live?.processes?.() ?? []).filter(v => v.status === "running" || (v.endedAt ?? 0) >= this.settledBefore);
+		const { agents, finishedAgents, processes, finishedProcesses } = currentExecutions(this.live, this.settledBefore);
+		const agentSection = (label: string, runs: typeof agents) => {
+			const lines = [heading(label)];
+			for (const run of runs) {
+				const { color, glyph } = statusMark(run);
+				const indent = "  ".repeat(Math.max(0, (run.depth ?? 1) - 1));
+				lines.push(...wrapTextWithAnsi(`${indent}${theme.fg(color, glyph)} ${runTitle(run)} · ${run.work?.role ?? run.role} · ${run.status} · depth ${run.depth ?? 1}`, inner));
+				lines.push(`${indent}  ${agentProgress(run, theme, Math.max(1, inner - indent.length - 2))}`);
+			}
+			if (!runs.length) lines.push(theme.fg("muted", "No current agents."));
+			return lines;
+		};
+		const processSection = (label: string, runs: typeof processes) =>
+			[heading(label), ...(runs.length ? runs.map(run => processLine(run, theme, inner)) : [theme.fg("muted", "No current processes.")])];
 		const sections: Record<Exclude<ActivityView, "All">, () => string[]> = {
-			Agents: () => {
-				const lines = [heading("Agents")];
-				for (const run of runs) {
-					const { color, glyph } = statusMark(run);
-					const indent = "  ".repeat(Math.max(0, (run.depth ?? 1) - 1));
-					lines.push(...wrapTextWithAnsi(`${indent}${theme.fg(color, glyph)} ${runTitle(run)} · ${run.work?.role ?? run.role} · ${run.status} · depth ${run.depth ?? 1}`, inner));
-					lines.push(`${indent}  ${agentProgress(run, theme, Math.max(1, inner - indent.length - 2))}`);
-				}
-				if (!runs.length) lines.push(theme.fg("muted", "No current agents."));
-				return lines;
-			},
-			Processes: () => [heading("Processes"), ...(commands.length ? commands.map(v => processLine(v, theme, inner)) : [theme.fg("muted", "No current processes.")])],
+			Agents: () => agentSection("Agents", [...agents, ...finishedAgents]),
+			Processes: () => processSection("Processes", [...processes, ...finishedProcesses]),
 			Todos: () => renderTodoOverviewLines(this.todos, theme, width),
 			Path: () => { const mom = this.mom?.(); return mom ? momSectionLines(mom, theme, width, false) : [heading("Path"), theme.fg("muted", "Path is unavailable.")]; },
 			Schedules: () => this.scheduleLines(theme, inner, this.view === "Schedules"),
@@ -320,11 +322,13 @@ export class ActivityCoordinator {
 		};
 		const tabs = ACTIVITY_VIEWS.map((view, index) => view === this.view
 			? theme.bold(theme.fg("accent", `[${index + 1} ${view}]`)) : theme.fg("muted", ` ${index + 1} ${view} `)).join("");
-		const body = this.view === "All"
-			? (["Agents", "Processes", "Todos", "Path", "Schedules", "Recap"] as const)
-				.filter(view => view !== "Processes" || commands.length)
-				.flatMap((view, index) => [...(index ? [""] : []), ...sections[view]()])
-			: sections[this.view]();
+		const body = this.view === "All" ? [
+			...(agents.length ? [agentSection("Agents", agents)] : []),
+			...(processes.length ? [processSection("Processes", processes)] : []),
+			...(finishedAgents.length || !agents.length ? [agentSection(agents.length ? "Finished agents" : "Agents", finishedAgents)] : []),
+			...(finishedProcesses.length ? [processSection(processes.length ? "Finished processes" : "Processes", finishedProcesses)] : []),
+			...(["Todos", "Path", "Schedules", "Recap"] as const).map(view => sections[view]()),
+		].flatMap((lines, index) => index ? ["", ...lines] : lines) : sections[this.view]();
 		return [...wrapTextWithAnsi(tabs, inner), "", ...body];
 	}
 
@@ -367,7 +371,7 @@ export class ActivityCoordinator {
 		const inner = Math.max(1, outer - 4);
 		const sections: string[][] = [];
 		const mom = this.mom?.();
-		if (this.panel) sections.push(this.panel.renderSection(inner + 4, this.compact), this.panel.renderProcessSection(inner + 4, this.compact));
+		if (this.panel) sections.push(...this.panel.renderSections(inner + 4, this.compact));
 		if (this.todos) sections.push(renderTodoSectionLines(this.todos, theme, inner + 4, this.compact));
 		this.spin(Boolean(mom?.trail && spinning(mom.status)));
 		if (mom) sections.push(momSectionLines(mom, theme, inner + 4, this.compact));

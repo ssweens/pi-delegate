@@ -93,6 +93,7 @@ text literally; tmux needs `-l` for literal input.
 - **Full TUI proof.** Run `npm run smoke:tui` from the repo root. It drives regular and fullscreen
   modes through spawn, live output, scrolling, resize, drafts, join, `delegate_ctl`, resume,
   restart, and reload, and prints `PASS ... Evidence: <root>` naming the evidence directory.
+- **Focused TUI proof.** `DELEGATE_FOCUSED_SMOKE=model-review npm run smoke:tui` checks the collapsed and expanded model review report. `DELEGATE_FOCUSED_SMOKE=active-first npm run smoke:tui` checks that active agents and processes stay above finished rows, including after scrolling the focused list and returning to the editor. Both run in regular and fullscreen mode.
 - **Single feature.** Follow the matching file under `features/`. The shared tmux vocabulary,
   copied from `test/terminal-smoke.ts`, is: `tmux -L "$SOCKET" capture-pane -p -t pi` to read the
   screen, `tmux -L "$SOCKET" send-keys -t pi -l <text>` for literal input,

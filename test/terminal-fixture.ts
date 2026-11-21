@@ -11,6 +11,10 @@ import { glance } from "../src/trail/projection.ts";
 /** Commands only control the fixture. All rendering and child work are the actual extension. */
 export default function (pi: any) {
 	const root = process.env.DELEGATE_SMOKE_ROOT!;
+	// The user-facing models tool still executes and renders normally; only the public catalog is scripted.
+	const fetch = globalThis.fetch;
+	globalThis.fetch = (input, init) => String(input) === "https://openrouter.ai/api/v1/models"
+		? Promise.resolve(Response.json({ data: [] })) : fetch(input, init);
 	const trace = (event: any) => appendFileSync(join(root, "trace.jsonl"), JSON.stringify(event) + "\n");
 	const { pi: captured, tools } = capturePi(pi, (target) => ({
 		sendMessage: (message: any, options: any) => {
