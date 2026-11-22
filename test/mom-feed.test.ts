@@ -8,6 +8,7 @@ const manager = {
 	getSessionId: () => "lead-session",
 	getSessionFile: () => "/tmp/lead-session.jsonl",
 	getCwd: () => process.cwd(),
+	getSessionDir: () => process.cwd(),
 	getLeafId: () => "todo-lead",
 	getEntry: (id: string) => id === leadTodo.id ? leadTodo : undefined,
 	getBranch: () => [leadTodo],
@@ -57,7 +58,7 @@ test("a 30k plain user message is clipped explicitly", () => {
 test("capture advances past an oversized user entry", async () => {
 	const entries = [userEntry("a", null, "first"), userEntry("b", "a", `<skill name="k" location="/l">${"z".repeat(25000)}</skill>\nDo it`),
 		userEntry("c", "b", "y".repeat(30000)), userEntry("d", "c", "last")];
-	const mgr = { getSessionId: () => "sess", getSessionFile: () => "/tmp/sess.jsonl", getCwd: () => process.cwd(),
+	const mgr = { getSessionId: () => "sess", getSessionFile: () => "/tmp/sess.jsonl", getCwd: () => process.cwd(), getSessionDir: () => process.cwd(),
 		getLeafId: () => "d", getEntry: (id: string) => entries.find(e => e.id === id), getBranch: () => entries };
 	const feed = new LiveFeed(mgr);
 	const batch = await feed.capture();

@@ -27,7 +27,7 @@ const until = async (check: () => boolean) => {
 	}
 };
 const records = () => {
-	const dir = join(box.cwd, ".agents/pi/subsessions");
+	const dir = join(box.root, "parents", "subsessions");
 	try { return readdirSync(dir).filter(f => /^(worker|scout)-.*\.json$/.test(f)).map(f => JSON.parse(readFileSync(join(dir, f), "utf8"))); }
 	catch { return []; }
 };

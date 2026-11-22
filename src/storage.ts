@@ -1,21 +1,55 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import writeFileAtomic from "write-file-atomic";
 import { DelegateError } from "./backend.ts";
 import { ownerAlive, processIdentity } from "./util/process.ts";
 
-export const SUBSESSION_DIR = join(".agents", "pi", "subsessions");
+const SUBSESSION_DIR = "subsessions";
+const STORAGE_MARKER = ".pi-delegate-storage.json";
+export interface SessionStorageInfo { root: string; customSessionDir: boolean }
+export interface SessionDirectoryProvider { getCwd(): string; getSessionDir(): string; usesDefaultSessionDir?(): boolean }
 
-export function storagePath(cwd: string): string {
-	return join(realpathSync(cwd), SUBSESSION_DIR);
+/** Resolve Pi's configured global session root, including custom --session-dir and nested child sessions. */
+export function sessionStorageInfo(cwd: string, sessionDir: string, usesDefaultSessionDir?: boolean): SessionStorageInfo {
+	const dir = realpathSync(sessionDir);
+	const marker = join(dir, STORAGE_MARKER);
+	if (existsSync(marker)) {
+		const saved = readRecord<SessionStorageInfo & { version: number }>(marker);
+		if (!saved || saved.version !== 1 || typeof saved.root !== "string" || typeof saved.customSessionDir !== "boolean")
+			throw new Error(`Invalid pi-delegate session storage marker: ${marker}`);
+		return { root: saved.root, customSessionDir: saved.customSessionDir };
+	}
+	if (usesDefaultSessionDir === true) return { root: dirname(dir), customSessionDir: false };
+	if (usesDefaultSessionDir === false) return { root: dir, customSessionDir: true };
+	const defaultSessionDir = SessionManager.create(cwd).getSessionDir();
+	if (resolve(defaultSessionDir) === dir) return { root: dirname(dir), customSessionDir: false };
+	return { root: dir, customSessionDir: true };
 }
 
-export function storageDir(cwd: string): string {
-	const dir = storagePath(cwd);
-	mkdirSync(dir, { recursive: true });
-	const ignore = join(dir, ".gitignore");
-	if (!existsSync(ignore)) writeFileSync(ignore, "*\n", { mode: 0o600 });
+export function sessionStorageInfoForManager(manager: SessionDirectoryProvider): SessionStorageInfo {
+	return sessionStorageInfo(manager.getCwd(), manager.getSessionDir(), manager.usesDefaultSessionDir?.());
+}
+
+export function storagePath(cwd: string, sessionDir: string, usesDefaultSessionDir?: boolean): string {
+	return join(sessionStorageInfo(cwd, sessionDir, usesDefaultSessionDir).root, SUBSESSION_DIR);
+}
+
+export function storagePathForManager(manager: SessionDirectoryProvider): string {
+	return join(sessionStorageInfoForManager(manager).root, SUBSESSION_DIR);
+}
+
+export function storageDir(cwd: string, sessionDir: string, usesDefaultSessionDir?: boolean): string {
+	const info = sessionStorageInfo(cwd, sessionDir, usesDefaultSessionDir);
+	const dir = join(info.root, SUBSESSION_DIR);
+	mkdirSync(dir, { recursive: true, mode: 0o700 });
+	const marker = join(dir, STORAGE_MARKER);
+	if (!existsSync(marker)) writeRecord(marker, { version: 1, ...info });
 	return dir;
+}
+
+export function storageDirForManager(manager: SessionDirectoryProvider): string {
+	return storageDir(manager.getCwd(), manager.getSessionDir(), manager.usesDefaultSessionDir?.());
 }
 
 /** A missing record is different from a corrupt or unreadable one. Never overwrite the latter. */
@@ -27,7 +61,7 @@ export function readRecord<T>(path: string): T | undefined {
 /** Replace the record atomically (temp file, fsync, rename), private to the user. Synchronous: callers save mid-event. */
 export function writeRecord(path: string, value: unknown): void {
 	const data = `${JSON.stringify(value)}\n`;
-	mkdirSync(dirname(path), { recursive: true });
+	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
 	writeFileAtomic.sync(path, data, { mode: 0o600 });
 }
 
@@ -47,7 +81,7 @@ export function processOwner(): RunOwner {
 	return owner;
 }
 
-/** True when another live process owns the run. Unowned records, our own and dead owners' are not "elsewhere". */
+/** True when another live process owns the run. Unowned records, ours and dead owners' are not "elsewhere". */
 export function ownedElsewhere(record: Partial<RunOwner>): boolean {
 	if (!record.ownerToken || record.ownerToken === processOwner().ownerToken) return false;
 	return ownerAlive({ pid: record.ownerPid, host: record.ownerHost, token: record.ownerToken });
@@ -79,7 +113,7 @@ export interface RunStoreOptions<R extends StoredRun, F extends OwnedRecord> {
 	revive(record: F, path: string): R;
 	/** This process adopted the run (its owner died, or it was ours before a reload): settle what was running when its record was saved. */
 	recover(run: R, savedAt: number): void;
-	/** The record of a run: the run without its in-process fields. */
+	/** The record of the run: the run without its in-process fields. */
 	persisted(run: R): object;
 	/**
 	 * Saving a run another live process owns. "throw" (pi): every write path is ours to guard. "skip" (acp): read-only

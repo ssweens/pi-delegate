@@ -1,14 +1,17 @@
 import { createHash, type Hash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { open, readFile, realpath, stat } from "node:fs/promises";
+import { open, readFile, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { scheduler } from "node:timers/promises";
+import { storagePath } from "../storage.js";
 import { makeRef, parseRef } from "../util/ref.ts";
 import { oneLine, textOf } from "../util/text.ts";
 export interface SessionReader {
 	getSessionId(): string;
 	getSessionFile(): string | undefined;
 	getCwd(): string;
+	getSessionDir?(): string;
+	usesDefaultSessionDir?(): boolean;
 	getLeafId(): string | null;
 	getEntry(id: string): Entry | undefined;
 	getBranch(): (Entry & { id: string })[];
@@ -367,7 +370,7 @@ export class LiveFeed {
 		for (const [id, announcedFile] of this.runs) {
 			try {
 				// Match pi-delegate's canonical storage root without calling its directory-creating helper.
-				owner ??= join(await realpath(this.manager.getCwd()), ".agents/pi/subsessions/owners", `${this.sessionId}.json`);
+				owner ??= join(storagePath(this.manager.getCwd(), this.manager.getSessionDir?.() ?? this.manager.getCwd(), this.manager.usesDefaultSessionDir?.()), "owners", `${this.sessionId}.json`);
 				const pointer = JSON.parse(await readFile(join(owner.slice(0, -5), `${encodeURIComponent(id)}.json`), "utf8"));
 				if (pointer.version !== 1 || typeof pointer.recordPath !== "string") throw new Error("Invalid owner pointer");
 				const run = JSON.parse(await readFile(pointer.recordPath, "utf8"));

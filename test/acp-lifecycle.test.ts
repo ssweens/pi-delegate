@@ -14,6 +14,7 @@ import { hostname } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { deferred, provider, sandbox, harness } from "./fixture.ts";
+import { storagePathForManager } from "../src/storage.js";
 import { acpCoordinator, configureAcpCoordinator, existingAcpCoordinator } from "../src/acp/instance.ts";
 
 const fakeAcpAgent = new URL("./acp/fixtures/fake-acp-agent.ts", import.meta.url).pathname;
@@ -34,7 +35,7 @@ test("acp lifecycle: outcomes, mixed-backend wait, and runs that survive a paren
 	const delegate = (args: Record<string, unknown>) => h.launchReady(args.task as string, { role: undefined, context: undefined, model: undefined, ...args });
 	const codeOf = (result: any) => result.details?.error?.code;
 	const parentId = h.ctx().sessionManager.getSessionId();
-	const recordDir = () => join(realpathSync(box.cwd), ".agents", "pi", "subsessions", "owners", parentId, "acp");
+	const recordDir = () => join(storagePathForManager(h.ctx().sessionManager), "owners", parentId, "acp");
 	const record = (id: string) => join(recordDir(), `${encodeURIComponent(id)}.json`);
 	/** Parent exit, then a new extension instance on the same parent. `between` runs while nothing holds the records. */
 	const reopenParent = async (between: () => void = () => {}) => {

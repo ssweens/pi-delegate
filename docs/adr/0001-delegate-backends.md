@@ -1,6 +1,6 @@
 # ADR 0001: One delegate surface over pi and acp backends
 
-Status: Accepted, 2026-09-30. Todos 039 and 040. Amended 2026-09-30 for parking and revival (043), and 2026-10-01 for one Coordinator per Pi process. Contract: `src/backend.ts`.
+Status: Accepted, 2026-09-30. Todos 039 and 040. Amended 2026-09-30 for parking and revival (043), 2026-10-01 for one Coordinator per Pi process, and 2026-11-22 for global session-root storage. Contract: `src/backend.ts`.
 
 ## Context
 
@@ -31,7 +31,7 @@ No `op_*` tool survives (053).
 
 ## Parking and revival (043)
 
-ACP runs are durable like pi runs. Each run's record (identity, origin, native session, turns with request IDs, delivery, outcome and output) is saved under the parent's `.agents/pi/subsessions/owners/<parent>/acp/` at every lifecycle step.
+ACP runs are durable like pi runs. Each run's record (identity, origin, native session, turns with request IDs, delivery, outcome and output) is saved under `<configured-session-dir>/subsessions/owners/<parent>/acp/` at every lifecycle step. The default configured session directory is `<agentDir>/sessions`; `--session-dir` is honored. Existing project-local `.agents/pi/subsessions/` state is left in place and is not discovered by the new store; inspect or remove it manually.
 
 - On parent exit, a run is parked, not closed. Its session is released the way close releases it: a created session is closed without discarding it, and an opened one is disconnected. No agent process outlives the parent. A turn still running then ends as `PARENT_PROCESS_LOST` with delivery `unknown`.
 - After a restart, `status`, `result` and `wait` read the record without starting a Coordinator.

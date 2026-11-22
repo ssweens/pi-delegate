@@ -1,6 +1,6 @@
 import "./setup.ts";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -25,6 +25,19 @@ test("unused registered lifecycle and read-only status leave storage untouched",
 		if (legacy) assert.deepEqual(readdirSync(storage), []);
 		else assert.equal(existsSync(join(box.cwd, ".agents")), false);
 	}
+});
+
+test("process output and run records use the configured session directory", async () => {
+	const box = sandbox("http://127.0.0.1:1/v1");
+	const h = await harness(box);
+	try {
+		const started = await h.launch("Global process storage", { role: undefined, model: undefined, context: undefined, backend: "process", command: "printf GLOBAL-OK" });
+		const done = await h.ctl("wait", started.details.id);
+		assert.equal(done.details.status, "done");
+		assert.match(readFileSync(done.details.outputFile, "utf8"), /GLOBAL-OK/);
+		assert.ok(done.details.outputFile.startsWith(join(realpathSync(join(box.root, "parents")), "subsessions")), done.details.outputFile);
+		assert.equal(existsSync(join(box.cwd, ".agents")), false, "the project directory stays untouched");
+	} finally { await h.runtime.dispose(); rmSync(box.root, { recursive: true, force: true }); }
 });
 
 test("codemode continues after successful process cancellation", async () => {
@@ -61,7 +74,7 @@ test("process tools: output, waits, notifications, cancel, reload and owner exit
 		await t.test("immediate launch, non-cancelling timed/aborted waits, unsupported controls", async () => {
 			const launch = await start("printf 'LIVE\\n'; sleep 30");
 			const v = launch.details;
-			assert.equal(readFileSync(join(box.cwd, ".agents/pi/subsessions/.gitignore"), "utf8"), "*\n");
+			assert.ok(v.outputFile.startsWith(join(realpathSync(join(box.root, "parents")), "subsessions")), v.outputFile);
 			assert.match(v.id, /^process-/); assert.equal(v.status, "running"); assert.equal(typeof v.pid, "number");
 			assert.match(launch.content[0].text, /PID: .*\noutputFile:/);
 			for (const action of ["steer", "close", "models"]) {

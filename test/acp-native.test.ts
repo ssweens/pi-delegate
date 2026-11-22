@@ -13,6 +13,7 @@ import { chmodSync, existsSync, readFileSync, realpathSync, rmSync, writeFileSyn
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { provider, sandbox, harness } from "./fixture.ts";
+import { storagePathForManager } from "../src/storage.js";
 import { configureAcpCoordinator, existingAcpCoordinator } from "../src/acp/instance.ts";
 
 const fakeAcpAgent = new URL("./acp/fixtures/fake-acp-agent.ts", import.meta.url).pathname;
@@ -47,7 +48,7 @@ test("native Amp sessions and observation through delegate", { timeout: 120000 }
 	const writeThreads = (value: unknown) => writeFileSync(store, JSON.stringify(value));
 	const message = (messageId: number, role: string, text: string) => ({ messageId, role, content: [{ type: "text", text }], createdAt: 1_790_000_000_000 + messageId, meta: { sentAt: 1 } });
 	const parentId = h.ctx().sessionManager.getSessionId();
-	const record = (id: string) => JSON.parse(readFileSync(join(realpathSync(box.cwd), ".agents", "pi", "subsessions", "owners", parentId, "acp", `${encodeURIComponent(id)}.json`), "utf8"));
+	const record = (id: string) => JSON.parse(readFileSync(join(storagePathForManager(h.ctx().sessionManager), "owners", parentId, "acp", `${encodeURIComponent(id)}.json`), "utf8"));
 	try {
 		await t.test("create: a new Amp run names local or Orb execution; there is no adapter default", async () => {
 			const unnamed = await delegate({ backend: "acp", agent: "amp", task: "where?" });

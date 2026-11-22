@@ -13,6 +13,7 @@ import { chmodSync, existsSync, readFileSync, realpathSync, rmSync, writeFileSyn
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { provider, sandbox, harness } from "./fixture.ts";
+import { storagePathForManager } from "../src/storage.js";
 import { configureAcpCoordinator } from "../src/acp/instance.ts";
 import { AMP_DELEGATE_LABEL, AMP_LABEL, ampRunLabel, ampThreadTitle, parseAmpCost } from "../src/acp/runtime/amp-cli.ts";
 import { asRunView } from "../src/render.ts";
@@ -65,7 +66,7 @@ test("Amp extras through delegate: mode, native T-ID, title and labels, cost", {
 	const setThread = (id: string, fields: Record<string, unknown>) => { const all = threads(); all[id] = { v: 0, messages: [], ...all[id], ...fields }; writeFileSync(store, JSON.stringify(all)); };
 	const until = async (check: () => boolean, what: string) => { const end = Date.now() + 10_000; while (!check()) { if (Date.now() > end) assert.fail(`timed out: ${what}`); await sleep(20); } };
 	const parentId = h.ctx().sessionManager.getSessionId();
-	const record = (id: string) => JSON.parse(readFileSync(join(realpathSync(box.cwd), ".agents", "pi", "subsessions", "owners", parentId, "acp", `${encodeURIComponent(id)}.json`), "utf8"));
+	const record = (id: string) => JSON.parse(readFileSync(join(storagePathForManager(h.ctx().sessionManager), "owners", parentId, "acp", `${encodeURIComponent(id)}.json`), "utf8"));
 	const created: Record<string, string> = {};
 	try {
 		await t.test("mode: fails explicitly off Amp, on pi, on an opened thread, and beside model; nothing runs", async () => {

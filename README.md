@@ -481,7 +481,7 @@ Every returned report is a run description followed by the child's own words, fe
 
 ```
 complete · worker-791ede7d · role worker · model anthropic/claude-sonnet-5:medium · context forked from 215 parent messages · 3 turns in 25s · tokens in 6, out 1.5k, cached 639.2k · $0.9446
-session: /…/.agents/pi/subsessions/….jsonl
+session: /…/sessions/subsessions/….jsonl
 changed: src/thing.ts
 
 ----- worker-791ede7d reported, verbatim -----
@@ -498,7 +498,7 @@ Async launches have no duplicate status card or dispatch frame in the conversati
 
 ## Run log
 
-`~/.pi/agent/delegate-runs.jsonl` — one line per run: id, role, model, thinking, context, cwd, **task text**, status, tokens, cost, duration, changed files, dropped tools, error, first 2 KB of output. A run also records its `depth`, and a run that a delegating child started records that child's run ID as `parentRunId`. Child transcripts persist in the working directory the child ran in: `<cwd>/.agents/pi/subsessions/` — `tail -f` one to watch a child live. The full path is in every run-log row (`sessionFile`) and in the expanded outcome record. Each child also has an atomic JSON snapshot of its identity, runtime inputs, stop state, and result. Parent indexes and ownership leases live in the parent's working directory under `.agents/pi/subsessions/owners/`. ACP run records (identity, native session, turns with request IDs, delivery and output) are saved next to them under `owners/<parent>/acp/`. The directory gets a self-ignoring `.gitignore` (`*`) on creation, so transcripts never reach `git status` or a child's `git add -A`; it is scoped to that directory, so a repo can still track `.agents/` for agent definitions.
+`~/.pi/agent/delegate-runs.jsonl` — one line per settled run segment: id, role, model, thinking, context, cwd, **task text**, status, tokens, cost, duration, changed files, dropped tools, error, first 2 KB of output. A run also records its `depth`, and a run that a delegating child started records that child's run ID as `parentRunId`. Run state and Pi child transcripts live in a dedicated `subsessions/` directory under Pi's configured session directory: by default `<agentDir>/sessions/subsessions/`; with `--session-dir`, `<configured-session-dir>/subsessions/`. This keeps them out of project working trees and makes custom session directories capture them. When a person types into a Pi child view, pi-delegate promotes that transcript into the configured normal session directory for the child's cwd, updates the saved run record, and removes the `subsessions/` copy. Model-authored `delegate_ctl steer` calls do not promote. Unpromoted transcripts are not auto-deleted; remove them manually when safe. The current session path appears in status/result and the expanded outcome record. Each child also has an atomic JSON snapshot of its identity, runtime inputs, stop state, and result. Parent indexes and ownership leases live under `subsessions/owners/`; ACP run records (identity, native session, turns with request IDs, delivery and output) live in `owners/<parent>/acp/`. Existing project-local `.agents/pi/subsessions/` data is left untouched and is not discovered by the new store; inspect or remove it manually.
 
 ## In-process milestone events
 

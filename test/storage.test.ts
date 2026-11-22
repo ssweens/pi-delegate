@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { spawnSync } from "node:child_process";
@@ -27,20 +27,22 @@ test("records distinguish missing, corrupt, and atomically replaced values", (t)
 	assert.throws(() => readRecord(path), SyntaxError);
 });
 
-test("subsession storage is self-ignored and resolves cwd aliases", (t) => {
+test("subsession storage is separate from cwd and follows the configured session directory", (t) => {
 	const dir = fixture(t);
-	const alias = `${dir}-alias`;
-	symlinkSync(dir, alias);
-	t.after(() => rmSync(alias));
-	const path = storagePath(dir);
-	assert.equal(storagePath(alias), path);
+	const sessionDir = join(dir, "sessions");
+	const alias = `${sessionDir}-alias`;
+	mkdirSync(sessionDir);
+	symlinkSync(sessionDir, alias);
+	t.after(() => rmSync(alias, { force: true }));
+	const path = storagePath(dir, sessionDir, false);
+	assert.equal(path, join(realpathSync(sessionDir), "subsessions"));
+	assert.equal(storagePath(dir, alias, false), path);
 	assert.equal(existsSync(path), false, "resolving storage does not create it");
-	assert.equal(storageDir(dir), path);
-	assert.equal(storageDir(alias), path);
-	assert.equal(readFileSync(join(path, ".gitignore"), "utf8"), "*\n");
-	writeFileSync(join(path, ".gitignore"), "*\n# retained\n");
-	storageDir(dir);
-	assert.equal(readFileSync(join(path, ".gitignore"), "utf8"), "*\n# retained\n");
+	assert.equal(storageDir(dir, sessionDir, false), path);
+	assert.equal(storageDir(dir, alias, false), path);
+	assert.equal(storagePath(dir, path, false), path, "nested child sessions reuse the marked global root");
+	assert.equal(readFileSync(join(path, ".pi-delegate-storage.json"), "utf8"), JSON.stringify({ version: 1, root: realpathSync(sessionDir), customSessionDir: true }) + "\n");
+	assert.equal(existsSync(join(dir, ".agents")), false, "storage never creates project-local state");
 });
 
 test("runs are owned per process: a live owner elsewhere is read-only, a dead owner is adoptable", () => {

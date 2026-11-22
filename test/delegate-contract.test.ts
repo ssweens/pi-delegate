@@ -20,6 +20,7 @@ import type { NativeSessionDescription, NormalizedEvent, RuntimeHandle, RuntimeP
 import { configureAcpCoordinator } from "../src/acp/instance.ts";
 import { acpCapabilities, type BackendCapabilities, type ContractErrorCode, type LifecycleAction, PI_CAPABILITIES } from "../src/backend.ts";
 import { provider, sandbox, harness } from "./fixture.ts";
+import { storagePathForManager } from "../src/storage.js";
 
 interface Calls { ensure: string[]; open: string[]; cancel: string[]; disconnect: string[]; close: string[] }
 
@@ -177,7 +178,7 @@ test("the delegate contract, by backend, origin and agent, through delegate and 
 			const other = await harness(box);
 			try {
 				// The run directory cannot be created: a file stands where it would go.
-				const owners = join(cwd, ".agents", "pi", "subsessions", "owners", other.ctx().sessionManager.getSessionId());
+				const owners = join(storagePathForManager(other.ctx().sessionManager), "owners", other.ctx().sessionManager.getSessionId());
 				mkdirSync(owners, { recursive: true });
 				writeFileSync(join(owners, "acp"), "not a directory");
 				const closes = fake.calls.close.length;

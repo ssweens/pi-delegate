@@ -8,8 +8,8 @@
  * resolves against the parent's roles, settings and catalog.
  */
 import { randomUUID } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { appendFileSync, constants, copyFileSync, existsSync, mkdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { basename, dirname, extname, join } from "node:path";
 import { createAgentSession, type DefaultResourceLoader, type ExtensionAPI, type ExtensionContext, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { AGENT_DIR, SETTINGS_PATH } from "./agent-dir.ts";
 import { type AcpBackend, runningAcpRuns } from "./acp-backend.js";
@@ -25,7 +25,7 @@ import { loadState as loadTodos } from "./todo-ext.ts";
 import type { TodoState, WorkContext } from "./todo.ts";
 import { droppedTools, toolAllowlist } from "./roles.js";
 import { modelKey, splitModelRef } from "./model-ref.ts";
-import { ownedElsewhereError, processOwner, readRecord, releaseOwner, RunStore, storageDir, storagePath, writeRecord } from "./storage.js";
+import { ownedElsewhereError, processOwner, readRecord, releaseOwner, RunStore, sessionStorageInfoForManager, storageDirForManager, storagePathForManager, writeRecord } from "./storage.js";
 import type { ActiveTool, ChildActivity } from "./transcript.js";
 import { formatDuration, formatTokens } from "./util/format.ts";
 import { gitSync } from "./util/git.ts";
@@ -141,6 +141,9 @@ export interface Run {
 	/** The verdicts the watchdog alerted on since the run last moved; cleared when it is moving again. */
 	alerted?: Verdict[];
 	sessionFile?: string;
+	/** Pi's configured session root, used for promotion and nested-session storage. */
+	sessionRoot?: string;
+	customSessionDir?: boolean;
 	// Per-run ownership (see storage.ts). A run owned by another live process is read-only here.
 	ownerPid?: number;
 	ownerHost?: string;
@@ -272,7 +275,7 @@ function milestone(run: Run, event: Omit<DelegateMilestone, "version" | "runId" 
 }
 function newId(role: string): string { return `${role}-${randomUUID()}`; }
 export function ownerPath(ctx: ExtensionContext): string {
-	return join(storagePath(ctx.sessionManager.getCwd()), "owners", `${ctx.sessionManager.getSessionId()}.json`);
+	return join(storagePathForManager(ctx.sessionManager), "owners", `${ctx.sessionManager.getSessionId()}.json`);
 }
 export function ownedRuns(owner: Owner): Run[] { return [...runs.values()].filter((r) => r.ownerKey === owner.key); }
 export function pointerDir(key: string): string { return key.replace(/\.json$/, ""); }
@@ -1857,6 +1860,40 @@ export class PiBackend implements DelegateBackend<"pi"> {
 		}
 	}
 
+	/** Move a Pi child transcript into Pi's normal session list after a person chooses to join its conversation. */
+	promote(run: Run): string | undefined {
+		this.hooks.owner();
+		if (run.foreign) throw ownedElsewhereError(run);
+		if (run.runtime === "oven") return undefined; // Oven owns and retains its hosted history.
+		const source = run.sessionFile;
+		if (!source || !existsSync(source)) throw new Error(`${run.id}: cannot promote; its saved transcript is missing.`);
+		const sessionDir = run.customSessionDir && run.sessionRoot
+			? run.sessionRoot
+			: SessionManager.create(run.cwd).getSessionDir();
+		if (dirname(source) === sessionDir) return source;
+		const manager = run.session?.sessionManager;
+		if (manager && manager.getSessionId() !== run.sessionId) throw new Error(`${run.id}: cannot promote a transcript with a different session identity.`);
+
+		const extension = extname(source) || ".jsonl";
+		const stem = basename(source, extname(source));
+		let target = join(sessionDir, basename(source));
+		if (existsSync(target)) target = join(sessionDir, `${stem}-promoted-${randomUUID()}${extension}`);
+		copyFileSync(source, target, constants.COPYFILE_EXCL);
+		try {
+			manager?.setSessionFile(target);
+			run.sessionFile = target;
+			saveRun(run);
+		} catch (error) {
+			run.sessionFile = source;
+			try { manager?.setSessionFile(source); } catch { /* preserve the source transcript */ }
+			try { unlinkSync(target); } catch { /* source remains authoritative */ }
+			throw error;
+		}
+		try { unlinkSync(source); } catch { /* the promoted copy and run record are authoritative */ }
+		changed();
+		return target;
+	}
+
 	/**
 	 * Steer a run: a running one takes the message into its live turn (an oven slice into its running work), a
 	 * settled one resumes in the background with a fresh segment, on `replacement`'s offering or budget when given.
@@ -1970,10 +2007,10 @@ export class PiBackend implements DelegateBackend<"pi"> {
 		const owner = this.hooks.owner();
 		const { inherited, ...fields } = spec;
 		// Freeze the runtime inputs before advertising a run, including project instructions.
-		// The record and session live with the parent's, never in the child's cwd: that is often a
-		// workspace another tool needs clean (Werkit refuses to archive one holding ignored files).
-		// Owner pointers hold absolute record paths, so restore finds them from the parent's side.
-		const dir = storageDir(ctx.sessionManager.getCwd());
+		// The record and transcript live in the configured global session directory, never in the
+		// project or child cwd. Owner pointers hold absolute record paths for restore.
+		const sessionInfo = sessionStorageInfoForManager(ctx.sessionManager);
+		const dir = storageDirForManager(ctx.sessionManager);
 		const created = SessionManager.create(spec.cwd, dir);
 		const sessionFile = created.getSessionFile()!;
 		// Pi normally defers the first disk write until an assistant replies. Establish its own
@@ -1987,6 +2024,7 @@ export class PiBackend implements DelegateBackend<"pi"> {
 			segment: 1, stopped: false, acknowledged: false,
 			contextFiles: [], appendSystemPrompt: spec.appendSystemPrompt ?? [],
 			sessionFile, sessionId: manager.getSessionId(),
+			sessionRoot: sessionInfo.root, customSessionDir: sessionInfo.customSessionDir,
 			completion: new RunCompletion<RunResult>(),
 			status: "running",
 			startedAt: Date.now(), segmentStartedAt: Date.now(),

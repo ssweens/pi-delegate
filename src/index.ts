@@ -39,7 +39,7 @@ import { tuiTemplate } from "./tui-template.js";
 import { installTodo } from "./todo-ext.js";
 import type { DealsDetails } from "./deals.js";
 import { resolveChildTrust, type ChildTrust } from "./project-trust.js";
-import { processOwner, storageDir } from "./storage.js";
+import { processOwner, storageDirForManager } from "./storage.js";
 import { isPiStringsWorkerProcess } from "./util/process.ts";
 import { installMom } from "./mom/index.js";
 import { activityFor } from "./ui/activity.js";
@@ -946,11 +946,17 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			}
 			const r = runs.get(id);
 			if (!inTree(r)) throw new Error(`${id}: child is not in this parent's tree`);
-			// A message typed directly by the human is an explicit restart request. A nested run is steered
-			// by the delegating child's binding, which owns its session and its revival.
-			if (r.ownerKey === requireOwner().key) { await piBackend.steerRun(r, message, true); return; }
-			const steerer = state.owners.get(r.ownerKey)?.steerFromUser;
-			if (!steerer) throw new Error(`${id}: its delegating child's session is not open; steer that child instead`);
+			// This path is the human typing into the child view, unlike model-authored delegate_ctl steers.
+			// Promote before sending so any resumed turn opens from Pi's normal session store.
+			if (r.ownerKey === requireOwner().key) {
+				piBackend.promote(r);
+				await piBackend.steerRun(r, message, true);
+				return;
+			}
+			const targetOwner = state.owners.get(r.ownerKey);
+			const steerer = targetOwner?.steerFromUser;
+			if (!steerer || !targetOwner?.piBackend) throw new Error(`${id}: its delegating child's session is not open; steer that child instead`);
+			targetOwner.piBackend.promote(r);
 			await steerer(r, message);
 		},
 		cancel: async (id) => {
@@ -1236,7 +1242,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			if (full) return failed(full);
 			if (start.value.backend === "process") {
 				try {
-					storageDir(ctx.sessionManager.getCwd());
+					storageDirForManager(ctx.sessionManager);
 					const v = await processes.start({ ...start.value, cwd: start.value.cwd ?? ctx.cwd }, signal, _id === "user-command" ? { userStarted: true } : {});
 					return { content: [{ type: "text", text: `${processText(v, false)}\n${START_HINT}` }], details: v };
 				} catch (error) { return failed(error); }
@@ -1247,7 +1253,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 					requireOwner();
 					// A created session works where the parent does unless told otherwise; an opened one keeps its native workspace.
 					const cwd = input.cwd !== undefined ? realpathSync(input.cwd) : input.origin === "created" ? realpathSync(ctx.cwd) : undefined;
-					storageDir(ctx.sessionManager.getCwd());
+					storageDirForManager(ctx.sessionManager);
 					const v = await acp.start({ ...input, ...(cwd !== undefined ? { cwd } : {}) });
 					return { content: [{ type: "text", text: acpStartText(v) }], details: v };
 				} catch (error) {
