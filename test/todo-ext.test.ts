@@ -117,6 +117,29 @@ test("tool drives the widget, restores it on session navigation, and clears when
 	assert.ok(completion.includes("☑ Keep the current task visible"));
 });
 
+test("items write, extend and complete several tasks in one call", async () => {
+	const h = harness();
+	const tool = h.tools.get("todo");
+	const call = (params: unknown) => tool.execute("items", params, undefined, undefined, h.ctx());
+	const tasks = () => loadState(h.ctx().sessionManager).phases.flatMap((p) => p.tasks.map((t) => `${p.name}:${t.content}:${t.status}`));
+	await call({ op: "add", content: "stale" });
+	const init = await call({ op: "init", phase: "Feature", items: ["1. Ground", "2. Brief", "3. Build"] });
+	assert.deepEqual(tasks(), ["Feature:1. Ground:pending", "Feature:2. Brief:pending", "Feature:3. Build:pending"]);
+	assert.match(init.content[0].text, /2\. Brief/);
+	await call({ op: "add", phase: "Feature", content: "4. Verify", items: ["5. Land"] });
+	await call({ op: "done", items: ["1. Ground", "2. Brief"] });
+	assert.deepEqual(tasks(), [
+		"Feature:1. Ground:completed", "Feature:2. Brief:completed", "Feature:3. Build:in_progress",
+		"Feature:4. Verify:pending", "Feature:5. Land:pending",
+	]);
+	await call({ op: "rm", items: ["4. Verify", "5. Land"] });
+	assert.equal(tasks().length, 3);
+	assert.equal(h.entries.length, 5, "each call is one state update");
+	await assert.rejects(call({ op: "start", items: ["3. Build"] }), /items is only for/);
+	const cleared = await call({ op: "init", items: [] });
+	assert.equal(cleared.content[0].text, "Todos cleared.");
+});
+
 test("work labels persist independently of checklist operations and branch restore", async () => {
 	const h = harness();
 	const tool = h.tools.get("todo");

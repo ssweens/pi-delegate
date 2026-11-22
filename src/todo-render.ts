@@ -118,12 +118,14 @@ function renderStatusLine(icon: string, title: string, meta: string[], theme: To
 
 /** Tool call header shown while the `todo` tool streams: `⏳ Todo · add <content>`. */
 export function renderTodoCallHeader(
-	args: { op?: string; content?: string; phase?: string },
+	args: { op?: string; content?: string; items?: string[]; phase?: string },
 	theme: TodoStyler,
 ): string {
 	const op = args.op ?? "update";
 	const parts = [op];
-	if (args.content) parts.push(args.content);
+	const count = args.items?.length ?? 0;
+	if (args.content) parts.push(count ? `${args.content} +${count} more` : args.content);
+	else if (count) parts.push(`${count} item${count === 1 ? "" : "s"}`);
 	else if (args.phase) parts.push(`phase: ${args.phase}`);
 	const icon = theme.fg("muted", PENDING_ICON);
 	return renderStatusLine(icon, "Todo", [parts.join(" ")], theme);

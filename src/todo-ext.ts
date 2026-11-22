@@ -80,6 +80,7 @@ const PARAMS = Type.Object({
 	]),
 	phase: Type.Optional(Type.String()),
 	content: Type.Optional(Type.String()),
+	items: Type.Optional(Type.Array(Type.String(), { description: "Several tasks in one call: init writes them as the new list, add appends them, done/drop/rm apply to each in order." })),
 	blocker: Type.Optional(Type.String()),
 	work: Type.Optional(Type.Object({
 		mode: Type.Optional(Type.String({ minLength: 1, maxLength: 80 })),
@@ -115,24 +116,34 @@ export function loadState(sessionManager: TodoBranchSource): TodoState {
 	return legacy ?? emptyState();
 }
 
+const LIST_OPS: ReadonlySet<TodoParams["op"]> = new Set(["init", "add", "done", "drop", "rm"]);
+
+/** The tasks a call names: `content` first, then `items`; a bare call keeps its old single-task meaning. */
+function named(p: TodoParams): string[] {
+	if (!p.items?.length) return [p.content ?? ""];
+	return p.content === undefined ? p.items : [p.content, ...p.items];
+}
+
 function applyOp(state: TodoState, p: TodoParams): TodoState {
+	if (p.items?.length && !LIST_OPS.has(p.op)) throw new Error("items is only for init, add, done, drop and rm");
+	const phase = p.phase ?? TODO_DEFAULT_PHASE;
 	switch (p.op) {
 		case "init":
-			return { ...state, phases: [] };
+			return (p.items ?? []).reduce<TodoState>((s, item) => addTask(s, phase, item), { ...state, phases: [] });
 		case "add":
-			return addTask(state, p.phase ?? TODO_DEFAULT_PHASE, p.content ?? "");
+			return named(p).reduce((s, item) => addTask(s, phase, item), state);
 		case "start":
 			return startTask(state, p.content ?? "");
 		case "done":
-			return completeTask(state, p.content ?? "");
+			return named(p).reduce(completeTask, state);
 		case "drop":
-			return dropTask(state, p.content ?? "");
+			return named(p).reduce(dropTask, state);
 		case "block":
 			return blockTask(state, p.content ?? "", p.blocker);
 		case "unblock":
 			return unblockTask(state, p.content ?? "");
 		case "rm":
-			return removeTask(state, p.content ?? "");
+			return named(p).reduce(removeTask, state);
 		case "view":
 		default:
 			return state;
@@ -197,8 +208,9 @@ export function installTodo(pi: ExtensionAPI, options: TodoInstallOptions = {}):
 		name: "todo",
 		label: "Todos",
 		description:
-			"Manage a phased todo list. Ops: init, add (content, phase), start (content), done (content), drop/rm (content), block/unblock (content, blocker), view. Optional work {mode, role} declares display labels for this session, including with view; {} clears labels. Tasks are addressed by their content string; one task is in_progress; completing auto-promotes the next open task.",
-		promptSnippet: "todo(op, content?, phase?, blocker?) — manage phased todos",
+			"Manage a phased todo list. Ops: init (optional items, phase: replaces the list), add (content or items, phase), start (content), done/drop/rm (content or items), block/unblock (content, blocker), view. items writes or updates several tasks in one call." +
+			" Optional work {mode, role} declares display labels for this session, including with view; {} clears labels. Tasks are addressed by their content string; one task is in_progress; completing auto-promotes the next open task.",
+		promptSnippet: "todo(op, content?, items?, phase?, blocker?) — manage phased todos",
 		parameters: PARAMS,
 		// The todo panel renders its own framed block (the Agents frame
 		// construction, src/render.ts); self-framing keeps pi's default
@@ -212,7 +224,7 @@ export function installTodo(pi: ExtensionAPI, options: TodoInstallOptions = {}):
 			const state = work ? { ...next, work } : next;
 			pi.appendEntry(TODO_CUSTOM_TYPE, state);
 			syncTodoWidget(ctx.ui, state, options.activity);
-			const text = params.op === "init" ? "Todos cleared." : viewTasks(state);
+			const text = params.op === "init" && !params.items?.length ? "Todos cleared." : viewTasks(state);
 			return {
 				content: [{ type: "text", text }],
 				details: { op: params.op, open: countOpen(state), state },
