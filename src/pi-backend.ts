@@ -172,6 +172,8 @@ export interface Run {
 	modelOverride?: string;
 	/** Set when a delegating child started this run. */
 	parentRunId?: string;
+	/** A model switch requested during a live Pi segment; consumed at its next clean segment boundary. */
+	pendingModelSwitch?: { message: string; replacement: Replacement };
 	/** Which entry of the role's model list the run got, and why earlier entries were skipped. */
 	modelPick?: string;
 	/** Started by /delegate: its owner manages it through safe follow-up notices. */
@@ -934,6 +936,7 @@ function finish(run: Run, status: Status, error?: string) {
 	run.endedAt = Date.now();
 	run.status = run.stopIntent?.cause ?? status;
 	if (error && !run.stopIntent) run.error = error;
+	if (run.status !== "complete") run.pendingModelSwitch = undefined;
 	if (run.runtime !== "oven") run.haltNote = run.stopIntent || run.stopped ? subtreeNote(run) : undefined;
 	try { if (run.session) harvest(run); }
 	catch (e) { if (!run.stopIntent) run.status = "error"; run.error = `Cannot read child transcript: ${errorMessage(e)}`; }
@@ -1822,6 +1825,7 @@ export class PiBackend implements DelegateBackend<"pi"> {
 			await this.openSession(run, onUpdate, preparedLoader);
 		})();
 		run.ready = sessionReady;
+		let queuedSwitch: Run["pendingModelSwitch"];
 		try {
 			await sessionReady;
 			if (run.status === "running") {
@@ -1849,9 +1853,30 @@ export class PiBackend implements DelegateBackend<"pi"> {
 					// Provider failures are assistant messages, not rejected prompt promises.
 					const last = messagesOf(run).findLast((message) => message.role === "assistant");
 					if (run.status === "running" && last?.stopReason === "error") throw new Error(last.errorMessage ?? "Child provider failed.");
+					if (run.status === "running" && run.pendingModelSwitch) {
+						queuedSwitch = run.pendingModelSwitch;
+						run.pendingModelSwitch = undefined;
+						saveRun(run);
+						break;
+					}
 				}
 			}
 			finish(run, run.status === "running" ? "complete" : run.status);
+			if (queuedSwitch && run.status === "complete" && !run.stopped) {
+				try {
+					const nested = childOwner(run);
+					if (nested?.busy?.()) throw new Error(`${run.id} has children of its own that have not settled; model switch remains queued.`);
+					if (nested) await closeChildOwner(run);
+					beginResume(run, false, queuedSwitch.replacement);
+					const resumedCompletion = run.completion;
+					await this.launch(run, queuedSwitch.message);
+					publish(resumedCompletion);
+				} catch (error) {
+					run.pendingModelSwitch = queuedSwitch;
+					run.error = `Queued model switch could not resume automatically: ${errorMessage(error)}. Use delegate_ctl steer to resume it.`;
+					try { saveRun(run); } catch { /* the settled segment remains authoritative */ }
+				}
+			}
 		} catch (e: any) {
 			finish(run, run.status === "running" ? "error" : run.status, run.error ?? errorMessage(e));
 		} finally {
@@ -1928,6 +1953,7 @@ export class PiBackend implements DelegateBackend<"pi"> {
 		}
 		// A running oven slice takes the message into its running work, as a live session's steer does.
 		if (run.runtime === "oven" && run.status === "running" && run.sliceId) {
+			if (replacement?.model) throw new Error(`${run.id} is running as an oven slice; its model cannot be changed in flight.`);
 			try { await steerLive(run, message); }
 			catch (error) { if (error instanceof SliceExpired) throw new DelegateError("RUN_EXPIRED", expiredText(run, error)); throw error; }
 			return;
@@ -1936,8 +1962,21 @@ export class PiBackend implements DelegateBackend<"pi"> {
 			await run.preparing;
 			await run.ready;
 			if (run.status === "running" && run.session) {
-				// A live turn is already bound to its model. Never swap it underneath running work.
-				if (replacement?.model) throw new Error(`${run.id} is running on ${run.model}; a different offering applies to its next segment. Wait for it or cancel it, then steer with model.`);
+				// A live segment stays on its offering. Queue the requested continuation on the replacement
+				// model; launch() consumes it only after the current prompt has completed cleanly.
+				if (replacement?.model) {
+					if (interrupt) throw new DelegateError("INPUT_INVALID", "A queued model switch cannot also interrupt the current segment.", "interrupt");
+					if (childOwner(run)?.busy?.()) throw new Error(`${run.id} has children of its own that have not settled; wait for them before switching its model.`);
+					run.pendingModelSwitch = { message, replacement };
+					if (replacement.timeoutMs !== undefined) {
+						run.timeoutMs = Date.now() - run.segmentStartedAt + replacement.timeoutMs;
+						run.extendRequest = undefined;
+						armTimeout(run);
+					}
+					saveRun(run);
+					changed();
+					return;
+				}
 				if (replacement?.timeoutMs !== undefined) {
 					// More time is the one change a live segment can take: it ends `timeoutMs` from now, re-armed at once.
 					run.timeoutMs = Date.now() - run.segmentStartedAt + replacement.timeoutMs;
@@ -1959,8 +1998,13 @@ export class PiBackend implements DelegateBackend<"pi"> {
 				await steerLive(run, message); return;
 			}
 		}
-		// It settled while this steer waited for its session.
+		// It settled while this steer waited for its session. A queued request blocked by a busy
+		// descendant is honored by the next explicit continuation, never left as a latent trigger.
 		if (interrupt) this.refuseInterrupt(run);
+		if (run.pendingModelSwitch) {
+			if (!replacement?.model) replacement = { ...run.pendingModelSwitch.replacement, ...replacement };
+			run.pendingModelSwitch = undefined;
+		}
 		const nested = childOwner(run);
 		if (nested && rebinds(run, replacement)) {
 			// A new offering reopens the session its own children report into.

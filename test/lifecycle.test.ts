@@ -303,12 +303,22 @@ test("real SDK delegation lifecycle (loopback provider, no credentials)", { time
 			const again = await h.ctl("wait", id);
 			assert.equal(again.details.model, "fixture-alias/fixture");
 			assert.equal(again.details.output, "STILL-SECOND-MODEL");
-			// A live turn is bound to the model it started on.
+			// A live turn keeps its model; a requested replacement starts automatically at the clean segment boundary.
 			const gate = deferred(), arrived = api.script("Live turn", { text: "LIVE", gate });
 			await h.ctl("steer", id, { message: "Live turn" }); await arrived;
-			await assert.rejects(h.ctl("steer", id, { message: "Swap now", model: "fixture/fixture" }), /applies to its next segment/);
+			assert.equal(state().runs.get(id).status, "running", "live response remains gated");
+			const switched = await h.ctl("steer", id, { message: "Continue on replacement", model: "fixture/fixture" });
+			assert.ok(state().runs.get(id).pendingModelSwitch, switched.content[0].text);
+			assert.match(switched.content[0].text, /Model switch queued/);
 			assert.equal(state().runs.get(id).model, "fixture-alias/fixture");
-			gate.resolve(); await h.ctl("wait", id);
+			const firstSegment = h.ctl("wait", id);
+			const continuation = api.script("Continue on replacement", { text: "SWITCHED-AUTOMATICALLY" });
+			gate.resolve();
+			assert.equal((await firstSegment).details.segment, 4);
+			const final = await h.ctl("wait", id);
+			assert.equal((await continuation).model, "fixture");
+			assert.equal(final.details.output, "SWITCHED-AUTOMATICALLY");
+			assert.equal(final.details.model, "fixture/fixture");
 		});
 		// Field report: the record moved to the new offering while the retained session kept
 		// calling the old one. Aliases above share a model id, so only the request can tell.
