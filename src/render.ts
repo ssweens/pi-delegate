@@ -33,6 +33,7 @@ export interface RunView {
 	task: string;
 	output: string;
 	outputAt?: number;
+	blockedWarning?: { reason: string; at: number };
 	todos?: TodoState;
 	work?: WorkContext;
 	turns: number;
@@ -196,7 +197,22 @@ export function progressText(text: string): string {
 	return line.replace(/[\x00-\x1f\x7f-\x9f]/g, "").replace(/^\s{0,3}(?:#{1,6}\s+|>\s*)/, "").replace(/\[([^\]]+)\]\([^)]*\)/g, "$1").replace(/\*\*|`/g, "").trim();
 }
 
-/** Semantic progress wins over execution detail; warnings are never hidden by an old note. */
+export function agentWarning(v: RunView, theme: FrameTheme, width: number): string[] {
+	const warning = v.blockedWarning;
+	if (!warning) return [];
+	const at = new Date(warning.at);
+	const time = `${String(at.getHours()).padStart(2, "0")}:${String(at.getMinutes()).padStart(2, "0")}`;
+	return [fit(theme.fg("warning", `  ⚠ blocked ${time} · ${progressText(warning.reason)}`), width)];
+}
+
+/** Execution state for the main Agents row. */
+export function agentState(v: RunView, theme: FrameTheme, width: number): string {
+	if (v.status !== "running" || v.providerRetry) return fit(agentProgress(v, theme, width), width);
+	const tool = v.activeTool?.name;
+	return fit(theme.fg("accent", tool ? `running · ${tool}` : "running"), width);
+}
+
+/** Semantic progress for the selected detail and overview. */
 export function agentProgress(v: RunView, theme: FrameTheme, width: number, now = Date.now()): string {
 	if (v.haltNote) return fit(theme.fg("warning", `${v.status} · release unconfirmed`), width);
 	if (!v.settled && v.status !== "running") return theme.fg("warning", "Stopping…");
@@ -204,7 +220,6 @@ export function agentProgress(v: RunView, theme: FrameTheme, width: number, now 
 	if (v.providerRetry) return theme.fg("warning", `retry ${v.providerRetry.attempt}/${v.providerRetry.maxAttempts}`);
 	if (v.backend === "acp") return fit(theme.fg("dim", `session ${v.nativeSessionId ?? "pending"}`), width);
 	const todo = todoProgress(v.todos);
-	if (todo?.blocker) return fit(theme.fg("warning", `blocked: ${progressText(todo.blocker)}`), width);
 	const phase = todo?.phase ? fit(progressText(todo.phase), width >= 44 ? Math.min(20, Math.floor(width / 3)) : 10) : "";
 	const count = todo ? `${phase ? `${phase} ` : ""}${todo.done}/${todo.total}${width >= 44 ? " tasks" : ""}` : "";
 	const note = progressText(v.output);
@@ -219,7 +234,7 @@ export function agentDetail(v: RunView, theme: FrameTheme, width: number, now = 
 	const todo = todoProgress(v.todos);
 	const work = v.work?.mode ? [progressText(v.work.mode)] : [];
 	const tool = v.activeTool ? formatToolCall(v.activeTool.name, v.activeTool.args, theme as Theme) + ((v.activeToolCount ?? 0) > 1 ? ` +${v.activeToolCount! - 1}` : "") : "";
-	const details = [...work, todo?.blocker ? `blocked: ${progressText(todo.blocker)}` : todo?.now ? `now: ${progressText(todo.now)}` : "", tool].filter(Boolean);
+	const details = [...work, todo?.now ? `now: ${progressText(todo.now)}` : "", tool].filter(Boolean);
 	if (!details.length) details.push(agentProgress(v, theme, width, now));
 	return fit(theme.fg("dim", `↳ ${details.join(" · ")}`), width);
 }

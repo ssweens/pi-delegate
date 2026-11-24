@@ -22,7 +22,7 @@ import { expiredEvent, OVEN_EXPIRES, ovenCall, ovenHeartbeat, requireExpiry, Sli
 import type { TrustSource } from "./project-trust.js";
 import type { RunView } from "./render.js";
 import { loadState as loadTodos } from "./todo-ext.ts";
-import type { TodoState, WorkContext } from "./todo.ts";
+import { todoProgress, type TodoState, type WorkContext } from "./todo.ts";
 import { droppedTools, toolAllowlist } from "./roles.js";
 import { modelKey, splitModelRef } from "./model-ref.ts";
 import { ownedElsewhereError, processOwner, readRecord, releaseOwner, RunStore, sessionStorageInfoForManager, storageDirForManager, storagePathForManager, writeRecord } from "./storage.js";
@@ -89,6 +89,7 @@ export interface Run {
 	status: Status;
 	startedAt: number;
 	endedAt?: number;
+	blockedWarning?: RunView["blockedWarning"];
 	turns: number;
 	tokens: { input: number; output: number; cacheRead: number; cacheWrite: number };
 	cost: number;
@@ -733,12 +734,48 @@ function dirtyDelta(before: Map<string, number> | undefined, cwd: string): strin
 	return changed;
 }
 
+function refreshTodos(run: Run, manager: SessionManager) {
+	const previous = todoProgress(run.todos)?.blocker;
+	run.todos = loadTodos(manager);
+	const reason = todoProgress(run.todos)?.blocker;
+	if (reason && reason !== previous) run.blockedWarning = { reason, at: Date.now() };
+}
+
+function reportStatus(output: string): { status: string; reason?: string } | undefined {
+	// A contract line, not quoted prose or a STATUS example inside a fenced block.
+	let fence: string | undefined;
+	let result: ReturnType<typeof reportStatus>;
+	for (const line of output.split(/\r?\n/)) {
+		const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+		if (fence) {
+			if (marker && marker[1].startsWith(fence) && !marker[2].trim()) fence = undefined;
+			continue;
+		}
+		if (marker) { fence = marker[1]; continue; }
+		const status = /^STATUS:[ \t]*(complete|partial|blocked)(?:[ \t]*[·:—-][ \t]*(.+))?[ \t]*$/i.exec(line);
+		if (status) result = { status: status[1].toLowerCase(), reason: status[2]?.trim() };
+		const gaps = /^GAPS:[ \t]*(.+)$/i.exec(line);
+		if (result?.status === "blocked" && !result.reason && gaps && !/^none[.!]?$/i.test(gaps[1].trim())) result.reason = gaps[1].trim();
+	}
+	return result;
+}
+
+export function dismissBlockedWarning(run: Run) {
+	const previous = run.blockedWarning;
+	if (!previous) return;
+	delete run.blockedWarning;
+	try { saveRun(run); }
+	catch (error) { run.blockedWarning = previous; throw error; }
+	run.revision++;
+	changed();
+}
+
 export function harvest(run: Run) {
 	// An oven run has no transcript here: its output and turns come from oven (launchOven).
 	if (run.runtime === "oven") return;
 	const manager = run.session?.sessionManager ?? openTranscript(run);
 	const msgs = messagesOf(run, manager);
-	run.todos = loadTodos(manager);
+	refreshTodos(run, manager);
 	let turns = 0;
 	const tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 	let cost = 0;
@@ -810,6 +847,7 @@ export function view(run: Run): RunView {
 		output: run.output,
 		...(run.outputAt !== undefined ? { outputAt: run.outputAt } : {}),
 		...(run.todos ? { todos: run.todos } : {}),
+		...(run.blockedWarning ? { blockedWarning: run.blockedWarning } : {}),
 		...((run.todos?.work ?? run.work) ? { work: run.todos?.work ?? run.work } : {}),
 		turns: run.turns,
 		tokens: run.tokens,
@@ -940,6 +978,12 @@ function finish(run: Run, status: Status, error?: string) {
 	if (run.runtime !== "oven") run.haltNote = run.stopIntent || run.stopped ? subtreeNote(run) : undefined;
 	try { if (run.session) harvest(run); }
 	catch (e) { if (!run.stopIntent) run.status = "error"; run.error = `Cannot read child transcript: ${errorMessage(e)}`; }
+	if (run.status === "complete") {
+		const report = reportStatus(run.output);
+		if (report?.status === "blocked") {
+			run.blockedWarning = { reason: report.reason || todoProgress(run.todos)?.blocker || "Child reported blocked", at: run.endedAt };
+		} else if (report?.status === "complete") delete run.blockedWarning;
+	}
 	if (run.status === "timeout" && !run.error) {
 		run.error = `Stopped after its ${Math.round(run.timeoutMs / 60000)} min budget (timeoutMs, default ${DEFAULT_TIMEOUT_MS / 60000} min). Its work up to that point stands and is not rolled back.`
 			+ (run.segmentFailedAttempts
@@ -1782,7 +1826,7 @@ export class PiBackend implements DelegateBackend<"pi"> {
 			}
 			if (ev.type === "tool_execution_end") {
 				run.activeTools.delete(ev.toolCallId);
-				if (ev.toolName === "todo") run.todos = loadTodos(session.sessionManager);
+				if (ev.toolName === "todo") refreshTodos(run, session.sessionManager);
 			}
 			trackProgress(run, ev);
 			run.revision++;

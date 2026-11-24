@@ -81,6 +81,10 @@ export default function (pi: any) {
 		const result = await tools.get("delegate_ctl").execute("fixture", { action, runId }, undefined, undefined, ctx);
 		trace({ event: "process-control", action, details: result.details });
 	} });
+	pi.registerCommand("fixture-control", { handler: async (args: string, ctx: any) => {
+		const result = await tools.get("delegate_ctl").execute("fixture", JSON.parse(args), undefined, undefined, ctx);
+		trace({ event: "control", details: result.details });
+	} });
 	pi.registerCommand("fixture-join", { handler: async (args: string, ctx: any) => {
 		const result = await tools.get("delegate_ctl").execute("fixture", { action: "wait", runId: args.trim() }, undefined, undefined, ctx);
 		trace({ event: "joined", details: result.details });

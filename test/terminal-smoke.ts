@@ -59,6 +59,37 @@ async function checkModelReview(mode: string) {
 }
 
 const focusedSmoke = process.env.DELEGATE_FOCUSED_SMOKE;
+async function checkBlockedWarning(mode: string) {
+	const task = "Blocked warning walk";
+	api.onUnscripted(() => ({ text: "COMPLETION-ACK" }));
+	const gate = deferred();
+	try {
+		api.script(task, { text: "STATUS: blocked\nGAPS: first blocker" });
+		await command(`/fixture-spawn ${task}`);
+		await expect(/Blocked warning walk[^\n]*\n[^\n]*⚠ blocked \d\d:\d\d · first blocker/);
+		const runId = JSON.parse(readFileSync(join(box.root, "trace.jsonl"), "utf8").trim().split("\n").findLast((line) => line.includes('"launch"'))!).details.id;
+		const control = (action: string, message?: string) => command(`/fixture-control ${JSON.stringify({ action, runId, message })}`);
+		api.script("Try the next step", { text: "STATUS: blocked · latest blocker", gate });
+		await control("steer", "Try the next step");
+		const resumed = /Blocked warning walk[^\n]*running[^\n]*\n[^\n]*⚠ blocked \d\d:\d\d · first blocker/;
+		console.log(`${mode} resumed:\n${(await expect(resumed)).match(resumed)![0]}`);
+		gate.resolve();
+		const blocked = /Blocked warning walk[^\n]*\n[^\n]*⚠ blocked \d\d:\d\d · latest blocker/;
+		console.log(`${mode} blocked again:\n${(await expect(blocked)).match(blocked)![0]}`);
+		await control("dismiss");
+		await expect(/⚠ blocked \d\d:\d\d · latest blocker/, true);
+		api.script("Try after dismissal", { text: "STATUS: blocked · a new blocker" });
+		await control("steer", "Try after dismissal");
+		await expect(/⚠ blocked \d\d:\d\d · a new blocker/);
+		api.script("Finish cleanly", { text: "STATUS: complete" });
+		await control("steer", "Finish cleanly");
+		await expect(/⚠ blocked \d\d:\d\d · a new blocker/, true);
+		await expect(/Blocked warning walk[^\n]*complete/);
+	} finally {
+		gate.resolve();
+		api.onUnscripted(undefined);
+	}
+}
 async function checkActiveFirst(mode: string) {
 	for (let i = 1; i <= 5; i++) {
 		const task = `Finished scout ${i}`;
@@ -124,6 +155,7 @@ try {
 		if (focusedSmoke) {
 			if (focusedSmoke === "model-review") await checkModelReview(mode);
 			else if (focusedSmoke === "active-first") await checkActiveFirst(mode);
+			else if (focusedSmoke === "blocked-warning") await checkBlockedWarning(mode);
 			else throw new Error(`Unknown focused smoke: ${focusedSmoke}`);
 			tmux("kill-session", "-t", "pi"); continue;
 		}

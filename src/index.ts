@@ -52,7 +52,7 @@ import type { SettingsRow } from "./ui/settings-panel.ts";
 import { FULLSCREEN } from "./ui/overlay.ts";
 import { AGENT_DIR, SETTINGS_PATH } from "./agent-dir.ts";
 import {
-	acknowledge, activeWriter, activityOf, admit, progressAt, allowlist, finishedNotice, PI_BUILTIN_TOOLS, notify, PiBackend, type PiCall, type PiRunSpec, cancelRun, cancelText, capacityError, changed, CHILD_SETTLED_PROMPT, childOwner, closeOwner, closingChildren, DEFAULT_TIMEOUT_MS, departed, finalResult, findDeparted, FORK_BRIDGE, harvest, inFlight, listeners, maxDepth, noticeKey, ownedRuns, type Owner, ownerPath, pointerDir, publish, recordedView, redeliver, restoreRun, resultText, type Run, runRecordPaths, runs, saveRun, state, summary, TRUST_UNKNOWN, view, type WaitRow,
+	acknowledge, activeWriter, activityOf, admit, progressAt, allowlist, finishedNotice, PI_BUILTIN_TOOLS, notify, PiBackend, type PiCall, type PiRunSpec, cancelRun, cancelText, capacityError, changed, dismissBlockedWarning, CHILD_SETTLED_PROMPT, childOwner, closeOwner, closingChildren, DEFAULT_TIMEOUT_MS, departed, finalResult, findDeparted, FORK_BRIDGE, harvest, inFlight, listeners, maxDepth, noticeKey, ownedRuns, type Owner, ownerPath, pointerDir, publish, recordedView, redeliver, restoreRun, resultText, type Run, runRecordPaths, runs, saveRun, state, summary, TRUST_UNKNOWN, view, type WaitRow,
 } from "./pi-backend.ts";
 
 export { AGENT_DIR };
@@ -1274,6 +1274,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			"Before using this tool, read skills/delegation/SKILL.md if you have not read it in this session. models without runId: every offering across all enabled providers, verbatim from the registry (provider/id, reasoning, context, $/M), plus live OpenRouter pricing, tiered rates, expirations and Artificial Analysis indices, your cached ratings, per-role defaults, blocking drift, and optional upgrades. Use for setup or MODEL_REVIEW_REQUIRED; see skills/delegate-model-setup/SKILL.md. models with an ACP runId list that agent's current model and selectable native/fallback IDs with labels and descriptions. One-run status/result show the same catalog compactly. deals: read-only OpenRouter promotion and price/quality shortlist for frontier and light work; does not choose or approve a model. " +
 			"rate: store quality ratings you researched, per exact offering (provider/id), so choices are grounded; stale after 14 days. approve: record a role's default model after the user agreed in conversation. " +
 			"roles: list roles. status: one run or all \u2014 a nonblocking progress read: status, current tool, tool calls so far, elapsed, remaining time budget. result: current report without waiting. wait: join an existing runId; returns its final report, immediately if finished. If queued messages arrive while waiting it returns early with the child still running — answer them, then wait again to rejoin. If the child stops without reporting completion it returns an error report instead of blocking until the run budget. Cancelling wait only detaches; the child keeps running. An attached waiter receives completion instead of a separate wake-up. steer: queue a correction or resume a finished child in the background, keeping its context; returns immediately. A running child reads a plain steer only at its next turn boundary (status shows `steer pending` until it does); with interrupt: true abort is requested immediately and the message becomes its next prompt after the current turn settles, same run and budget — use that when a child is silent, looping or in a long think. For a running in-process Pi child, passing model queues the message for the next segment: the current segment stays on its model, then the same run resumes automatically on the requested model after a clean checkpoint. It does not interrupt; interrupt cannot be combined with a queued model switch. Use wait to join the resumed work. Saved children are restored on parent reopen without running; steer revives them with their original configuration unless you pass model:, which moves that child to another offering from the next segment on \u2014 propose it in conversation first, including when the saved offering is exhausted or gone. Explicitly stopped children require restart:true and the user's request. cancel: stop the child and prevent automatic revival. " +
+			"dismiss: clear the blocked warning in the Agents widget for a Pi or Oven runId without changing its status or checklist. " +
 			"Process runIds support status/result/wait/cancel, with outputFile, bounded output tail, status, exit code and signal. steer/close/models on a process fail ACTION_UNSUPPORTED. No model lookup is needed for commands. " +
 			"wait with runIds joins pi, acp and process runs at once and returns when the first settles by default; pass mode=\"all\" when every result is required. timeoutMs only ends that wait, never the runs. " +
 			"Runs started with backend acp take the same runId actions: status and result read the session and its latest turn; wait joins it; steer sends the next turn, queued behind another attachment's active Amp turn when needed; cancel stops only a turn this run started; close releases the session \u2014 a created one is disposed, an opened one only disconnected, never archived or deleted. close is acp only and final. " +
@@ -1281,7 +1282,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			"status and result on an open Amp run read the native thread once by default (one amp threads export, never in the background) and return only messages after the last ones this attachment showed, from any participant; a failed read is reported as unknown. Other runs do not observe a native thread. " +
 			"An Amp run's thread cost (amp threads usage) is read once per settled turn, which its wait result or wake-up reports, and by status or result with a runId unless the cached cost is current (a closed run, or a created run with no turn since); unknown when it was never read, and a failed read keeps the last cost with when it was read.",
 		parameters: Type.Object({
-			action: StringEnum(["models", "deals", "rate", "approve", "roles", "status", "result", "wait", "steer", "cancel", "close"] as const),
+			action: StringEnum(["models", "deals", "rate", "approve", "roles", "status", "result", "wait", "steer", "cancel", "close", "dismiss"] as const),
 			role: Type.Optional(Type.String({ description: "approve: role name" })),
 			model: Type.Optional(Type.String({ description: "approve: provider/id[:thinking] the user agreed to. steer: run the next segment on this offering instead of the child's saved one; the user chooses it, you never substitute silently" })),
 			runId: Type.Optional(Type.String()),
@@ -1309,7 +1310,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			remember(ctx);
 			// Idle lead sessions may have retired with readable descendants. Reattach their saved
 			// owner chain (without a model turn), as the Agents frame does before steering one.
-			const runAction = ["status", "result", "wait", "steer", "cancel", "close", "models"].includes(p.action);
+			const runAction = ["status", "result", "wait", "steer", "cancel", "close", "models", "dismiss"].includes(p.action);
 			const requestedIds = p.action === "wait" ? p.runIds ?? (p.runId ? [p.runId] : []) : runAction && p.runId ? [p.runId] : [];
 			try {
 				for (const id of requestedIds) {
@@ -1534,6 +1535,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 							const turn = v.turns.at(-1);
 							return { content: [{ type: "text", text: `${id}: cancel requested; turn ${turn?.requestId} is ${turn?.status}.\n${acpSummary(v)}` }], details: v };
 						}
+						case "dismiss": return failed(new DelegateError("ACTION_UNSUPPORTED", "dismiss is supported only on Pi and Oven runs"));
 						case "close": {
 							const v = await acp.close(id, { ...(p.force !== undefined ? { force: p.force } : {}), ...(p.discardPersistentState !== undefined ? { discardPersistentState: p.discardPersistentState } : {}) });
 							return { content: [{ type: "text", text: `${id}: closed; ${v.session.origin === "opened" ? "disconnected, and the native session is unchanged" : "its session was disposed"}.\n${acpSummary(v)}` }], details: v };
@@ -1543,6 +1545,11 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			}
 			const run = p.runId ? runs.get(p.runId) : undefined;
 			if (!run || run.ownerKey !== owner.key) return failed(new DelegateError("RUN_NOT_FOUND", `unknown runId ${p.runId ?? "(none)"}; known: ${knownRuns(owner)}`, "runId"));
+			if (p.action === "dismiss") {
+				try { dismissBlockedWarning(run); }
+				catch (error) { return failed(error); }
+				return { content: [{ type: "text", text: `${run.id}: blocked warning cleared.` }], details: recordedView(run) };
+			}
 			// The pi backend's capability report decides what it cannot do; that fails, it never becomes another action.
 			const capability = requireAction(run.runtime === "oven" ? OVEN_CAPABILITIES : PI_CAPABILITIES, p.action as LifecycleAction);
 			if (!capability.ok) return failed(new DelegateError(capability.error.code, capability.error.message));

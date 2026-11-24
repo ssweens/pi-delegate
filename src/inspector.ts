@@ -9,7 +9,7 @@ import { agentListHint, chordLabel, hint, joinHints, keyLabel } from "./ui/hints
 import { navKeys } from "./ui/keys.ts";
 import { keepInView, moveIndex, stepFor } from "./ui/scroll.ts";
 import { fit, fitPad, indent, padTo } from "./ui/text.ts";
-import { agentDetail, agentProgress, progressText, frame, runTitle, statusMark, withLegend, processLine, processText, type RunView } from "./render.js";
+import { agentDetail, agentProgress, agentState, agentWarning, progressText, frame, runTitle, statusMark, withLegend, processLine, processText, type RunView } from "./render.js";
 import type { ProcessRunView } from "./process-backend.js";
 import { wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { renderTodoOverviewLines } from "./todo-render.ts";
@@ -180,12 +180,16 @@ export class AgentsPanel implements Component, Focusable {
 			const time = formatDuration(v.durationMs);
 			const title = this.theme.fg(selected ? "accent" : v.settled ? "muted" : "text", progressText(runTitle(v)));
 			const detail = selected ? ["    " + (inner < 65 ? agentProgress(v, this.theme, Math.max(1, inner - 4), now) : agentDetail(v, this.theme, Math.max(1, inner - 4), now))] : [];
-			if (inner < 65) return [fitPad(`${prefix}${title}`, Math.max(1, inner - time.length - 1)) + ` ${time}`, ...detail];
+			const warning = agentWarning(v, this.theme, inner);
+			if (inner < 65) {
+				const state = agentState(v, this.theme, Math.floor(inner / 2));
+				return [fitPad(`${prefix}${title}`, Math.max(1, inner - time.length - visibleWidth(state) - 2)) + ` ${state} ${time}`, ...warning, ...detail];
+			}
 			const model = modelWidth ? fitPad(this.theme.fg("muted", v.model), modelWidth) + " " : "";
 			const activityWidth = Math.max(1, inner - visibleWidth(prefix) - titleWidth - roleWidth - visibleWidth(model) - time.length - 3);
-			const activity = agentProgress(v, this.theme, activityWidth, now);
+			const activity = agentState(v, this.theme, activityWidth);
 			const role = progressText(v.work?.role ?? v.role);
-			return [prefix + fitPad(title, titleWidth) + " " + fitPad(this.theme.fg("muted", role), roleWidth) + " " + model + fitPad(activity, activityWidth) + " " + this.theme.fg("dim", time), ...detail];
+			return [prefix + fitPad(title, titleWidth) + " " + fitPad(this.theme.fg("muted", role), roleWidth) + " " + model + fitPad(activity, activityWidth) + " " + this.theme.fg("dim", time), ...warning, ...detail];
 		};
 		for (const run of shown) (run.settled ? finishedBody : activeBody).push(...renderRow(run).map(line => fit(line, inner)));
 		const range = rows.length > count ? ` · ${this.offset + 1}–${this.offset + count}/${rows.length}` : "";

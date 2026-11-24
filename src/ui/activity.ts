@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, type Focusable, type TUI, type TuiMouseEvent, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { AgentsPanel, currentExecutions, type LiveSource } from "../inspector.js";
-import { agentProgress, frame, runTitle, statusMark, withLegend, processLine } from "../render.js";
+import { agentProgress, agentWarning, frame, runLine, withLegend, processLine } from "../render.js";
 import { renderTodoOverviewLines, renderTodoSectionLines } from "../todo-render.js";
 import type { TodoState } from "../todo.js";
 import { COMPACT_KEY, FOCUS_KEY, momSectionLines, type PanelView } from "./panel.ts";
@@ -302,10 +302,11 @@ export class ActivityCoordinator {
 		const agentSection = (label: string, runs: typeof agents) => {
 			const lines = [heading(label)];
 			for (const run of runs) {
-				const { color, glyph } = statusMark(run);
 				const indent = "  ".repeat(Math.max(0, (run.depth ?? 1) - 1));
-				lines.push(...wrapTextWithAnsi(`${indent}${theme.fg(color, glyph)} ${runTitle(run)} · ${run.work?.role ?? run.role} · ${run.status} · depth ${run.depth ?? 1}`, inner));
-				lines.push(`${indent}  ${agentProgress(run, theme, Math.max(1, inner - indent.length - 2))}`);
+				const width = Math.max(1, inner - indent.length);
+				lines.push(indent + runLine(run, theme, width));
+				for (const warning of agentWarning(run, theme, width)) lines.push(indent + warning);
+				lines.push(`${indent}  ${agentProgress(run, theme, Math.max(1, width - 2))}`);
 			}
 			if (!runs.length) lines.push(theme.fg("muted", "No current agents."));
 			return lines;
