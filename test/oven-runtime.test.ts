@@ -62,7 +62,7 @@ test("runtime oven runs a child as an oven slice over MCP: create with the role'
 			assert.match(started.content[0].text, /running \(oven slice, fixture\/fixture\)/);
 			const request = await arrived;
 			const system = request.messages.find((m: any) => m.role === "system")?.content ?? "";
-			assert.match(system, /^<instructions>\n## Plan conflicts come first[\s\S]*\n\nBake carefully\./, "the plan-conflict rule precedes the role's instructions");
+			assert.match(system, /^<instructions>\nBake carefully\./, "the role's instructions lead the slice's system prompt");
 			assert.deepEqual(request.tools.map((tool: any) => tool.function.name).sort(), ["bash", "read"], "the role's tools narrow the slice's");
 			const slice = (await ovenCall<any[]>("list", {})).find((s) => s.task === "Bake one");
 			assert.equal(slice.sender, realpathSync(box.cwd));

@@ -72,12 +72,6 @@ const mode = () => readDelegateSettings(SETTINGS_PATH).mode;
  */
 const ORCHESTRATOR_PROMPT = ` Delegation mode: orchestrator (the user's setting). You coordinate; children execute. Hand every task the user gives you to a child with delegate, in the background, and stay free to keep talking with the user while children run. Do not block on delegate_ctl wait unless the user asks for a result now or your reply cannot be written without it. With nothing else to do, end your turn instead: completions and watchdog alerts start your next one, and a wait holds messages from peer sessions (intercom) and other extensions until it returns. Read the plan and the sources that define the mechanism before the first brief, and report each child's result when its completion arrives. Report to the user in at most 5 lines: what is moving, what is stuck, and the one thing you need from them. Keep briefs small: one deliverable per child, with firstDeliverableMin set on every writer (10-15 for a one-commit unit) and FIRST DELIVERABLE, STOP WHEN and KNOWN FACTS lines; for implementation ask for one commit-sized unit, then the next. Point each child at the plan clauses and the exact file and function it depends on; never tell it not to read them, and a summary does not replace that source. Watch with delegate_ctl status (one verdict per run), not transcripts. A timed check-in is fine: one fixed cron schedule per session, updated rather than recreated, reading live runs from delegate_ctl status instead of naming run ids. Act on exceptions: slow or silent, steer once (interrupt: true in a long think); looping or browsing, interrupt with the missing fact; no-artifact, interrupt and demand the first deliverable; still stuck after one interrupt, cancel and relaunch smaller. Extend a child's budget only on evidence (moving verdict, or it asked with EXTEND:), by delegate_ctl steer timeoutMs=<milliseconds from now, e.g. 600000 for 10 min>; never extend a silent, looping or no-artifact run. You cannot edit or write files yourself in this mode: those calls are refused. This overrides the delegate tool's own advice on when to delegate.`;
 const SKILL_PATH = join(dirname(fileURLToPath(import.meta.url)), "..", "skills", "delegation", "SKILL.md");
-// Every child gets this ahead of its role, including roles that bring their own STATUS contract and skip the footer.
-const PLAN_CONFLICT_RULE = `## Plan conflicts come first
-Before you build, check your brief against the plan or design doc it names, or the repo's plan for this work. If the brief, a steer, or what you find contradicts that plan, do not build the contradicting part. Stop with STATUS: blocked and report the brief's line, the plan's line (file:line), and the resolution you would propose. This outranks any instruction to keep going or never stop.
-
-`;
-
 const contractFooter = (delegates: boolean, atDepthCap = false, cap = MAX_DELEGATION_DEPTH) => `
 
 ## Delegated worker contract
@@ -1167,7 +1161,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		if (runtime === "oven" && (p.omitAgentsMd !== undefined || omitAgentsMd)) throw new DelegateError("INPUT_INVALID", "omitAgentsMd is supported only by in-process Pi children; Oven and hosted TUIs own their instruction loading", "omitAgentsMd");
 		const parentPrompt = context === "fork" ? ("getSystemPromptOptions" in ctx ? (ctx as ExtensionCommandContext).getSystemPromptOptions() : promptContext) : undefined;
 		const inheritedContextFiles = context === "fork" ? (nesting ? instructionFiles(nesting) : parentPrompt?.contextFiles ?? []) : [];
-		const systemPrompt = PLAN_CONFLICT_RULE + role.systemPrompt + (role.systemPrompt.includes("STATUS:") ? "" : contractFooter(delegates, atDepthCap && toolAllowlist(tools).allows("delegate"), cap))
+		const systemPrompt = role.systemPrompt + (role.systemPrompt.includes("STATUS:") ? "" : contractFooter(delegates, atDepthCap && toolAllowlist(tools).allows("delegate"), cap))
 			+ (delegates ? childrenFooter(depth + 1, cap) : "") + (context === "fork" ? FORK_FOOTER : "");
 		// An oven slice writes in its own copy, never in this tree.
 		if (isWriter && runtime !== "oven") {
