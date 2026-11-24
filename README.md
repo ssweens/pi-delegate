@@ -68,8 +68,8 @@ A role is a Markdown file with frontmatter. These directories are read in order,
 ```markdown
 ---
 name: scout
-description: Read-only recon of code the parent has not seen.
-tools: read, grep, find, ls, bash
+description: Recon of code the parent has not seen.
+tools: read, grep, find, ls, bash, write, edit
 context: fresh
 omitAgentsMd: true
 thinking: low
