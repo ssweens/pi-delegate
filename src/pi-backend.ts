@@ -573,6 +573,8 @@ export function progressAt(run: Pick<Run, "lastProgressAt" | "sessionFile">): nu
 export function healthAlert(run: Run, now = Date.now()) {
 	const health = runHealth({ ...run, lastProgressAt: progressAt(run) }, now);
 	if (health.verdict === "moving" || health.verdict === "settled") { run.alerted = undefined; return; }
+	// One provider retry is routine backoff; the parent hears about it only from the second attempt.
+	if (health.verdict === "retrying" && (run.providerRetry?.attempt ?? 0) < 2) return;
 	if (run.alerted?.includes(health.verdict)) return;
 	(run.alerted ??= []).push(health.verdict);
 	if (health.verdict === "browsing") {

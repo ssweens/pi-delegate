@@ -108,8 +108,11 @@ test("the watchdog alerts once per transition out of moving, never for moving", 
 	run.turnStartedAt = undefined;
 	run.lastProgressAt = Date.now() + 10 * 60_000;
 	healthAlert(run, run.lastProgressAt);
-	run.providerRetry = { attempt: 2, maxAttempts: 3, delayMs: 1000, errorMessage: "overloaded", startedAt: 0 };
+	run.providerRetry = { attempt: 1, maxAttempts: 3, delayMs: 1000, errorMessage: "overloaded", startedAt: 0 };
 	healthAlert(run, run.lastProgressAt + 1);
+	assert.equal(sent.length, 2, "a single provider retry raises no alert");
+	run.providerRetry = { attempt: 2, maxAttempts: 3, delayMs: 1000, errorMessage: "overloaded", startedAt: 0 };
+	healthAlert(run, run.lastProgressAt + 2);
 	assert.match(sent[2].content, /watch-a retrying: .*provider retry 2\/3 \(overloaded\)/);
 });
 
