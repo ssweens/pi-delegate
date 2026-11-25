@@ -25,6 +25,8 @@ export type BackendName = (typeof BACKENDS)[number];
 /** Omitting `backend` means pi, the current behavior. This is a default, not a fallback. */
 export const DEFAULT_BACKEND: BackendName = "pi";
 
+export const PI_LAUNCH_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
 export const EXECUTION_ENVIRONMENTS = ["local", "orb"] as const;
 export type ExecutionEnvironment = (typeof EXECUTION_ENVIRONMENTS)[number];
 
@@ -52,6 +54,8 @@ export interface PiStartInput extends CommonStartInput {
 	task: string;
 	/** provider/id[:thinking] */
 	model?: string;
+	/** Override only reasoning effort on an in-process Pi launch. */
+	thinking?: (typeof PI_LAUNCH_THINKING_LEVELS)[number];
 	context?: "fork" | "fresh";
 	/** Explicit workflow and work-role labels, separate from the tool-permission role. */
 	work?: WorkContext;
@@ -480,7 +484,7 @@ export function validateStartInput(raw: Record<string, unknown>): Validated<Star
 	if (!common.ok) return common;
 
 	if (backend.value === "process") {
-		for (const field of ["role", "model", "context", "omitAgentsMd", "agent", "sessionId", "runtime", "tui", "mode", "firstDeliverableMin", "executionEnvironment", "reason", "work"]) {
+		for (const field of ["role", "model", "thinking", "context", "omitAgentsMd", "agent", "sessionId", "runtime", "tui", "mode", "firstDeliverableMin", "executionEnvironment", "reason", "work"]) {
 			if (raw[field] !== undefined) return fail("INPUT_INVALID", `${field} is not supported on backend process`, field);
 		}
 		if (!isNonEmptyString(raw.command)) return fail("INPUT_INVALID", "command is required with backend process", "command");
@@ -514,6 +518,10 @@ export function validateStartInput(raw: Record<string, unknown>): Validated<Star
 			if (!isNonEmptyString(raw.model)) return fail("INPUT_INVALID", "model must be a non-empty string", "model");
 			value.model = raw.model;
 		}
+		if (raw.thinking !== undefined) {
+			if (!isOneOf(PI_LAUNCH_THINKING_LEVELS, raw.thinking)) return fail("INPUT_INVALID", `thinking must be one of ${PI_LAUNCH_THINKING_LEVELS.join(", ")}`, "thinking");
+			value.thinking = raw.thinking;
+		}
 		if (raw.context !== undefined) {
 			if (raw.context !== "fork" && raw.context !== "fresh") return fail("INPUT_INVALID", 'context must be "fork" or "fresh"', "context");
 			value.context = raw.context;
@@ -530,6 +538,7 @@ export function validateStartInput(raw: Record<string, unknown>): Validated<Star
 		return { ok: true, value };
 	}
 
+	if (raw.thinking !== undefined) return fail("FIELD_NOT_ON_ACP", "thinking is only supported on in-process Pi launches", "thinking");
 	for (const field of PI_ONLY_FIELDS) {
 		if (raw[field] !== undefined) return fail("FIELD_NOT_ON_ACP", `${field} is pi-only; an ACP child cannot receive the parent conversation`, field);
 	}

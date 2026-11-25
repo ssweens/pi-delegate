@@ -42,10 +42,12 @@ test("the launch reply names the first deliverable's time: a writer's default, a
 		};
 		const dueIn = (text: string) => /, first deliverable due (\d\d:\d\d)\. /.exec(text)?.[1];
 
-		const reader = await launch("Reader", { timeoutMs: 60 * min }, 0);
+		const reader = await launch("Reader", { role: "reviewer", timeoutMs: 60 * min }, 0);
 		assert.equal(dueIn(reader.text), undefined, "a reader has no deadline unless the call sets one");
-		const readerSet = await launch("Reader with a deadline", { timeoutMs: 60 * min, firstDeliverableMin: 7 }, 7 * min);
+		const readerSet = await launch("Reader with a deadline", { role: "reviewer", timeoutMs: 60 * min, firstDeliverableMin: 7 }, 7 * min);
 		assert.ok(readerSet.due.has(dueIn(readerSet.text)!), readerSet.text);
+		const scout = await launch("Scout with a writer deadline", { role: "scout", timeoutMs: 60 * min }, 15 * min);
+		assert.ok(scout.due.has(dueIn(scout.text)!), scout.text);
 		const writer = await launch("Writer", { role: "worker", timeoutMs: 20 * min }, 6 * min);
 		assert.ok(writer.due.has(dueIn(writer.text)!), `6 min floor of 20 min: ${writer.text}`);
 		const longWriter = await launch("Long writer", { role: "worker", timeoutMs: 120 * min }, 15 * min);

@@ -306,7 +306,7 @@ test("the Agents frame shows each child's provider and model, and drops the colu
 	const { acpCapabilities } = await import("../src/backend.ts");
 	const pi: any = {
 		id: "pi-1", status: "running", settled: false, stopped: false, role: "scout",
-		model: "anthropic/claude-sonnet-5", task: "Map the parser", cwd: "/repo", thinking: "high",
+		model: "openai/gpt-6", task: "Map the parser", cwd: "/repo", thinking: "high",
 		context: "fresh", segment: 1, output: "", turns: 1, durationMs: 4000,
 		tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, cost: 0,
 		changedFiles: [], droppedTools: [], toolCalls: [], revision: 1,
@@ -322,15 +322,16 @@ test("the Agents frame shows each child's provider and model, and drops the colu
 	const tui: any = { addInputListener: () => () => {}, requestRender: () => {}, hasOverlay: () => false, terminal: { rows: 40 } };
 	const panel = new AgentsPanel({ all: () => [pi, acp, opened], activity: () => ({ messages: [], activeTools: new Map() }), subscribe: () => () => {}, steer: async () => {}, cancel: async () => {} }, theme, tui, async () => {});
 	try {
-		const wide = panel.render(140).join("\n");
-		assert.match(wide, /anthropic\/claude-sonnet-5/, "a pi row shows provider/id");
-		assert.doesNotMatch(wide, /claude-sonnet-5:high/, "thinking stays out of the frame");
+		const wide = panel.render(160).join("\n");
+		assert.match(wide, /openai\/gpt-6/, "a pi row shows provider/id");
+		assert.doesNotMatch(wide, /gpt-6:high/, "thinking stays out of the frame");
 		assert.match(wide, /gpt-5\.6/, "an ACP row shows the agent's model");
 		const blank = wide.split("\n").find((l) => l.includes("Read the docs")) ?? "";
 		assert.doesNotMatch(blank, /gpt-5\.6/, "an opened session with no model leaves the column blank");
-		assert.equal(blank.indexOf("session"), wide.split("\n").find((l) => l.includes("Port the parser"))!.indexOf("session"), "the blank column still holds its width, so activity lines up");
+		assert.match(blank, /running · session/);
+		assert.equal(blank.indexOf("running"), wide.split("\n").find((l) => l.includes("Port the parser"))!.indexOf("running"), "the blank column still holds its width, so activity lines up");
 		const narrow = panel.render(80).join("\n");
-		assert.doesNotMatch(narrow, /anthropic\/claude-sonnet-5|gpt-5\.6/, "the column drops before it crowds the activity");
+		assert.doesNotMatch(narrow, /openai\/gpt-6|gpt-5\.6/, "the column drops before it crowds the activity");
 		assert.match(narrow, /Map the parser/);
 	} finally { panel.dispose(); }
 });

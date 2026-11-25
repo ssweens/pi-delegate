@@ -71,6 +71,16 @@ test("pi keeps today's fields and requires a role name and a task", () => {
 	assert.equal(errorOf(validateStartInput({ role: "scout", task: "t", timeoutMs: -1 })).field, "timeoutMs");
 });
 
+test("thinking is a validated Pi-only launch field independent of model", () => {
+	assert.deepEqual(validateStartInput({ role: "worker", task: "t", thinking: "low" }),
+		{ ok: true, value: { backend: "pi", role: "worker", task: "t", thinking: "low" } });
+	for (const thinking of ["default", "large", null, 1]) {
+		assert.equal(errorOf(validateStartInput({ role: "worker", task: "t", thinking })).field, "thinking");
+	}
+	assert.equal(errorOf(validateStartInput({ backend: "process", command: "true", thinking: "low" })).field, "thinking");
+	assert.equal(errorOf(validateStartInput({ backend: "acp", agent: "pi", task: "t", thinking: "low" })).code, "FIELD_NOT_ON_ACP");
+});
+
 test("work labels are explicit, bounded and Pi-only", () => {
 	assert.deepEqual(validateStartInput({ role: "worker", task: "t", work: { mode: "Werkit", role: "Op" } }),
 		{ ok: true, value: { backend: "pi", role: "worker", task: "t", work: { mode: "Werkit", role: "Op" } } });

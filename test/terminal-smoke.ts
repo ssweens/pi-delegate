@@ -323,7 +323,7 @@ try {
 		assert.match(listed, /delegate_ctl roles 3/);
 		// One aligned row per role, no wrapped wall of paths.
 		for (const role of ["reviewer", "scout", "worker"]) assert.match(listed, new RegExp(`\\n\\s+${role} +(fresh|fork)`));
-		assert.match(listed, /scout +fresh:low +needs approval +read-only · 5 tools/);
+		assert.match(listed, /scout +fresh:low +needs approval +writes · 7 tools/);
 		assert.match(listed, /worker +fork:medium +needs approval +writes · 8 tools/);
 		// Prose written for the model does not survive a column; no row ends mid-word.
 		assert.doesNotMatch(listed, /Read-only recon of code/);
@@ -331,7 +331,7 @@ try {
 		save(`${mode}-control-collapsed`);
 		key("C-o");
 		await expect(/roles\/scout\.md/);
-		assert.match(capture(), /Read-only recon of code the parent has not seen/, "the full purpose is what the expand is for");
+		assert.match(capture(), /Recon of code the parent has not seen/, "the full purpose is what the expand is for");
 		save(`${mode}-control-expanded`); key("C-o");
 		await checkModelReview(mode);
 		// A long text report previews its head — what it leads with — not its tail.

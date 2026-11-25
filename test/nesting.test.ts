@@ -42,7 +42,7 @@ test("nested delegation follows the role's tools and is capped in depth (real SD
 			const result = await h.waitLaunch("Plain scout work");
 			assert.equal(result.details.status, "complete", result.content[0].text);
 			const request = requestFor("Plain scout work");
-			assert.deepEqual(toolNames(request).sort(), ["bash", "find", "grep", "ls", "read"]);
+			assert.deepEqual(toolNames(request).sort(), ["bash", "edit", "find", "grep", "ls", "read", "write"]);
 			assert.match(system(request), /no delegation tools and cannot start another agent/);
 			assert.doesNotMatch(system(request), /Your own children/);
 			const run = h.state().runs.get(result.details.id);
@@ -63,7 +63,7 @@ test("nested delegation follows the role's tools and is capped in depth (real SD
 			assert.match(system(coordinator), /You run at delegation depth 1\. A delegate call that would start a child deeper than 3 fails, so a child at depth 3 gets neither `delegate` nor `delegate_ctl`\./);
 			assert.doesNotMatch(system(coordinator), /no delegation tools/);
 			const nested = requestFor("Nested scout");
-			assert.deepEqual(toolNames(nested).sort(), ["bash", "find", "grep", "ls", "read"], "the coordinator's scout gets no delegation tools");
+			assert.deepEqual(toolNames(nested).sort(), ["bash", "edit", "find", "grep", "ls", "read", "write"], "the coordinator's scout gets no delegation tools");
 			const rows = logRows();
 			const parentRow = rows.find((row) => row.task === "Coordinate review");
 			const childRow = rows.find((row) => row.task === "Nested scout");
@@ -72,7 +72,7 @@ test("nested delegation follows the role's tools and is capped in depth (real SD
 			assert.equal(childRow.depth, 2);
 			assert.equal(childRow.parentRunId, result.details.id);
 			assert.equal(childRow.status, "complete");
-			assert.deepEqual(childRow.tools.sort(), ["bash", "find", "grep", "ls", "read"]);
+			assert.deepEqual(childRow.tools.sort(), ["bash", "edit", "find", "grep", "ls", "read", "write"]);
 			assert.deepEqual(parentRow.tools.sort(), ["delegate", "delegate_ctl", "grep", "read"]);
 			assert.deepEqual(parentRow.droppedTools, []);
 			assert.equal(h.notices.length, 0, "joined runs wake no one");

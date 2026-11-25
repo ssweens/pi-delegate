@@ -208,6 +208,7 @@ export function agentWarning(v: RunView, theme: FrameTheme, width: number): stri
 /** Execution state for the main Agents row. */
 export function agentState(v: RunView, theme: FrameTheme, width: number): string {
 	if (v.status !== "running" || v.providerRetry) return fit(agentProgress(v, theme, width), width);
+	if (v.backend === "acp") return fit(theme.fg("accent", `running · session ${v.nativeSessionId ?? "pending"}`), width);
 	const tool = v.activeTool?.name;
 	return fit(theme.fg("accent", tool ? `running · ${tool}` : "running"), width);
 }

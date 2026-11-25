@@ -28,7 +28,7 @@ import { type ApprovedDefault, readLegacySection, readSettings, writeSettings } 
 import type { LiveSource } from "./inspector.js";
 import { budgetText, clock, firstDeliverableAt, runHealth } from "./health.js";
 import { type AAIndices, acpRowView, asRunView, boardLine, empty, framed, type LiveFacts, type ModelRow, type ModelsDetails, onBoard, resultLines, resultView, type RunView } from "./render.js";
-import { type AcpRunView, firstDeliverableError, type LifecycleAction, type PiStartInput, OVEN_CAPABILITIES, PI_CAPABILITIES, requireAction, validateStartInput, validateSteer } from "./backend.js";
+import { type AcpRunView, firstDeliverableError, type LifecycleAction, type PiStartInput, OVEN_CAPABILITIES, PI_CAPABILITIES, PI_LAUNCH_THINKING_LEVELS, requireAction, validateStartInput, validateSteer } from "./backend.js";
 import { ACP_JOIN_LOST, AcpBackend, acpModelsText, acpResultText, acpStatusText, acpSummary, DelegateError, sessionLabel, unwrap } from "./acp-backend.js";
 import { type Join, type JoinOutcome, joinRuns, waitCancelled } from "./wait.ts";
 import { ProcessBackend, type ProcessRunView } from "./process-backend.js";
@@ -1113,6 +1113,12 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		// A tui child is another agent's own TUI in oven: its model comes from the role's template (or the call's
 		// model, passed to oven as an override), never from this session's Pi models.
 		const tui = p.tui ?? role.tui;
+		const runtime = tui ? "oven" : p.runtime ?? role.runtime ?? "in-process";
+		if (p.thinking !== undefined) {
+			if (runtime !== "in-process") throw new DelegateError("INPUT_INVALID", "thinking is only supported on in-process Pi launches", "thinking");
+			const suffix = p.model ? parseModelSpec(p.model).thinking : undefined;
+			if (suffix !== undefined && suffix !== p.thinking) throw new DelegateError("INPUT_INVALID", "thinking conflicts with the explicit model suffix", "thinking");
+		}
 		if (tui && p.runtime === "in-process") throw new DelegateError("INPUT_INVALID", `role "${role.name}" runs as a ${tui} tui child in oven; runtime "in-process" does not apply`, "runtime");
 		let approved = !tui && !p.model ? loadDefaults()[role.name] : undefined;
 		let live: LiveOR | undefined;
@@ -1140,7 +1146,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			if (!resolved.model) throw new DelegateError("MODEL_UNAVAILABLE", "no model available for child", "model");
 		}
 		const { model, thinking: specThinking, pick: modelPick } = resolved;
-		const thinking = String(specThinking ?? role.thinking ?? (tui ? "default" : "medium"));
+		const thinking = String(p.thinking ?? specThinking ?? role.thinking ?? (tui ? "default" : "medium"));
 		const timeoutMs = p.timeoutMs ?? role.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 		// Validated against the call's own timeoutMs already; the role's or the default budget is known only here.
 		const late = p.firstDeliverableMin !== undefined ? firstDeliverableError(p.firstDeliverableMin, timeoutMs) : undefined;
@@ -1153,8 +1159,6 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 		// A Claude or Amp TUI has no delegate tools; a Pi TUI loads the user's extensions, pi-delegate among them.
 		const delegates = (!tui || tui === "pi") && allows("delegate");
 		const isWriter = WRITE_TOOLS.some(allows);
-		// Like the model: the role's line is a default the call can override.
-		const runtime = tui ? "oven" : p.runtime ?? role.runtime ?? "in-process";
 		// An oven slice runs outside this process and never receives the conversation, as an ACP child.
 		const context = runtime === "oven" ? "fresh" : p.context ?? role.context ?? "fresh";
 		const omitAgentsMd = p.omitAgentsMd ?? role.omitAgentsMd ?? false;
@@ -1204,6 +1208,7 @@ function installDelegate(pi: ExtensionAPI, nesting?: Run) {
 			role: Type.Optional(Type.String({ description: 'pi: role name, required (delegate_ctl action=roles lists them). acp: "read-only" (default) or "writer" for a created session; not allowed with sessionId' })),
 			task: Type.Optional(Type.String({ description: "agent brief; required except acp with sessionId. process: optional human title" })),
 			model: Type.Optional(Type.String({ description: "override. pi: provider/id[:thinking]. acp: the agent's own model ID, created sessions only" })),
+			thinking: Type.Optional(StringEnum(PI_LAUNCH_THINKING_LEVELS, { description: "In-process Pi only: reasoning effort for this launch, without selecting a different model. Omit to keep the default." })),
 			context: Type.Optional(StringEnum(["fork", "fresh"] as const)),
 			work: Type.Optional(Type.Object({
 				mode: Type.Optional(Type.String({ minLength: 1, maxLength: 80 })),

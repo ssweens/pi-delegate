@@ -26,7 +26,7 @@ test("a child of an untrusted project reads nothing from its .pi: no project MCP
 	// A project extension, which an untrusted child must not load.
 	mkdirSync(join(box.cwd, ".pi", "extensions"), { recursive: true });
 	writeFileSync(join(box.cwd, ".pi", "extensions", "project-ext.js"), `import { writeFileSync } from "node:fs";\nexport default function (pi) { writeFileSync(${JSON.stringify(marker("project-ext"))}, "loaded"); pi.registerTool({ name: "project_tool", label: "p", description: "p", parameters: { type: "object", properties: {} }, async execute() { return { content: [{ type: "text", text: "p" }] }; } }); }\n`);
-	writeFileSync(join(box.cwd, ".pi", "agents", "scout.md"), "---\nname: scout\ndescription: PROJECT-SCOUT redefined by the repository.\ntools: read, write, edit, bash\ncontext: fresh\n---\n\nPROJECT-SCOUT instructions.\n");
+	writeFileSync(join(box.cwd, ".pi", "agents", "scout.md"), "---\nname: scout\ndescription: PROJECT-SCOUT redefined by the repository.\ntools: read, write, edit, bash, delegate, mcp__fake__*\ncontext: fresh\n---\n\nPROJECT-SCOUT instructions.\n");
 	// Roles the user defined: the agent directory's, which do not depend on the project's trust.
 	const userRoles = join(box.agentDir, "agents");
 	mkdirSync(userRoles, { recursive: true });
@@ -71,7 +71,7 @@ test("a child of an untrusted project reads nothing from its .pi: no project MCP
 		const [scoutRequest] = requestsFor("Untrusted scout");
 		assert(scoutRequest, "the coordinator's scout ran");
 		assert.doesNotMatch(system(scoutRequest), /PROJECT-SCOUT/, "the nested delegate used the packaged scout, not the project's");
-		assert.deepEqual(toolNames(scoutRequest), ["bash", "find", "grep", "ls", "read"], "the project's redefinition could not hand the scout write tools");
+		assert.deepEqual(toolNames(scoutRequest), ["bash", "edit", "find", "grep", "ls", "read", "write"], "the bundled tools, not the project's chosen delegation or MCP tools");
 
 		api.script("Named server", { text: "NAMED-DONE" });
 		const named = await h.waitLaunch("Named server", { role: "fake-user" });
@@ -142,7 +142,7 @@ test("a folder whose only project resource is .pi/agents is trust-gated: a trust
 		assert.equal(t.prompts.length, 1, "asked, though Pi gates nothing in the folder and the parent is trusted");
 		assert.equal(a.trusted, false);
 		assert.equal(a.source, "prompted");
-		assert.deepEqual(a.run.tools, ["read", "grep", "find", "ls", "bash"], "the packaged scout, not the repository's writer");
+		assert.deepEqual(a.run.tools, ["read", "grep", "find", "ls", "bash", "write", "edit"], "the packaged scout, not the repository's redefinition");
 		assert.doesNotMatch(a.run.systemPrompt, /PROJECT-SCOUT/);
 		const accepted = rolesOnlyFolder(join(t.box.root, "roles-accepted"));
 		const b = await t.child(accepted, "Roles-only accepted");

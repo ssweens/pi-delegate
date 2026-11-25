@@ -12,7 +12,7 @@ import { departed } from "../src/pi-backend.ts";
 const text = (content: any) => typeof content === "string" ? content : (content ?? []).filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n");
 const lastUser = (request: any) => text(request.messages.findLast((m: any) => m.role === "user")?.content);
 const lastTool = (request: any) => text(request.messages.findLast((m: any) => m.role === "tool")?.content);
-const delegateCall = (task: string): Reply => ({ tool: { name: "delegate", arguments: { role: "scout", context: "fresh", task, model: "fixture/fixture:off" } } });
+const delegateCall = (task: string, role = "scout"): Reply => ({ tool: { name: "delegate", arguments: { role, context: "fresh", task, model: "fixture/fixture:off" } } });
 async function until(condition: () => boolean, what: string, ms = 8000) {
 	const end = Date.now() + ms;
 	while (!condition()) {
@@ -106,6 +106,7 @@ test("a delegating child's subtree ends with it, and a late report is never drop
 	const agents = join(box.cwd, ".pi", "agents");
 	mkdirSync(agents, { recursive: true });
 	writeFileSync(join(agents, "coordinator.md"), "---\nname: coordinator\ndescription: Starts its own children.\ntools: read, grep, delegate, delegate_ctl\ncontext: fresh\n---\n\nCoordinate.\n");
+	writeFileSync(join(agents, "read-only-scout.md"), "---\nname: read-only-scout\ntools: read\ncontext: fresh\n---\n\nRead, then report.\n");
 	writeFileSync(join(agents, "writer-coordinator.md"), "---\nname: writer-coordinator\ndescription: Writes and starts its own children.\ntools: read, write, delegate, delegate_ctl\ncontext: fresh\n---\n\nCoordinate and write.\n");
 	const h = await harness(box);
 	api.onUnscripted((request) => {
@@ -182,10 +183,12 @@ test("a delegating child's subtree ends with it, and a late report is never drop
 
 		await t.test("a refused revival delivers the late report to the delegating child's owner", async () => {
 			const scoutGate = gated();
-			api.script("Writer coordinator", delegateCall("Writer scout"), { text: "WRITER-FIRST" });
+			api.script("Writer coordinator", delegateCall("Conflicting bundled Scout"), delegateCall("Writer scout", "read-only-scout"), { text: "WRITER-FIRST" });
 			api.script("Writer scout", { text: "WRITER-SCOUT-REPORT", gate: scoutGate });
 			const first = await h.waitLaunch("Writer coordinator", { role: "writer-coordinator" });
 			assert.equal(first.details.status, "complete", first.content[0].text);
+			assert.match(lastTool(requestsFor("Writer coordinator")[1]), /WRITER_CWD_OWNED/);
+			assert.equal(requestsFor("Conflicting bundled Scout").length, 0);
 			// Another writer now holds the same directory, so the coordinator's revival is refused.
 			const holdGate = gated();
 			const held = api.script("Holding writer", { text: "HOLD", gate: holdGate });

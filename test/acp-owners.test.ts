@@ -51,7 +51,13 @@ test("acp runs with two parents in one process, and a mixed wait", { timeout: 60
 			try {
 				const gates = [deferred(), deferred()];
 				const arrived = gates.map((gate, i) => api.script(`Mixed child ${i}`, { text: `PI-${i}`, gate }));
-				const pis = [(await a.launch("Mixed child 0")).details.id, (await a.launch("Mixed child 1")).details.id];
+				// This exercises concurrent waits, not writer exclusion. Both children can read one cwd.
+				const pis: string[] = [];
+				for (let i = 0; i < gates.length; i++) {
+					const launched = await a.launch(`Mixed child ${i}`, { role: "reviewer" });
+					assert.ok(!launched.isError, launched.content[0].text);
+					pis.push(launched.details.id);
+				}
 				await Promise.all(arrived);
 				const acp = (await a.launch("WAIT", acpArgs)).details.id;
 				const waiting = a.ctl("wait", undefined, { runIds: [...pis, acp], mode: "all", timeoutMs: 900 });
